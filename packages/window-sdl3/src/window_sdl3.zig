@@ -213,6 +213,7 @@ pub fn pollEvents(app: *engine.App) void {
                 state.input_svc.injectMouseMove(ev.motion.x, ev.motion.y);
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP => {
+                state.input_svc.injectMouseMove(ev.button.x, ev.button.y);
                 const button = mapMouseButton(ev.button.button) orelse continue;
                 state.input_svc.injectMouseButton(button, ev.button.down);
             },

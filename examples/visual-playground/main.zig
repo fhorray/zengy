@@ -257,9 +257,9 @@ pub fn main() !void {
         \\  <button id="spawn_btn" action="playground.spawn">Spawn Sprite</button>
         \\  <button id="log_dn" action="playground.scroll_down">Scroll Log Down</button>
         \\  <button id="log_up" action="playground.scroll_up">Scroll Log Up</button>
-        \\  <list id="log_list">
+        \\  <virtual-list id="log_list">
         \\    <label id="log_boot">Ready (WASD pan, click to spawn)</label>
-        \\  </list>
+        \\  </virtual-list>
         \\</panel>
     , tree);
 

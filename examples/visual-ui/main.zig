@@ -122,16 +122,16 @@ pub fn main() !void {
         \\  <label id="title">ZigEng D4 — UI & Text (High-DPI)</label>
         \\  <label id="status">Clicks: 0</label>
         \\  <button id="inc_btn" action="demo.increment">Click Me (+1)</button>
-        \\  <textbox id="input_box">Type here...</textbox>
+        \\  <text-input id="input_box">Type here...</text-input>
         \\  <button id="scroll_dn" action="demo.scroll_down">Scroll List Down</button>
         \\  <button id="scroll_up" action="demo.scroll_up">Scroll List Up</button>
-        \\  <list id="clip_list">
+        \\  <virtual-list id="clip_list">
         \\    <label id="item_0">Clipped Item 0</label>
         \\    <label id="item_1">Clipped Item 1</label>
         \\    <label id="item_2">Clipped Item 2</label>
         \\    <label id="item_3">Clipped Item 3</label>
         \\    <label id="item_4">Clipped Item 4</label>
-        \\  </list>
+        \\  </virtual-list>
         \\</panel>
     , tree);
 
