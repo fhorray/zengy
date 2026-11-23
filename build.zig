@@ -203,6 +203,26 @@ pub fn build(b: *std.Build) void {
     const run_playground_step = b.step("run-playground", "Run the integrated engine playground");
     run_playground_step.dependOn(&run_playground.step);
 
+    // Microbenchmark suite (`benchmarks/main.zig`)
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("benchmarks/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("engine", engine_mod);
+    bench_mod.addImport("graphics", graphics_mod);
+    bench_mod.addImport("ui_core", ui_core_mod);
+    bench_mod.addImport("scene", scene_mod);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "zigeng-bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+    const run_bench = b.addRunArtifact(bench_exe);
+    const run_bench_step = b.step("run-bench", "Run the engine microbenchmark suite");
+    run_bench_step.dependOn(&run_bench.step);
+
     // Per-module test suites
     const test_step = b.step("test", "Run all per-module unit, integration, and C ABI tests");
 

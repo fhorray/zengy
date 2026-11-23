@@ -183,8 +183,11 @@ pub const TypeRegistry = struct {
             .fields = fields,
         };
 
-        try self.schemas.put(self.allocator, schema_id, schema);
-        try self.name_to_schema.put(self.allocator, full_name, schema_id);
+        try self.schemas.ensureUnusedCapacity(self.allocator, 1);
+        try self.name_to_schema.ensureUnusedCapacity(self.allocator, 1);
+
+        self.schemas.putAssumeCapacity(schema_id, schema);
+        self.name_to_schema.putAssumeCapacity(full_name, schema_id);
         return schema;
     }
 

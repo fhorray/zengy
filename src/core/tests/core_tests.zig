@@ -323,3 +323,76 @@ test "Phase 4: TypeRegistry dynamic ComponentSchema and field reflection" {
     try testing.expectApproxEqAbs(@as(f32, 75.5), cur.f32_t, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 100.0), max.f32_t, 0.001);
 }
+
+test "ZE-002: EventBus reentrant unsubscribe, unsubscribeByOwner, and subscribe during drain()" {
+    var bus = engine.EventBus.init(testing.allocator, 16, .drop_newest);
+    defer bus.deinit();
+
+    const State = struct {
+        bus: *engine.EventBus,
+        self_id: engine.events.SubscriptionId = 0,
+        calls: usize = 0,
+
+        fn onSelfUnsub(raw: ?*anyopaque, _: engine.EventEnvelope) void {
+            const st: *@This() = @ptrCast(@alignCast(raw.?));
+            st.calls += 1;
+            _ = st.bus.unsubscribe(st.self_id);
+        }
+
+        fn onCount(raw: ?*anyopaque, _: engine.EventEnvelope) void {
+            const st: *@This() = @ptrCast(@alignCast(raw.?));
+            st.calls += 1;
+        }
+    };
+
+    var s1 = State{ .bus = &bus };
+    var s2 = State{ .bus = &bus };
+    s1.self_id = try bus.subscribe(1, "tick", State.onSelfUnsub, &s1);
+    _ = try bus.subscribe(2, "tick", State.onCount, &s2);
+
+    try bus.post(.{ .name = "tick", .payload = "1" });
+    try bus.post(.{ .name = "tick", .payload = "2" });
+    _ = bus.drain();
+
+    // s1 unsubscribed itself on the first event, so it only ran once; s2 ran twice.
+    try testing.expectEqual(@as(usize, 1), s1.calls);
+    try testing.expectEqual(@as(usize, 2), s2.calls);
+    try testing.expectEqual(@as(usize, 1), bus.subscriptionCount());
+}
+
+test "ZE-003 & ZE-007: TypeRegistry and World.spawn remain consistent under OOM" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var reg = engine.TypeRegistry.init(failing.allocator());
+    defer reg.deinit();
+
+    const res = reg.registerSchema("ns", "Comp", 1, .blittable, &.{
+        .{ .name = "x", .field_type = .f32_t },
+    });
+    try testing.expectError(error.OutOfMemory, res);
+
+    var fail_world = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var world = engine.World.init(fail_world.allocator(), .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+
+    try testing.expectError(error.OutOfMemory, world.spawn());
+    try testing.expectEqual(@as(usize, 0), world.entity_count);
+    try testing.expectEqual(world.generations.items.len, world.alive_flags.items.len);
+    try testing.expectEqual(world.generations.items.len, world.guids.items.len);
+}
+
+test "ZE-006: ComponentPool preserves align(64) across reallocations" {
+    const Aligned64 = struct {
+        value: u64 align(64),
+    };
+
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+
+    for (0..64) |i| {
+        const e = try world.spawn();
+        try world.set(e, Aligned64, .{ .value = i });
+        const ptr = world.getConst(e, Aligned64).?;
+        try testing.expectEqual(@as(usize, 0), @intFromPtr(ptr) % 64);
+        try testing.expectEqual(@as(u64, i), ptr.value);
+    }
+}

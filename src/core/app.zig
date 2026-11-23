@@ -128,6 +128,7 @@ pub const App = struct {
 
     /// Registers an optional `Module` to participate in topological resolution.
     pub fn registerModule(self: *App, module: module_mod.Module) !void {
+        if (self.state != .created and self.state != .configured) return error.InvalidAppState;
         try self.modules.register(module);
         self.state = .configured;
     }

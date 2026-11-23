@@ -55,3 +55,41 @@ test "Phase 3: Load real compiled C shared library plugin and validate ABI rejec
     };
     try testing.expectError(error.UnsupportedAbi, host.loadFromApi(&bad_api, null));
 }
+
+test "ZE-004: PluginHost unloads plugin state on OOM during registration and maps unknown status safely" {
+    const DummyPlugin = struct {
+        var unloaded: bool = false;
+        fn load(_: *const engine.abi.AEHostApi, out_state: *?*anyopaque) callconv(.c) i32 {
+            unloaded = false;
+            out_state.* = @ptrFromInt(0x1234);
+            return 0;
+        }
+        fn start(_: ?*anyopaque) callconv(.c) i32 {
+            return 9999; // unknown status code
+        }
+        fn stop(_: ?*anyopaque) callconv(.c) void {}
+        fn unload(_: ?*anyopaque) callconv(.c) void {
+            unloaded = true;
+        }
+    };
+
+    const api = engine.abi.AEPluginApi{
+        .struct_size = @sizeOf(engine.abi.AEPluginApi),
+        .abi_major = engine.abi.ABI_MAJOR,
+        .abi_minor = engine.abi.ABI_MINOR,
+        .plugin_id = engine.abi.AEStringView.fromSlice("test.dummy"),
+        .load = DummyPlugin.load,
+        .start = DummyPlugin.start,
+        .stop = DummyPlugin.stop,
+        .unload = DummyPlugin.unload,
+    };
+
+    // Normal host: unknown return code maps safely to AEStatus.err without trapping.
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    const host = try app.ensurePluginHost();
+    const h = try host.loadFromApi(&api, null);
+    try testing.expectEqual(engine.abi.AEStatus.err, host.startPlugin(h));
+    try testing.expectEqual(engine.abi.AEStatus.ok, host.unloadPlugin(h));
+    try testing.expect(DummyPlugin.unloaded);
+}

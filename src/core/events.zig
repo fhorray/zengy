@@ -6,9 +6,10 @@
 //! Key guarantees:
 //! - Bounded queue capacity with explicit overflow policy (`drop_newest` or `drop_oldest`).
 //! - `dropped_events` metric tracks backpressure/overflow occurrences.
+//! - Reentrancy-safe `drain()`: tracks `dispatch_depth`, tombstones removed subscriptions
+//!   during active dispatch, and sweeps them cleanly once `dispatch_depth` returns to 0.
 //! - Subscriptions carry an `owner_id` so module/plugin unload cancels all owned
 //!   subscriptions via `unsubscribeByOwner()`, preventing dangling callbacks.
-//! - `drain()` snapshots the current queue so re-entrant `post()` calls are deferred to the next drain.
 
 const std = @import("std");
 
@@ -34,6 +35,7 @@ const Subscription = struct {
     event_name: []const u8,
     callback: EventCallback,
     user_data: ?*anyopaque,
+    pending_remove: bool = false,
 };
 
 const QueuedEvent = struct {
@@ -50,6 +52,7 @@ pub const EventBus = struct {
     queue: std.ArrayList(QueuedEvent),
     subscriptions: std.ArrayList(Subscription),
     next_sub_id: SubscriptionId,
+    dispatch_depth: u32,
     dropped_events: u64,
     total_posted: u64,
     total_drained: u64,
@@ -62,6 +65,7 @@ pub const EventBus = struct {
             .queue = .empty,
             .subscriptions = .empty,
             .next_sub_id = 1,
+            .dispatch_depth = 0,
             .dropped_events = 0,
             .total_posted = 0,
             .total_drained = 0,
@@ -100,15 +104,20 @@ pub const EventBus = struct {
             .event_name = name_copy,
             .callback = callback,
             .user_data = user_data,
+            .pending_remove = false,
         });
         return id;
     }
 
     pub fn unsubscribe(self: *EventBus, sub_id: SubscriptionId) bool {
-        for (self.subscriptions.items, 0..) |sub, idx| {
-            if (sub.id == sub_id) {
-                self.allocator.free(sub.event_name);
-                _ = self.subscriptions.orderedRemove(idx);
+        for (self.subscriptions.items, 0..) |*sub, idx| {
+            if (sub.id == sub_id and !sub.pending_remove) {
+                if (self.dispatch_depth > 0) {
+                    sub.pending_remove = true;
+                } else {
+                    self.allocator.free(sub.event_name);
+                    _ = self.subscriptions.orderedRemove(idx);
+                }
                 return true;
             }
         }
@@ -117,6 +126,16 @@ pub const EventBus = struct {
 
     pub fn unsubscribeByOwner(self: *EventBus, owner_id: u64) usize {
         var removed: usize = 0;
+        if (self.dispatch_depth > 0) {
+            for (self.subscriptions.items) |*sub| {
+                if (sub.owner_id == owner_id and !sub.pending_remove) {
+                    sub.pending_remove = true;
+                    removed += 1;
+                }
+            }
+            return removed;
+        }
+
         var i: usize = 0;
         while (i < self.subscriptions.items.len) {
             if (self.subscriptions.items[i].owner_id == owner_id) {
@@ -128,6 +147,18 @@ pub const EventBus = struct {
             }
         }
         return removed;
+    }
+
+    fn sweepTombstones(self: *EventBus) void {
+        var i: usize = 0;
+        while (i < self.subscriptions.items.len) {
+            if (self.subscriptions.items[i].pending_remove) {
+                self.allocator.free(self.subscriptions.items[i].event_name);
+                _ = self.subscriptions.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     pub fn post(self: *EventBus, envelope: EventEnvelope) !void {
@@ -173,6 +204,14 @@ pub const EventBus = struct {
             batch.deinit(self.allocator);
         }
 
+        self.dispatch_depth += 1;
+        defer {
+            self.dispatch_depth -= 1;
+            if (self.dispatch_depth == 0) {
+                self.sweepTombstones();
+            }
+        }
+
         for (batch.items) |ev| {
             const env = EventEnvelope{
                 .name = ev.name,
@@ -180,7 +219,12 @@ pub const EventBus = struct {
                 .world_id = ev.world_id,
                 .entity_handle = ev.entity_handle,
             };
-            for (self.subscriptions.items) |sub| {
+            // Snapshot subscriber count so callbacks subscribing new handlers do not
+            // invalidate indices or execute on the current event mid-loop.
+            const sub_len = self.subscriptions.items.len;
+            for (0..sub_len) |idx| {
+                const sub = self.subscriptions.items[idx];
+                if (sub.pending_remove) continue;
                 if (std.mem.eql(u8, sub.event_name, ev.name) or std.mem.eql(u8, sub.event_name, "*")) {
                     sub.callback(sub.user_data, env);
                 }
@@ -195,6 +239,10 @@ pub const EventBus = struct {
     }
 
     pub fn subscriptionCount(self: *const EventBus) usize {
-        return self.subscriptions.items.len;
+        var active: usize = 0;
+        for (self.subscriptions.items) |sub| {
+            if (!sub.pending_remove) active += 1;
+        }
+        return active;
     }
 };

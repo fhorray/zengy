@@ -227,6 +227,19 @@ pub const PluginHost = struct {
         return self.loadFromApi(api, lib);
     }
 
+    pub fn statusFromInt(rc: i32) AEStatus {
+        return switch (rc) {
+            0 => .ok,
+            1 => .err,
+            2 => .unsupported_abi,
+            3 => .missing_service,
+            4 => .invalid_handle,
+            5 => .permission_denied,
+            6 => .busy,
+            else => .err,
+        };
+    }
+
     pub fn loadFromApi(self: *PluginHost, api: *const AEPluginApi, lib: ?NativeLib) !PluginHandle {
         const status = validatePluginApi(api);
         if (status != .ok) return error.UnsupportedAbi;
@@ -236,6 +249,7 @@ pub const PluginHost = struct {
         if (load_rc != @intFromEnum(AEStatus.ok)) {
             return error.PluginLoadFailed;
         }
+        errdefer api.unload.?(state);
 
         const owner_id = self.next_owner_id;
         self.next_owner_id += 1;
@@ -261,7 +275,8 @@ pub const PluginHost = struct {
     pub fn startPlugin(self: *PluginHost, handle: PluginHandle) AEStatus {
         const plugin = self.getPluginMut(handle) orelse return .invalid_handle;
         const rc = plugin.api.start.?(plugin.state);
-        if (rc != @intFromEnum(AEStatus.ok)) return @enumFromInt(rc);
+        const st = statusFromInt(rc);
+        if (st != .ok) return st;
         plugin.started = true;
         return .ok;
     }

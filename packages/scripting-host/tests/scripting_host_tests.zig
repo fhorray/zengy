@@ -84,3 +84,37 @@ test "ScriptingHost coexistence of two independent runtimes without Core branche
     const stale_res = host.invokeScript(mod_lua, "on_tick", "");
     try testing.expect(!stale_res.ok);
 }
+
+test "ZE-001: ScriptingHost.registerRuntime does not double-free on create() failure" {
+    const FailingVm = struct {
+        fn create(_: std.mem.Allocator, _: *scripting_host.ScriptEngineBridge) !*anyopaque {
+            return error.SimulatedVmInitFailure;
+        }
+        fn load(_: *anyopaque, _: []const u8, _: []const u8) !u64 {
+            return 0;
+        }
+        fn invoke(_: *anyopaque, _: u64, _: []const u8, _: []const u8) scripting_host.ScriptResult {
+            return .{ .ok = false };
+        }
+        fn unload(_: *anyopaque, _: u64) void {}
+        fn destroy(_: *anyopaque, _: std.mem.Allocator) void {}
+    };
+
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(scripting_host.module());
+    try app.initialize();
+
+    const host = app.resources.get(scripting_host.ScriptingHost).?;
+    try testing.expectError(
+        error.SimulatedVmInitFailure,
+        host.registerRuntime(.{ .language_id = "fail", .language_version = "0" }, .{
+            .create = FailingVm.create,
+            .load = FailingVm.load,
+            .invoke = FailingVm.invoke,
+            .unload = FailingVm.unload,
+            .destroy = FailingVm.destroy,
+        }),
+    );
+}

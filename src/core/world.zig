@@ -53,11 +53,12 @@ const ComponentPool = struct {
     stride: usize,
     sparse: std.ArrayList(u32),
     dense_entities: std.ArrayList(EntityHandle),
-    dense_bytes: std.ArrayList(u8),
+    dense_bytes: std.array_list.Aligned(u8, .@"64"),
 
     fn init(allocator: std.mem.Allocator, type_id: ComponentTypeId, name: []const u8, elem_size: usize) !ComponentPool {
         const name_copy = try allocator.dupe(u8, name);
-        const stride = if (elem_size == 0) 0 else std.mem.alignForward(usize, elem_size, 16);
+        // Align stride to 64 bytes so components up to align(64) are safely aligned.
+        const stride = if (elem_size == 0) 0 else std.mem.alignForward(usize, elem_size, 64);
         return .{
             .type_id = type_id,
             .name = name_copy,
@@ -246,10 +247,9 @@ pub const World = struct {
     pub fn spawn(self: *World) !EntityHandle {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
 
-        const guid = self.next_guid;
-        self.next_guid += 1;
-
         if (self.free_indices.pop()) |idx| {
+            const guid = self.next_guid;
+            self.next_guid += 1;
             const gen = self.generations.items[idx];
             self.alive_flags.items[idx] = true;
             self.guids.items[idx] = guid;
@@ -257,10 +257,16 @@ pub const World = struct {
             return .{ .index = idx, .generation = gen };
         }
 
+        try self.generations.ensureUnusedCapacity(self.allocator, 1);
+        try self.alive_flags.ensureUnusedCapacity(self.allocator, 1);
+        try self.guids.ensureUnusedCapacity(self.allocator, 1);
+
+        const guid = self.next_guid;
+        self.next_guid += 1;
         const idx: u32 = @intCast(self.generations.items.len);
-        try self.generations.append(self.allocator, 1);
-        try self.alive_flags.append(self.allocator, true);
-        try self.guids.append(self.allocator, guid);
+        self.generations.appendAssumeCapacity(1);
+        self.alive_flags.appendAssumeCapacity(true);
+        self.guids.appendAssumeCapacity(guid);
         self.entity_count += 1;
         return .{ .index = idx, .generation = 1 };
     }
@@ -268,6 +274,8 @@ pub const World = struct {
     pub fn despawn(self: *World, entity: EntityHandle) !bool {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
         if (!self.isAlive(entity)) return false;
+
+        try self.free_indices.ensureUnusedCapacity(self.allocator, 1);
 
         var it = self.pools.valueIterator();
         while (it.next()) |pool| {
@@ -279,7 +287,7 @@ pub const World = struct {
         if (self.generations.items[entity.index] == 0) {
             self.generations.items[entity.index] = 1;
         }
-        try self.free_indices.append(self.allocator, entity.index);
+        self.free_indices.appendAssumeCapacity(entity.index);
         self.entity_count -= 1;
         return true;
     }

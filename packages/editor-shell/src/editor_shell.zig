@@ -75,6 +75,7 @@ pub const EditorShellService = struct {
     }
 
     /// Inspects and edits a dynamic component field via `TypeRegistry`, recording an undo entry.
+    /// Transactional: allocates and reserves undo_stack capacity before mutating the world.
     pub fn setInspectedField(
         self: *EditorShellService,
         world: *engine.World,
@@ -88,12 +89,13 @@ pub const EditorShellService = struct {
         const bytes = world.getRaw(entity, schema.component_type_id) orelse return error.ComponentNotPresent;
         const old_value = try engine.TypeRegistry.getField(schema, bytes, field_name);
 
-        try engine.TypeRegistry.setField(schema, bytes, field_name, new_value);
-
         const fname_copy = try self.allocator.dupe(u8, field_name);
         errdefer self.allocator.free(fname_copy);
+        try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
 
-        try self.undo_stack.append(self.allocator, .{
+        try engine.TypeRegistry.setField(schema, bytes, field_name, new_value);
+
+        self.undo_stack.appendAssumeCapacity(.{
             .entity = entity,
             .type_id = schema.component_type_id,
             .schema_id = schema_id,
@@ -107,20 +109,28 @@ pub const EditorShellService = struct {
     }
 
     pub fn undo(self: *EditorShellService, world: *engine.World, types: *const engine.TypeRegistry) !bool {
-        const tx = self.undo_stack.pop() orelse return false;
+        if (self.undo_stack.items.len == 0) return false;
+        const tx = self.undo_stack.items[self.undo_stack.items.len - 1];
         const schema = types.getById(tx.schema_id) orelse return error.SchemaNotFound;
         const bytes = world.getRaw(tx.entity, tx.type_id) orelse return error.ComponentNotPresent;
+        try self.redo_stack.ensureUnusedCapacity(self.allocator, 1);
+
         try engine.TypeRegistry.setField(schema, bytes, tx.field_name, tx.old_value);
-        try self.redo_stack.append(self.allocator, tx);
+        _ = self.undo_stack.pop();
+        self.redo_stack.appendAssumeCapacity(tx);
         return true;
     }
 
     pub fn redo(self: *EditorShellService, world: *engine.World, types: *const engine.TypeRegistry) !bool {
-        const tx = self.redo_stack.pop() orelse return false;
+        if (self.redo_stack.items.len == 0) return false;
+        const tx = self.redo_stack.items[self.redo_stack.items.len - 1];
         const schema = types.getById(tx.schema_id) orelse return error.SchemaNotFound;
         const bytes = world.getRaw(tx.entity, tx.type_id) orelse return error.ComponentNotPresent;
+        try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
+
         try engine.TypeRegistry.setField(schema, bytes, tx.field_name, tx.new_value);
-        try self.undo_stack.append(self.allocator, tx);
+        _ = self.redo_stack.pop();
+        self.undo_stack.appendAssumeCapacity(tx);
         return true;
     }
 };
