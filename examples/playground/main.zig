@@ -1,4 +1,4 @@
-//! Integrated Engine Playground (`projects/playground/main.zig`).
+//! Integrated Engine Playground (`examples/playground/main.zig`).
 //!
 //! End-to-end sandbox composing the minimal headless core with optional packages:
 //! - `official.window` & `official.graphics` (surface, input, draw commands, present)

@@ -78,7 +78,7 @@ All packages under `packages/` are optional `engine.Module` implementations that
 
 ## 10. Playground & CLI
 
-- **Playground (`projects/playground/main.zig`):** `zig build run-playground` — end-to-end sandbox composing all optional packages and `libc_plugin.so`.
+- **Playground (`examples/playground/main.zig`):** `zig build run-playground` — end-to-end sandbox composing all optional packages and `libc_plugin.so`.
 - **Diagnostic CLI (`tools/cli/main.zig`):**
   - `zig build run-cli` (`doctor`) — checks ABI version, module resolution, and service count.
   - `zig build run-cli -Dcli-cmd=packages` — prints resolved topological module order and registered providers.

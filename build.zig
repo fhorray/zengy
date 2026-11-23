@@ -233,13 +233,34 @@ pub fn build(b: *std.Build) void {
     scripting_lua_mod.addImport("scripting_host", scripting_host_mod);
     scripting_lua_mod.addImport("lua_c", lua_c_mod);
 
+    // PocketPy v2.2.0 (MIT) vendored in third_party/pocketpy: compiled as one C11 unit.
+    const pocketpy_c_mod = blk: {
+        const translate_pocketpy = b.addTranslateC(.{
+            .root_source_file = b.path("packages/scripting-python/src/pocketpy_bundle.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        translate_pocketpy.addIncludePath(b.path("third_party/pocketpy"));
+        const mod = translate_pocketpy.createModule();
+        mod.addIncludePath(b.path("third_party/pocketpy"));
+        mod.addCSourceFile(.{
+            .file = b.path("third_party/pocketpy/pocketpy.c"),
+            .flags = &.{"-std=c11"},
+        });
+        // PocketPy's `socket` module uses Winsock on Windows.
+        if (target.result.os.tag == .windows) mod.linkSystemLibrary("ws2_32", .{});
+        break :blk mod;
+    };
+
     const scripting_python_mod = b.addModule("scripting_python", .{
         .root_source_file = b.path("packages/scripting-python/src/scripting_python.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     scripting_python_mod.addImport("engine", engine_mod);
     scripting_python_mod.addImport("scripting_host", scripting_host_mod);
+    scripting_python_mod.addImport("pocketpy_c", pocketpy_c_mod);
 
     const default_plugins_mod = b.addModule("default_plugins", .{
         .root_source_file = b.path("packages/default-plugins/src/default_plugins.zig"),
@@ -289,9 +310,9 @@ pub fn build(b: *std.Build) void {
     const run_cli_step = b.step("run-cli", "Run the engine diagnostic CLI (doctor, packages)");
     run_cli_step.dependOn(&run_cli.step);
 
-    // Integrated Playground project (`projects/playground`)
+    // Integrated Playground example (`examples/playground`)
     const playground_mod = b.createModule(.{
-        .root_source_file = b.path("projects/playground/main.zig"),
+        .root_source_file = b.path("examples/playground/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -318,6 +339,57 @@ pub fn build(b: *std.Build) void {
     run_playground.step.dependOn(&install_c_plugin.step);
     const run_playground_step = b.step("run-playground", "Run the integrated engine playground");
     run_playground_step.dependOn(&run_playground.step);
+
+    // SDL 3.4.20 (zlib) vendored in third_party/sdl3 (Windows x64 binaries for D1).
+    const sdl3_c_mod = blk: {
+        const translate_sdl3 = b.addTranslateC(.{
+            .root_source_file = b.path("packages/window-sdl3/src/sdl3_bundle.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        translate_sdl3.addIncludePath(b.path("third_party/sdl3/include"));
+        const mod = translate_sdl3.createModule();
+        mod.addIncludePath(b.path("third_party/sdl3/include"));
+        mod.addLibraryPath(b.path("third_party/sdl3/lib/x64"));
+        mod.linkSystemLibrary("SDL3", .{});
+        break :blk mod;
+    };
+
+    const window_sdl3_mod = b.addModule("window_sdl3", .{
+        .root_source_file = b.path("packages/window-sdl3/src/window_sdl3.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    window_sdl3_mod.addImport("engine", engine_mod);
+    window_sdl3_mod.addImport("window", window_mod);
+    window_sdl3_mod.addImport("sdl3_c", sdl3_c_mod);
+
+    // Visual hello (D1): native SDL3 window, input and DPI. Run with `zig build run-visual-hello`.
+    const visual_hello_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-hello/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_hello_mod.addImport("engine", engine_mod);
+    visual_hello_mod.addImport("window_sdl3", window_sdl3_mod);
+
+    const visual_hello_exe = b.addExecutable(.{
+        .name = "visual-hello",
+        .root_module = visual_hello_mod,
+    });
+    b.installArtifact(visual_hello_exe);
+
+    // The SDL3 runtime DLL must sit next to the executable in zig-out/bin.
+    const install_sdl3_dll = b.addInstallBinFile(b.path("third_party/sdl3/bin/x64/SDL3.dll"), "SDL3.dll");
+    b.getInstallStep().dependOn(&install_sdl3_dll.step);
+    // Run the installed copy: the cache copy has no SDL3.dll beside it (Windows exit 0xC0000135).
+    const run_visual_hello = b.addSystemCommand(&.{"zig-out/bin/visual-hello.exe"});
+    run_visual_hello.setCwd(b.path("."));
+    run_visual_hello.step.dependOn(b.getInstallStep());
+    const run_visual_hello_step = b.step("run-visual-hello", "Open the native SDL3 hello window (D1)");
+    run_visual_hello_step.dependOn(&run_visual_hello.step);
 
     // Microbenchmark suite (`benchmarks/main.zig`)
     const bench_mod = b.createModule(.{

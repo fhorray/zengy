@@ -16,7 +16,7 @@
 | [`ui-immediate/`](ui-immediate/src/ui_immediate.zig) | `community.ui.immediate` | `engine.ui.backend.immediate/1` | Immediate-mode UI backend consuming `window`/`input`/`graphics` without `ui-core`. |
 | [`scripting-host/`](scripting-host/src/scripting_host.zig) | `official.script.host` | `engine.script.host/1` | Language-agnostic Scripting Host Protocol (SHP) and handle-based `ScriptEngineBridge`. |
 | [`scripting-lua/`](scripting-lua/src/scripting_lua.zig) | `official.script.lua` | `engine.script.runtime.lua/1` | Real embedded **Lua 5.5** VM (`zlua`) registered with `ScriptingHost`. |
-| [`scripting-python/`](scripting-python/src/scripting_python.zig) | `official.script.python` | `engine.script.runtime.python/1` | Real **CPython 3** runtime (`NativeLib`) registered with `ScriptingHost`. |
+| [`scripting-python/`](scripting-python/src/scripting_python.zig) | `official.script.python` | `engine.script.runtime.python/1` | **PocketPy v2.2.0** (Python subset, vendored in `third_party/pocketpy`) runtime, one VM per `ScriptingHost` runtime, registered with `ScriptingHost`. |
 | [`assets/`](assets/src/assets.zig) | `official.assets` | `engine.assets/1` | URI-cached asset registry, priority-ordered importers, and owner-scoped unload. |
 | [`scene/`](scene/src/scene.zig) | `official.scene` | `engine.scene.2d/1` | 2D transform hierarchy (`Transform2D`, `Parent`), `.post_update` propagation, and `SceneSnapshot`. |
 | [`editor-shell/`](editor-shell/src/editor_shell.zig) | `official.tools.editor_shell` | `engine.tools.editor_shell/1` | Optional dockable panel registry, schema-driven inspector, and transactional undo/redo. |

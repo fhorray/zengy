@@ -1,7 +1,7 @@
-//! Real CPython 3 + Lua 5.5 Coexistence Tests (`packages/scripting-python/tests/scripting_python_tests.zig`).
+//! PocketPy + Lua Coexistence Tests (`packages/scripting-python/tests/scripting_python_tests.zig`).
 //!
-//! Validates `official.script.python` (real CPython via `NativeLib`) and proves
-//! Section 7.8: Lua 5.5 and CPython 3 coexist in the same `App`, spawning ECS
+//! Validates `official.script.python` (PocketPy v2.2.0, vendored) and proves
+//! Section 7.8: Lua and PocketPy coexist in the same `App`, spawning ECS
 //! entities and exchanging events through `ScriptingHost` with zero Core branches.
 
 const std = @import("std");
@@ -11,7 +11,7 @@ const scripting_host = @import("scripting_host");
 const scripting_lua = @import("scripting_lua");
 const scripting_python = @import("scripting_python");
 
-test "CPython 3 and Lua 5.5 coexist in one App, spawn entities, and exchange events" {
+test "PocketPy and Lua coexist in one App, spawn entities, and exchange events" {
     var app = engine.App.init(testing.allocator, .{});
     defer app.deinit();
 
@@ -34,7 +34,7 @@ test "CPython 3 and Lua 5.5 coexist in one App, spawn entities, and exchange eve
 
     const host = app.resources.get(scripting_host.ScriptingHost).?;
 
-    // Runtime 0 = Lua 5.5, Runtime 1 = CPython 3
+    // Runtime 0 = Lua, Runtime 1 = PocketPy
     const lua_mod = try host.loadScript(0, "a.lua",
         \\local M = {}
         \\function M.run(arg)

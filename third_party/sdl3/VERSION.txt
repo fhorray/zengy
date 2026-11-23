@@ -1,0 +1,2 @@
+SDL 3.4.20 (release-3.4.20), Windows x64 binaries from https://github.com/libsdl-org/SDL/releases
+License: zlib (see LICENSE.txt)
