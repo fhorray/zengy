@@ -26,6 +26,16 @@ pub const GpuTextureHandle = packed struct(u64) {
     generation: u32,
 };
 
+pub const GpuMeshHandle = packed struct(u64) {
+    index: u32,
+    generation: u32,
+};
+
+pub const MeshUniforms = extern struct {
+    mvp: [16]f32,
+    base_color: [4]f32,
+};
+
 /// Vertex layout matching `shaders/pos_color.vert`:
 /// - location 0: `vec2 in_pos` (8 bytes)
 /// - location 1: `vec4 in_color` (16 bytes)

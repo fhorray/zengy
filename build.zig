@@ -245,7 +245,7 @@ pub fn build(b: *std.Build) void {
         mod.addIncludePath(b.path("third_party/pocketpy"));
         mod.addCSourceFile(.{
             .file = b.path("third_party/pocketpy/pocketpy.c"),
-            .flags = &.{"-std=c11"},
+            .flags = &.{ "-std=c11", "-DPK_ENABLE_OS=0" },
         });
         // PocketPy's `socket` module uses Winsock on Windows.
         if (target.result.os.tag == .windows) mod.linkSystemLibrary("ws2_32", .{});
@@ -535,6 +535,58 @@ pub fn build(b: *std.Build) void {
     run_visual_pg.step.dependOn(b.getInstallStep());
     const run_visual_pg_step = b.step("run-visual-playground", "Open the integrated 2D + UI Visual Playground (D5)");
     run_visual_pg_step.dependOn(&run_visual_pg.step);
+
+    // Visual Python (PocketPy + SDL_GPU): Python script driving `engine.draw_rect`. Run with `zig build run-visual-python`.
+    const visual_py_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-python/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_py_mod.addImport("engine", engine_mod);
+    visual_py_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_py_mod.addImport("graphics", graphics_mod);
+    visual_py_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_py_mod.addImport("scripting_host", scripting_host_mod);
+    visual_py_mod.addImport("scripting_python", scripting_python_mod);
+
+    const visual_py_exe = b.addExecutable(.{
+        .name = "visual-python",
+        .root_module = visual_py_mod,
+    });
+    b.installArtifact(visual_py_exe);
+
+    const run_visual_py = b.addSystemCommand(&.{"zig-out/bin/visual-python.exe"});
+    run_visual_py.setCwd(b.path("."));
+    run_visual_py.step.dependOn(b.getInstallStep());
+    const run_visual_py_step = b.step("run-visual-python", "Open the PocketPy + SDL_GPU visual demo");
+    run_visual_py_step.dependOn(&run_visual_py.step);
+
+    // Visual 3D (Phase E): 3D unlit meshes, depth buffer, Camera3D & frustum culling. Run with `zig build run-visual-3d`.
+    const visual_3d_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-3d/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_3d_mod.addImport("engine", engine_mod);
+    visual_3d_mod.addImport("window", window_mod);
+    visual_3d_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_3d_mod.addImport("graphics", graphics_mod);
+    visual_3d_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_3d_mod.addImport("render_3d", render_3d_mod);
+
+    const visual_3d_exe = b.addExecutable(.{
+        .name = "visual-3d",
+        .root_module = visual_3d_mod,
+    });
+    b.installArtifact(visual_3d_exe);
+
+    const run_visual_3d = b.addSystemCommand(&.{"zig-out/bin/visual-3d.exe"});
+    run_visual_3d.setCwd(b.path("."));
+    run_visual_3d.step.dependOn(b.getInstallStep());
+    const run_visual_3d_step = b.step("run-visual-3d", "Open the Phase E 3D Foundation demo");
+    run_visual_3d_step.dependOn(&run_visual_3d.step);
 
     // Microbenchmark suite (`benchmarks/main.zig`)
     const bench_mod = b.createModule(.{

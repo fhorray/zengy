@@ -68,3 +68,28 @@ test "PocketPy and Lua coexist in one App, spawn entities, and exchange events" 
     try testing.expect(catcher.lua_seen);
     try testing.expect(catcher.py_seen);
 }
+
+test "PocketPy engine.draw_rect populates ScriptDrawQueue" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(scripting_host.module());
+    try app.registerModule(scripting_python.module());
+    try app.initialize();
+
+    const h_entry = try app.services.getService("engine.script.host", 1);
+    const host: *scripting_host.ScriptingHost = @ptrCast(@alignCast(@constCast(h_entry.api_ptr)));
+
+    const rt: u16 = 0;
+    const mod = try host.loadScript(rt, "draw_test.py",
+        \\import engine
+        \\def draw(arg):
+        \\    engine.draw_rect(10, 20, 100, 50, 0.2, 0.4, 0.8, 1.0)
+    );
+    try testing.expect(host.invokeScript(mod, "draw", "").ok);
+
+    const q = app.resources.get(scripting_host.ScriptDrawQueue).?;
+    try testing.expectEqual(@as(usize, 1), q.rects.items.len);
+    try testing.expectEqual(@as(f32, 10.0), q.rects.items[0].x);
+    try testing.expectEqual(@as(f32, 100.0), q.rects.items[0].width);
+}

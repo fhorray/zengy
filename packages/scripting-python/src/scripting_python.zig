@@ -91,6 +91,29 @@ fn enginePostEvent(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
     return true;
 }
 
+fn pyNumberArg(val: c.py_Ref) ?f32 {
+    var out: c.py_f64 = 0.0;
+    if (!c.py_castfloat(val, &out)) return null;
+    return @floatCast(out);
+}
+
+fn engineDrawRect(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
+    if (argc < 4 or argc > 8) return c.py_exception(c.tp_TypeError, "engine.draw_rect(x, y, w, h, r=1, g=1, b=1, a=1) expects 4..8 args");
+    const x = pyNumberArg(&argv[0]) orelse return false;
+    const y = pyNumberArg(&argv[1]) orelse return false;
+    const w = pyNumberArg(&argv[2]) orelse return false;
+    const h = pyNumberArg(&argv[3]) orelse return false;
+    const r: f32 = if (argc >= 5) (pyNumberArg(&argv[4]) orelse return false) else 1.0;
+    const g: f32 = if (argc >= 6) (pyNumberArg(&argv[5]) orelse return false) else 1.0;
+    const b: f32 = if (argc >= 7) (pyNumberArg(&argv[6]) orelse return false) else 1.0;
+    const a: f32 = if (argc >= 8) (pyNumberArg(&argv[7]) orelse return false) else 1.0;
+
+    const bridge = bridgeFromEngineModule() orelse return false;
+    bridge.drawRect(.{ .x = x, .y = y, .width = w, .height = h, .r = r, .g = g, .b = b, .a = a }) catch {};
+    c.py_newnone(c.py_retval());
+    return true;
+}
+
 const PythonRuntimeState = struct {
     allocator: std.mem.Allocator,
     vm_index: c_int,
@@ -134,6 +157,7 @@ fn createPythonRuntime(allocator: std.mem.Allocator, bridge: *scripting_host.Scr
     c.py_bindfunc(mod, "log", engineLog);
     c.py_bindfunc(mod, "spawn_entity", engineSpawnEntity);
     c.py_bindfunc(mod, "post_event", enginePostEvent);
+    c.py_bindfunc(mod, "draw_rect", engineDrawRect);
 
     const st = try allocator.create(PythonRuntimeState);
     st.* = .{

@@ -29,6 +29,8 @@ pub const GpuBufferHandle = gpu_resources.GpuBufferHandle;
 pub const GpuPipelineHandle = gpu_resources.GpuPipelineHandle;
 pub const GpuShaderHandle = gpu_resources.GpuShaderHandle;
 pub const GpuTextureHandle = gpu_resources.GpuTextureHandle;
+pub const GpuMeshHandle = gpu_resources.GpuMeshHandle;
+pub const MeshUniforms = gpu_resources.MeshUniforms;
 
 pub const MODULE_OWNER_ID: u64 = 2012;
 pub const PROVIDER_ID = "official.graphics.sdlgpu";
@@ -37,6 +39,8 @@ const POS_VERT_SPV = @embedFile("shaders/pos_color.vert.spv");
 const POS_FRAG_SPV = @embedFile("shaders/pos_color.frag.spv");
 const TEX_VERT_SPV = @embedFile("shaders/textured.vert.spv");
 const TEX_FRAG_SPV = @embedFile("shaders/textured.frag.spv");
+const MESH_VERT_SPV = @embedFile("shaders/mesh_unlit.vert.spv");
+const MESH_FRAG_SPV = @embedFile("shaders/mesh_unlit.frag.spv");
 
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
 
@@ -47,6 +51,21 @@ pub const GpuConfig = struct {
 };
 
 const TexturePool = gpu_resources.GenerationalPool(*c.SDL_GPUTexture, GpuTextureHandle);
+
+const GpuMesh = struct {
+    vertex_buffer: *c.SDL_GPUBuffer,
+    index_buffer: *c.SDL_GPUBuffer,
+    index_count: u32,
+};
+
+const MeshPool = gpu_resources.GenerationalPool(GpuMesh, GpuMeshHandle);
+
+const QueuedMeshDraw = struct {
+    mesh: GpuMeshHandle,
+    mvp: [16]f32,
+    color: [4]f32,
+    texture: GpuTextureHandle,
+};
 
 const DrawBatch = struct {
     first_vertex: u32,
@@ -62,6 +81,10 @@ const SdlGpuState = struct {
     sdl_window: *c.SDL_Window,
     device: *c.SDL_GPUDevice,
     swapchain_format: c.SDL_GPUTextureFormat,
+    depth_format: c.SDL_GPUTextureFormat,
+    depth_texture: ?*c.SDL_GPUTexture = null,
+    depth_w: u32 = 0,
+    depth_h: u32 = 0,
 
     // D2: pos_color pipeline
     pos_vert_shader: *c.SDL_GPUShader,
@@ -82,6 +105,13 @@ const SdlGpuState = struct {
     textures: TexturePool,
     white_texture: GpuTextureHandle,
     font_texture: GpuTextureHandle,
+
+    // Phase E: 3D unlit depth-tested pipeline + mesh pool
+    mesh_vert_shader: *c.SDL_GPUShader,
+    mesh_frag_shader: *c.SDL_GPUShader,
+    mesh_pipeline: *c.SDL_GPUGraphicsPipeline,
+    meshes: MeshPool,
+    queued_meshes: std.ArrayList(QueuedMeshDraw),
 
     default_clear_color: graphics.Color,
     ndc_vertices: std.ArrayList(Vertex2D),
@@ -218,6 +248,120 @@ fn createTexturedPipeline(
     return c.SDL_CreateGPUGraphicsPipeline(device, &info) orelse sdlFail(diag, "SDL_CreateGPUGraphicsPipeline (textured) failed");
 }
 
+fn createMeshUnlitPipeline(
+    device: *c.SDL_GPUDevice,
+    diag: *engine.Diagnostics,
+    vert: *c.SDL_GPUShader,
+    frag: *c.SDL_GPUShader,
+    swapchain_format: c.SDL_GPUTextureFormat,
+    depth_format: c.SDL_GPUTextureFormat,
+) !*c.SDL_GPUGraphicsPipeline {
+    const vb_desc = [_]c.SDL_GPUVertexBufferDescription{.{
+        .slot = 0,
+        .pitch = 32, // Vertex3D: pos(12) + normal(12) + uv(8)
+        .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
+        .instance_step_rate = 0,
+    }};
+    const attrs = [_]c.SDL_GPUVertexAttribute{
+        .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = 0 },
+        .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = 12 },
+        .{ .location = 2, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 24 },
+    };
+    const targets = alphaBlendTarget(swapchain_format);
+    const info = std.mem.zeroInit(c.SDL_GPUGraphicsPipelineCreateInfo, .{
+        .vertex_shader = vert,
+        .fragment_shader = frag,
+        .vertex_input_state = .{
+            .vertex_buffer_descriptions = &vb_desc,
+            .num_vertex_buffers = vb_desc.len,
+            .vertex_attributes = &attrs,
+            .num_vertex_attributes = attrs.len,
+        },
+        .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .rasterizer_state = std.mem.zeroInit(c.SDL_GPURasterizerState, .{
+            .fill_mode = c.SDL_GPU_FILLMODE_FILL,
+            .cull_mode = c.SDL_GPU_CULLMODE_BACK,
+            .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE,
+        }),
+        .multisample_state = std.mem.zeroInit(c.SDL_GPUMultisampleState, .{ .sample_count = c.SDL_GPU_SAMPLECOUNT_1 }),
+        .depth_stencil_state = std.mem.zeroInit(c.SDL_GPUDepthStencilState, .{
+            .enable_depth_test = true,
+            .enable_depth_write = true,
+            .compare_op = c.SDL_GPU_COMPAREOP_LESS,
+        }),
+        .target_info = .{
+            .color_target_descriptions = &targets,
+            .num_color_targets = targets.len,
+            .depth_stencil_format = depth_format,
+            .has_depth_stencil_target = true,
+        },
+    });
+    return c.SDL_CreateGPUGraphicsPipeline(device, &info) orelse sdlFail(diag, "SDL_CreateGPUGraphicsPipeline (mesh_unlit) failed");
+}
+
+fn ensureDepthTexture(state: *SdlGpuState, w: u32, h: u32) !*c.SDL_GPUTexture {
+    if (state.depth_texture != null and state.depth_w == w and state.depth_h == h) {
+        return state.depth_texture.?;
+    }
+    if (state.depth_texture) |old| {
+        c.SDL_ReleaseGPUTexture(state.device, old);
+        state.depth_texture = null;
+    }
+    const tex = c.SDL_CreateGPUTexture(state.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+        .type = c.SDL_GPU_TEXTURETYPE_2D,
+        .format = state.depth_format,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+        .width = w,
+        .height = h,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+        .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+    })) orelse return sdlFail(state.diagnostics, "SDL_CreateGPUTexture (depth) failed");
+    state.depth_texture = tex;
+    state.depth_w = w;
+    state.depth_h = h;
+    return tex;
+}
+
+fn uploadStaticGpuBuffer(
+    device: *c.SDL_GPUDevice,
+    diag: *engine.Diagnostics,
+    usage: c.SDL_GPUBufferUsageFlags,
+    data: []const u8,
+) !*c.SDL_GPUBuffer {
+    const buf = c.SDL_CreateGPUBuffer(device, &std.mem.zeroInit(c.SDL_GPUBufferCreateInfo, .{
+        .usage = usage,
+        .size = @as(u32, @intCast(data.len)),
+    })) orelse return sdlFail(diag, "SDL_CreateGPUBuffer (static) failed");
+    errdefer c.SDL_ReleaseGPUBuffer(device, buf);
+
+    const tb = c.SDL_CreateGPUTransferBuffer(device, &std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo, .{
+        .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size = @as(u32, @intCast(data.len)),
+    })) orelse return sdlFail(diag, "SDL_CreateGPUTransferBuffer (static) failed");
+    defer c.SDL_ReleaseGPUTransferBuffer(device, tb);
+
+    const mapped = c.SDL_MapGPUTransferBuffer(device, tb, false) orelse return sdlFail(diag, "SDL_MapGPUTransferBuffer (static) failed");
+    const dst: [*]u8 = @ptrCast(mapped);
+    @memcpy(dst[0..data.len], data);
+    c.SDL_UnmapGPUTransferBuffer(device, tb);
+
+    const cmd = c.SDL_AcquireGPUCommandBuffer(device) orelse return sdlFail(diag, "SDL_AcquireGPUCommandBuffer (static) failed");
+    const cp = c.SDL_BeginGPUCopyPass(cmd) orelse {
+        _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+        return sdlFail(diag, "SDL_BeginGPUCopyPass (static) failed");
+    };
+    c.SDL_UploadToGPUBuffer(
+        cp,
+        &.{ .transfer_buffer = tb, .offset = 0 },
+        &.{ .buffer = buf, .offset = 0, .size = @as(u32, @intCast(data.len)) },
+        false,
+    );
+    c.SDL_EndGPUCopyPass(cp);
+    if (!c.SDL_SubmitGPUCommandBuffer(cmd)) return sdlFail(diag, "SDL_SubmitGPUCommandBuffer (static) failed");
+    return buf;
+}
+
 fn ensureDynamicBuffer(
     device: *c.SDL_GPUDevice,
     diag: *engine.Diagnostics,
@@ -333,6 +477,7 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
         state.queued_quads.clearRetainingCapacity();
         state.tex_vertices.clearRetainingCapacity();
         state.tex_batches.clearRetainingCapacity();
+        state.queued_meshes.clearRetainingCapacity();
     }
 
     const dpi_scale: f32 = if (window_sdl3.pixelSize(state.app)) |px|
@@ -500,10 +645,55 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
         return;
     }
 
+    // Optional Phase E 3D depth-tested pass.
+    const has_3d = state.queued_meshes.items.len > 0;
+    if (has_3d) {
+        const depth_tex = try ensureDepthTexture(state, tex_w, tex_h);
+        const color_3d = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
+            .texture = swapchain_tex.?,
+            .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_STORE,
+        });
+        const depth_target = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
+            .texture = depth_tex,
+            .clear_depth = 1.0,
+            .load_op = c.SDL_GPU_LOADOP_CLEAR,
+            .store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+            .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
+            .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+        });
+        const pass_3d = c.SDL_BeginGPURenderPass(cmd_buf, &color_3d, 1, &depth_target) orelse {
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
+            return sdlFail(state.diagnostics, "SDL_BeginGPURenderPass (3D) failed");
+        };
+        c.SDL_SetGPUViewport(pass_3d, &.{
+            .x = 0.0,
+            .y = 0.0,
+            .w = @floatFromInt(tex_w),
+            .h = @floatFromInt(tex_h),
+            .min_depth = 0.0,
+            .max_depth = 1.0,
+        });
+        c.SDL_BindGPUGraphicsPipeline(pass_3d, state.mesh_pipeline);
+        for (state.queued_meshes.items) |qm| {
+            const gpu_mesh = state.meshes.get(qm.mesh) orelse continue;
+            const gpu_tex = state.textures.get(qm.texture) orelse state.textures.get(state.white_texture).?;
+            c.SDL_BindGPUVertexBuffers(pass_3d, 0, &.{ .buffer = gpu_mesh.vertex_buffer, .offset = 0 }, 1);
+            c.SDL_BindGPUIndexBuffer(pass_3d, &.{ .buffer = gpu_mesh.index_buffer, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
+            const uniforms = MeshUniforms{ .mvp = qm.mvp, .base_color = qm.color };
+            c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &uniforms, @sizeOf(MeshUniforms));
+            c.SDL_BindGPUFragmentSamplers(pass_3d, 0, &.{ .texture = gpu_tex, .sampler = state.sampler }, 1);
+            c.SDL_DrawGPUIndexedPrimitives(pass_3d, gpu_mesh.index_count, 1, 0, 0, 0);
+        }
+        c.SDL_EndGPURenderPass(pass_3d);
+    }
+
+    const color_load_op: c.SDL_GPULoadOp = if (has_3d) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR;
     const color_target = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
         .texture = swapchain_tex.?,
         .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
-        .load_op = c.SDL_GPU_LOADOP_CLEAR,
+        .load_op = color_load_op,
         .store_op = c.SDL_GPU_STOREOP_STORE,
     });
 
@@ -614,6 +804,47 @@ pub fn fontTextureHandle(app: *engine.App) ?GpuTextureHandle {
     return state.font_texture;
 }
 
+/// Uploads a 3D mesh (32-byte Vertex3D stride + u32 indices) to the GPU.
+pub fn createMesh3D(app: *engine.App, vertex_bytes: []const u8, indices: []const u32) !GpuMeshHandle {
+    const state = app.resources.get(SdlGpuState) orelse return error.MissingGpuState;
+    const vb = try uploadStaticGpuBuffer(state.device, state.diagnostics, c.SDL_GPU_BUFFERUSAGE_VERTEX, vertex_bytes);
+    errdefer c.SDL_ReleaseGPUBuffer(state.device, vb);
+    const ib = try uploadStaticGpuBuffer(state.device, state.diagnostics, c.SDL_GPU_BUFFERUSAGE_INDEX, std.mem.sliceAsBytes(indices));
+    errdefer c.SDL_ReleaseGPUBuffer(state.device, ib);
+    return try state.meshes.insert(.{
+        .vertex_buffer = vb,
+        .index_buffer = ib,
+        .index_count = @intCast(indices.len),
+    });
+}
+
+/// Releases a 3D GPU mesh previously created with `createMesh3D`.
+pub fn destroyMesh3D(app: *engine.App, handle: GpuMeshHandle) void {
+    const state = app.resources.get(SdlGpuState) orelse return;
+    if (state.meshes.remove(handle)) |m| {
+        _ = c.SDL_WaitForGPUIdle(state.device);
+        c.SDL_ReleaseGPUBuffer(state.device, m.index_buffer);
+        c.SDL_ReleaseGPUBuffer(state.device, m.vertex_buffer);
+    }
+}
+
+/// Queues a 3D mesh draw for the next `present()` call (rendered with depth testing).
+pub fn queueMeshDraw(
+    app: *engine.App,
+    mesh: GpuMeshHandle,
+    mvp: [16]f32,
+    color: [4]f32,
+    texture: ?GpuTextureHandle,
+) !void {
+    const state = app.resources.get(SdlGpuState) orelse return error.MissingGpuState;
+    try state.queued_meshes.append(state.allocator, .{
+        .mesh = mesh,
+        .mvp = mvp,
+        .color = color,
+        .texture = texture orelse state.white_texture,
+    });
+}
+
 /// Returns the active SDL_GPU driver name (e.g., "vulkan", "direct3d12", "metal").
 pub fn driverName(app: *engine.App) ?[]const u8 {
     const state = app.resources.get(SdlGpuState) orelse return null;
@@ -645,7 +876,13 @@ fn buildModule(raw_app: *anyopaque) !void {
     errdefer c.SDL_ReleaseWindowFromGPUDevice(device, sdl_window);
 
     const swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(device, sdl_window);
-    logDiag(&app.diagnostics, .info, "Claimed window for SDL_GPU (swapchain format: {d})", .{swapchain_format});
+    const depth_format: c.SDL_GPUTextureFormat = if (c.SDL_GPUTextureSupportsFormat(
+        device,
+        c.SDL_GPU_TEXTUREFORMAT_D24_UNORM,
+        c.SDL_GPU_TEXTURETYPE_2D,
+        c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+    )) c.SDL_GPU_TEXTUREFORMAT_D24_UNORM else c.SDL_GPU_TEXTUREFORMAT_D16_UNORM;
+    logDiag(&app.diagnostics, .info, "Claimed window for SDL_GPU (swapchain: {d}, depth: {d})", .{ swapchain_format, depth_format });
 
     const pos_vert = try createShader(device, &app.diagnostics, c.SDL_GPU_SHADERSTAGE_VERTEX, POS_VERT_SPV, 0, 1);
     errdefer c.SDL_ReleaseGPUShader(device, pos_vert);
@@ -661,7 +898,14 @@ fn buildModule(raw_app: *anyopaque) !void {
     const tex_pipeline = try createTexturedPipeline(device, &app.diagnostics, tex_vert, tex_frag, swapchain_format);
     errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, tex_pipeline);
 
-    logDiag(&app.diagnostics, .info, "Created pos_color and textured SPIR-V pipelines", .{});
+    const mesh_vert = try createShader(device, &app.diagnostics, c.SDL_GPU_SHADERSTAGE_VERTEX, MESH_VERT_SPV, 0, 1);
+    errdefer c.SDL_ReleaseGPUShader(device, mesh_vert);
+    const mesh_frag = try createShader(device, &app.diagnostics, c.SDL_GPU_SHADERSTAGE_FRAGMENT, MESH_FRAG_SPV, 1, 0);
+    errdefer c.SDL_ReleaseGPUShader(device, mesh_frag);
+    const mesh_pipeline = try createMeshUnlitPipeline(device, &app.diagnostics, mesh_vert, mesh_frag, swapchain_format, depth_format);
+    errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, mesh_pipeline);
+
+    logDiag(&app.diagnostics, .info, "Created pos_color, textured, and mesh_unlit SPIR-V pipelines", .{});
 
     const sampler = c.SDL_CreateGPUSampler(device, &std.mem.zeroInit(c.SDL_GPUSamplerCreateInfo, .{
         .min_filter = c.SDL_GPU_FILTER_NEAREST,
@@ -723,6 +967,7 @@ fn buildModule(raw_app: *anyopaque) !void {
         .sdl_window = sdl_window,
         .device = device,
         .swapchain_format = swapchain_format,
+        .depth_format = depth_format,
         .pos_vert_shader = pos_vert,
         .pos_frag_shader = pos_frag,
         .pos_pipeline = pos_pipeline,
@@ -739,6 +984,11 @@ fn buildModule(raw_app: *anyopaque) !void {
         .textures = tex_pool,
         .white_texture = white_handle,
         .font_texture = font_handle,
+        .mesh_vert_shader = mesh_vert,
+        .mesh_frag_shader = mesh_frag,
+        .mesh_pipeline = mesh_pipeline,
+        .meshes = MeshPool.init(app.allocator),
+        .queued_meshes = .empty,
         .default_clear_color = cfg.default_clear_color,
         .ndc_vertices = .empty,
         .queued_quads = .empty,
@@ -780,10 +1030,24 @@ fn stopModule(raw_app: *anyopaque) void {
 
     if (app.resources.get(SdlGpuState)) |state| {
         _ = c.SDL_WaitForGPUIdle(state.device);
+        if (state.depth_texture) |dt| c.SDL_ReleaseGPUTexture(state.device, dt);
+
+        for (state.meshes.slots.items) |slot| {
+            if (slot.alive) {
+                c.SDL_ReleaseGPUBuffer(state.device, slot.value.index_buffer);
+                c.SDL_ReleaseGPUBuffer(state.device, slot.value.vertex_buffer);
+            }
+        }
+        state.meshes.deinit();
+
         for (state.textures.slots.items) |slot| {
             if (slot.alive) c.SDL_ReleaseGPUTexture(state.device, slot.value);
         }
         state.textures.deinit();
+
+        c.SDL_ReleaseGPUGraphicsPipeline(state.device, state.mesh_pipeline);
+        c.SDL_ReleaseGPUShader(state.device, state.mesh_frag_shader);
+        c.SDL_ReleaseGPUShader(state.device, state.mesh_vert_shader);
 
         c.SDL_ReleaseGPUSampler(state.device, state.sampler);
         c.SDL_ReleaseGPUTransferBuffer(state.device, state.tex_transfer_buffer);
@@ -801,6 +1065,7 @@ fn stopModule(raw_app: *anyopaque) void {
         c.SDL_ReleaseWindowFromGPUDevice(state.device, state.sdl_window);
         c.SDL_DestroyGPUDevice(state.device);
 
+        state.queued_meshes.deinit(state.allocator);
         state.ndc_vertices.deinit(state.allocator);
         state.queued_quads.deinit(state.allocator);
         state.tex_vertices.deinit(state.allocator);

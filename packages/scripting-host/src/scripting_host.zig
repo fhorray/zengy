@@ -33,6 +33,34 @@ pub const ScriptResult = struct {
     error_message: []const u8 = "",
 };
 
+pub const ScriptRect = struct {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    r: f32 = 1.0,
+    g: f32 = 1.0,
+    b: f32 = 1.0,
+    a: f32 = 1.0,
+};
+
+pub const ScriptDrawQueue = struct {
+    allocator: std.mem.Allocator,
+    rects: std.ArrayList(ScriptRect),
+
+    pub fn init(allocator: std.mem.Allocator) ScriptDrawQueue {
+        return .{ .allocator = allocator, .rects = .empty };
+    }
+
+    pub fn deinit(self: *ScriptDrawQueue) void {
+        self.rects.deinit(self.allocator);
+    }
+
+    pub fn clear(self: *ScriptDrawQueue) void {
+        self.rects.clearRetainingCapacity();
+    }
+};
+
 /// Handle-based bridge exposed to scripting runtimes without leaking raw ECS pointers.
 pub const ScriptEngineBridge = struct {
     app: *engine.App,
@@ -66,6 +94,17 @@ pub const ScriptEngineBridge = struct {
 
     pub fn log(self: *ScriptEngineBridge, level: engine.LogLevel, msg: []const u8) !void {
         try self.app.diagnostics.log(level, "script", msg);
+    }
+
+    pub fn drawRect(self: *ScriptEngineBridge, rect: ScriptRect) !void {
+        const q = self.app.resources.get(ScriptDrawQueue) orelse return;
+        try q.rects.append(q.allocator, rect);
+    }
+
+    pub fn clearDrawQueue(self: *ScriptEngineBridge) void {
+        if (self.app.resources.get(ScriptDrawQueue)) |q| {
+            q.clear();
+        }
     }
 };
 
@@ -241,6 +280,7 @@ pub const ScriptingHost = struct {
 
 fn buildModule(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
+    try app.resources.insert(ScriptDrawQueue, ScriptDrawQueue.init(app.allocator));
     try app.resources.insert(ScriptingHost, ScriptingHost.init(app.allocator, app));
     const host = app.resources.get(ScriptingHost).?;
 
@@ -261,6 +301,10 @@ fn stopModule(raw_app: *anyopaque) void {
     if (app.resources.get(ScriptingHost)) |host| {
         host.deinit();
         _ = app.resources.remove(ScriptingHost);
+    }
+    if (app.resources.get(ScriptDrawQueue)) |q| {
+        q.deinit();
+        _ = app.resources.remove(ScriptDrawQueue);
     }
 }
 
