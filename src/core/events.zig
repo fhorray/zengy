@@ -1,3 +1,15 @@
+//! Bounded Event Bus (`core/events`).
+//!
+//! Provides a host-managed, world-isolated event queue using a language-neutral
+//! `EventEnvelope` (event name, byte payload, world ID, entity handle).
+//!
+//! Key guarantees:
+//! - Bounded queue capacity with explicit overflow policy (`drop_newest` or `drop_oldest`).
+//! - `dropped_events` metric tracks backpressure/overflow occurrences.
+//! - Subscriptions carry an `owner_id` so module/plugin unload cancels all owned
+//!   subscriptions via `unsubscribeByOwner()`, preventing dangling callbacks.
+//! - `drain()` snapshots the current queue so re-entrant `post()` calls are deferred to the next drain.
+
 const std = @import("std");
 
 pub const OverflowPolicy = enum {

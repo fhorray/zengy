@@ -1,3 +1,13 @@
+//! Optional Window & Input Package (`official.window`).
+//!
+//! Provides `WindowService` (`engine.window/1`) and `InputService` (`engine.input/1`)
+//! as an optional `engine.Module` without any dependencies inside `src/core/`.
+//!
+//! Features:
+//! - Generational `WindowHandle` lifecycle (create, resize, requestClose, destroy).
+//! - Per-frame input state tracking (mouse position, button clicks, keyboard presses, text).
+//! - Emits `window.resized` and `window.close_requested` events via `EventBus`.
+
 const std = @import("std");
 const engine = @import("engine");
 

@@ -1,3 +1,16 @@
+//! Deterministic Stage Scheduler (`core/scheduler`).
+//!
+//! Organizes systems into ordered execution stages:
+//! `startup -> pre_update -> fixed_update -> update -> post_update -> render_extract -> shutdown`.
+//!
+//! Features:
+//! - Topological sorting of systems per stage using `before` / `after` constraints
+//!   with Kahn's algorithm (preserving insertion order as deterministic tie-breaker).
+//! - Explicit `DependencyCycle` detection at schedule build time.
+//! - Read/write conflict detection helper (`hasWriteConflict`).
+//! - Fixed-timestep accumulator for `.fixed_update` with `max_fixed_steps` clamping.
+//! - Automatic `CommandBuffer.apply()` barrier after every stage and `EventBus.drain()` per frame.
+
 const std = @import("std");
 const world_mod = @import("world.zig");
 const commands_mod = @import("commands.zig");

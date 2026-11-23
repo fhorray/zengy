@@ -1,3 +1,14 @@
+//! C ABI Extension Host & Dynamic Plugin Loader (`core/abi`).
+//!
+//! Implements the host side of `include/engine_extension.h` (`AEHostApi`, `AEPluginApi`).
+//!
+//! Safety & ABI Rules:
+//! - Validates `struct_size` and `abi_major` before invoking any plugin callback.
+//! - Tracks each loaded plugin with a generational `PluginHandle` and unique `owner_id`.
+//! - On `unloadPlugin()`, revokes all `EventBus` subscriptions and `ServiceRegistry`
+//!   entries owned by the plugin before calling `stop() -> unload()` and closing `DynLib`.
+//! - Rejects stale handles deterministically with `AEStatus.invalid_handle`.
+
 const std = @import("std");
 const diagnostics_mod = @import("diagnostics.zig");
 const service_mod = @import("service_registry.zig");

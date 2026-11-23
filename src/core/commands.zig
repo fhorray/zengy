@@ -1,3 +1,12 @@
+//! Deferred ECS Command Buffer (`core/commands`).
+//!
+//! Structural ECS mutations (`spawn`, `despawn`, `set`, `remove`) and deferred events
+//! recorded during active queries or system execution are queued in `CommandBuffer`
+//! and flushed deterministically at scheduler stage barriers via `apply()`.
+//!
+//! This prevents iterator invalidation and keeps cross-language/scripting mutations
+//! synchronized with the ECS world state.
+
 const std = @import("std");
 const world_mod = @import("world.zig");
 const events_mod = @import("events.zig");

@@ -1,3 +1,11 @@
+//! Official HTML-like UI Markup Frontend (`official.ui.markup`).
+//!
+//! Translates declarative `<ui-document>` / `<panel>` / `<label>` / `<button>` /
+//! `<text-input>` / `<virtual-list>` markup into `ui_core.UiTree` nodes.
+//!
+//! This frontend is completely optional and replaceable; `ui-core` and `src/core/`
+//! have zero knowledge of HTML or markup syntax.
+
 const std = @import("std");
 const ui_core = @import("ui_core");
 

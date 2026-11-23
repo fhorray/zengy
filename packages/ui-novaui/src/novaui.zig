@@ -1,3 +1,9 @@
+//! Community UI DSL Frontend Proof (`community.ui.novaui`).
+//!
+//! Demonstrates that an external/community declarative UI syntax (`NovaUI`) can
+//! compile into the exact same `ui_core.UiTree` intermediate representation as
+//! `official.ui.markup` without any special-casing in `src/core/` or `ui-core`.
+
 const std = @import("std");
 const ui_core = @import("ui_core");
 

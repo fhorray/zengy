@@ -1,3 +1,13 @@
+/**
+ * @file plugin.c
+ * @brief Phase 3 Gate Example: Pure C11 shared library plugin against `engine_extension.h`.
+ *
+ * Demonstrates two-way C <-> Zig ABI interoperability:
+ * - Validates `AEHostApi.struct_size` and `AEHostApi.abi_major` on `load()`.
+ * - Allocates plugin-owned state in `load()` and frees it in `unload()`.
+ * - Logs to the Zig host via `host->log()` and probes services via `host->get_service()`.
+ */
+
 #include "engine_extension.h"
 #include <stdlib.h>
 #include <string.h>

@@ -1,3 +1,14 @@
+//! Runtime Reflection & Component Schema Registry (`core/reflection`).
+//!
+//! Enables dynamic component registration, inspection, and serialization across
+//! Zig, C ABI plugins, and scripting runtimes without recompiling the host.
+//!
+//! Features:
+//! - Deterministic `SchemaId` computed from `namespace + name + version`.
+//! - Automatic C-like field alignment and offset calculation (`FieldDescriptor`).
+//! - Three storage policies: `blittable`, `managed_handle`, and `blob`.
+//! - Safe dynamic `getField()` / `setField()` over raw component byte slices.
+
 const std = @import("std");
 const world_mod = @import("world.zig");
 

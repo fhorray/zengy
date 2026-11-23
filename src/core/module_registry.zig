@@ -1,3 +1,14 @@
+//! Topological Module Lifecycle Registry (`core/modules`).
+//!
+//! Manages optional engine and application modules (`ModuleDescriptor` + `build`/`start`/`stop`).
+//!
+//! Guarantees:
+//! - Resolves module initialization order via topological sort over `provides_capabilities`,
+//!   `required_capabilities`, and `optional_capabilities` — independent of registration order.
+//! - Rejects missing required capabilities (`MissingRequiredCapability`) and cycles (`DependencyCycle`).
+//! - Rolls back already-initialized modules in reverse order if any `build()` or `start()` fails.
+//! - Executes `stopAll()` in exact reverse topological order on shutdown.
+
 const std = @import("std");
 
 pub const ModuleDescriptor = struct {

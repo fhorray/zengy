@@ -1,3 +1,9 @@
+//! Phase 1 Gate Example: Headless ECS Simulation (`examples/headless-ecs`).
+//!
+//! Demonstrates that `engine.App` compiles and runs 1,000 entities through a
+//! `fixed_update` movement system and `EventBus` without loading any window,
+//! GPU device, UI, or scripting runtime.
+
 const std = @import("std");
 const engine = @import("engine");
 

@@ -1,3 +1,15 @@
+//! Capability & Provider Service Registry (`core/services`).
+//!
+//! Decouples capability contracts (e.g., `engine.graphics.device`, `engine.window`)
+//! from concrete provider implementations.
+//!
+//! Resolution rules:
+//! - Capabilities are versioned by `major_version` (breaking boundary) and `minor_version`.
+//! - Exclusive capabilities fail deterministically with `AmbiguousProvider` when multiple
+//!   providers exist without an explicit `selectProvider()` override.
+//! - Missing capabilities return `ProviderNotFound`; incompatible majors return `VersionMismatch`.
+//! - Services track `owner_id` so module/plugin unload revokes them via `unregisterByOwner()`.
+
 const std = @import("std");
 
 pub const CapabilityScope = enum {

@@ -1,5 +1,14 @@
+//! Typed Resource Registry (`core/resources`).
+//!
+//! Stores singleton application- or world-scoped resources keyed by a deterministic
+//! compile-time type hash (`typeId`). Each inserted resource stores a type-erased
+//! destructor so `deinit()` and `remove()` cleanly release memory without leaks.
+
 const std = @import("std");
 
+/// Computes a deterministic type identifier from `@typeName(T)`.
+/// Hashing `@typeName(T)` avoids LLVM identical-code-folding (ICF) collisions
+/// that can occur with empty marker structs.
 pub fn typeId(comptime T: type) usize {
     return @truncate(std.hash.Wyhash.hash(0x9e3779b97f4a7c15, @typeName(T)));
 }
@@ -9,6 +18,7 @@ const ResourceEntry = struct {
     destroy_fn: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
+/// Type-erased registry of singleton resources owned by an `App` or `World`.
 pub const ResourceRegistry = struct {
     allocator: std.mem.Allocator,
     entries: std.AutoHashMapUnmanaged(usize, ResourceEntry),
@@ -28,6 +38,7 @@ pub const ResourceRegistry = struct {
         self.entries.deinit(self.allocator);
     }
 
+    /// Inserts or overwrites a resource of type `T`.
     pub fn insert(self: *ResourceRegistry, comptime T: type, value: T) !void {
         const key = typeId(T);
         if (self.entries.get(key)) |existing| {
@@ -52,20 +63,24 @@ pub const ResourceRegistry = struct {
         });
     }
 
+    /// Returns a mutable pointer to resource `T`, or `null` if not registered.
     pub fn get(self: *ResourceRegistry, comptime T: type) ?*T {
         const entry = self.entries.get(typeId(T)) orelse return null;
         return @ptrCast(@alignCast(entry.ptr));
     }
 
+    /// Returns an immutable pointer to resource `T`, or `null` if not registered.
     pub fn getConst(self: *const ResourceRegistry, comptime T: type) ?*const T {
         const entry = self.entries.get(typeId(T)) orelse return null;
         return @ptrCast(@alignCast(entry.ptr));
     }
 
+    /// Returns `true` if resource `T` is currently registered.
     pub fn contains(self: *const ResourceRegistry, comptime T: type) bool {
         return self.entries.contains(typeId(T));
     }
 
+    /// Removes and destroys resource `T`, returning `false` if it was not present.
     pub fn remove(self: *ResourceRegistry, comptime T: type) bool {
         const kv = self.entries.fetchRemove(typeId(T)) orelse return false;
         kv.value.destroy_fn(kv.value.ptr, self.allocator);

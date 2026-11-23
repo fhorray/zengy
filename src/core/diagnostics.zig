@@ -1,5 +1,12 @@
+//! Structured Diagnostics Subsystem (`core/diagnostics`).
+//!
+//! Provides a bounded ring-buffer log store and frame/profiler counters.
+//! Finite retention ensures that long-running headless simulations or noisy plugins
+//! cannot exhaust host memory via unbounded log accumulation.
+
 const std = @import("std");
 
+/// Severity levels for structured log records.
 pub const LogLevel = enum(u32) {
     debug = 0,
     info = 1,
@@ -7,6 +14,7 @@ pub const LogLevel = enum(u32) {
     err = 3,
 };
 
+/// Single retained log entry owned by `Diagnostics`.
 pub const LogRecord = struct {
     sequence: u64,
     level: LogLevel,
@@ -14,10 +22,12 @@ pub const LogRecord = struct {
     message: []const u8,
 };
 
+/// Bounded ring-buffer logger and frame telemetry container.
 pub const Diagnostics = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
     entries: std.ArrayList(LogRecord),
+    /// Index of the oldest entry once the ring buffer reaches `capacity`.
     head: usize,
     total_logs: u64,
     evicted_logs: u64,
@@ -45,6 +55,8 @@ pub const Diagnostics = struct {
         self.entries.deinit(self.allocator);
     }
 
+    /// Appends a log record, copying `subsystem` and `message`.
+    /// When full, evicts the oldest record and increments `evicted_logs`.
     pub fn log(self: *Diagnostics, level: LogLevel, subsystem: []const u8, message: []const u8) !void {
         const sub_copy = try self.allocator.dupe(u8, subsystem);
         errdefer self.allocator.free(sub_copy);
@@ -71,11 +83,12 @@ pub const Diagnostics = struct {
         }
     }
 
+    /// Returns the number of currently retained log records.
     pub fn count(self: *const Diagnostics) usize {
         return self.entries.items.len;
     }
 
-    /// Returns log record at chronological index `idx` (0 = oldest retained).
+    /// Returns the log record at chronological index `idx` (0 = oldest retained).
     pub fn get(self: *const Diagnostics, idx: usize) ?LogRecord {
         if (idx >= self.entries.items.len) return null;
         if (self.entries.items.len < self.capacity) {
@@ -85,6 +98,7 @@ pub const Diagnostics = struct {
         return self.entries.items[physical];
     }
 
+    /// Frees all retained records while keeping allocated ring capacity.
     pub fn clear(self: *Diagnostics) void {
         for (self.entries.items) |rec| {
             self.allocator.free(rec.subsystem);

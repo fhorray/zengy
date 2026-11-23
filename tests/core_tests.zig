@@ -1,3 +1,14 @@
+//! Core Engine Unit, Integration, and C ABI Compatibility Tests (Phases 1–4).
+//!
+//! Validates:
+//! - Phase 1: Headless `App` lifecycle, 1000-entity ECS simulation, generational handles,
+//!   `Scheduler` topological ordering & cycle detection, `CommandBuffer`, and `EventBus`.
+//! - Phase 2: `ServiceRegistry` capability/version/exclusivity resolution and `ModuleRegistry`
+//!   topological ordering, rollback on init failure, and reverse teardown.
+//! - Phase 3: C ABI struct layout parity (`include/engine_extension.h` via `translate-c`),
+//!   loading `libc_plugin.so`, stale handle rejection, and ABI major mismatch rejection.
+//! - Phase 4: `TypeRegistry` dynamic `ComponentSchema` registration and field reflection.
+
 const std = @import("std");
 const testing = std.testing;
 const engine = @import("engine");

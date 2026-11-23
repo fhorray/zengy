@@ -1,3 +1,13 @@
+// Build script for the Modular Zig Engine (`zigeng`).
+//
+// Targets:
+// - `engine`: Minimal headless core SDK module (`src/engine.zig`)
+// - `headless-ecs`: Phase 1 standalone 1000-entity simulation (`zig build run-headless`)
+// - `c_plugin`: Phase 3 pure C11 shared library plugin (`examples/c-plugin/plugin.c`)
+// - Optional packages: `window`, `graphics`, `ui_core`, `ui_markup`, `ui_novaui`,
+//   `ui_immediate`, `scripting_host`, `assets`, and CLI tools.
+// - `test`: Full unit, integration, and C ABI layout test suite (`zig build test`)
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -125,6 +135,38 @@ pub fn build(b: *std.Build) void {
     });
     scripting_host_mod.addImport("engine", engine_mod);
 
+    const assets_mod = b.addModule("assets", .{
+        .root_source_file = b.path("packages/assets/src/assets.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    assets_mod.addImport("engine", engine_mod);
+
+    // Diagnostic CLI tool (`tools/cli`)
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("tools/cli/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_mod.addImport("engine", engine_mod);
+    cli_mod.addImport("window", window_mod);
+    cli_mod.addImport("graphics", graphics_mod);
+    cli_mod.addImport("ui_core", ui_core_mod);
+    cli_mod.addImport("scripting_host", scripting_host_mod);
+    cli_mod.addImport("assets", assets_mod);
+
+    const cli_exe = b.addExecutable(.{
+        .name = "engine-cli",
+        .root_module = cli_mod,
+    });
+    b.installArtifact(cli_exe);
+
+    const run_cli = b.addRunArtifact(cli_exe);
+    const cli_cmd = b.option([]const u8, "cli-cmd", "CLI subcommand (doctor, packages)") orelse "doctor";
+    run_cli.addArg(cli_cmd);
+    const run_cli_step = b.step("run-cli", "Run the engine diagnostic CLI (doctor, packages)");
+    run_cli_step.dependOn(&run_cli.step);
+
     const pkg_test_mod = b.createModule(.{
         .root_source_file = b.path("tests/packages_tests.zig"),
         .target = target,
@@ -138,6 +180,7 @@ pub fn build(b: *std.Build) void {
     pkg_test_mod.addImport("ui_novaui", ui_novaui_mod);
     pkg_test_mod.addImport("ui_immediate", ui_immediate_mod);
     pkg_test_mod.addImport("scripting_host", scripting_host_mod);
+    pkg_test_mod.addImport("assets", assets_mod);
 
     const pkg_tests = b.addTest(.{
         .root_module = pkg_test_mod,

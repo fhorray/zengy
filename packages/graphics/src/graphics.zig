@@ -1,3 +1,14 @@
+//! Optional Graphics Device Package (`official.graphics`).
+//!
+//! Provides `GraphicsDeviceService` (`engine.graphics.device/1`) as an optional
+//! `engine.Module` depending on `engine.window/1`.
+//!
+//! Responsibilities:
+//! - Manages generational `RenderTargetHandle` surfaces bound to window handles.
+//! - Records `DrawCommand` lists (`clear`, `rect`, `text`) per frame and tracks `present()`.
+//! - Enables `scheduler.render_extract_enabled` only while this module is active.
+//! - Reports `error.DeviceUnavailable` deterministically when the device is lost.
+
 const std = @import("std");
 const engine = @import("engine");
 

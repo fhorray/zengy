@@ -1,3 +1,16 @@
+//! Generational ECS World Facade (`core/world`).
+//!
+//! Provides the public entity-component-system contract (`World`, `EntityHandle`,
+//! `EntityGuid`, `WorldId`, `ComponentTypeId`, `Query`) without exposing any
+//! third-party ECS types or raw internal pointers (ADR-007).
+//!
+//! Memory & Safety Guarantees:
+//! - `EntityHandle` packs `(index: u32, generation: u32)`; despawning bumps generation
+//!   so stale handles are deterministically rejected by `isAlive()`, `get()`, and `set()`.
+//! - Each component type is stored in a 16-byte-aligned dense sparse-set `ComponentPool`.
+//! - `active_queries` tracks open iterators and rejects structural mutations (`spawn`,
+//!   `despawn`, `set`, `remove`) while a query is active; use `CommandBuffer` instead.
+
 const std = @import("std");
 const resources = @import("resources.zig");
 

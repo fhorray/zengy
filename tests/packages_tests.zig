@@ -1,3 +1,12 @@
+//! Optional Packages Integration Tests (Phases 5, 6, 7, 9, and 10).
+//!
+//! Validates that optional modules compose cleanly without modifying `src/core/`:
+//! - Phase 5: `official.window` + `official.graphics` resize, present, and device-lost errors.
+//! - Phase 6: `official.ui.core` 1000-node layout, hit testing, focus, click actions, and paint list.
+//! - Phase 9 & 10: `official.ui.markup` and `community.ui.novaui` producing identical `UiTree` IR.
+//! - Phase 10: `community.ui.immediate` working without `official.ui.core`.
+//! - Phase 7: `official.script.host` running two coexisting runtimes with isolated errors.
+
 const std = @import("std");
 const testing = std.testing;
 const engine = @import("engine");
@@ -8,6 +17,7 @@ const ui_markup = @import("ui_markup");
 const ui_novaui = @import("ui_novaui");
 const ui_immediate = @import("ui_immediate");
 const scripting_host = @import("scripting_host");
+const assets = @import("assets");
 
 test "Phase 5: Window, Input, and Graphics modules with resize, present, and device-lost error" {
     var app = engine.App.init(testing.allocator, .{});
@@ -260,4 +270,46 @@ test "Phase 7: ScriptingHost coexistence of two independent runtimes without Cor
     host.destroyRuntime(rt_lua);
     const stale_res = host.invokeScript(mod_lua, "on_tick", "");
     try testing.expect(!stale_res.ok);
+}
+
+test "Phase 11: AssetService importer priority, caching, reload, and stale handle rejection" {
+    const TextImporter = struct {
+        fn importLow(allocator: std.mem.Allocator, _: []const u8, raw: []const u8) !assets.AssetArtifact {
+            return .{
+                .kind = try allocator.dupe(u8, "text/low"),
+                .bytes = try allocator.dupe(u8, raw),
+            };
+        }
+        fn importHigh(allocator: std.mem.Allocator, _: []const u8, raw: []const u8) !assets.AssetArtifact {
+            const upper = try allocator.dupe(u8, raw);
+            for (upper) |*c| c.* = std.ascii.toUpper(c.*);
+            return .{
+                .kind = try allocator.dupe(u8, "text/high"),
+                .bytes = upper,
+            };
+        }
+    };
+
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(assets.module());
+    try app.initialize();
+
+    const svc = app.resources.get(assets.AssetService).?;
+    try svc.registerImporter(.{ .id = "low", .extension = ".txt", .priority = 10, .import_fn = TextImporter.importLow });
+    try svc.registerImporter(.{ .id = "high", .extension = ".txt", .priority = 200, .import_fn = TextImporter.importHigh });
+
+    const h1 = try svc.loadFromBytes("project://hello.txt", "hello");
+    const h2 = try svc.loadFromBytes("project://hello.txt", "ignored");
+    try testing.expectEqual(h1, h2);
+    try testing.expectEqualStrings("HELLO", svc.getBytes(h1).?);
+    try testing.expectEqual(@as(?u32, 1), svc.getVersion(h1));
+
+    try svc.reload(h1, "world");
+    try testing.expectEqualStrings("WORLD", svc.getBytes(h1).?);
+    try testing.expectEqual(@as(?u32, 2), svc.getVersion(h1));
+
+    try testing.expect(svc.unload(h1));
+    try testing.expect(svc.getBytes(h1) == null);
 }

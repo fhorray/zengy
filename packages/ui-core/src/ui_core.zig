@@ -1,3 +1,14 @@
+//! Optional Retained UI Core Package (`official.ui.core`).
+//!
+//! Provides `UiTree` (`engine.ui.tree/1`), a syntax-agnostic retained UI tree
+//! decoupled from any HTML/CSS parser or scripting runtime.
+//!
+//! Pipeline:
+//! `Frontend (Zig / HTML-like / NovaUI) -> UiTree -> layoutTree() -> paint() -> GraphicsDeviceService`
+//!
+//! Supports flex-like `column`/`row` layout, spatial `hitTest()`, focus tracking,
+//! `ui.action` event emission, and deterministic `DrawCommand` generation.
+
 const std = @import("std");
 const engine = @import("engine");
 const graphics = @import("graphics");

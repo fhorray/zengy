@@ -1,3 +1,14 @@
+//! Optional Scripting Host Protocol (`official.script.host`).
+//!
+//! Provides `ScriptingHost` (`engine.script.host/1`), allowing multiple independent
+//! scripting language runtimes (e.g., Lua, Python, QuickJS) to coexist without
+//! introducing any language-specific branches into `src/core/`.
+//!
+//! Safety & Ownership:
+//! - Scripts interact with the engine through `ScriptEngineBridge` using opaque handles.
+//! - `ScriptModuleHandle` includes a runtime/module generation that is invalidated on unload.
+//! - Destroying a runtime automatically revokes all `EventBus` subscriptions it owns.
+
 const std = @import("std");
 const engine = @import("engine");
 

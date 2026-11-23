@@ -1,3 +1,9 @@
+//! Alternative Immediate-Mode UI Backend (`community.ui.immediate`).
+//!
+//! Proves architectural independence from `official.ui.core`: this package does NOT
+//! import `ui-core` or build a retained `UiTree`. Instead, it consumes only
+//! `engine.window/1`, `engine.input/1`, and `engine.graphics.device/1` directly.
+
 const std = @import("std");
 const engine = @import("engine");
 const window = @import("window");
