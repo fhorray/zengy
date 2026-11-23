@@ -1,19 +1,15 @@
-//! Core Engine Unit, Integration, and C ABI Compatibility Tests (Phases 1–4).
+//! Core Engine Unit & Integration Tests (`src/core/tests/core_tests.zig`).
 //!
 //! Validates:
 //! - Phase 1: Headless `App` lifecycle, 1000-entity ECS simulation, generational handles,
 //!   `Scheduler` topological ordering & cycle detection, `CommandBuffer`, and `EventBus`.
 //! - Phase 2: `ServiceRegistry` capability/version/exclusivity resolution and `ModuleRegistry`
 //!   topological ordering, rollback on init failure, and reverse teardown.
-//! - Phase 3: C ABI struct layout parity (`include/engine_extension.h` via `translate-c`),
-//!   loading `libc_plugin.so`, stale handle rejection, and ABI major mismatch rejection.
 //! - Phase 4: `TypeRegistry` dynamic `ComponentSchema` registration and field reflection.
 
 const std = @import("std");
 const testing = std.testing;
 const engine = @import("engine");
-
-const c_abi = @import("c_abi");
 
 const Position = struct { x: f32 = 0, y: f32 = 0 };
 const Velocity = struct { x: f32 = 0, y: f32 = 0 };
@@ -295,46 +291,6 @@ test "Phase 2: ModuleRegistry topological order, rollback, and reverse teardown"
         try testing.expectError(error.SimulatedInitFailure, app.initialize());
         try testing.expectEqualStrings("Aa", Trace.slice());
     }
-}
-
-test "Phase 3: C ABI struct layout parity with include/engine_extension.h" {
-    try testing.expectEqual(@as(usize, @sizeOf(c_abi.AEStringView)), @sizeOf(engine.abi.AEStringView));
-    try testing.expectEqual(@as(usize, @alignOf(c_abi.AEStringView)), @alignOf(engine.abi.AEStringView));
-    try testing.expectEqual(@as(usize, @sizeOf(c_abi.AEHostApi)), @sizeOf(engine.abi.AEHostApi));
-    try testing.expectEqual(@as(usize, @offsetOf(c_abi.AEHostApi, "get_service")), @offsetOf(engine.abi.AEHostApi, "get_service"));
-    try testing.expectEqual(@as(usize, @sizeOf(c_abi.AEPluginApi)), @sizeOf(engine.abi.AEPluginApi));
-    try testing.expectEqual(@as(usize, @offsetOf(c_abi.AEPluginApi, "unload")), @offsetOf(engine.abi.AEPluginApi, "unload"));
-}
-
-test "Phase 3: Load real compiled C shared library plugin and validate ABI rejection" {
-    var app = engine.App.init(testing.allocator, .{});
-    defer app.deinit();
-
-    const host = try app.ensurePluginHost();
-
-    // Load compiled C plugin from zig-out/lib/libc_plugin.so
-    const handle = try host.loadSharedLibrary("zig-out/lib/libc_plugin.so");
-    try testing.expectEqual(engine.abi.AEStatus.ok, host.startPlugin(handle));
-
-    // Verify C plugin logged through AEHostApi.log into Diagnostics
-    try testing.expect(app.diagnostics.count() >= 3);
-
-    // Unload plugin and verify stale handle is rejected
-    try testing.expectEqual(engine.abi.AEStatus.ok, host.unloadPlugin(handle));
-    try testing.expectEqual(engine.abi.AEStatus.invalid_handle, host.startPlugin(handle));
-
-    // Reject incompatible ABI major version
-    const bad_api = engine.abi.AEPluginApi{
-        .struct_size = @sizeOf(engine.abi.AEPluginApi),
-        .abi_major = 99,
-        .abi_minor = 0,
-        .plugin_id = engine.abi.AEStringView.fromSlice("bad.major"),
-        .load = null,
-        .start = null,
-        .stop = null,
-        .unload = null,
-    };
-    try testing.expectError(error.UnsupportedAbi, host.loadFromApi(&bad_api, null));
 }
 
 test "Phase 4: TypeRegistry dynamic ComponentSchema and field reflection" {

@@ -5,8 +5,9 @@
 // - `headless-ecs`: Phase 1 standalone 1000-entity simulation (`zig build run-headless`)
 // - `c_plugin`: Phase 3 pure C11 shared library plugin (`examples/c-plugin/plugin.c`)
 // - Optional packages: `window`, `graphics`, `ui_core`, `ui_markup`, `ui_novaui`,
-//   `ui_immediate`, `scripting_host`, `assets`, and CLI tools.
-// - `test`: Full unit, integration, and C ABI layout test suite (`zig build test`)
+//   `ui_immediate`, `scripting_host`, `assets`, `scene`, `editor_shell`, `render_3d`
+// - `engine-cli`: Diagnostic CLI (`zig build run-cli`)
+// - `test`: Per-module test suites organized inside each module's `tests/` directory
 
 const std = @import("std");
 
@@ -66,23 +67,7 @@ pub fn build(b: *std.Build) void {
     });
     const c_abi_mod = translate_c.createModule();
 
-    // Unit, integration, and ABI compatibility tests
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("tests/core_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    test_mod.addImport("engine", engine_mod);
-    test_mod.addImport("c_abi", c_abi_mod);
-
-    const tests = b.addTest(.{
-        .root_module = test_mod,
-    });
-    const run_tests = b.addRunArtifact(tests);
-    run_tests.step.dependOn(&install_c_plugin.step);
-
-    // Optional packages (Phases 5, 6, 7, 9, 10)
+    // Optional packages (Phases 5-13)
     const window_mod = b.addModule("window", .{
         .root_source_file = b.path("packages/window/src/window.zig"),
         .target = target,
@@ -142,6 +127,27 @@ pub fn build(b: *std.Build) void {
     });
     assets_mod.addImport("engine", engine_mod);
 
+    const scene_mod = b.addModule("scene", .{
+        .root_source_file = b.path("packages/scene/src/scene.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scene_mod.addImport("engine", engine_mod);
+
+    const editor_shell_mod = b.addModule("editor_shell", .{
+        .root_source_file = b.path("packages/editor-shell/src/editor_shell.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    editor_shell_mod.addImport("engine", engine_mod);
+
+    const render_3d_mod = b.addModule("render_3d", .{
+        .root_source_file = b.path("packages/render-3d/src/render_3d.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    render_3d_mod.addImport("engine", engine_mod);
+
     // Diagnostic CLI tool (`tools/cli`)
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("tools/cli/main.zig"),
@@ -167,27 +173,103 @@ pub fn build(b: *std.Build) void {
     const run_cli_step = b.step("run-cli", "Run the engine diagnostic CLI (doctor, packages)");
     run_cli_step.dependOn(&run_cli.step);
 
-    const pkg_test_mod = b.createModule(.{
-        .root_source_file = b.path("tests/packages_tests.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    pkg_test_mod.addImport("engine", engine_mod);
-    pkg_test_mod.addImport("window", window_mod);
-    pkg_test_mod.addImport("graphics", graphics_mod);
-    pkg_test_mod.addImport("ui_core", ui_core_mod);
-    pkg_test_mod.addImport("ui_markup", ui_markup_mod);
-    pkg_test_mod.addImport("ui_novaui", ui_novaui_mod);
-    pkg_test_mod.addImport("ui_immediate", ui_immediate_mod);
-    pkg_test_mod.addImport("scripting_host", scripting_host_mod);
-    pkg_test_mod.addImport("assets", assets_mod);
+    // Per-module test suites
+    const test_step = b.step("test", "Run all per-module unit, integration, and C ABI tests");
 
-    const pkg_tests = b.addTest(.{
-        .root_module = pkg_test_mod,
-    });
-    const run_pkg_tests = b.addRunArtifact(pkg_tests);
+    const addModuleTest = struct {
+        fn add(
+            builder: *std.Build,
+            step: *std.Build.Step,
+            path: []const u8,
+            tgt: std.Build.ResolvedTarget,
+            opt: std.builtin.OptimizeMode,
+            link_c: bool,
+            imports: []const struct { name: []const u8, mod: *std.Build.Module },
+            dep_step: ?*std.Build.Step,
+        ) void {
+            const m = builder.createModule(.{
+                .root_source_file = builder.path(path),
+                .target = tgt,
+                .optimize = opt,
+                .link_libc = link_c,
+            });
+            for (imports) |imp| {
+                m.addImport(imp.name, imp.mod);
+            }
+            const t = builder.addTest(.{ .root_module = m });
+            const r = builder.addRunArtifact(t);
+            if (dep_step) |ds| r.step.dependOn(ds);
+            step.dependOn(&r.step);
+        }
+    }.add;
 
-    const test_step = b.step("test", "Run all unit, integration, and C ABI tests");
-    test_step.dependOn(&run_tests.step);
-    test_step.dependOn(&run_pkg_tests.step);
+    addModuleTest(b, test_step, "src/core/tests/core_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "src/core/tests/abi_tests.zig", target, optimize, true, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "c_abi", .mod = c_abi_mod },
+    }, &install_c_plugin.step);
+
+    addModuleTest(b, test_step, "packages/window/tests/window_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/graphics/tests/graphics_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/ui-core/tests/ui_core_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/ui-markup/tests/ui_frontends_tests.zig", target, optimize, false, &.{
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "ui_markup", .mod = ui_markup_mod },
+        .{ .name = "ui_novaui", .mod = ui_novaui_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/ui-immediate/tests/ui_immediate_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_immediate", .mod = ui_immediate_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/scripting-host/tests/scripting_host_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "scripting_host", .mod = scripting_host_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/assets/tests/assets_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "assets", .mod = assets_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/scene/tests/scene_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "scene", .mod = scene_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/editor-shell/tests/editor_shell_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "editor_shell", .mod = editor_shell_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/render-3d/tests/render_3d_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "render_3d", .mod = render_3d_mod },
+    }, null);
 }
