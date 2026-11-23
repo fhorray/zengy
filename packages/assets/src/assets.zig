@@ -124,6 +124,7 @@ pub const AssetService = struct {
             .generation = 1,
             .alive = true,
         });
+        errdefer _ = self.assets.pop();
         try self.uri_to_index.put(self.allocator, uri_copy, idx);
 
         return .{ .index = idx, .generation = 1 };

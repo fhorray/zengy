@@ -76,31 +76,28 @@ pub const SceneSnapshot = struct {
     }
 };
 
-/// Propagates local `Transform2D` coordinates through `Parent` links.
+/// Propagates local `Transform2D` coordinates through arbitrary-depth `Parent` chains.
 pub fn propagateTransformsSystem(ctx: *engine.SystemContext) !void {
-    // Pass 1: initialize root transforms to their local coordinates.
-    {
-        var q = try ctx.query(.{ .write = .{Transform2D} });
-        defer q.deinit();
-        while (q.next()) |row| {
-            const t = row.write(Transform2D);
-            t.world_x = t.x;
-            t.world_y = t.y;
-        }
-    }
+    var q = try ctx.query(.{ .write = .{Transform2D} });
+    defer q.deinit();
 
-    // Pass 2: apply parent world offset to child entities.
-    {
-        var q = try ctx.query(.{ .write = .{Transform2D}, .read = .{Parent} });
-        defer q.deinit();
-        while (q.next()) |row| {
-            const child_t = row.write(Transform2D);
-            const parent_ref = row.read(Parent).entity;
-            if (ctx.world.getConst(parent_ref, Transform2D)) |parent_t| {
-                child_t.world_x = parent_t.world_x + child_t.x;
-                child_t.world_y = parent_t.world_y + child_t.y;
-            }
+    while (q.next()) |row| {
+        const t = row.write(Transform2D);
+        var wx = t.x;
+        var wy = t.y;
+
+        var curr = row.entity;
+        var depth: u32 = 0;
+        while (depth < 64) : (depth += 1) {
+            const parent_comp = ctx.world.getConst(curr, Parent) orelse break;
+            const parent_t = ctx.world.getConst(parent_comp.entity, Transform2D) orelse break;
+            wx += parent_t.x;
+            wy += parent_t.y;
+            curr = parent_comp.entity;
         }
+
+        t.world_x = wx;
+        t.world_y = wy;
     }
 }
 

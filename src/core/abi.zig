@@ -187,6 +187,9 @@ pub const PluginHost = struct {
         return .ok;
     }
 
+    /// Opens a shared library plugin and resolves `ae_plugin_entry`.
+    /// Note: On POSIX/Linux, host binaries loading `libc`-linked C plugins must be
+    /// built with `.link_libc = true` so `dlopen` performs full dynamic relocations.
     pub fn loadSharedLibrary(self: *PluginHost, path: []const u8) !PluginHandle {
         var lib = try std.DynLib.open(path);
         errdefer lib.close();

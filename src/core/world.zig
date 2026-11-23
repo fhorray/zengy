@@ -360,42 +360,63 @@ pub fn Query(comptime spec: anytype) type {
         const Self = @This();
 
         pub const Row = struct {
-            world: *World,
+            query_ptr: *const Self,
             entity: EntityHandle,
 
             pub fn read(self: Row, comptime T: type) *const T {
-                return self.world.getConst(self.entity, T).?;
+                inline for (read_types, 0..) |RT, idx| {
+                    if (RT == T) {
+                        const bytes = self.query_ptr.read_pools[idx].?.getBytesConst(self.entity).?;
+                        return @ptrCast(@alignCast(bytes.ptr));
+                    }
+                }
+                inline for (write_types, 0..) |WT, idx| {
+                    if (WT == T) {
+                        const bytes = self.query_ptr.write_pools[idx].?.getBytesConst(self.entity).?;
+                        return @ptrCast(@alignCast(bytes.ptr));
+                    }
+                }
+                @compileError("Component type not present in Query spec");
             }
 
             pub fn write(self: Row, comptime T: type) *T {
-                return self.world.get(self.entity, T).?;
+                inline for (write_types, 0..) |WT, idx| {
+                    if (WT == T) {
+                        const bytes = self.query_ptr.write_pools[idx].?.getBytes(self.entity).?;
+                        return @ptrCast(@alignCast(bytes.ptr));
+                    }
+                }
+                @compileError("Component type not declared as write in Query spec");
             }
         };
 
         world: *World,
         driver_pool: ?*ComponentPool,
+        write_pools: [write_types.len]?*ComponentPool,
+        read_pools: [read_types.len]?*ComponentPool,
         cursor: usize,
 
         pub fn init(world: *World) !Self {
             var smallest: ?*ComponentPool = null;
+            var w_pools: [write_types.len]?*ComponentPool = @splat(null);
+            var r_pools: [read_types.len]?*ComponentPool = @splat(null);
+            var missing = false;
 
-            inline for (write_types) |T| {
+            inline for (write_types, 0..) |T, idx| {
                 const pool = world.pools.getPtr(World.comptimeTypeId(T));
+                w_pools[idx] = pool;
                 if (pool == null) {
-                    world.active_queries += 1;
-                    return .{ .world = world, .driver_pool = null, .cursor = 0 };
-                }
-                if (smallest == null or pool.?.dense_entities.items.len < smallest.?.dense_entities.items.len) {
+                    missing = true;
+                } else if (smallest == null or pool.?.dense_entities.items.len < smallest.?.dense_entities.items.len) {
                     smallest = pool;
                 }
             }
-            inline for (read_types) |T| {
+            inline for (read_types, 0..) |T, idx| {
                 const pool = world.pools.getPtr(World.comptimeTypeId(T));
+                r_pools[idx] = pool;
                 if (pool == null) {
-                    world.active_queries += 1;
-                    return .{ .world = world, .driver_pool = null, .cursor = 0 };
-                }
-                if (smallest == null or pool.?.dense_entities.items.len < smallest.?.dense_entities.items.len) {
+                    missing = true;
+                } else if (smallest == null or pool.?.dense_entities.items.len < smallest.?.dense_entities.items.len) {
                     smallest = pool;
                 }
             }
@@ -403,7 +424,9 @@ pub fn Query(comptime spec: anytype) type {
             world.active_queries += 1;
             return .{
                 .world = world,
-                .driver_pool = smallest,
+                .driver_pool = if (missing) null else smallest,
+                .write_pools = w_pools,
+                .read_pools = r_pools,
                 .cursor = 0,
             };
         }
@@ -423,22 +446,22 @@ pub fn Query(comptime spec: anytype) type {
                 self.cursor += 1;
 
                 var matches = true;
-                inline for (write_types) |T| {
-                    if (!self.world.has(entity, T)) {
+                inline for (0..write_types.len) |idx| {
+                    if (!self.write_pools[idx].?.has(entity)) {
                         matches = false;
                         break;
                     }
                 }
                 if (matches) {
-                    inline for (read_types) |T| {
-                        if (!self.world.has(entity, T)) {
+                    inline for (0..read_types.len) |idx| {
+                        if (!self.read_pools[idx].?.has(entity)) {
                             matches = false;
                             break;
                         }
                     }
                 }
                 if (matches) {
-                    return .{ .world = self.world, .entity = entity };
+                    return .{ .query_ptr = self, .entity = entity };
                 }
             }
             return null;

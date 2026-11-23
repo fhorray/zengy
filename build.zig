@@ -173,6 +173,36 @@ pub fn build(b: *std.Build) void {
     const run_cli_step = b.step("run-cli", "Run the engine diagnostic CLI (doctor, packages)");
     run_cli_step.dependOn(&run_cli.step);
 
+    // Integrated Playground project (`projects/playground`)
+    const playground_mod = b.createModule(.{
+        .root_source_file = b.path("projects/playground/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    playground_mod.addImport("engine", engine_mod);
+    playground_mod.addImport("window", window_mod);
+    playground_mod.addImport("graphics", graphics_mod);
+    playground_mod.addImport("ui_core", ui_core_mod);
+    playground_mod.addImport("ui_markup", ui_markup_mod);
+    playground_mod.addImport("ui_novaui", ui_novaui_mod);
+    playground_mod.addImport("scripting_host", scripting_host_mod);
+    playground_mod.addImport("assets", assets_mod);
+    playground_mod.addImport("scene", scene_mod);
+    playground_mod.addImport("editor_shell", editor_shell_mod);
+    playground_mod.addImport("render_3d", render_3d_mod);
+
+    const playground_exe = b.addExecutable(.{
+        .name = "playground",
+        .root_module = playground_mod,
+    });
+    b.installArtifact(playground_exe);
+
+    const run_playground = b.addRunArtifact(playground_exe);
+    run_playground.step.dependOn(&install_c_plugin.step);
+    const run_playground_step = b.step("run-playground", "Run the integrated engine playground");
+    run_playground_step.dependOn(&run_playground.step);
+
     // Per-module test suites
     const test_step = b.step("test", "Run all per-module unit, integration, and C ABI tests");
 
