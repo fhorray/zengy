@@ -114,6 +114,48 @@ fn engineDrawRect(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
     return true;
 }
 
+fn engineIsKeyDown(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
+    if (argc != 1) return c.py_exception(c.tp_TypeError, "engine.is_key_down(scancode) expects 1 argument");
+    if (!c.py_checkint(&argv[0])) return false;
+    const raw = c.py_toint(&argv[0]);
+    const bridge = bridgeFromEngineModule() orelse return false;
+    const down = if (raw >= 0 and raw < 256) bridge.isKeyDown(@intCast(raw)) else false;
+    c.py_newbool(c.py_retval(), down);
+    return true;
+}
+
+fn engineMouseX(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
+    _ = argv;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.mouse_x() takes no arguments");
+    const bridge = bridgeFromEngineModule() orelse return false;
+    c.py_newfloat(c.py_retval(), bridge.mouseX());
+    return true;
+}
+
+fn engineMouseY(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
+    _ = argv;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.mouse_y() takes no arguments");
+    const bridge = bridgeFromEngineModule() orelse return false;
+    c.py_newfloat(c.py_retval(), bridge.mouseY());
+    return true;
+}
+
+fn engineIsMouseDown(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
+    _ = argv;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.is_mouse_down() takes no arguments");
+    const bridge = bridgeFromEngineModule() orelse return false;
+    c.py_newbool(c.py_retval(), bridge.isMouseDown());
+    return true;
+}
+
+fn engineWasMouseClicked(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
+    _ = argv;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.was_mouse_clicked() takes no arguments");
+    const bridge = bridgeFromEngineModule() orelse return false;
+    c.py_newbool(c.py_retval(), bridge.wasMouseClicked());
+    return true;
+}
+
 const PythonRuntimeState = struct {
     allocator: std.mem.Allocator,
     vm_index: c_int,
@@ -158,6 +200,11 @@ fn createPythonRuntime(allocator: std.mem.Allocator, bridge: *scripting_host.Scr
     c.py_bindfunc(mod, "spawn_entity", engineSpawnEntity);
     c.py_bindfunc(mod, "post_event", enginePostEvent);
     c.py_bindfunc(mod, "draw_rect", engineDrawRect);
+    c.py_bindfunc(mod, "is_key_down", engineIsKeyDown);
+    c.py_bindfunc(mod, "mouse_x", engineMouseX);
+    c.py_bindfunc(mod, "mouse_y", engineMouseY);
+    c.py_bindfunc(mod, "is_mouse_down", engineIsMouseDown);
+    c.py_bindfunc(mod, "was_mouse_clicked", engineWasMouseClicked);
 
     const st = try allocator.create(PythonRuntimeState);
     st.* = .{

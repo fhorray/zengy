@@ -79,7 +79,7 @@ jobs:
           TAG="${{ needs.meta.outputs.tag }}"
           STAGE="dist/zigeng-${TAG}-x86_64-linux"
           mkdir -p "$STAGE/include" "$STAGE/lib"
-          cp zig-out/bin/headless-ecs zig-out/bin/engine-cli zig-out/bin/playground zig-out/bin/zigeng-bench "$STAGE/" 2>/dev/null || true
+          cp zig-out/bin/headless-ecs zig-out/bin/zigeng zig-out/bin/playground zig-out/bin/zigeng-bench "$STAGE/" 2>/dev/null || true
           cp zig-out/lib/* "$STAGE/lib/" 2>/dev/null || true
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"

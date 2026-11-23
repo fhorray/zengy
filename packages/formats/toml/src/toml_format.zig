@@ -79,6 +79,59 @@ pub const TomlService = struct {
             .abi_major = abi_major,
         };
     }
+
+    pub const GameManifest = struct {
+        title: []const u8,
+        width: u32 = 1280,
+        height: u32 = 720,
+        mode: []const u8,
+        entry_script: []const u8,
+        ui: []const u8,
+
+        pub fn deinit(self: *GameManifest, allocator: std.mem.Allocator) void {
+            allocator.free(self.title);
+            allocator.free(self.mode);
+            allocator.free(self.entry_script);
+            allocator.free(self.ui);
+        }
+    };
+
+    /// Parses a `game.toml` project manifest (`[game]` table).
+    pub fn parseGameManifest(allocator: std.mem.Allocator, source: []const u8) !GameManifest {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const root = try toml.parseSlice(arena.allocator(), source, null);
+        const game_val = root.get("game") orelse return error.MissingGameSection;
+        const tbl = switch (game_val) {
+            .table => |t| t,
+            else => return error.InvalidGameSection,
+        };
+
+        const title_s = if (tbl.get("title")) |v| (if (v == .string) v.string else "ZigEng Game") else "ZigEng Game";
+        const mode_s = if (tbl.get("mode")) |v| (if (v == .string) v.string else "2d") else "2d";
+        const script_s = if (tbl.get("entry_script")) |v| (if (v == .string) v.string else "") else "";
+        const ui_s = if (tbl.get("ui")) |v| (if (v == .string) v.string else "") else "";
+        const w: u32 = if (tbl.get("width")) |v| (if (v == .integer and v.integer.value > 0) @intCast(v.integer.value) else 1280) else 1280;
+        const h: u32 = if (tbl.get("height")) |v| (if (v == .integer and v.integer.value > 0) @intCast(v.integer.value) else 720) else 720;
+
+        const title_copy = try allocator.dupe(u8, title_s);
+        errdefer allocator.free(title_copy);
+        const mode_copy = try allocator.dupe(u8, mode_s);
+        errdefer allocator.free(mode_copy);
+        const script_copy = try allocator.dupe(u8, script_s);
+        errdefer allocator.free(script_copy);
+        const ui_copy = try allocator.dupe(u8, ui_s);
+
+        return .{
+            .title = title_copy,
+            .width = w,
+            .height = h,
+            .mode = mode_copy,
+            .entry_script = script_copy,
+            .ui = ui_copy,
+        };
+    }
 };
 
 var g_toml_service = TomlService{};

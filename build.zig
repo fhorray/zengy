@@ -299,15 +299,18 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("testing_sdk", testing_sdk_mod);
 
     const cli_exe = b.addExecutable(.{
-        .name = "engine-cli",
+        .name = "zigeng",
         .root_module = cli_mod,
     });
     b.installArtifact(cli_exe);
 
     const run_cli = b.addRunArtifact(cli_exe);
-    const cli_cmd = b.option([]const u8, "cli-cmd", "CLI subcommand (doctor, packages)") orelse "doctor";
+    const cli_cmd = b.option([]const u8, "cli-cmd", "CLI subcommand (doctor, packages, list-official, new, run, add)") orelse "doctor";
     run_cli.addArg(cli_cmd);
-    const run_cli_step = b.step("run-cli", "Run the engine diagnostic CLI (doctor, packages)");
+    if (b.option([]const u8, "cli-arg", "Optional argument for CLI subcommand")) |arg| {
+        run_cli.addArg(arg);
+    }
+    const run_cli_step = b.step("run-cli", "Run the zigeng CLI (doctor, packages, list-official, new, run, add)");
     run_cli_step.dependOn(&run_cli.step);
 
     // Integrated Playground example (`examples/playground`)
@@ -587,6 +590,31 @@ pub fn build(b: *std.Build) void {
     run_visual_3d.step.dependOn(b.getInstallStep());
     const run_visual_3d_step = b.step("run-visual-3d", "Open the Phase E 3D Foundation demo");
     run_visual_3d_step.dependOn(&run_visual_3d.step);
+
+    // Manifesto-driven visual runtime (`tools/runtime/main.zig`): reads game.toml in CWD.
+    const runtime_mod = b.createModule(.{
+        .root_source_file = b.path("tools/runtime/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    runtime_mod.addImport("engine", engine_mod);
+    runtime_mod.addImport("window", window_mod);
+    runtime_mod.addImport("window_sdl3", window_sdl3_mod);
+    runtime_mod.addImport("graphics", graphics_mod);
+    runtime_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    runtime_mod.addImport("ui_core", ui_core_mod);
+    runtime_mod.addImport("ui_markup", ui_markup_mod);
+    runtime_mod.addImport("scripting_host", scripting_host_mod);
+    runtime_mod.addImport("scripting_python", scripting_python_mod);
+    runtime_mod.addImport("scripting_lua", scripting_lua_mod);
+    runtime_mod.addImport("toml_format", toml_format_mod);
+
+    const runtime_exe = b.addExecutable(.{
+        .name = "zigeng-runtime",
+        .root_module = runtime_mod,
+    });
+    b.installArtifact(runtime_exe);
 
     // Microbenchmark suite (`benchmarks/main.zig`)
     const bench_mod = b.createModule(.{

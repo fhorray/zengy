@@ -103,6 +103,96 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
     });
 }
 
+fn writeFileRelative(io: std.Io, path: []const u8, content: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, content);
+}
+
+fn scaffoldProject(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void {
+    const dirs = [_][]const u8{ "", "/scripts", "/ui", "/assets" };
+    for (dirs) |sub| {
+        const p = try std.fmt.allocPrint(allocator, "{s}{s}", .{ name, sub });
+        defer allocator.free(p);
+        try std.Io.Dir.cwd().createDirPath(io, p);
+    }
+
+    const toml_path = try std.fmt.allocPrint(allocator, "{s}/game.toml", .{name});
+    defer allocator.free(toml_path);
+    const toml_src = try std.fmt.allocPrint(allocator,
+        \\[game]
+        \\title = "{s}"
+        \\width = 1280
+        \\height = 720
+        \\mode = "2d"
+        \\entry_script = "scripts/main.py"
+        \\ui = "ui/hud.html"
+        \\
+    , .{name});
+    defer allocator.free(toml_src);
+    try writeFileRelative(io, toml_path, toml_src);
+
+    const py_path = try std.fmt.allocPrint(allocator, "{s}/scripts/main.py", .{name});
+    defer allocator.free(py_path);
+    try writeFileRelative(io, py_path,
+        \\import engine
+        \\
+        \\px = 600.0
+        \\py = 340.0
+        \\color_idx = 0
+        \\
+        \\def on_ui_action(action):
+        \\    global color_idx
+        \\    if action == "game.cycle_color":
+        \\        color_idx = (color_idx + 1) % 3
+        \\        engine.log("Color changed!")
+        \\
+        \\def on_frame(dt_str):
+        \\    global px, py
+        \\    dt = float(dt_str)
+        \\    speed = 280.0 * dt
+        \\    # WASD scancodes: A=4, D=7, S=22, W=26
+        \\    if engine.is_key_down(4): px = px - speed
+        \\    if engine.is_key_down(7): px = px + speed
+        \\    if engine.is_key_down(26): py = py - speed
+        \\    if engine.is_key_down(22): py = py + speed
+        \\
+        \\    colors = [
+        \\        (0.25, 0.85, 0.65),
+        \\        (0.95, 0.45, 0.35),
+        \\        (0.35, 0.65, 0.98),
+        \\    ]
+        \\    r, g, b = colors[color_idx]
+        \\    engine.draw_rect(px, py, 64.0, 64.0, r, g, b, 1.0)
+        \\
+    );
+
+    const ui_path = try std.fmt.allocPrint(allocator, "{s}/ui/hud.html", .{name});
+    defer allocator.free(ui_path);
+    try writeFileRelative(io, ui_path,
+        \\<panel id="hud">
+        \\  <label id="title">WASD to move</label>
+        \\  <button id="color_btn" action="game.cycle_color">Change Color</button>
+        \\</panel>
+        \\
+    );
+
+    std.debug.print("Created zigeng game project '{s}/':\n  cd {s}\n  zigeng run\n", .{ name, name });
+}
+
+fn runProject(allocator: std.mem.Allocator, io: std.Io) !void {
+    const runtime_bin = if (builtin.os.tag == .windows) "zigeng-runtime.exe" else "zigeng-runtime";
+    const res = try std.process.run(allocator, io, .{ .argv = &.{runtime_bin} });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+    if (res.stdout.len > 0) std.debug.print("{s}", .{res.stdout});
+    if (res.stderr.len > 0) std.debug.print("{s}", .{res.stderr});
+    switch (res.term) {
+        .exited => |code| if (code != 0) return error.RuntimeExitedWithError,
+        else => return error.RuntimeExitedWithError,
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -111,8 +201,22 @@ pub fn main(init: std.process.Init) !void {
     _ = args_it.next(); // skip executable name
     const cmd = args_it.next() orelse "doctor";
 
+    if (std.mem.eql(u8, cmd, "new")) {
+        const proj_name = args_it.next() orelse {
+            std.debug.print("Usage: zigeng new <project-name>\n", .{});
+            return;
+        };
+        try scaffoldProject(allocator, init.io, proj_name);
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "run")) {
+        try runProject(allocator, init.io);
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "list-official")) {
-        std.debug.print("Official zigeng packages (install with: engine-cli add <name>):\n", .{});
+        std.debug.print("Official zigeng packages (install with: zigeng add <name>):\n", .{});
         for (OFFICIAL_PACKAGES) |pkg| {
             std.debug.print("  - {s:<18} {s}\n", .{ pkg.name, pkg.summary });
         }
@@ -121,11 +225,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "add")) {
         const pkg_name = args_it.next() orelse {
-            std.debug.print("Usage: engine-cli add <package-name>\nRun 'engine-cli list-official' to see available packages.\n", .{});
+            std.debug.print("Usage: zigeng add <package-name>\nRun 'zigeng list-official' to see available packages.\n", .{});
             return;
         };
         const pkg = findOfficialPackage(pkg_name) orelse {
-            std.debug.print("Unknown official package '{s}'. Run 'engine-cli list-official' to see available packages.\n", .{pkg_name});
+            std.debug.print("Unknown official package '{s}'. Run 'zigeng list-official' to see available packages.\n", .{pkg_name});
             return error.UnknownPackage;
         };
         try installOfficialPackage(allocator, init.io, pkg);

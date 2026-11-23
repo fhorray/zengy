@@ -61,6 +61,14 @@ pub const ScriptDrawQueue = struct {
     }
 };
 
+pub const ScriptInputState = struct {
+    mouse_x: f32 = 0.0,
+    mouse_y: f32 = 0.0,
+    mouse_left_down: bool = false,
+    mouse_left_clicked: bool = false,
+    keys_down: [256]bool = @splat(false),
+};
+
 /// Handle-based bridge exposed to scripting runtimes without leaking raw ECS pointers.
 pub const ScriptEngineBridge = struct {
     app: *engine.App,
@@ -105,6 +113,31 @@ pub const ScriptEngineBridge = struct {
         if (self.app.resources.get(ScriptDrawQueue)) |q| {
             q.clear();
         }
+    }
+
+    pub fn isKeyDown(self: *const ScriptEngineBridge, scancode: u8) bool {
+        const inp = self.app.resources.get(ScriptInputState) orelse return false;
+        return inp.keys_down[scancode];
+    }
+
+    pub fn mouseX(self: *const ScriptEngineBridge) f32 {
+        const inp = self.app.resources.get(ScriptInputState) orelse return 0.0;
+        return inp.mouse_x;
+    }
+
+    pub fn mouseY(self: *const ScriptEngineBridge) f32 {
+        const inp = self.app.resources.get(ScriptInputState) orelse return 0.0;
+        return inp.mouse_y;
+    }
+
+    pub fn isMouseDown(self: *const ScriptEngineBridge) bool {
+        const inp = self.app.resources.get(ScriptInputState) orelse return false;
+        return inp.mouse_left_down;
+    }
+
+    pub fn wasMouseClicked(self: *const ScriptEngineBridge) bool {
+        const inp = self.app.resources.get(ScriptInputState) orelse return false;
+        return inp.mouse_left_clicked;
     }
 };
 
@@ -280,6 +313,7 @@ pub const ScriptingHost = struct {
 
 fn buildModule(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
+    try app.resources.insert(ScriptInputState, .{});
     try app.resources.insert(ScriptDrawQueue, ScriptDrawQueue.init(app.allocator));
     try app.resources.insert(ScriptingHost, ScriptingHost.init(app.allocator, app));
     const host = app.resources.get(ScriptingHost).?;
@@ -306,6 +340,7 @@ fn stopModule(raw_app: *anyopaque) void {
         q.deinit();
         _ = app.resources.remove(ScriptDrawQueue);
     }
+    _ = app.resources.remove(ScriptInputState);
 }
 
 pub fn module() engine.Module {
