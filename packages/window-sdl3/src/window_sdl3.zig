@@ -158,6 +158,20 @@ fn refreshPixelSize(state: *SdlState) void {
     state.dpi_scale = c.SDL_GetWindowDisplayScale(state.sdl_window);
 }
 
+/// Returns an opaque pointer to the underlying `SDL_Window` for sibling native backends
+/// (such as `official.graphics.sdlgpu`) without leaking SDL types into public engine contracts.
+pub fn sdlWindowOpaque(app: *engine.App) ?*anyopaque {
+    const state = app.resources.get(SdlState) orelse return null;
+    return @ptrCast(state.sdl_window);
+}
+
+/// Returns true if the main window is currently minimized or has zero pixel extent.
+pub fn isMinimized(app: *engine.App) bool {
+    const state = app.resources.get(SdlState) orelse return false;
+    if ((c.SDL_GetWindowFlags(state.sdl_window) & c.SDL_WINDOW_MINIMIZED) != 0) return true;
+    return state.pixel_w == 0 or state.pixel_h == 0;
+}
+
 /// Returns the window's current size in physical pixels (for render targets) and its DPI scale.
 pub fn pixelSize(app: *engine.App) ?struct { width: u32, height: u32, dpi_scale: f32 } {
     const state = app.resources.get(SdlState) orelse return null;
@@ -175,12 +189,15 @@ pub fn pollEvents(app: *engine.App) void {
             c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
                 _ = state.window_svc.requestClose(state.handle);
             },
-            c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED => {
+            c.SDL_EVENT_WINDOW_RESIZED, c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, c.SDL_EVENT_WINDOW_RESTORED => {
                 var w: c_int = 0;
                 var h: c_int = 0;
                 if (c.SDL_GetWindowSize(state.sdl_window, &w, &h)) {
                     _ = state.window_svc.resize(state.handle, @intCast(w), @intCast(h));
                 }
+                refreshPixelSize(state);
+            },
+            c.SDL_EVENT_WINDOW_MINIMIZED => {
                 refreshPixelSize(state);
             },
             c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP => {
@@ -231,6 +248,12 @@ pub fn runVisualLoop(app: *engine.App) !void {
         pollEvents(app);
         if (closeRequested(app)) break;
 
+        if (isMinimized(app)) {
+            c.SDL_Delay(50);
+            last = c.SDL_GetPerformanceCounter();
+            continue;
+        }
+
         const now = c.SDL_GetPerformanceCounter();
         const dt_ns_raw = (now - last) * std.time.ns_per_s / freq;
         last = now;
@@ -238,7 +261,7 @@ pub fn runVisualLoop(app: *engine.App) !void {
 
         try app.tick(dt);
 
-        // Frame pacing: sleep off the remaining budget so an idle or minimized window does not spin.
+        // Frame pacing: sleep off the remaining budget so an idle window does not spin.
         const frame_ns = (c.SDL_GetPerformanceCounter() - now) * std.time.ns_per_s / freq;
         if (frame_ns < TARGET_FRAME_NS) {
             c.SDL_Delay(@intCast((TARGET_FRAME_NS - frame_ns) / std.time.ns_per_ms));

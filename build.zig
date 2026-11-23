@@ -381,15 +381,160 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(visual_hello_exe);
 
-    // The SDL3 runtime DLL must sit next to the executable in zig-out/bin.
-    const install_sdl3_dll = b.addInstallBinFile(b.path("third_party/sdl3/bin/x64/SDL3.dll"), "SDL3.dll");
-    b.getInstallStep().dependOn(&install_sdl3_dll.step);
+    // The SDL3 runtime DLL must sit next to the executable in zig-out/bin when present.
+    if (std.Io.Dir.cwd().access(b.graph.io, "third_party/sdl3/bin/x64/SDL3.dll", .{})) |_| {
+        const install_sdl3_dll = b.addInstallBinFile(b.path("third_party/sdl3/bin/x64/SDL3.dll"), "SDL3.dll");
+        b.getInstallStep().dependOn(&install_sdl3_dll.step);
+    } else |_| {}
     // Run the installed copy: the cache copy has no SDL3.dll beside it (Windows exit 0xC0000135).
     const run_visual_hello = b.addSystemCommand(&.{"zig-out/bin/visual-hello.exe"});
     run_visual_hello.setCwd(b.path("."));
     run_visual_hello.step.dependOn(b.getInstallStep());
     const run_visual_hello_step = b.step("run-visual-hello", "Open the native SDL3 hello window (D1)");
     run_visual_hello_step.dependOn(&run_visual_hello.step);
+
+    const text_mod = b.addModule("text", .{
+        .root_source_file = b.path("packages/text/src/text.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    text_mod.addImport("graphics", graphics_mod);
+
+    const render_2d_mod = b.addModule("render_2d", .{
+        .root_source_file = b.path("packages/render-2d/src/render_2d.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    render_2d_mod.addImport("engine", engine_mod);
+    render_2d_mod.addImport("graphics", graphics_mod);
+    render_2d_mod.addImport("scene", scene_mod);
+
+    const gpu_resources_mod = b.addModule("gpu_resources", .{
+        .root_source_file = b.path("packages/graphics-sdlgpu/src/gpu_resources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gpu_resources_mod.addImport("graphics", graphics_mod);
+
+    const graphics_sdlgpu_mod = b.addModule("graphics_sdlgpu", .{
+        .root_source_file = b.path("packages/graphics-sdlgpu/src/graphics_sdlgpu.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    graphics_sdlgpu_mod.addImport("engine", engine_mod);
+    graphics_sdlgpu_mod.addImport("graphics", graphics_mod);
+    graphics_sdlgpu_mod.addImport("window_sdl3", window_sdl3_mod);
+    graphics_sdlgpu_mod.addImport("text", text_mod);
+    graphics_sdlgpu_mod.addImport("sdl3_c", sdl3_c_mod);
+
+    // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
+    const visual_gpu_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-gpu/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_gpu_mod.addImport("engine", engine_mod);
+    visual_gpu_mod.addImport("window", window_mod);
+    visual_gpu_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_gpu_mod.addImport("graphics", graphics_mod);
+    visual_gpu_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+
+    const visual_gpu_exe = b.addExecutable(.{
+        .name = "visual-gpu",
+        .root_module = visual_gpu_mod,
+    });
+    b.installArtifact(visual_gpu_exe);
+
+    const run_visual_gpu = b.addSystemCommand(&.{"zig-out/bin/visual-gpu.exe"});
+    run_visual_gpu.setCwd(b.path("."));
+    run_visual_gpu.step.dependOn(b.getInstallStep());
+    const run_visual_gpu_step = b.step("run-visual-gpu", "Open the native SDL3 + SDL_GPU hello window (D2)");
+    run_visual_gpu_step.dependOn(&run_visual_gpu.step);
+
+    // Visual 2D hello (D3): Camera2D, Sprite, Transform2D, and batched textures. Run with `zig build run-visual-2d`.
+    const visual_2d_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-2d/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_2d_mod.addImport("engine", engine_mod);
+    visual_2d_mod.addImport("window", window_mod);
+    visual_2d_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_2d_mod.addImport("graphics", graphics_mod);
+    visual_2d_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_2d_mod.addImport("scene", scene_mod);
+    visual_2d_mod.addImport("render_2d", render_2d_mod);
+
+    const visual_2d_exe = b.addExecutable(.{
+        .name = "visual-2d",
+        .root_module = visual_2d_mod,
+    });
+    b.installArtifact(visual_2d_exe);
+
+    const run_visual_2d = b.addSystemCommand(&.{"zig-out/bin/visual-2d.exe"});
+    run_visual_2d.setCwd(b.path("."));
+    run_visual_2d.step.dependOn(b.getInstallStep());
+    const run_visual_2d_step = b.step("run-visual-2d", "Open the native SDL3 2D sprites & Camera2D demo (D3)");
+    run_visual_2d_step.dependOn(&run_visual_2d.step);
+
+    // Visual UI hello (D4): UiTree, ui_markup, font atlas text, click, textbox & clipping. Run with `zig build run-visual-ui`.
+    const visual_ui_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-ui/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_ui_mod.addImport("engine", engine_mod);
+    visual_ui_mod.addImport("window", window_mod);
+    visual_ui_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_ui_mod.addImport("graphics", graphics_mod);
+    visual_ui_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_ui_mod.addImport("ui_core", ui_core_mod);
+    visual_ui_mod.addImport("ui_markup", ui_markup_mod);
+
+    const visual_ui_exe = b.addExecutable(.{
+        .name = "visual-ui",
+        .root_module = visual_ui_mod,
+    });
+    b.installArtifact(visual_ui_exe);
+
+    const run_visual_ui = b.addSystemCommand(&.{"zig-out/bin/visual-ui.exe"});
+    run_visual_ui.setCwd(b.path("."));
+    run_visual_ui.step.dependOn(b.getInstallStep());
+    const run_visual_ui_step = b.step("run-visual-ui", "Open the native SDL3 UI & text demo (D4)");
+    run_visual_ui_step.dependOn(&run_visual_ui.step);
+
+    // Visual Playground (D5): integrated 2D scene + UI panel (FPS, Spawn, Log). Run with `zig build run-visual-playground`.
+    const visual_pg_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-playground/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_pg_mod.addImport("engine", engine_mod);
+    visual_pg_mod.addImport("window", window_mod);
+    visual_pg_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_pg_mod.addImport("graphics", graphics_mod);
+    visual_pg_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_pg_mod.addImport("scene", scene_mod);
+    visual_pg_mod.addImport("render_2d", render_2d_mod);
+    visual_pg_mod.addImport("ui_core", ui_core_mod);
+    visual_pg_mod.addImport("ui_markup", ui_markup_mod);
+
+    const visual_pg_exe = b.addExecutable(.{
+        .name = "visual-playground",
+        .root_module = visual_pg_mod,
+    });
+    b.installArtifact(visual_pg_exe);
+
+    const run_visual_pg = b.addSystemCommand(&.{"zig-out/bin/visual-playground.exe"});
+    run_visual_pg.setCwd(b.path("."));
+    run_visual_pg.step.dependOn(b.getInstallStep());
+    const run_visual_pg_step = b.step("run-visual-playground", "Open the integrated 2D + UI Visual Playground (D5)");
+    run_visual_pg_step.dependOn(&run_visual_pg.step);
 
     // Microbenchmark suite (`benchmarks/main.zig`)
     const bench_mod = b.createModule(.{
@@ -547,5 +692,23 @@ pub fn build(b: *std.Build) void {
         .{ .name = "scripting_host", .mod = scripting_host_mod },
         .{ .name = "scripting_lua", .mod = scripting_lua_mod },
         .{ .name = "scripting_python", .mod = scripting_python_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/graphics-sdlgpu/tests/graphics_sdlgpu_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "gpu_resources", .mod = gpu_resources_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/text/tests/text_tests.zig", target, optimize, false, &.{
+        .{ .name = "text", .mod = text_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/render-2d/tests/render_2d_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "scene", .mod = scene_mod },
+        .{ .name = "render_2d", .mod = render_2d_mod },
     }, null);
 }

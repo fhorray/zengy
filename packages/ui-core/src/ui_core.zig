@@ -35,6 +35,7 @@ pub const UiStyle = struct {
     min_height: f32 = 24,
     padding: f32 = 8,
     gap: f32 = 4,
+    clip_children: bool = false,
     bg_color: graphics.Color = .{ .r = 0.08, .g = 0.10, .b = 0.13 },
     text_color: graphics.Color = .{ .r = 0.90, .g = 0.92, .b = 0.94 },
 };
@@ -68,6 +69,7 @@ pub const UiNode = struct {
     layout: Rect,
     children: std.ArrayList(usize),
     focused: bool,
+    scroll_y: f32 = 0,
 };
 
 pub const UiTree = struct {
@@ -179,7 +181,7 @@ pub const UiTree = struct {
         const min_h = node.style.min_height;
 
         var child_x = x + pad;
-        var child_y = y + pad;
+        var child_y = y + pad - node.scroll_y;
         const inner_w = @max(0, w - pad * 2);
         const inner_h = @max(0, avail_h - pad * 2);
 
@@ -264,6 +266,42 @@ pub const UiTree = struct {
         return hit;
     }
 
+    pub fn setNodeText(self: *UiTree, idx: usize, new_text: []const u8) !void {
+        if (idx >= self.nodes.items.len) return error.InvalidNode;
+        const copy = try self.allocator.dupe(u8, new_text);
+        self.allocator.free(self.nodes.items[idx].text);
+        self.nodes.items[idx].text = copy;
+    }
+
+    pub fn handleTextInput(self: *UiTree, input_text: []const u8) !bool {
+        const idx = self.focused_node orelse return false;
+        if (idx >= self.nodes.items.len) return false;
+        const node = &self.nodes.items[idx];
+        if (node.kind != .textbox or input_text.len == 0) return false;
+
+        const next = try std.mem.concat(self.allocator, u8, &.{ node.text, input_text });
+        self.allocator.free(node.text);
+        node.text = next;
+        return true;
+    }
+
+    pub fn handleBackspace(self: *UiTree) !bool {
+        const idx = self.focused_node orelse return false;
+        if (idx >= self.nodes.items.len) return false;
+        const node = &self.nodes.items[idx];
+        if (node.kind != .textbox or node.text.len == 0) return false;
+
+        const next = try self.allocator.dupe(u8, node.text[0 .. node.text.len - 1]);
+        self.allocator.free(node.text);
+        node.text = next;
+        return true;
+    }
+
+    pub fn scrollNode(self: *UiTree, idx: usize, delta_y: f32) void {
+        if (idx >= self.nodes.items.len) return;
+        self.nodes.items[idx].scroll_y = @max(0.0, self.nodes.items[idx].scroll_y + delta_y);
+    }
+
     pub fn paint(self: *const UiTree, allocator: std.mem.Allocator, out_cmds: *std.ArrayList(graphics.DrawCommand)) !void {
         for (self.roots.items) |root_idx| {
             try self.paintNode(allocator, root_idx, out_cmds);
@@ -291,8 +329,22 @@ pub const UiTree = struct {
                 },
             });
         }
+        const clips = (node.style.clip_children or node.kind == .virtual_list) and node.children.items.len > 0;
+        if (clips) {
+            try out_cmds.append(allocator, .{
+                .clip_rect = .{
+                    .x = node.layout.x,
+                    .y = node.layout.y,
+                    .width = node.layout.width,
+                    .height = node.layout.height,
+                },
+            });
+        }
         for (node.children.items) |c_idx| {
             try self.paintNode(allocator, c_idx, out_cmds);
+        }
+        if (clips) {
+            try out_cmds.append(allocator, .{ .clip_rect = null });
         }
     }
 };

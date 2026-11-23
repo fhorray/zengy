@@ -158,6 +158,7 @@ pub const CaptureService = struct {
                         cursor_x += 4.0;
                     }
                 },
+                .clip_rect => {},
             }
         }
     }

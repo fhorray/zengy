@@ -9,7 +9,11 @@
 | Package | Module ID | Capability Provided | Description |
 |---|---|---|---|
 | [`window/`](window/src/window.zig) | `official.window` | `engine.window/1`, `engine.input/1` | Window lifecycle, DPI/resize events, and keyboard/mouse input state. |
+| [`window-sdl3/`](window-sdl3/src/window_sdl3.zig) | `official.window.sdl3` | `engine.window/1`, `engine.input/1` | Native SDL3 window, OS event loop, DPI scaling, and keyboard/mouse input. |
 | [`graphics/`](graphics/src/graphics.zig) | `official.graphics` | `engine.graphics.device/1` | Render targets, draw command lists (`clear`, `rect`, `text`), and `present()`. |
+| [`graphics-sdlgpu/`](graphics-sdlgpu/src/graphics_sdlgpu.zig) | `official.graphics.sdlgpu` | `engine.graphics.device/1` | Native SDL_GPU backend (Vulkan/SPIR-V), swapchain, pipelines, and Diagnostics logging. |
+| [`text/`](text/src/text.zig) | `official.text` | — | Embedded 8x8 ASCII bitmap font atlas, glyph UVs, text measurement, and quad emission. |
+| [`render-2d/`](render-2d/src/render_2d.zig) | `official.render.2d` | `engine.render.2d/1` | `Camera2D`, `Sprite`, `Visibility`, and `.render_extract` 2D batch extraction. |
 | [`ui-core/`](ui-core/src/ui_core.zig) | `official.ui.core` | `engine.ui.tree/1` | Syntax-agnostic retained `UiTree`, flex layout, O(1) ID index, focus, and hit testing. |
 | [`ui-markup/`](ui-markup/src/ui_markup.zig) | `official.ui.markup` | — | Official HTML-like markup parser compiling into `UiTree` IR. |
 | [`ui-novaui/`](ui-novaui/src/novaui.zig) | `community.ui.novaui` | — | Alternative community DSL (`NovaUI`) compiling into the same `UiTree` IR. |
