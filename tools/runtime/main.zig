@@ -96,6 +96,23 @@ fn runtimeUpdateSystem(ctx: *engine.SystemContext) !void {
     }
 }
 
+const HeadlessScriptState = struct {
+    host: *scripting_host.ScriptingHost,
+    script: ?scripting_host.ScriptModuleHandle,
+};
+
+fn headlessUpdateSystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(HeadlessScriptState) orelse return;
+    if (st.script) |sc| {
+        var dt_buf: [32]u8 = undefined;
+        const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
+        const res = st.host.invokeScript(sc, "on_frame", dt_str);
+        if (!res.ok) {
+            std.debug.print("[zigeng-runtime] script error: {s}\n", .{res.error_message});
+        }
+    }
+}
+
 fn runtimeRenderSystem(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(RuntimeState) orelse return;
     st.cmds.clearRetainingCapacity();
@@ -131,12 +148,15 @@ fn isSharedLibName(name: []const u8) bool {
         std.mem.endsWith(u8, name, ".dylib");
 }
 
-fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App, manifest_plugins: []const []const u8) !usize {
+fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App, manifest_plugins: []const []const u8, has_physics_jolt: bool) !usize {
     var loaded_count: usize = 0;
 
     // 1. Load explicit shared library paths listed in game.toml
     for (manifest_plugins) |spec| {
         if (isSharedLibName(spec)) {
+            if (has_physics_jolt and std.mem.indexOf(u8, spec, "zigeng_physics_jolt") != null) {
+                continue;
+            }
             const ph = try app.ensurePluginHost();
             const h = try ph.loadSharedLibrary(spec);
             const rc = ph.startPlugin(h);
@@ -156,6 +176,9 @@ fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!isSharedLibName(entry.name)) continue;
+        if (has_physics_jolt and std.mem.indexOf(u8, entry.name, "zigeng_physics_jolt") != null) {
+            continue;
+        }
 
         const full_path = try std.fmt.allocPrint(allocator, ".zigeng/plugins/{s}", .{entry.name});
         defer allocator.free(full_path);
@@ -257,18 +280,24 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (headless) {
+        try app.scheduler.addSystem(.{ .name = "runtime.headless_update", .stage = .update, .run = headlessUpdateSystem });
         try app.initialize();
-        const dynamic_loaded = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
+        const dynamic_loaded = try loadDynamicPlugins(allocator, io, &app, manifest.plugins, has_physics_jolt);
 
         const host = app.resources.get(scripting_host.ScriptingHost).?;
+        var loaded_script: ?scripting_host.ScriptModuleHandle = null;
         if (entry_script) |sp| {
             if (sp.len > 0) {
                 const src = try readFileCwd(allocator, io, sp);
                 defer allocator.free(src);
                 const rt_idx: u16 = if (std.mem.endsWith(u8, sp, ".lua")) 0 else 1;
-                _ = try host.loadScript(rt_idx, sp, src);
+                loaded_script = try host.loadScript(rt_idx, sp, src);
             }
         }
+        try app.resources.insert(HeadlessScriptState, .{
+            .host = host,
+            .script = loaded_script,
+        });
 
         var t: u64 = 0;
         while (t < headless_ticks) : (t += 1) {
@@ -277,6 +306,7 @@ pub fn main(init: std.process.Init) !void {
 
         const phys_steps: u64 = if (app.resources.get(physics.PhysicsService)) |ps| ps.step_count else 0;
         const phys_backend = if (app.resources.get(physics.PhysicsService)) |ps| ps.hasBackend() else false;
+        app.shutdown();
         std.debug.print(
             "{{\"mode\":\"headless\",\"ticks\":{d},\"dynamic_plugins\":{d},\"physics_steps\":{d},\"physics_backend\":{},\"status\":\"ok\"}}\n",
             .{ headless_ticks, dynamic_loaded, phys_steps, phys_backend },
@@ -295,7 +325,7 @@ pub fn main(init: std.process.Init) !void {
     try app.scheduler.addSystem(.{ .name = "runtime.render", .stage = .render_extract, .run = runtimeRenderSystem });
 
     try app.initialize();
-    _ = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
+    _ = try loadDynamicPlugins(allocator, io, &app, manifest.plugins, has_physics_jolt);
 
     const i_entry = try app.services.getService("engine.input", 1);
     const input: *window.InputService = @ptrCast(@alignCast(@constCast(i_entry.api_ptr)));

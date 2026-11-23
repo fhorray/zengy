@@ -216,16 +216,16 @@ fn hasCommand(allocator: std.mem.Allocator, io: std.Io, check_cmd: []const u8) b
     };
 }
 
-fn fileExists(io: std.Io, base_dir: []const u8, rel: []const u8) bool {
-    const full = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ base_dir, rel }) catch return false;
-    defer std.heap.page_allocator.free(full);
+fn fileExists(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8, rel: []const u8) bool {
+    const full = std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, rel }) catch return false;
+    defer allocator.free(full);
     std.Io.Dir.cwd().access(io, full, .{}) catch return false;
     return true;
 }
 
 fn compileAndInstallPluginDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, label: []const u8) !void {
-    const has_cargo = fileExists(io, dir_path, "Cargo.toml");
-    const has_zig = fileExists(io, dir_path, "build.zig");
+    const has_cargo = fileExists(allocator, io, dir_path, "Cargo.toml");
+    const has_zig = fileExists(allocator, io, dir_path, "build.zig");
 
     if (has_cargo) {
         const cargo_ok = hasCommand(allocator, io, if (builtin.os.tag == .windows) "where cargo >nul 2>nul && where rustc >nul 2>nul" else "command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1");
@@ -380,12 +380,9 @@ fn runProject(allocator: std.mem.Allocator, io: std.Io, args_it: anytype) !void 
         try argv_list.append(allocator, arg);
     }
 
-    const res = try std.process.run(allocator, io, .{ .argv = argv_list.items });
-    defer allocator.free(res.stdout);
-    defer allocator.free(res.stderr);
-    if (res.stdout.len > 0) std.debug.print("{s}", .{res.stdout});
-    if (res.stderr.len > 0) std.debug.print("{s}", .{res.stderr});
-    switch (res.term) {
+    var child = try std.process.spawn(io, .{ .argv = argv_list.items });
+    const term = try child.wait(io);
+    switch (term) {
         .exited => |code| if (code != 0) return error.RuntimeExitedWithError,
         else => return error.RuntimeExitedWithError,
     }

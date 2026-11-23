@@ -97,7 +97,7 @@ pub const App = struct {
         if (self.state == .initialized or self.state == .running) {
             self.shutdown();
         }
-        // Unload external C ABI plugins before tearing down services, events, and diagnostics.
+        // Unload external C ABI plugins if shutdown() was not called (e.g. failed startup).
         if (self.plugin_host) |host| {
             host.deinit();
             self.plugin_host = null;
@@ -239,6 +239,12 @@ pub const App = struct {
         var ctx = self.makeSystemContext(0.0);
         self.scheduler.runStage(.shutdown, &ctx) catch {};
         _ = self.events.drain();
+
+        // Unload external C ABI plugins before stopping modules and unregistering their services.
+        if (self.plugin_host) |host| {
+            host.deinit();
+            self.plugin_host = null;
+        }
 
         self.modules.stopAll(self);
         self.state = .stopped;

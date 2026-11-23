@@ -120,7 +120,7 @@ inline uint64_t encode_handle(BodyID id) {
 } // namespace
 
 struct JoltWorld {
-    TempAllocatorImpl temp_allocator{10 * 1024 * 1024};
+    TempAllocatorImpl temp_allocator{2 * 1024 * 1024};
     JobSystemThreadPool job_system{cMaxPhysicsJobs, cMaxPhysicsBarriers, 1};
     BPLayerInterfaceImpl bp_layer_interface;
     ObjectVsBroadPhaseLayerFilterImpl obj_vs_bp_filter;
@@ -311,7 +311,8 @@ void jolt_world_step(JoltWorld *world, float dt, const float gravity[3]) {
         world->broadphase_dirty = false;
     }
     world->physics_system.SetGravity(Vec3(gravity[0], gravity[1], gravity[2]));
-    world->physics_system.Update(dt, 1, &world->temp_allocator, &world->job_system);
+    int collision_steps = (dt > (1.0f / 55.0f)) ? std::min(4, std::max(1, static_cast<int>(std::ceil(dt / (1.0f / 60.0f))))) : 1;
+    world->physics_system.Update(dt, collision_steps, &world->temp_allocator, &world->job_system);
 }
 
 bool jolt_world_raycast(
