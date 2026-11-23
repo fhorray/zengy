@@ -74,6 +74,7 @@ pub const UiTree = struct {
     allocator: std.mem.Allocator,
     nodes: std.ArrayList(UiNode),
     roots: std.ArrayList(usize),
+    id_index: std.StringHashMapUnmanaged(usize),
     focused_node: ?usize,
 
     pub fn init(allocator: std.mem.Allocator) UiTree {
@@ -81,11 +82,13 @@ pub const UiTree = struct {
             .allocator = allocator,
             .nodes = .empty,
             .roots = .empty,
+            .id_index = .empty,
             .focused_node = null,
         };
     }
 
     pub fn deinit(self: *UiTree) void {
+        self.id_index.deinit(self.allocator);
         for (self.nodes.items) |*node| {
             self.allocator.free(node.id);
             self.allocator.free(node.text);
@@ -97,6 +100,7 @@ pub const UiTree = struct {
     }
 
     pub fn clear(self: *UiTree) void {
+        self.id_index.clearRetainingCapacity();
         for (self.nodes.items) |*node| {
             self.allocator.free(node.id);
             self.allocator.free(node.text);
@@ -116,8 +120,18 @@ pub const UiTree = struct {
         const action_copy = try self.allocator.dupe(u8, desc.action);
         errdefer self.allocator.free(action_copy);
 
+        if (parent_idx) |p| {
+            try self.nodes.items[p].children.ensureUnusedCapacity(self.allocator, 1);
+        } else {
+            try self.roots.ensureUnusedCapacity(self.allocator, 1);
+        }
+        try self.nodes.ensureUnusedCapacity(self.allocator, 1);
+        if (id_copy.len > 0) {
+            try self.id_index.ensureUnusedCapacity(self.allocator, 1);
+        }
+
         const idx = self.nodes.items.len;
-        try self.nodes.append(self.allocator, .{
+        self.nodes.appendAssumeCapacity(.{
             .id = id_copy,
             .kind = desc.kind,
             .text = text_copy,
@@ -129,18 +143,18 @@ pub const UiTree = struct {
         });
 
         if (parent_idx) |p| {
-            try self.nodes.items[p].children.append(self.allocator, idx);
+            self.nodes.items[p].children.appendAssumeCapacity(idx);
         } else {
-            try self.roots.append(self.allocator, idx);
+            self.roots.appendAssumeCapacity(idx);
+        }
+        if (id_copy.len > 0) {
+            self.id_index.putAssumeCapacity(id_copy, idx);
         }
         return idx;
     }
 
     pub fn findById(self: *const UiTree, id: []const u8) ?usize {
-        for (self.nodes.items, 0..) |node, i| {
-            if (std.mem.eql(u8, node.id, id)) return i;
-        }
-        return null;
+        return self.id_index.get(id);
     }
 
     pub fn nodeCount(self: *const UiTree) usize {

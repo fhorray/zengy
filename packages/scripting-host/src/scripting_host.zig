@@ -132,10 +132,8 @@ pub const ScriptingHost = struct {
         errdefer self.allocator.destroy(bridge);
         bridge.* = .{ .app = self.app, .owner_id = owner_id };
 
-        const state = vtable.create(self.allocator, bridge) catch |err| {
-            self.allocator.destroy(bridge);
-            return err;
-        };
+        const state = try vtable.create(self.allocator, bridge);
+        errdefer vtable.destroy(state, self.allocator);
 
         const idx: u16 = @intCast(self.runtimes.items.len);
         try self.runtimes.append(self.allocator, .{
@@ -155,6 +153,7 @@ pub const ScriptingHost = struct {
         }
         const rt = &self.runtimes.items[runtime_idx];
         const internal_id = try rt.vtable.load(rt.state, source_name, source);
+        errdefer rt.vtable.unload(rt.state, internal_id);
 
         const mod_idx: u16 = @intCast(self.scripts.items.len);
         try self.scripts.append(self.allocator, .{

@@ -323,3 +323,142 @@ test "Phase 4: TypeRegistry dynamic ComponentSchema and field reflection" {
     try testing.expectApproxEqAbs(@as(f32, 75.5), cur.f32_t, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 100.0), max.f32_t, 0.001);
 }
+
+test "ZE-002: EventBus reentrant unsubscribe, unsubscribeByOwner, and subscribe during drain()" {
+    var bus = engine.EventBus.init(testing.allocator, 16, .drop_newest);
+    defer bus.deinit();
+
+    const State = struct {
+        bus: *engine.EventBus,
+        self_id: engine.events.SubscriptionId = 0,
+        calls: usize = 0,
+
+        fn onSelfUnsub(raw: ?*anyopaque, _: engine.EventEnvelope) void {
+            const st: *@This() = @ptrCast(@alignCast(raw.?));
+            st.calls += 1;
+            _ = st.bus.unsubscribe(st.self_id);
+        }
+
+        fn onCount(raw: ?*anyopaque, _: engine.EventEnvelope) void {
+            const st: *@This() = @ptrCast(@alignCast(raw.?));
+            st.calls += 1;
+        }
+    };
+
+    var s1 = State{ .bus = &bus };
+    var s2 = State{ .bus = &bus };
+    s1.self_id = try bus.subscribe(1, "tick", State.onSelfUnsub, &s1);
+    _ = try bus.subscribe(2, "tick", State.onCount, &s2);
+
+    try bus.post(.{ .name = "tick", .payload = "1" });
+    try bus.post(.{ .name = "tick", .payload = "2" });
+    _ = bus.drain();
+
+    // s1 unsubscribed itself on the first event, so it only ran once; s2 ran twice.
+    try testing.expectEqual(@as(usize, 1), s1.calls);
+    try testing.expectEqual(@as(usize, 2), s2.calls);
+    try testing.expectEqual(@as(usize, 1), bus.subscriptionCount());
+}
+
+test "ZE-003 & ZE-007: TypeRegistry and World.spawn remain consistent under OOM" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var reg = engine.TypeRegistry.init(failing.allocator());
+    defer reg.deinit();
+
+    const res = reg.registerSchema("ns", "Comp", 1, .blittable, &.{
+        .{ .name = "x", .field_type = .f32_t },
+    });
+    try testing.expectError(error.OutOfMemory, res);
+
+    var fail_world = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var world = engine.World.init(fail_world.allocator(), .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+
+    try testing.expectError(error.OutOfMemory, world.spawn());
+    try testing.expectEqual(@as(usize, 0), world.entity_count);
+    try testing.expectEqual(world.generations.items.len, world.alive_flags.items.len);
+    try testing.expectEqual(world.generations.items.len, world.guids.items.len);
+}
+
+test "ZE-006: ComponentPool preserves align(64) across reallocations" {
+    const Aligned64 = struct {
+        value: u64 align(64),
+    };
+
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+
+    for (0..64) |i| {
+        const e = try world.spawn();
+        try world.set(e, Aligned64, .{ .value = i });
+        const ptr = world.getConst(e, Aligned64).?;
+        try testing.expectEqual(@as(usize, 0), @intFromPtr(ptr) % 64);
+        try testing.expectEqual(@as(u64, i), ptr.value);
+    }
+}
+
+test "EventBus O(1) ring buffer drop_oldest preserves newest events across wrap-around" {
+    var bus = engine.EventBus.init(testing.allocator, 3, .drop_oldest);
+    defer bus.deinit();
+
+    const Recorder = struct {
+        sum: usize = 0,
+        fn onEv(raw: ?*anyopaque, ev: engine.EventEnvelope) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.sum += ev.entity_handle;
+        }
+    };
+    var rec = Recorder{};
+    _ = try bus.subscribe(1, "num", Recorder.onEv, &rec);
+
+    // Post 5 events into a capacity-3 ring: 1 and 2 are evicted; 3, 4, 5 remain.
+    for (1..6) |i| {
+        try bus.post(.{ .name = "num", .payload = "", .entity_handle = i });
+    }
+    try testing.expectEqual(@as(u64, 2), bus.dropped_events);
+    try testing.expectEqual(@as(usize, 3), bus.pendingCount());
+
+    _ = bus.drain();
+    try testing.expectEqual(@as(usize, 3 + 4 + 5), rec.sum);
+}
+
+test "World.registerDynamicComponent rolls back cleanly on OOM" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var world = engine.World.init(failing.allocator(), .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+
+    try testing.expectError(error.OutOfMemory, world.registerDynamicComponent("test.FailComp", 16));
+    try testing.expectEqual(@as(usize, 0), world.pools.count());
+}
+
+test "event_subscribe_during_drain: subscribing during callback is safe and runs on next drain" {
+    var bus = engine.EventBus.init(testing.allocator, 16, .drop_newest);
+    defer bus.deinit();
+
+    const State = struct {
+        bus: *engine.EventBus,
+        second_calls: usize = 0,
+
+        fn onSecond(raw: ?*anyopaque, _: engine.EventEnvelope) void {
+            const st: *@This() = @ptrCast(@alignCast(raw.?));
+            st.second_calls += 1;
+        }
+
+        fn onFirst(raw: ?*anyopaque, _: engine.EventEnvelope) void {
+            const st: *@This() = @ptrCast(@alignCast(raw.?));
+            _ = st.bus.subscribe(2, "ping", onSecond, st) catch {};
+        }
+    };
+
+    var st = State{ .bus = &bus };
+    _ = try bus.subscribe(1, "ping", State.onFirst, &st);
+
+    try bus.post(.{ .name = "ping", .payload = "a" });
+    _ = bus.drain();
+    // Newly subscribed handler did not run on the current event mid-loop.
+    try testing.expectEqual(@as(usize, 0), st.second_calls);
+
+    try bus.post(.{ .name = "ping", .payload = "b" });
+    _ = bus.drain();
+    try testing.expectEqual(@as(usize, 1), st.second_calls);
+}

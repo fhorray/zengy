@@ -173,28 +173,29 @@ pub const ModuleRegistry = struct {
     }
 
     pub fn startAll(self: *ModuleRegistry, app_ctx: *anyopaque) !void {
-        var started_count: usize = 0;
-        for (self.resolved_order.items) |mod_idx| {
+        for (self.resolved_order.items, 0..) |mod_idx, pos| {
             const mod = &self.modules.items[mod_idx];
             if (mod.module.start) |start_fn| {
                 start_fn(app_ctx) catch |err| {
                     mod.state = .failed;
-                    // Rollback already started modules in reverse order
-                    var j = started_count;
+                    // Rollback all previously started AND built modules in reverse topological order.
+                    var j = self.resolved_order.items.len;
                     while (j > 0) {
                         j -= 1;
+                        if (j == pos) continue;
                         const prev_idx = self.resolved_order.items[j];
                         const prev_mod = &self.modules.items[prev_idx];
-                        if (prev_mod.module.stop) |stop_fn| {
-                            stop_fn(app_ctx);
+                        if (prev_mod.state == .started or prev_mod.state == .built) {
+                            if (prev_mod.module.stop) |stop_fn| {
+                                stop_fn(app_ctx);
+                            }
+                            prev_mod.state = .stopped;
                         }
-                        prev_mod.state = .stopped;
                     }
                     return err;
                 };
             }
             mod.state = .started;
-            started_count += 1;
         }
     }
 

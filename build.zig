@@ -141,6 +141,65 @@ pub fn build(b: *std.Build) void {
     });
     editor_shell_mod.addImport("engine", engine_mod);
 
+    // External dependencies (validated for Zig 0.17.1)
+    const z_toml_dep = b.dependency("z_toml", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const lookout_dep = b.dependency("lookout", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const yyjson_dep = b.dependency("yyjson", .{});
+
+    const translate_yyjson = b.addTranslateC(.{
+        .root_source_file = yyjson_dep.path("src/yyjson.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const yyjson_c_mod = translate_yyjson.createModule();
+    yyjson_c_mod.addIncludePath(yyjson_dep.path("src"));
+    yyjson_c_mod.addCSourceFile(.{
+        .file = yyjson_dep.path("src/yyjson.c"),
+        .flags = &.{"-std=c11"},
+    });
+
+    const toml_format_mod = b.addModule("toml_format", .{
+        .root_source_file = b.path("packages/formats/toml/src/toml_format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    toml_format_mod.addImport("engine", engine_mod);
+    toml_format_mod.addImport("toml", z_toml_dep.module("toml"));
+
+    const json_format_mod = b.addModule("json_format", .{
+        .root_source_file = b.path("packages/formats/json/src/json_format.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    json_format_mod.addImport("engine", engine_mod);
+    json_format_mod.addImport("yyjson_c", yyjson_c_mod);
+
+    const file_watcher_mod = b.addModule("file_watcher", .{
+        .root_source_file = b.path("packages/tooling/file-watcher/src/file_watcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    file_watcher_mod.addImport("engine", engine_mod);
+    file_watcher_mod.addImport("lookout", lookout_dep.module("lookout"));
+
+    const testing_sdk_mod = b.addModule("testing_sdk", .{
+        .root_source_file = b.path("packages/testing/src/testing_sdk.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    testing_sdk_mod.addImport("engine", engine_mod);
+    testing_sdk_mod.addImport("window", window_mod);
+    testing_sdk_mod.addImport("graphics", graphics_mod);
+    testing_sdk_mod.addImport("ui_core", ui_core_mod);
+    testing_sdk_mod.addImport("toml_format", toml_format_mod);
+
     const render_3d_mod = b.addModule("render_3d", .{
         .root_source_file = b.path("packages/render-3d/src/render_3d.zig"),
         .target = target,
@@ -160,6 +219,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("ui_core", ui_core_mod);
     cli_mod.addImport("scripting_host", scripting_host_mod);
     cli_mod.addImport("assets", assets_mod);
+    cli_mod.addImport("testing_sdk", testing_sdk_mod);
 
     const cli_exe = b.addExecutable(.{
         .name = "engine-cli",
@@ -202,6 +262,28 @@ pub fn build(b: *std.Build) void {
     run_playground.step.dependOn(&install_c_plugin.step);
     const run_playground_step = b.step("run-playground", "Run the integrated engine playground");
     run_playground_step.dependOn(&run_playground.step);
+
+    // Microbenchmark suite (`benchmarks/main.zig`)
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("benchmarks/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    bench_mod.addImport("engine", engine_mod);
+    bench_mod.addImport("graphics", graphics_mod);
+    bench_mod.addImport("ui_core", ui_core_mod);
+    bench_mod.addImport("scene", scene_mod);
+    bench_mod.addImport("json_format", json_format_mod);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "zigeng-bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+    const run_bench = b.addRunArtifact(bench_exe);
+    const run_bench_step = b.step("run-bench", "Run the engine microbenchmark suite");
+    run_bench_step.dependOn(&run_bench.step);
 
     // Per-module test suites
     const test_step = b.step("test", "Run all per-module unit, integration, and C ABI tests");
@@ -301,5 +383,28 @@ pub fn build(b: *std.Build) void {
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "render_3d", .mod = render_3d_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/formats/toml/tests/toml_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "toml_format", .mod = toml_format_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/formats/json/tests/json_tests.zig", target, optimize, true, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "json_format", .mod = json_format_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/tooling/file-watcher/tests/file_watcher_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "file_watcher", .mod = file_watcher_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/testing/tests/testing_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "testing_sdk", .mod = testing_sdk_mod },
     }, null);
 }

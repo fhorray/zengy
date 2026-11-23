@@ -53,11 +53,12 @@ const ComponentPool = struct {
     stride: usize,
     sparse: std.ArrayList(u32),
     dense_entities: std.ArrayList(EntityHandle),
-    dense_bytes: std.ArrayList(u8),
+    dense_bytes: std.array_list.Aligned(u8, .@"64"),
 
-    fn init(allocator: std.mem.Allocator, type_id: ComponentTypeId, name: []const u8, elem_size: usize) !ComponentPool {
+    fn init(allocator: std.mem.Allocator, type_id: ComponentTypeId, name: []const u8, elem_size: usize, elem_align: usize) !ComponentPool {
         const name_copy = try allocator.dupe(u8, name);
-        const stride = if (elem_size == 0) 0 else std.mem.alignForward(usize, elem_size, 16);
+        const safe_align = if (elem_align == 0) 1 else elem_align;
+        const stride = if (elem_size == 0) 0 else std.mem.alignForward(usize, elem_size, safe_align);
         return .{
             .type_id = type_id,
             .name = name_copy,
@@ -221,12 +222,14 @@ pub const World = struct {
         const tid = comptimeTypeId(T);
         if (self.pools.contains(tid)) return tid;
 
-        const pool = try ComponentPool.init(self.allocator, tid, @typeName(T), @sizeOf(T));
-        try self.pools.put(self.allocator, tid, pool);
-
+        var pool = try ComponentPool.init(self.allocator, tid, @typeName(T), @sizeOf(T), @alignOf(T));
+        errdefer pool.deinit(self.allocator);
+        try self.pools.ensureUnusedCapacity(self.allocator, 1);
+        try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
         const key_copy = try self.allocator.dupe(u8, @typeName(T));
-        errdefer self.allocator.free(key_copy);
-        try self.name_to_type.put(self.allocator, key_copy, tid);
+
+        self.pools.putAssumeCapacity(tid, pool);
+        self.name_to_type.putAssumeCapacity(key_copy, tid);
         return tid;
     }
 
@@ -234,22 +237,23 @@ pub const World = struct {
         const tid = dynamicTypeId(name);
         if (self.pools.contains(tid)) return tid;
 
-        const pool = try ComponentPool.init(self.allocator, tid, name, size);
-        try self.pools.put(self.allocator, tid, pool);
-
+        var pool = try ComponentPool.init(self.allocator, tid, name, size, 16);
+        errdefer pool.deinit(self.allocator);
+        try self.pools.ensureUnusedCapacity(self.allocator, 1);
+        try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
         const key_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(key_copy);
-        try self.name_to_type.put(self.allocator, key_copy, tid);
+
+        self.pools.putAssumeCapacity(tid, pool);
+        self.name_to_type.putAssumeCapacity(key_copy, tid);
         return tid;
     }
 
     pub fn spawn(self: *World) !EntityHandle {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
 
-        const guid = self.next_guid;
-        self.next_guid += 1;
-
         if (self.free_indices.pop()) |idx| {
+            const guid = self.next_guid;
+            self.next_guid += 1;
             const gen = self.generations.items[idx];
             self.alive_flags.items[idx] = true;
             self.guids.items[idx] = guid;
@@ -257,10 +261,16 @@ pub const World = struct {
             return .{ .index = idx, .generation = gen };
         }
 
+        try self.generations.ensureUnusedCapacity(self.allocator, 1);
+        try self.alive_flags.ensureUnusedCapacity(self.allocator, 1);
+        try self.guids.ensureUnusedCapacity(self.allocator, 1);
+
+        const guid = self.next_guid;
+        self.next_guid += 1;
         const idx: u32 = @intCast(self.generations.items.len);
-        try self.generations.append(self.allocator, 1);
-        try self.alive_flags.append(self.allocator, true);
-        try self.guids.append(self.allocator, guid);
+        self.generations.appendAssumeCapacity(1);
+        self.alive_flags.appendAssumeCapacity(true);
+        self.guids.appendAssumeCapacity(guid);
         self.entity_count += 1;
         return .{ .index = idx, .generation = 1 };
     }
@@ -268,6 +278,8 @@ pub const World = struct {
     pub fn despawn(self: *World, entity: EntityHandle) !bool {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
         if (!self.isAlive(entity)) return false;
+
+        try self.free_indices.ensureUnusedCapacity(self.allocator, 1);
 
         var it = self.pools.valueIterator();
         while (it.next()) |pool| {
@@ -279,7 +291,7 @@ pub const World = struct {
         if (self.generations.items[entity.index] == 0) {
             self.generations.items[entity.index] = 1;
         }
-        try self.free_indices.append(self.allocator, entity.index);
+        self.free_indices.appendAssumeCapacity(entity.index);
         self.entity_count -= 1;
         return true;
     }
@@ -362,18 +374,22 @@ pub fn Query(comptime spec: anytype) type {
         pub const Row = struct {
             query_ptr: *const Self,
             entity: EntityHandle,
+            w_dense: [write_types.len]u32,
+            r_dense: [read_types.len]u32,
 
             pub fn read(self: Row, comptime T: type) *const T {
                 inline for (read_types, 0..) |RT, idx| {
                     if (RT == T) {
-                        const bytes = self.query_ptr.read_pools[idx].?.getBytesConst(self.entity).?;
-                        return @ptrCast(@alignCast(bytes.ptr));
+                        const pool = self.query_ptr.read_pools[idx].?;
+                        const start = @as(usize, self.r_dense[idx]) * pool.stride;
+                        return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
                     }
                 }
                 inline for (write_types, 0..) |WT, idx| {
                     if (WT == T) {
-                        const bytes = self.query_ptr.write_pools[idx].?.getBytesConst(self.entity).?;
-                        return @ptrCast(@alignCast(bytes.ptr));
+                        const pool = self.query_ptr.write_pools[idx].?;
+                        const start = @as(usize, self.w_dense[idx]) * pool.stride;
+                        return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
                     }
                 }
                 @compileError("Component type not present in Query spec");
@@ -382,8 +398,9 @@ pub fn Query(comptime spec: anytype) type {
             pub fn write(self: Row, comptime T: type) *T {
                 inline for (write_types, 0..) |WT, idx| {
                     if (WT == T) {
-                        const bytes = self.query_ptr.write_pools[idx].?.getBytes(self.entity).?;
-                        return @ptrCast(@alignCast(bytes.ptr));
+                        const pool = self.query_ptr.write_pools[idx].?;
+                        const start = @as(usize, self.w_dense[idx]) * pool.stride;
+                        return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
                     }
                 }
                 @compileError("Component type not declared as write in Query spec");
@@ -442,26 +459,55 @@ pub fn Query(comptime spec: anytype) type {
             const driver = self.driver_pool orelse return null;
 
             while (self.cursor < driver.dense_entities.items.len) {
+                const driver_dense: u32 = @intCast(self.cursor);
                 const entity = driver.dense_entities.items[self.cursor];
                 self.cursor += 1;
 
+                var w_dense: [write_types.len]u32 = undefined;
+                var r_dense: [read_types.len]u32 = undefined;
                 var matches = true;
+
                 inline for (0..write_types.len) |idx| {
-                    if (!self.write_pools[idx].?.has(entity)) {
+                    const pool = self.write_pools[idx].?;
+                    if (pool == driver) {
+                        w_dense[idx] = driver_dense;
+                    } else if (entity.index < pool.sparse.items.len) {
+                        const d = pool.sparse.items[entity.index];
+                        if (d == ABSENT_INDEX or pool.dense_entities.items[d].generation != entity.generation) {
+                            matches = false;
+                            break;
+                        }
+                        w_dense[idx] = d;
+                    } else {
                         matches = false;
                         break;
                     }
                 }
                 if (matches) {
                     inline for (0..read_types.len) |idx| {
-                        if (!self.read_pools[idx].?.has(entity)) {
+                        const pool = self.read_pools[idx].?;
+                        if (pool == driver) {
+                            r_dense[idx] = driver_dense;
+                        } else if (entity.index < pool.sparse.items.len) {
+                            const d = pool.sparse.items[entity.index];
+                            if (d == ABSENT_INDEX or pool.dense_entities.items[d].generation != entity.generation) {
+                                matches = false;
+                                break;
+                            }
+                            r_dense[idx] = d;
+                        } else {
                             matches = false;
                             break;
                         }
                     }
                 }
                 if (matches) {
-                    return .{ .query_ptr = self, .entity = entity };
+                    return .{
+                        .query_ptr = self,
+                        .entity = entity,
+                        .w_dense = w_dense,
+                        .r_dense = r_dense,
+                    };
                 }
             }
             return null;

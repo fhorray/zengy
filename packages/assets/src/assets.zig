@@ -33,6 +33,7 @@ pub const ImporterDescriptor = struct {
     id: []const u8,
     extension: []const u8,
     priority: u32 = 100,
+    owner_id: u64 = 0,
     import_fn: ImportFn,
 };
 
@@ -71,13 +72,45 @@ pub const AssetService = struct {
             }
         }
         self.assets.deinit(self.allocator);
+        for (self.importers.items) |imp| {
+            self.allocator.free(imp.id);
+            self.allocator.free(imp.extension);
+        }
         self.importers.deinit(self.allocator);
         self.uri_to_index.deinit(self.allocator);
     }
 
     /// Registers an importer for a file extension (e.g., `.png`, `.novaui`, `.json`).
     pub fn registerImporter(self: *AssetService, desc: ImporterDescriptor) !void {
-        try self.importers.append(self.allocator, desc);
+        const id_copy = try self.allocator.dupe(u8, desc.id);
+        errdefer self.allocator.free(id_copy);
+        const ext_copy = try self.allocator.dupe(u8, desc.extension);
+        errdefer self.allocator.free(ext_copy);
+
+        try self.importers.append(self.allocator, .{
+            .id = id_copy,
+            .extension = ext_copy,
+            .priority = desc.priority,
+            .owner_id = desc.owner_id,
+            .import_fn = desc.import_fn,
+        });
+    }
+
+    /// Unregisters all importers owned by `owner_id` (safe module/plugin unload).
+    pub fn unregisterImportersByOwner(self: *AssetService, owner_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.importers.items.len) {
+            if (self.importers.items[i].owner_id == owner_id) {
+                const imp = self.importers.orderedRemove(i);
+                self.allocator.free(imp.id);
+                self.allocator.free(imp.extension);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        return removed;
     }
 
     /// Selects the highest-priority importer matching the URI's extension.

@@ -1,19 +1,25 @@
-//! Engine Diagnostic & Inspection CLI (`tools/cli`).
+//! Engine Diagnostic & Scenario Runner CLI (`tools/cli`).
 //!
-//! Implements the ergonomic developer CLI commands (`doctor`, `packages`)
-//! over the engine's `ModuleRegistry`, `ServiceRegistry`, and C ABI metadata.
+//! Implements ergonomic developer & AI-agent CLI commands:
+//! - `doctor`: validates ABI version, module graph resolution, and service count.
+//! - `packages`: prints resolved topological module order and registered providers.
+//! - `test-scenario`: runs a deterministic TOML scenario and outputs a structured
+//!   `run.json` report (Marco B) with Zig version, ticks, entity count, and capture hash.
 //!
 //! Usage:
-//!   zig build run-cli -- doctor
-//!   zig build run-cli -- packages
+//!   zig build run-cli
+//!   zig build run-cli -Dcli-cmd=packages
+//!   zig build run-cli -Dcli-cmd=test-scenario
 
 const std = @import("std");
+const builtin = @import("builtin");
 const engine = @import("engine");
 const window = @import("window");
 const graphics = @import("graphics");
 const ui_core = @import("ui_core");
 const scripting_host = @import("scripting_host");
 const assets = @import("assets");
+const testing_sdk = @import("testing_sdk");
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -24,6 +30,61 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer args_it.deinit();
     _ = args_it.next(); // skip executable name
     const cmd = args_it.next() orelse "doctor";
+
+    if (std.mem.eql(u8, cmd, "test-scenario")) {
+        var scen_app = engine.App.init(allocator, .{ .fixed_dt = 1.0 / 60.0 });
+        defer scen_app.deinit();
+
+        try scen_app.registerModule(window.module());
+        try scen_app.registerModule(graphics.module());
+        try scen_app.registerModule(ui_core.module());
+        try scen_app.registerModule(testing_sdk.module());
+        try scen_app.initialize();
+
+        const tree = scen_app.resources.get(ui_core.UiTree).?;
+        const panel = try tree.createNode(null, .{ .id = "root", .kind = .panel });
+        _ = try tree.createNode(panel, .{ .id = "btn", .kind = .button, .text = "Play", .action = "game.play" });
+        tree.layoutTree(128, 128);
+
+        const sample_toml =
+            \\[scenario]
+            \\name = "cli_smoke"
+            \\ticks = 10
+            \\
+            \\[[actions]]
+            \\at_tick = 2
+            \\type = "ui_click"
+            \\target = "btn"
+        ;
+
+        var scen = try testing_sdk.TestDriver.parseScenarioToml(allocator, sample_toml);
+        defer scen.deinit();
+
+        const i_entry = try scen_app.services.getService("engine.input", 1);
+        const input: *window.InputService = @ptrCast(@alignCast(@constCast(i_entry.api_ptr)));
+        const drv = scen_app.resources.get(testing_sdk.TestDriver).?;
+        try drv.runScenario(&scen, &scen_app, input, tree);
+
+        var cmds: std.ArrayList(graphics.DrawCommand) = .empty;
+        defer cmds.deinit(allocator);
+        try cmds.append(allocator, .{ .clear = .{ .r = 0.05, .g = 0.05, .b = 0.08 } });
+        try tree.paint(allocator, &cmds);
+
+        const cap = scen_app.resources.get(testing_sdk.CaptureService).?;
+        cap.rasterize(cmds.items);
+
+        std.debug.print(
+            "{{\"scenario\":\"{s}\",\"zig_version\":\"{s}\",\"ticks\":{d},\"entities\":{d},\"framebuffer_hash\":{d},\"status\":\"ok\"}}\n",
+            .{
+                scen.name,
+                builtin.zig_version_string,
+                drv.current_tick,
+                scen_app.world.entity_count,
+                cap.computeHash(),
+            },
+        );
+        return;
+    }
 
     // Compose a representative application graph to inspect resolution & ABI health.
     var app = engine.App.init(allocator, .{});
@@ -67,6 +128,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
             });
         }
     } else {
-        std.debug.print("Unknown command '{s}'. Available: doctor, packages\n", .{cmd});
+        std.debug.print("Unknown command '{s}'. Available: doctor, packages, test-scenario\n", .{cmd});
     }
 }

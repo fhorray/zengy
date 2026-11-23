@@ -249,6 +249,15 @@ pub const Scheduler = struct {
         try ctx.commands.apply(ctx.world, ctx.events);
     }
 
+    /// Executes exactly one `.fixed_update` tick deterministically (no accumulator)
+    /// and drains any events emitted during the tick.
+    pub fn stepFixedTick(self: *Scheduler, ctx: *SystemContext) !void {
+        ctx.dt = @floatCast(self.fixed_dt);
+        ctx.fixed_dt = @floatCast(self.fixed_dt);
+        try self.runStage(.fixed_update, ctx);
+        _ = ctx.events.drain();
+    }
+
     pub fn stepFrame(self: *Scheduler, frame_dt: f64, ctx: *SystemContext) !u32 {
         ctx.dt = @floatCast(frame_dt);
         ctx.fixed_dt = @floatCast(self.fixed_dt);

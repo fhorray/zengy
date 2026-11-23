@@ -3,14 +3,30 @@
     .version = "0.1.0",
     .fingerprint = 0x4f1cee9bb6b8157b,
     .minimum_zig_version = "0.17.1",
-    .dependencies = .{},
+    .dependencies = .{
+        .z_toml = .{
+            .url = "git+https://github.com/eneskemalergin/z-toml?ref=v0.4.1#53d891af838b13bbe727a0f20030aea19a1233ce",
+            .hash = "z_toml-0.4.1-QKon87ZJCADvMa8T85VNGDHfVD-GJ4RFPQtzFPnT8YIC",
+        },
+        .lookout = .{
+            .url = "git+https://github.com/pedronaugusto/lookout#a283a19ec488d17c75717926af022ace67baea78",
+            .hash = "lookout-0.7.4-EbT0_87LEwC0iI1WWwiS2c2yRaaO7l1cSsz154q15xxy",
+        },
+        .yyjson = .{
+            .url = "git+https://github.com/ibireme/yyjson#be9bd74bb3c96e00006c2075c330a6b8b90123dc",
+            .hash = "N-V-__8AAJsIbwD0xnA1FiI2YEmbcx30OjSxx8mr3F_6vf_N",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "include",
         "src",
+        "packages",
+        "projects",
         "examples",
-        "tests",
+        "benchmarks",
+        "tools",
         "LICENSE",
         "README.md",
     },

@@ -118,6 +118,7 @@ pub const App = struct {
         if (self.plugin_host) |host| return host;
         const host = try abi_mod.PluginHost.init(
             self.allocator,
+            &self.world,
             &self.diagnostics,
             &self.services,
             &self.events,
@@ -128,6 +129,7 @@ pub const App = struct {
 
     /// Registers an optional `Module` to participate in topological resolution.
     pub fn registerModule(self: *App, module: module_mod.Module) !void {
+        if (self.state != .created and self.state != .configured) return error.InvalidAppState;
         try self.modules.register(module);
         self.state = .configured;
     }
@@ -184,6 +186,21 @@ pub const App = struct {
 
         var ctx = self.makeSystemContext(@floatCast(frame_dt));
         _ = try self.scheduler.stepFrame(frame_dt, &ctx);
+        self.diagnostics.frame_count += 1;
+    }
+
+    /// Advances the application by exactly one `.fixed_update` tick deterministically.
+    pub fn tickFixed(self: *App) !void {
+        if (self.state == .created or self.state == .configured) {
+            try self.initialize();
+        }
+        if (self.state == .initialized) {
+            self.state = .running;
+        }
+        if (self.state != .running) return error.InvalidAppState;
+
+        var ctx = self.makeSystemContext(@floatCast(self.scheduler.fixed_dt));
+        try self.scheduler.stepFixedTick(&ctx);
         self.diagnostics.frame_count += 1;
     }
 
