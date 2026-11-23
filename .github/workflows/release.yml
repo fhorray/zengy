@@ -2,6 +2,7 @@ name: Release
 
 on:
   push:
+    branches: [ main ]
     tags:
       - "v*"
   workflow_dispatch:
@@ -15,8 +16,29 @@ permissions:
   contents: write
 
 jobs:
+  meta:
+    name: Resolve Release Tag
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.set.outputs.tag }}
+      prerelease: ${{ steps.set.outputs.prerelease }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=nightly" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-windows:
     name: Package Windows x64
+    needs: meta
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +49,7 @@ jobs:
         run: zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
       - name: Stage Windows release archive
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="${{ needs.meta.outputs.tag }}"
           STAGE="dist/zigeng-${TAG}-x86_64-windows"
           mkdir -p "$STAGE/include"
           cp zig-out/bin/*.exe "$STAGE/"
@@ -41,6 +63,7 @@ jobs:
 
   build-linux:
     name: Package Linux x64
+    needs: meta
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +76,7 @@ jobs:
           zig build install -Doptimize=ReleaseSafe || true
       - name: Stage Linux release archive
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="${{ needs.meta.outputs.tag }}"
           STAGE="dist/zigeng-${TAG}-x86_64-linux"
           mkdir -p "$STAGE/include" "$STAGE/lib"
           cp zig-out/bin/headless-ecs zig-out/bin/engine-cli zig-out/bin/playground zig-out/bin/zigeng-bench "$STAGE/" 2>/dev/null || true
@@ -68,7 +91,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    needs: [ build-windows, build-linux ]
+    needs: [ meta, build-windows, build-linux ]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -77,7 +100,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.meta.outputs.tag }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: |
             artifacts/windows-x64-bundle/*.zip
