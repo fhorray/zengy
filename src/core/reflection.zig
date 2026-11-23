@@ -187,7 +187,12 @@ pub const TypeRegistry = struct {
         try self.name_to_schema.ensureUnusedCapacity(self.allocator, 1);
 
         self.schemas.putAssumeCapacity(schema_id, schema);
-        self.name_to_schema.putAssumeCapacity(full_name, schema_id);
+        if (self.name_to_schema.getPtr(full_name)) |existing_sid| {
+            existing_sid.* = schema_id;
+            self.allocator.free(full_name);
+        } else {
+            self.name_to_schema.putAssumeCapacity(full_name, schema_id);
+        }
         return schema;
     }
 

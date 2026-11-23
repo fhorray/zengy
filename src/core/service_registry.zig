@@ -25,6 +25,7 @@ pub const ServiceError = error{
     ProviderNotFound,
     VersionMismatch,
     AmbiguousProvider,
+    InvalidServiceSize,
     OutOfMemory,
 };
 
@@ -166,6 +167,7 @@ pub const ServiceRegistry = struct {
 
     pub fn getTyped(self: *const ServiceRegistry, comptime T: type, capability: []const u8, requested_major: u32) ServiceError!*const T {
         const entry = try self.getService(capability, requested_major);
+        if (entry.api_size < @sizeOf(T)) return error.InvalidServiceSize;
         return @ptrCast(@alignCast(entry.api_ptr));
     }
 

@@ -113,11 +113,13 @@ pub const AssetService = struct {
         return removed;
     }
 
-    /// Selects the highest-priority importer matching the URI's extension.
+    /// Selects the highest-priority importer matching the URI's extension (case-insensitive).
     pub fn resolveImporter(self: *const AssetService, uri: []const u8) ?ImporterDescriptor {
         var best: ?ImporterDescriptor = null;
         for (self.importers.items) |imp| {
-            if (std.mem.endsWith(u8, uri, imp.extension)) {
+            if (uri.len >= imp.extension.len and
+                std.ascii.eqlIgnoreCase(uri[uri.len - imp.extension.len ..], imp.extension))
+            {
                 if (best == null or imp.priority > best.?.priority) {
                     best = imp;
                 }
@@ -181,8 +183,12 @@ pub const AssetService = struct {
     pub fn unload(self: *AssetService, handle: AssetHandle) bool {
         const slot = self.getSlotMut(handle) orelse return false;
         _ = self.uri_to_index.remove(slot.uri);
+        self.allocator.free(slot.uri);
+        slot.uri = &.{};
         self.allocator.free(slot.kind);
+        slot.kind = &.{};
         self.allocator.free(slot.bytes);
+        slot.bytes = &.{};
         slot.alive = false;
         slot.generation +%= 1;
         return true;

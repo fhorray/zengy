@@ -78,8 +78,11 @@ const ComponentPool = struct {
     }
 
     fn ensureSparse(self: *ComponentPool, allocator: std.mem.Allocator, entity_index: u32) !void {
-        while (self.sparse.items.len <= entity_index) {
-            try self.sparse.append(allocator, ABSENT_INDEX);
+        const old_len = self.sparse.items.len;
+        if (old_len <= entity_index) {
+            const new_len = @as(usize, entity_index) + 1;
+            try self.sparse.resize(allocator, new_len);
+            @memset(self.sparse.items[old_len..new_len], ABSENT_INDEX);
         }
     }
 
@@ -380,6 +383,12 @@ pub fn Query(comptime spec: anytype) type {
             pub fn read(self: Row, comptime T: type) *const T {
                 inline for (read_types, 0..) |RT, idx| {
                     if (RT == T) {
+                        if (@sizeOf(T) == 0) {
+                            const Zst = struct {
+                                var dummy: T = undefined;
+                            };
+                            return &Zst.dummy;
+                        }
                         const pool = self.query_ptr.read_pools[idx].?;
                         const start = @as(usize, self.r_dense[idx]) * pool.stride;
                         return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
@@ -387,6 +396,12 @@ pub fn Query(comptime spec: anytype) type {
                 }
                 inline for (write_types, 0..) |WT, idx| {
                     if (WT == T) {
+                        if (@sizeOf(T) == 0) {
+                            const Zst = struct {
+                                var dummy: T = undefined;
+                            };
+                            return &Zst.dummy;
+                        }
                         const pool = self.query_ptr.write_pools[idx].?;
                         const start = @as(usize, self.w_dense[idx]) * pool.stride;
                         return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
@@ -398,6 +413,12 @@ pub fn Query(comptime spec: anytype) type {
             pub fn write(self: Row, comptime T: type) *T {
                 inline for (write_types, 0..) |WT, idx| {
                     if (WT == T) {
+                        if (@sizeOf(T) == 0) {
+                            const Zst = struct {
+                                var dummy: T = undefined;
+                            };
+                            return &Zst.dummy;
+                        }
                         const pool = self.query_ptr.write_pools[idx].?;
                         const start = @as(usize, self.w_dense[idx]) * pool.stride;
                         return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));

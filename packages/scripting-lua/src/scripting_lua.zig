@@ -22,6 +22,8 @@ const LuaRuntimeState = struct {
     L: *c.lua_State,
     bridge: *scripting_host.ScriptEngineBridge,
     next_mod_id: u64,
+    last_error: [256]u8 = undefined,
+    last_error_len: usize = 0,
 };
 
 fn getBridge(L: ?*c.lua_State) ?*scripting_host.ScriptEngineBridge {
@@ -99,13 +101,44 @@ fn createLuaRuntime(allocator: std.mem.Allocator, bridge: *scripting_host.Script
     return st;
 }
 
-fn loadLuaScript(raw: *anyopaque, _: []const u8, source: []const u8) !u64 {
+fn captureLuaError(st: *LuaRuntimeState) []const u8 {
+    if (luaToSlice(st.L, -1)) |msg| {
+        const n = @min(msg.len, st.last_error.len);
+        @memcpy(st.last_error[0..n], msg[0..n]);
+        st.last_error_len = n;
+        return st.last_error[0..n];
+    }
+    return "lua runtime exception";
+}
+
+fn loadLuaScript(raw: *anyopaque, source_name: []const u8, source: []const u8) !u64 {
     const st: *LuaRuntimeState = @ptrCast(@alignCast(raw));
-    if (c.luaL_loadbufferx(st.L, source.ptr, source.len, "script", null) != c.LUA_OK) {
+
+    var name_buf: [256]u8 = undefined;
+    const chunk_name: [:0]const u8 = if (source_name.len > 0 and source_name.len < name_buf.len) blk: {
+        @memcpy(name_buf[0..source_name.len], source_name);
+        name_buf[source_name.len] = 0;
+        break :blk name_buf[0..source_name.len :0];
+    } else "script";
+
+    if (c.luaL_loadbufferx(st.L, source.ptr, source.len, chunk_name.ptr, null) != c.LUA_OK) {
+        const msg = captureLuaError(st);
+        st.bridge.log(.err, msg) catch {};
         c.lua_pop(st.L, 1);
         return error.LuaSyntaxError;
     }
+
+    // Give each script its own isolated _ENV table inheriting globals via __index = _G.
+    c.lua_newtable(st.L); // _ENV
+    c.lua_newtable(st.L); // metatable
+    _ = c.lua_rawgeti(st.L, c.LUA_REGISTRYINDEX, c.LUA_RIDX_GLOBALS);
+    c.lua_setfield(st.L, -2, "__index");
+    _ = c.lua_setmetatable(st.L, -2);
+    _ = c.lua_setupvalue(st.L, -2, 1); // binds _ENV as upvalue 1 of loaded chunk
+
     if (c.lua_pcallk(st.L, 0, 1, 0, 0, null) != c.LUA_OK) {
+        const msg = captureLuaError(st);
+        st.bridge.log(.err, msg) catch {};
         c.lua_pop(st.L, 1);
         return error.LuaRuntimeError;
     }
@@ -113,7 +146,7 @@ fn loadLuaScript(raw: *anyopaque, _: []const u8, source: []const u8) !u64 {
     const id = st.next_mod_id;
     st.next_mod_id += 1;
 
-    var key_buf: [32]u8 = undefined;
+    var key_buf: [48]u8 = undefined;
     const key = try std.fmt.bufPrintSentinel(&key_buf, "_zigeng_mod_{d}", .{id}, 0);
     c.lua_setfield(st.L, c.LUA_REGISTRYINDEX, key.ptr);
     return id;
@@ -122,7 +155,7 @@ fn loadLuaScript(raw: *anyopaque, _: []const u8, source: []const u8) !u64 {
 fn invokeLuaScript(raw: *anyopaque, script_id: u64, fn_name: []const u8, arg: []const u8) scripting_host.ScriptResult {
     const st: *LuaRuntimeState = @ptrCast(@alignCast(raw));
 
-    var key_buf: [32]u8 = undefined;
+    var key_buf: [48]u8 = undefined;
     const key = std.fmt.bufPrintSentinel(&key_buf, "_zigeng_mod_{d}", .{script_id}, 0) catch {
         return .{ .ok = false, .error_message = "invalid script id" };
     };
@@ -132,11 +165,21 @@ fn invokeLuaScript(raw: *anyopaque, script_id: u64, fn_name: []const u8, arg: []
         return .{ .ok = false, .error_message = "lua module did not return a table" };
     }
 
-    const z_fn = std.fmt.allocPrintSentinel(st.allocator, "{s}", .{fn_name}, 0) catch {
-        c.lua_pop(st.L, 1);
-        return .{ .ok = false, .error_message = "out of memory" };
+    var stack_fn_buf: [128]u8 = undefined;
+    var heap_fn: ?[:0]u8 = null;
+    defer if (heap_fn) |h| st.allocator.free(h);
+
+    const z_fn: [:0]const u8 = if (fn_name.len < stack_fn_buf.len) blk: {
+        @memcpy(stack_fn_buf[0..fn_name.len], fn_name);
+        stack_fn_buf[fn_name.len] = 0;
+        break :blk stack_fn_buf[0..fn_name.len :0];
+    } else blk: {
+        heap_fn = std.fmt.allocPrintSentinel(st.allocator, "{s}", .{fn_name}, 0) catch {
+            c.lua_pop(st.L, 1);
+            return .{ .ok = false, .error_message = "out of memory" };
+        };
+        break :blk heap_fn.?;
     };
-    defer st.allocator.free(z_fn);
 
     _ = c.lua_getfield(st.L, -1, z_fn.ptr);
     if (c.lua_type(st.L, -1) != c.LUA_TFUNCTION) {
@@ -146,8 +189,9 @@ fn invokeLuaScript(raw: *anyopaque, script_id: u64, fn_name: []const u8, arg: []
 
     _ = c.lua_pushlstring(st.L, arg.ptr, arg.len);
     if (c.lua_pcallk(st.L, 1, 0, 0, 0, null) != c.LUA_OK) {
+        const err_msg = captureLuaError(st);
         c.lua_pop(st.L, 2);
-        return .{ .ok = false, .error_message = "lua runtime exception" };
+        return .{ .ok = false, .error_message = err_msg };
     }
     c.lua_pop(st.L, 1);
     return .{ .ok = true };
@@ -155,7 +199,7 @@ fn invokeLuaScript(raw: *anyopaque, script_id: u64, fn_name: []const u8, arg: []
 
 fn unloadLuaScript(raw: *anyopaque, script_id: u64) void {
     const st: *LuaRuntimeState = @ptrCast(@alignCast(raw));
-    var key_buf: [32]u8 = undefined;
+    var key_buf: [48]u8 = undefined;
     const key = std.fmt.bufPrintSentinel(&key_buf, "_zigeng_mod_{d}", .{script_id}, 0) catch return;
     c.lua_pushnil(st.L);
     c.lua_setfield(st.L, c.LUA_REGISTRYINDEX, key.ptr);

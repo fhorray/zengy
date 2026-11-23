@@ -130,6 +130,22 @@ pub const WindowService = struct {
         const title_copy = try self.allocator.dupe(u8, desc.title);
         errdefer self.allocator.free(title_copy);
 
+        for (self.windows.items, 0..) |*slot, i| {
+            if (!slot.alive) {
+                const gen = if (slot.generation == 0) @as(u32, 1) else slot.generation;
+                slot.* = .{
+                    .title = title_copy,
+                    .width = desc.width,
+                    .height = desc.height,
+                    .dpi_scale = desc.dpi_scale,
+                    .generation = gen,
+                    .alive = true,
+                    .close_requested = false,
+                };
+                return .{ .index = @intCast(i), .generation = gen };
+            }
+        }
+
         const idx: u32 = @intCast(self.windows.items.len);
         try self.windows.append(self.allocator, .{
             .title = title_copy,
@@ -196,6 +212,10 @@ pub const WindowService = struct {
 
     pub fn destroyWindow(self: *WindowService, handle: WindowHandle) bool {
         const slot = self.getSlotMut(handle) orelse return false;
+        if (slot.title.len > 0) {
+            self.allocator.free(slot.title);
+            slot.title = &.{};
+        }
         slot.alive = false;
         slot.generation +%= 1;
         return true;

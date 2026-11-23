@@ -121,6 +121,7 @@ pub const UiTree = struct {
         errdefer self.allocator.free(action_copy);
 
         if (parent_idx) |p| {
+            if (p >= self.nodes.items.len) return error.InvalidParentNode;
             try self.nodes.items[p].children.ensureUnusedCapacity(self.allocator, 1);
         } else {
             try self.roots.ensureUnusedCapacity(self.allocator, 1);
@@ -201,7 +202,7 @@ pub const UiTree = struct {
                 if (dir == .column) {
                     child_y += c_rect.height + gap;
                 } else {
-                    child_x += slot_w + gap;
+                    child_x += c_rect.width + gap;
                 }
             }
         }
@@ -257,7 +258,7 @@ pub const UiTree = struct {
             events.post(.{
                 .name = "ui.action",
                 .payload = action,
-                .entity_handle = @intCast(hit),
+                .entity_handle = 0,
             }) catch {};
         }
         return hit;

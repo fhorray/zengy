@@ -93,6 +93,22 @@ pub const GraphicsDeviceService = struct {
 
     pub fn createSurface(self: *GraphicsDeviceService, window_handle: u64, width: u32, height: u32) !RenderTargetHandle {
         if (!self.device_available) return error.DeviceUnavailable;
+        for (self.targets.items, 0..) |*slot, i| {
+            if (!slot.alive) {
+                const gen = if (slot.generation == 0) @as(u32, 1) else slot.generation;
+                slot.* = .{
+                    .window_handle = window_handle,
+                    .width = width,
+                    .height = height,
+                    .generation = gen,
+                    .alive = true,
+                    .frame_open = false,
+                    .submitted_commands = 0,
+                    .presented_frames = 0,
+                };
+                return .{ .index = @intCast(i), .generation = gen };
+            }
+        }
         const idx: u32 = @intCast(self.targets.items.len);
         try self.targets.append(self.allocator, .{
             .window_handle = window_handle,
