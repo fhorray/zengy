@@ -16,6 +16,7 @@ Welcome to the `zigeng` documentation. This engine is built around a **minimal h
 - **Architecture & Decisions**
   - [Architecture Plan & Roadmap](architecture/zig_modular_engine_architecture_plan.md)
   - [Agnostic Physics Roadmap](roadmap/physics.md)
+  - [External Plugins & Local Build Workflow](roadmap/external-plugins.md)
   - [ADR-001: Minimal Core Scope](adr/ADR-001-minimal-core.md)
   - [ADR-002: Module Contract, Lifecycle, and Scopes](adr/ADR-002-module-lifecycle.md)
   - [ADR-003: Capability and Provider Resolution](adr/ADR-003-service-resolution.md)

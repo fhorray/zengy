@@ -334,6 +334,24 @@ pub fn build(b: *std.Build) void {
     physics_jolt_mod.addIncludePath(b.path("packages/physics-jolt/src"));
     physics_jolt_mod.linkLibrary(jolt_c_lib);
 
+    const jolt_plugin_mod = b.createModule(.{
+        .root_source_file = b.path("packages/physics-jolt/src/plugin_entry.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    jolt_plugin_mod.addImport("engine", engine_mod);
+    jolt_plugin_mod.addImport("physics", physics_mod);
+    jolt_plugin_mod.addImport("physics_jolt", physics_jolt_mod);
+
+    const jolt_plugin_lib = b.addLibrary(.{
+        .name = "zigeng_physics_jolt",
+        .linkage = .dynamic,
+        .root_module = jolt_plugin_mod,
+    });
+    b.installArtifact(jolt_plugin_lib);
+
     const translate_yyjson = b.addTranslateC(.{
         .root_source_file = yyjson_dep.path("src/yyjson.h"),
         .target = target,
@@ -479,6 +497,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("scripting_host", scripting_host_mod);
     cli_mod.addImport("assets", assets_mod);
     cli_mod.addImport("testing_sdk", testing_sdk_mod);
+    cli_mod.addImport("toml_format", toml_format_mod);
 
     const cli_exe = b.addExecutable(.{
         .name = "zigeng",
