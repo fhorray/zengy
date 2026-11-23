@@ -53,6 +53,32 @@ fn onUiAction(user_ctx: ?*anyopaque, ev: engine.EventEnvelope) void {
     }
 }
 
+fn invokeOptionalHook(
+    host: *scripting_host.ScriptingHost,
+    sc: scripting_host.ScriptModuleHandle,
+    fn_name: []const u8,
+    arg: []const u8,
+) void {
+    const res = host.invokeScript(sc, fn_name, arg);
+    if (!res.ok) {
+        if (std.mem.eql(u8, res.error_message, "python function not found") or
+            std.mem.eql(u8, res.error_message, "lua function not found"))
+        {
+            return;
+        }
+        std.debug.print("[zigeng-runtime] script error in '{s}': {s}\n", .{ fn_name, res.error_message });
+    }
+}
+
+fn runtimeFixedUpdateSystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(RuntimeState) orelse return;
+    if (st.script) |sc| {
+        var dt_buf: [32]u8 = undefined;
+        const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.fixedDeltaSeconds()}) catch "0.01667";
+        invokeOptionalHook(st.host, sc, "fixed_update", dt_str);
+    }
+}
+
 fn runtimeUpdateSystem(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(RuntimeState) orelse return;
 
@@ -88,10 +114,14 @@ fn runtimeUpdateSystem(ctx: *engine.SystemContext) !void {
     if (st.script) |sc| {
         var dt_buf: [32]u8 = undefined;
         const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
-        const res = st.host.invokeScript(sc, "on_frame", dt_str);
-        if (!res.ok) {
-            std.debug.print("[zigeng-runtime] script error: {s}\n", .{res.error_message});
-        }
+        invokeOptionalHook(st.host, sc, "update", dt_str);
+    }
+}
+
+fn runtimeDestroySystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(RuntimeState) orelse return;
+    if (st.script) |sc| {
+        invokeOptionalHook(st.host, sc, "destroy", "");
     }
 }
 
@@ -100,15 +130,28 @@ const HeadlessScriptState = struct {
     script: ?scripting_host.ScriptModuleHandle,
 };
 
+fn headlessFixedUpdateSystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(HeadlessScriptState) orelse return;
+    if (st.script) |sc| {
+        var dt_buf: [32]u8 = undefined;
+        const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.fixedDeltaSeconds()}) catch "0.01667";
+        invokeOptionalHook(st.host, sc, "fixed_update", dt_str);
+    }
+}
+
 fn headlessUpdateSystem(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(HeadlessScriptState) orelse return;
     if (st.script) |sc| {
         var dt_buf: [32]u8 = undefined;
         const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
-        const res = st.host.invokeScript(sc, "on_frame", dt_str);
-        if (!res.ok) {
-            std.debug.print("[zigeng-runtime] script error: {s}\n", .{res.error_message});
-        }
+        invokeOptionalHook(st.host, sc, "update", dt_str);
+    }
+}
+
+fn headlessDestroySystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(HeadlessScriptState) orelse return;
+    if (st.script) |sc| {
+        invokeOptionalHook(st.host, sc, "destroy", "");
     }
 }
 
@@ -262,7 +305,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (headless) {
+        try app.scheduler.addSystem(.{ .name = "runtime.headless_fixed_update", .stage = .fixed_update, .run = headlessFixedUpdateSystem });
         try app.scheduler.addSystem(.{ .name = "runtime.headless_update", .stage = .update, .run = headlessUpdateSystem });
+        try app.scheduler.addSystem(.{ .name = "runtime.headless_destroy", .stage = .shutdown, .run = headlessDestroySystem });
         try app.initialize();
         const dynamic_loaded = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
 
@@ -280,6 +325,9 @@ pub fn main(init: std.process.Init) !void {
             .host = host,
             .script = loaded_script,
         });
+        if (loaded_script) |sc| {
+            invokeOptionalHook(host, sc, "start", "");
+        }
 
         var t: u64 = 0;
         while (t < headless_ticks) : (t += 1) {
@@ -303,8 +351,10 @@ pub fn main(init: std.process.Init) !void {
         .resizable = true,
     });
 
+    try app.scheduler.addSystem(.{ .name = "runtime.fixed_update", .stage = .fixed_update, .run = runtimeFixedUpdateSystem });
     try app.scheduler.addSystem(.{ .name = "runtime.update", .stage = .update, .run = runtimeUpdateSystem });
     try app.scheduler.addSystem(.{ .name = "runtime.render", .stage = .render_extract, .run = runtimeRenderSystem });
+    try app.scheduler.addSystem(.{ .name = "runtime.destroy", .stage = .shutdown, .run = runtimeDestroySystem });
 
     try app.initialize();
     _ = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
@@ -336,6 +386,9 @@ pub fn main(init: std.process.Init) !void {
             const rt_idx: u16 = if (std.mem.endsWith(u8, sp, ".lua")) 0 else 1;
             loaded_script = try host.loadScript(rt_idx, sp, src);
         }
+    }
+    if (loaded_script) |sc| {
+        invokeOptionalHook(host, sc, "start", "");
     }
 
     const px = window_sdl3.pixelSize(&app);

@@ -145,13 +145,19 @@ fn scaffoldProject(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !
         \\py = 340.0
         \\color_idx = 0
         \\
+        \\def start(_arg):
+        \\    engine.log("Game started!")
+        \\
         \\def on_ui_action(action):
         \\    global color_idx
         \\    if action == "game.cycle_color":
         \\        color_idx = (color_idx + 1) % 3
         \\        engine.log("Color changed!")
         \\
-        \\def on_frame(dt_str):
+        \\def fixed_update(dt_str):
+        \\    pass
+        \\
+        \\def update(dt_str):
         \\    global px, py
         \\    dt = float(dt_str)
         \\    speed = 280.0 * dt
@@ -168,6 +174,9 @@ fn scaffoldProject(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !
         \\    ]
         \\    r, g, b = colors[color_idx]
         \\    engine.draw_rect(px, py, 64.0, 64.0, r, g, b, 1.0)
+        \\
+        \\def destroy(_arg):
+        \\    engine.log("Game destroyed!")
         \\
     );
 
