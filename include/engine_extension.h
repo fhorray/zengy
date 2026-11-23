@@ -57,6 +57,29 @@ typedef struct AEStringView {
 } AEStringView;
 
 /**
+ * Stable C ABI v1 function table for ECS World operations (`engine.world/1`).
+ */
+typedef struct AEWorldApiV1 {
+    uint32_t struct_size;
+    uint32_t abi_major;
+    void *world_context;
+    AEStatus (*spawn)(void *world_context, AEHandle *out_entity);
+    AEStatus (*despawn)(void *world_context, AEHandle entity);
+    uint32_t (*is_alive)(void *world_context, AEHandle entity);
+    size_t (*entity_count)(void *world_context);
+} AEWorldApiV1;
+
+/**
+ * Stable C ABI v1 function table for EventBus operations (`engine.events/1`).
+ */
+typedef struct AEEventsApiV1 {
+    uint32_t struct_size;
+    uint32_t abi_major;
+    void *events_context;
+    AEStatus (*post)(void *events_context, AEStringView name, AEStringView payload, AEHandle entity);
+} AEEventsApiV1;
+
+/**
  * Host capability table passed to `AEPluginApi.load()`.
  * Allows plugins to log diagnostics and resolve registered engine services.
  */

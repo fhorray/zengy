@@ -219,6 +219,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("ui_core", ui_core_mod);
     cli_mod.addImport("scripting_host", scripting_host_mod);
     cli_mod.addImport("assets", assets_mod);
+    cli_mod.addImport("testing_sdk", testing_sdk_mod);
 
     const cli_exe = b.addExecutable(.{
         .name = "engine-cli",

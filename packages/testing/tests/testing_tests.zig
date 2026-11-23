@@ -251,3 +251,69 @@ test "capture_known_baseline & capture_invalid_coordinates" {
         .{ .rect = .{ .x = -10, .y = -10, .width = std.math.inf(f32), .height = 10, .color = .{ .r = 1, .g = 0, .b = 0 } } },
     });
 }
+
+test "ui_click_occluded: overlapping top panel blocks click on occluded button" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(window.module());
+    try app.registerModule(graphics.module());
+    try app.registerModule(ui_core.module());
+    try app.registerModule(testing_sdk.module());
+    try app.initialize();
+
+    const State = struct {
+        var under_clicked: bool = false;
+        fn onAction(_: ?*anyopaque, ev: engine.EventEnvelope) void {
+            if (std.mem.eql(u8, ev.payload, "under.act")) under_clicked = true;
+        }
+    };
+    State.under_clicked = false;
+    _ = try app.events.subscribe(1, "ui.action", State.onAction, null);
+
+    const tree = app.resources.get(ui_core.UiTree).?;
+    const base_panel = try tree.createNode(null, .{ .id = "base", .kind = .panel });
+    _ = try tree.createNode(base_panel, .{
+        .id = "btn_under",
+        .kind = .button,
+        .action = "under.act",
+    });
+    // Second root panel covers the same viewport area on top of base_panel
+    const overlay = try tree.createNode(null, .{
+        .id = "modal_overlay",
+        .kind = .panel,
+        .style = .{ .min_height = 200 },
+    });
+    tree.layoutTree(400, 400);
+    // Position overlay on top of base_panel to test occlusion
+    tree.nodes.items[overlay].layout = .{ .x = 0, .y = 0, .width = 400, .height = 400 };
+
+    const drv = app.resources.get(testing_sdk.TestDriver).?;
+    const hit_idx = try drv.clickUiById(tree, "btn_under", &app.events);
+    _ = app.events.drain();
+
+    // Hit test hits modal_overlay (index 2), NOT btn_under (index 1), so action does not fire.
+    try testing.expectEqual(@as(usize, 2), hit_idx);
+    try testing.expect(!State.under_clicked);
+}
+
+test "CaptureService alpha blending and text glyph rasterization" {
+    var cap = try testing_sdk.CaptureService.init(testing.allocator, 32, 32);
+    defer cap.deinit();
+
+    cap.rasterize(&.{
+        .{ .clear = .{ .r = 0, .g = 0, .b = 0, .a = 1 } },
+        // ~50% alpha red over black -> ~127 red
+        .{ .rect = .{ .x = 0, .y = 0, .width = 16, .height = 16, .color = .{ .r = 1, .g = 0, .b = 0, .a = 0.5 } } },
+        .{ .text = .{ .x = 2, .y = 2, .content = "OK", .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } } },
+    });
+
+    // Blended background pixel at (12, 12)
+    const bg_px = cap.readPixel(12, 12).?;
+    try testing.expect(bg_px[0] >= 125 and bg_px[0] <= 130);
+    try testing.expectEqual(@as(u8, 0), bg_px[1]);
+
+    // Text glyph pixel at (2, 2)
+    const txt_px = cap.readPixel(2, 2).?;
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, txt_px);
+}

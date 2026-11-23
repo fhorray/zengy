@@ -40,13 +40,22 @@ pub const CaptureService = struct {
         return @intFromFloat(@round(clamped * 255.0));
     }
 
-    fn setPixel(self: *CaptureService, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) void {
-        if (x >= self.width or y >= self.height) return;
+    fn blendPixel(self: *CaptureService, x: u32, y: u32, sr: u8, sg: u8, sb: u8, sa: u8) void {
+        if (x >= self.width or y >= self.height or sa == 0) return;
         const idx = (@as(usize, y) * @as(usize, self.width) + @as(usize, x)) * 4;
-        self.pixels[idx] = r;
-        self.pixels[idx + 1] = g;
-        self.pixels[idx + 2] = b;
-        self.pixels[idx + 3] = a;
+        if (sa == 255) {
+            self.pixels[idx] = sr;
+            self.pixels[idx + 1] = sg;
+            self.pixels[idx + 2] = sb;
+            self.pixels[idx + 3] = 255;
+            return;
+        }
+        const a: u32 = sa;
+        const inv_a: u32 = 255 - a;
+        self.pixels[idx] = @intCast((@as(u32, sr) * a + @as(u32, self.pixels[idx]) * inv_a) / 255);
+        self.pixels[idx + 1] = @intCast((@as(u32, sg) * a + @as(u32, self.pixels[idx + 1]) * inv_a) / 255);
+        self.pixels[idx + 2] = @intCast((@as(u32, sb) * a + @as(u32, self.pixels[idx + 2]) * inv_a) / 255);
+        self.pixels[idx + 3] = @intCast(@min(@as(u32, 255), a + (@as(u32, self.pixels[idx + 3]) * inv_a) / 255));
     }
 
     /// Rasterizes a slice of `graphics.DrawCommand`s into the offscreen RGBA8 buffer.
@@ -95,12 +104,40 @@ pub const CaptureService = struct {
                     while (py < y1) : (py += 1) {
                         var px = x0;
                         while (px < x1) : (px += 1) {
-                            self.setPixel(px, py, r, g, b, a);
+                            self.blendPixel(px, py, r, g, b, a);
                         }
                     }
                 },
-                // Limited software reference rasterizer: text glyphs are not rasterized yet.
-                .text => {},
+                // Deterministic 4x6 monochrome glyph blocks for visible text presence checks.
+                .text => |tx| {
+                    if (!std.math.isFinite(tx.x) or !std.math.isFinite(tx.y)) continue;
+                    const r = floatToU8(tx.color.r);
+                    const g = floatToU8(tx.color.g);
+                    const b = floatToU8(tx.color.b);
+                    const a = floatToU8(tx.color.a);
+
+                    var cursor_x = tx.x;
+                    for (tx.content) |ch| {
+                        if (ch != ' ') {
+                            const gx0: i32 = @intFromFloat(@round(cursor_x));
+                            const gy0: i32 = @intFromFloat(@round(tx.y));
+                            for (0..5) |dy| {
+                                for (0..3) |dx| {
+                                    // Deterministic glyph mask derived from character code
+                                    const bit = ((@as(u32, ch) >> @intCast((dy + dx) % 7)) & 1) == 1 or (dy == 0 or dy == 4);
+                                    if (bit) {
+                                        const px = gx0 + @as(i32, @intCast(dx));
+                                        const py = gy0 + @as(i32, @intCast(dy));
+                                        if (px >= 0 and py >= 0) {
+                                            self.blendPixel(@intCast(px), @intCast(py), r, g, b, a);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cursor_x += 4.0;
+                    }
+                },
             }
         }
     }

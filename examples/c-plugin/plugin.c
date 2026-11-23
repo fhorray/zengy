@@ -1,11 +1,12 @@
 /**
  * @file plugin.c
- * @brief Phase 3 Gate Example: Pure C11 shared library plugin against `engine_extension.h`.
+ * @brief Phase 3 & Phase B C11 shared library plugin against `engine_extension.h`.
  *
- * Demonstrates two-way C <-> Zig ABI interoperability:
+ * Demonstrates real two-way C <-> Zig ABI interoperability:
  * - Validates `AEHostApi.struct_size` and `AEHostApi.abi_major` on `load()`.
- * - Allocates plugin-owned state in `load()` and frees it in `unload()`.
- * - Logs to the Zig host via `host->log()` and probes services via `host->get_service()`.
+ * - Resolves `engine.world/1` (`AEWorldApiV1`) and `engine.events/1` (`AEEventsApiV1`).
+ * - Spawns a real ECS entity and posts an event in `start()`, and despawns it in `stop()`.
+ * - Frees plugin-owned state in `unload()`.
  */
 
 #include "engine_extension.h"
@@ -14,6 +15,9 @@
 
 typedef struct ExamplePluginState {
     const AEHostApi *host;
+    const AEWorldApiV1 *world_api;
+    const AEEventsApiV1 *events_api;
+    AEHandle spawned_entity;
     int started;
     int stopped;
     uint32_t magic;
@@ -39,6 +43,9 @@ static AEStatus plugin_load(const AEHostApi *host, void **out_state) {
         return AE_ERROR;
     }
     state->host = host;
+    state->world_api = NULL;
+    state->events_api = NULL;
+    state->spawned_entity = 0;
     state->started = 0;
     state->stopped = 0;
     state->magic = 0x43504C47u; /* "CPLG" */
@@ -55,23 +62,34 @@ static AEStatus plugin_start(void *raw_state) {
     }
     state->started = 1;
 
-    /* Probe optional host service to verify two-way service lookup across C ABI */
     if (state->host && state->host->get_service) {
         const void *svc_api = NULL;
         uint32_t svc_size = 0;
-        const char *svc_name = "engine.diagnostics";
-        AEStringView id = { svc_name, strlen(svc_name) };
-        AEStatus st = state->host->get_service(
-            state->host->host_context,
-            id,
-            1,
-            &svc_api,
-            &svc_size
-        );
-        if (st == AE_OK) {
-            log_msg(state->host, 1, "c-plugin: resolved engine.diagnostics/1");
-        } else {
-            log_msg(state->host, 1, "c-plugin: engine.diagnostics/1 not registered (ok)");
+
+        /* Resolve engine.world/1 and spawn an entity */
+        AEStringView world_id = { "engine.world", 12 };
+        if (state->host->get_service(state->host->host_context, world_id, 1, &svc_api, &svc_size) == AE_OK &&
+            svc_size >= sizeof(AEWorldApiV1)) {
+            const AEWorldApiV1 *w = (const AEWorldApiV1 *)svc_api;
+            if (w->abi_major == AE_ABI_MAJOR && w->spawn) {
+                state->world_api = w;
+                if (w->spawn(w->world_context, &state->spawned_entity) == AE_OK) {
+                    log_msg(state->host, 1, "c-plugin: spawned ECS entity");
+                }
+            }
+        }
+
+        /* Resolve engine.events/1 and post an event */
+        AEStringView events_id = { "engine.events", 13 };
+        if (state->host->get_service(state->host->host_context, events_id, 1, &svc_api, &svc_size) == AE_OK &&
+            svc_size >= sizeof(AEEventsApiV1)) {
+            const AEEventsApiV1 *ev = (const AEEventsApiV1 *)svc_api;
+            if (ev->abi_major == AE_ABI_MAJOR && ev->post) {
+                state->events_api = ev;
+                AEStringView ev_name = { "c_plugin.entity_spawned", 23 };
+                AEStringView ev_payload = { "from_c11", 8 };
+                ev->post(ev->events_context, ev_name, ev_payload, state->spawned_entity);
+            }
         }
     }
 
@@ -83,6 +101,10 @@ static void plugin_stop(void *raw_state) {
     ExamplePluginState *state = (ExamplePluginState *)raw_state;
     if (!state || state->magic != 0x43504C47u) {
         return;
+    }
+    if (state->world_api && state->world_api->despawn && state->spawned_entity != 0) {
+        state->world_api->despawn(state->world_api->world_context, state->spawned_entity);
+        state->spawned_entity = 0;
     }
     state->stopped = 1;
     log_msg(state->host, 1, "c-plugin: stopped");

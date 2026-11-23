@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const diagnostics_mod = @import("diagnostics.zig");
 const service_mod = @import("service_registry.zig");
 const events_mod = @import("events.zig");
+const world_mod = @import("world.zig");
 
 /// Cross-platform dynamic library loader supporting Windows (kernel32) and POSIX (std.DynLib).
 pub const NativeLib = if (builtin.os.tag == .windows) struct {
@@ -99,6 +100,23 @@ pub const AEPluginApi = extern struct {
     unload: ?*const fn (state: ?*anyopaque) callconv(.c) void,
 };
 
+pub const AEWorldApiV1 = extern struct {
+    struct_size: u32,
+    abi_major: u32,
+    world_context: ?*anyopaque,
+    spawn: ?*const fn (world_context: ?*anyopaque, out_entity: *AEHandle) callconv(.c) i32,
+    despawn: ?*const fn (world_context: ?*anyopaque, entity: AEHandle) callconv(.c) i32,
+    is_alive: ?*const fn (world_context: ?*anyopaque, entity: AEHandle) callconv(.c) u32,
+    entity_count: ?*const fn (world_context: ?*anyopaque) callconv(.c) usize,
+};
+
+pub const AEEventsApiV1 = extern struct {
+    struct_size: u32,
+    abi_major: u32,
+    events_context: ?*anyopaque,
+    post: ?*const fn (events_context: ?*anyopaque, name: AEStringView, payload: AEStringView, entity: AEHandle) callconv(.c) i32,
+};
+
 pub const AEPluginEntryFn = *const fn () callconv(.c) ?*const AEPluginApi;
 
 pub const PluginHandle = packed struct(u64) {
@@ -118,6 +136,7 @@ pub const LoadedPlugin = struct {
 };
 
 pub const HostContext = struct {
+    world: *world_mod.World,
     diagnostics: *diagnostics_mod.Diagnostics,
     services: *service_mod.ServiceRegistry,
     events: *events_mod.EventBus,
@@ -127,24 +146,32 @@ pub const PluginHost = struct {
     allocator: std.mem.Allocator,
     host_ctx: HostContext,
     host_api: AEHostApi,
+    world_api: AEWorldApiV1,
+    events_api: AEEventsApiV1,
     plugins: std.ArrayList(LoadedPlugin),
     next_owner_id: u64,
 
     pub fn init(
         allocator: std.mem.Allocator,
+        world: *world_mod.World,
         diagnostics: *diagnostics_mod.Diagnostics,
         services: *service_mod.ServiceRegistry,
         events: *events_mod.EventBus,
     ) !*PluginHost {
         const self = try allocator.create(PluginHost);
+        errdefer allocator.destroy(self);
+
         self.* = .{
             .allocator = allocator,
             .host_ctx = .{
+                .world = world,
                 .diagnostics = diagnostics,
                 .services = services,
                 .events = events,
             },
             .host_api = undefined,
+            .world_api = undefined,
+            .events_api = undefined,
             .plugins = .empty,
             .next_owner_id = 1000,
         };
@@ -156,7 +183,77 @@ pub const PluginHost = struct {
             .log = hostLogCallback,
             .get_service = hostGetServiceCallback,
         };
+        self.world_api = .{
+            .struct_size = @sizeOf(AEWorldApiV1),
+            .abi_major = ABI_MAJOR,
+            .world_context = world,
+            .spawn = cWorldSpawn,
+            .despawn = cWorldDespawn,
+            .is_alive = cWorldIsAlive,
+            .entity_count = cWorldEntityCount,
+        };
+        self.events_api = .{
+            .struct_size = @sizeOf(AEEventsApiV1),
+            .abi_major = ABI_MAJOR,
+            .events_context = events,
+            .post = cEventsPost,
+        };
+
+        try services.register(.{
+            .capability = "engine.world",
+            .major_version = 1,
+            .provider_id = "core.world.c_abi_v1",
+            .owner_id = 1,
+            .exclusive = true,
+            .api_ptr = &self.world_api,
+            .api_size = @sizeOf(AEWorldApiV1),
+        });
+        errdefer _ = services.unregisterByOwner(1);
+
+        try services.register(.{
+            .capability = "engine.events",
+            .major_version = 1,
+            .provider_id = "core.events.c_abi_v1",
+            .owner_id = 1,
+            .exclusive = true,
+            .api_ptr = &self.events_api,
+            .api_size = @sizeOf(AEEventsApiV1),
+        });
+
         return self;
+    }
+
+    fn cWorldSpawn(raw_world: ?*anyopaque, out_entity: *AEHandle) callconv(.c) i32 {
+        const w: *world_mod.World = @ptrCast(@alignCast(raw_world orelse return @intFromEnum(AEStatus.err)));
+        const e = w.spawn() catch return @intFromEnum(AEStatus.err);
+        out_entity.* = e.toU64();
+        return @intFromEnum(AEStatus.ok);
+    }
+
+    fn cWorldDespawn(raw_world: ?*anyopaque, entity: AEHandle) callconv(.c) i32 {
+        const w: *world_mod.World = @ptrCast(@alignCast(raw_world orelse return @intFromEnum(AEStatus.err)));
+        const ok = w.despawn(world_mod.EntityHandle.fromU64(entity)) catch return @intFromEnum(AEStatus.err);
+        return if (ok) @intFromEnum(AEStatus.ok) else @intFromEnum(AEStatus.invalid_handle);
+    }
+
+    fn cWorldIsAlive(raw_world: ?*anyopaque, entity: AEHandle) callconv(.c) u32 {
+        const w: *world_mod.World = @ptrCast(@alignCast(raw_world orelse return 0));
+        return if (w.isAlive(world_mod.EntityHandle.fromU64(entity))) 1 else 0;
+    }
+
+    fn cWorldEntityCount(raw_world: ?*anyopaque) callconv(.c) usize {
+        const w: *world_mod.World = @ptrCast(@alignCast(raw_world orelse return 0));
+        return w.entity_count;
+    }
+
+    fn cEventsPost(raw_events: ?*anyopaque, name: AEStringView, payload: AEStringView, entity: AEHandle) callconv(.c) i32 {
+        const bus: *events_mod.EventBus = @ptrCast(@alignCast(raw_events orelse return @intFromEnum(AEStatus.err)));
+        bus.post(.{
+            .name = name.toSlice(),
+            .payload = payload.toSlice(),
+            .entity_handle = entity,
+        }) catch return @intFromEnum(AEStatus.err);
+        return @intFromEnum(AEStatus.ok);
     }
 
     pub fn deinit(self: *PluginHost) void {

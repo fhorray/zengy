@@ -118,6 +118,7 @@ pub const App = struct {
         if (self.plugin_host) |host| return host;
         const host = try abi_mod.PluginHost.init(
             self.allocator,
+            &self.world,
             &self.diagnostics,
             &self.services,
             &self.events,
