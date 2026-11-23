@@ -40,35 +40,25 @@ const Command = union(enum) {
 
 pub const CommandBuffer = struct {
     allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
     commands: std.ArrayList(Command),
 
     pub fn init(allocator: std.mem.Allocator) CommandBuffer {
         return .{
             .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
             .commands = .empty,
         };
     }
 
     pub fn deinit(self: *CommandBuffer) void {
-        self.clear();
         self.commands.deinit(self.allocator);
+        self.arena.deinit();
     }
 
     pub fn clear(self: *CommandBuffer) void {
-        for (self.commands.items) |cmd| {
-            switch (cmd) {
-                .set_raw => |s| {
-                    self.allocator.free(s.type_name);
-                    self.allocator.free(s.bytes);
-                },
-                .emit_event => |e| {
-                    self.allocator.free(e.name);
-                    self.allocator.free(e.payload);
-                },
-                else => {},
-            }
-        }
         self.commands.clearRetainingCapacity();
+        _ = self.arena.reset(.retain_capacity);
     }
 
     pub fn spawn(self: *CommandBuffer) !void {
@@ -80,10 +70,9 @@ pub const CommandBuffer = struct {
     }
 
     pub fn set(self: *CommandBuffer, entity: EntityHandle, comptime T: type, value: T) !void {
-        const bytes_copy = try self.allocator.dupe(u8, std.mem.asBytes(&value));
-        errdefer self.allocator.free(bytes_copy);
-        const name_copy = try self.allocator.dupe(u8, @typeName(T));
-        errdefer self.allocator.free(name_copy);
+        const scratch = self.arena.allocator();
+        const bytes_copy = try scratch.dupe(u8, std.mem.asBytes(&value));
+        const name_copy = try scratch.dupe(u8, @typeName(T));
 
         try self.commands.append(self.allocator, .{
             .set_raw = .{
@@ -105,10 +94,9 @@ pub const CommandBuffer = struct {
     }
 
     pub fn emit(self: *CommandBuffer, envelope: EventEnvelope) !void {
-        const name_copy = try self.allocator.dupe(u8, envelope.name);
-        errdefer self.allocator.free(name_copy);
-        const payload_copy = try self.allocator.dupe(u8, envelope.payload);
-        errdefer self.allocator.free(payload_copy);
+        const scratch = self.arena.allocator();
+        const name_copy = try scratch.dupe(u8, envelope.name);
+        const payload_copy = try scratch.dupe(u8, envelope.payload);
 
         try self.commands.append(self.allocator, .{
             .emit_event = .{

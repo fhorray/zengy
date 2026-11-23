@@ -165,6 +165,8 @@ pub const App = struct {
         self.state = .configured;
 
         try self.modules.startAll(self);
+        errdefer self.modules.stopAll(self);
+
         try self.scheduler.buildAll();
 
         var ctx = self.makeSystemContext(0.0);
@@ -187,6 +189,9 @@ pub const App = struct {
         var ctx = self.makeSystemContext(@floatCast(frame_dt));
         _ = try self.scheduler.stepFrame(frame_dt, &ctx);
         self.diagnostics.frame_count += 1;
+        if (std.math.isFinite(frame_dt) and frame_dt >= 0.0) {
+            self.diagnostics.last_frame_ns = @intFromFloat(frame_dt * 1_000_000_000.0);
+        }
     }
 
     /// Advances the application by exactly one `.fixed_update` tick deterministically.

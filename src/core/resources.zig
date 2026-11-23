@@ -9,8 +9,8 @@ const std = @import("std");
 /// Computes a deterministic type identifier from `@typeName(T)`.
 /// Hashing `@typeName(T)` avoids LLVM identical-code-folding (ICF) collisions
 /// that can occur with empty marker structs.
-pub fn typeId(comptime T: type) usize {
-    return @truncate(std.hash.Wyhash.hash(0x9e3779b97f4a7c15, @typeName(T)));
+pub fn typeId(comptime T: type) u64 {
+    return std.hash.Wyhash.hash(0x9e3779b97f4a7c15, @typeName(T));
 }
 
 const ResourceEntry = struct {
@@ -21,7 +21,7 @@ const ResourceEntry = struct {
 /// Type-erased registry of singleton resources owned by an `App` or `World`.
 pub const ResourceRegistry = struct {
     allocator: std.mem.Allocator,
-    entries: std.AutoHashMapUnmanaged(usize, ResourceEntry),
+    entries: std.AutoHashMapUnmanaged(u64, ResourceEntry),
 
     pub fn init(allocator: std.mem.Allocator) ResourceRegistry {
         return .{
@@ -48,6 +48,7 @@ pub const ResourceRegistry = struct {
         }
 
         const ptr = try self.allocator.create(T);
+        errdefer self.allocator.destroy(ptr);
         ptr.* = value;
 
         const Destroy = struct {

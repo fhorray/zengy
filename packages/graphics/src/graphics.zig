@@ -48,6 +48,12 @@ pub const DrawCommand = union(enum) {
         content: []const u8,
         color: Color,
     },
+    clip_rect: ?struct {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    },
 };
 
 const RenderTargetSlot = struct {
@@ -61,12 +67,23 @@ const RenderTargetSlot = struct {
     presented_frames: u64,
 };
 
+/// Optional backend hooks for native GPU providers (e.g., `official.graphics.sdlgpu`).
+/// When `backend` is null, `GraphicsDeviceService` operates in headless software mode.
+pub const BackendVTable = struct {
+    on_create_surface: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, window_handle: u64, width: u32, height: u32) anyerror!void = null,
+    on_resize_surface: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, width: u32, height: u32) void = null,
+    on_destroy_surface: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle) void = null,
+    on_present: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, commands: []const DrawCommand) anyerror!void = null,
+};
+
 pub const GraphicsDeviceService = struct {
     allocator: std.mem.Allocator,
     targets: std.ArrayList(RenderTargetSlot),
     last_frame_commands: std.ArrayList(DrawCommand),
     device_available: bool,
     caps: DeviceCapabilities,
+    backend: ?*const BackendVTable = null,
+    backend_ctx: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator) GraphicsDeviceService {
         return .{
@@ -75,6 +92,23 @@ pub const GraphicsDeviceService = struct {
             .last_frame_commands = .empty,
             .device_available = true,
             .caps = .{},
+        };
+    }
+
+    pub fn initWithBackend(
+        allocator: std.mem.Allocator,
+        backend: *const BackendVTable,
+        backend_ctx: *anyopaque,
+        caps: DeviceCapabilities,
+    ) GraphicsDeviceService {
+        return .{
+            .allocator = allocator,
+            .targets = .empty,
+            .last_frame_commands = .empty,
+            .device_available = true,
+            .caps = caps,
+            .backend = backend,
+            .backend_ctx = backend_ctx,
         };
     }
 
@@ -93,6 +127,29 @@ pub const GraphicsDeviceService = struct {
 
     pub fn createSurface(self: *GraphicsDeviceService, window_handle: u64, width: u32, height: u32) !RenderTargetHandle {
         if (!self.device_available) return error.DeviceUnavailable;
+        for (self.targets.items, 0..) |*slot, i| {
+            if (!slot.alive) {
+                const gen = if (slot.generation == 0) @as(u32, 1) else slot.generation;
+                slot.* = .{
+                    .window_handle = window_handle,
+                    .width = width,
+                    .height = height,
+                    .generation = gen,
+                    .alive = true,
+                    .frame_open = false,
+                    .submitted_commands = 0,
+                    .presented_frames = 0,
+                };
+                const handle: RenderTargetHandle = .{ .index = @intCast(i), .generation = gen };
+                if (self.backend) |vt| {
+                    if (vt.on_create_surface) |cb| {
+                        errdefer slot.alive = false;
+                        try cb(self.backend_ctx.?, handle, window_handle, width, height);
+                    }
+                }
+                return handle;
+            }
+        }
         const idx: u32 = @intCast(self.targets.items.len);
         try self.targets.append(self.allocator, .{
             .window_handle = window_handle,
@@ -104,7 +161,14 @@ pub const GraphicsDeviceService = struct {
             .submitted_commands = 0,
             .presented_frames = 0,
         });
-        return .{ .index = idx, .generation = 1 };
+        const handle: RenderTargetHandle = .{ .index = idx, .generation = 1 };
+        if (self.backend) |vt| {
+            if (vt.on_create_surface) |cb| {
+                errdefer self.targets.items[idx].alive = false;
+                try cb(self.backend_ctx.?, handle, window_handle, width, height);
+            }
+        }
+        return handle;
     }
 
     fn getSlotMut(self: *GraphicsDeviceService, handle: RenderTargetHandle) ?*RenderTargetSlot {
@@ -118,11 +182,17 @@ pub const GraphicsDeviceService = struct {
         const slot = self.getSlotMut(handle) orelse return false;
         slot.width = width;
         slot.height = height;
+        if (self.backend) |vt| {
+            if (vt.on_resize_surface) |cb| cb(self.backend_ctx.?, handle, width, height);
+        }
         return true;
     }
 
     pub fn destroySurface(self: *GraphicsDeviceService, handle: RenderTargetHandle) bool {
         const slot = self.getSlotMut(handle) orelse return false;
+        if (self.backend) |vt| {
+            if (vt.on_destroy_surface) |cb| cb(self.backend_ctx.?, handle);
+        }
         slot.alive = false;
         slot.generation +%= 1;
         return true;
@@ -149,6 +219,11 @@ pub const GraphicsDeviceService = struct {
         if (!self.device_available) return error.DeviceUnavailable;
         const slot = self.getSlotMut(handle) orelse return error.InvalidSurfaceHandle;
         if (!slot.frame_open) return error.FrameNotStarted;
+        if (self.backend) |vt| {
+            if (vt.on_present) |cb| {
+                try cb(self.backend_ctx.?, handle, self.last_frame_commands.items);
+            }
+        }
         slot.frame_open = false;
         slot.presented_frames += 1;
     }

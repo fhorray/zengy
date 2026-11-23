@@ -187,6 +187,17 @@ pub const TestDriver = struct {
         };
     }
 
+    fn resolveKeyCode(target: []const u8) ?u8 {
+        if (target.len == 0) return null;
+        if (target.len == 1) return target[0];
+        if (std.ascii.eqlIgnoreCase(target, "Space")) return ' ';
+        if (std.ascii.eqlIgnoreCase(target, "Enter") or std.ascii.eqlIgnoreCase(target, "Return")) return '\r';
+        if (std.ascii.eqlIgnoreCase(target, "Escape") or std.ascii.eqlIgnoreCase(target, "Esc")) return 27;
+        if (std.ascii.eqlIgnoreCase(target, "Tab")) return '\t';
+        if (std.ascii.eqlIgnoreCase(target, "Backspace")) return 8;
+        return target[0];
+    }
+
     /// Executes a parsed TOML `Scenario` tick-by-tick deterministically using `stepFixed`.
     pub fn runScenario(
         self: *TestDriver,
@@ -200,8 +211,8 @@ pub const TestDriver = struct {
             for (scenario.actions.items) |act| {
                 if (act.at_tick == tick_idx) {
                     switch (act.kind) {
-                        .key_down => if (act.target.len > 0) self.pressKey(input, act.target[0]),
-                        .key_up => if (act.target.len > 0) self.releaseKey(input, act.target[0]),
+                        .key_down => if (resolveKeyCode(act.target)) |k| self.pressKey(input, k),
+                        .key_up => if (resolveKeyCode(act.target)) |k| self.releaseKey(input, k),
                         .ui_click => if (ui_tree) |tree| {
                             _ = try self.clickUiById(tree, act.target, &app.events);
                         },

@@ -196,22 +196,16 @@ pub const EventBus = struct {
     }
 
     pub fn post(self: *EventBus, envelope: EventEnvelope) !void {
-        self.total_posted += 1;
         if (self.queue.len == 0) {
+            self.total_posted += 1;
             self.dropped_events += 1;
             return;
         }
 
-        if (self.queue_len >= self.queue.len) {
+        if (self.queue_len >= self.queue.len and self.overflow_policy == .drop_newest) {
+            self.total_posted += 1;
             self.dropped_events += 1;
-            switch (self.overflow_policy) {
-                .drop_newest => return,
-                .drop_oldest => {
-                    self.queue[self.queue_head].freeHeap(self.allocator);
-                    self.queue_head = (self.queue_head + 1) % self.queue.len;
-                    self.queue_len -= 1;
-                },
-            }
+            return;
         }
 
         var ev: QueuedEvent = .{
@@ -239,12 +233,22 @@ pub const EventBus = struct {
             ev.payload_heap = try self.allocator.dupe(u8, envelope.payload);
         }
 
+        self.total_posted += 1;
+        if (self.queue_len >= self.queue.len) {
+            self.dropped_events += 1;
+            // Overflow policy is .drop_oldest (handled .drop_newest above).
+            self.queue[self.queue_head].freeHeap(self.allocator);
+            self.queue_head = (self.queue_head + 1) % self.queue.len;
+            self.queue_len -= 1;
+        }
+
         const tail = (self.queue_head + self.queue_len) % self.queue.len;
         self.queue[tail] = ev;
         self.queue_len += 1;
     }
 
     pub fn drain(self: *EventBus) usize {
+        if (self.dispatch_depth > 0) return 0;
         const count = self.queue_len;
         if (count == 0) return 0;
 

@@ -100,27 +100,47 @@ pub const CaptureService = struct {
                     const x1: u32 = @intFromFloat(cx1);
                     const y1: u32 = @intFromFloat(cy1);
 
-                    var py = y0;
-                    while (py < y1) : (py += 1) {
-                        var px = x0;
-                        while (px < x1) : (px += 1) {
-                            self.blendPixel(px, py, r, g, b, a);
+                    if (a == 255) {
+                        var py = y0;
+                        while (py < y1) : (py += 1) {
+                            const row_base = @as(usize, py) * @as(usize, self.width);
+                            var px = x0;
+                            while (px < x1) : (px += 1) {
+                                const idx = (row_base + @as(usize, px)) * 4;
+                                self.pixels[idx] = r;
+                                self.pixels[idx + 1] = g;
+                                self.pixels[idx + 2] = b;
+                                self.pixels[idx + 3] = 255;
+                            }
+                        }
+                    } else if (a > 0) {
+                        var py = y0;
+                        while (py < y1) : (py += 1) {
+                            var px = x0;
+                            while (px < x1) : (px += 1) {
+                                self.blendPixel(px, py, r, g, b, a);
+                            }
                         }
                     }
                 },
-                // Deterministic 4x6 monochrome glyph blocks for visible text presence checks.
+                // Deterministic 3x5 monochrome glyph blocks for visible text presence checks.
                 .text => |tx| {
                     if (!std.math.isFinite(tx.x) or !std.math.isFinite(tx.y)) continue;
+                    const fh: f32 = @floatFromInt(self.height);
+                    const fw: f32 = @floatFromInt(self.width);
+                    if (tx.y < -8.0 or tx.y >= fh) continue;
+
                     const r = floatToU8(tx.color.r);
                     const g = floatToU8(tx.color.g);
                     const b = floatToU8(tx.color.b);
                     const a = floatToU8(tx.color.a);
 
+                    const gy0: i32 = @intFromFloat(@round(tx.y));
                     var cursor_x = tx.x;
                     for (tx.content) |ch| {
-                        if (ch != ' ') {
+                        if (cursor_x >= fw) break;
+                        if (ch != ' ' and cursor_x >= -4.0) {
                             const gx0: i32 = @intFromFloat(@round(cursor_x));
-                            const gy0: i32 = @intFromFloat(@round(tx.y));
                             for (0..5) |dy| {
                                 for (0..3) |dx| {
                                     // Deterministic glyph mask derived from character code
@@ -138,6 +158,7 @@ pub const CaptureService = struct {
                         cursor_x += 4.0;
                     }
                 },
+                .clip_rect => {},
             }
         }
     }

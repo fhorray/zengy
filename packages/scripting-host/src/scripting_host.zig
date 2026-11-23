@@ -33,6 +33,34 @@ pub const ScriptResult = struct {
     error_message: []const u8 = "",
 };
 
+pub const ScriptRect = struct {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    r: f32 = 1.0,
+    g: f32 = 1.0,
+    b: f32 = 1.0,
+    a: f32 = 1.0,
+};
+
+pub const ScriptDrawQueue = struct {
+    allocator: std.mem.Allocator,
+    rects: std.ArrayList(ScriptRect),
+
+    pub fn init(allocator: std.mem.Allocator) ScriptDrawQueue {
+        return .{ .allocator = allocator, .rects = .empty };
+    }
+
+    pub fn deinit(self: *ScriptDrawQueue) void {
+        self.rects.deinit(self.allocator);
+    }
+
+    pub fn clear(self: *ScriptDrawQueue) void {
+        self.rects.clearRetainingCapacity();
+    }
+};
+
 /// Handle-based bridge exposed to scripting runtimes without leaking raw ECS pointers.
 pub const ScriptEngineBridge = struct {
     app: *engine.App,
@@ -66,6 +94,17 @@ pub const ScriptEngineBridge = struct {
 
     pub fn log(self: *ScriptEngineBridge, level: engine.LogLevel, msg: []const u8) !void {
         try self.app.diagnostics.log(level, "script", msg);
+    }
+
+    pub fn drawRect(self: *ScriptEngineBridge, rect: ScriptRect) !void {
+        const q = self.app.resources.get(ScriptDrawQueue) orelse return;
+        try q.rects.append(q.allocator, rect);
+    }
+
+    pub fn clearDrawQueue(self: *ScriptEngineBridge) void {
+        if (self.app.resources.get(ScriptDrawQueue)) |q| {
+            q.clear();
+        }
     }
 };
 
@@ -135,6 +174,7 @@ pub const ScriptingHost = struct {
         const state = try vtable.create(self.allocator, bridge);
         errdefer vtable.destroy(state, self.allocator);
 
+        if (self.runtimes.items.len >= std.math.maxInt(u16)) return error.TooManyRuntimes;
         const idx: u16 = @intCast(self.runtimes.items.len);
         try self.runtimes.append(self.allocator, .{
             .descriptor = descriptor,
@@ -155,6 +195,23 @@ pub const ScriptingHost = struct {
         const internal_id = try rt.vtable.load(rt.state, source_name, source);
         errdefer rt.vtable.unload(rt.state, internal_id);
 
+        for (self.scripts.items, 0..) |*slot, i| {
+            if (!slot.active) {
+                slot.* = .{
+                    .runtime_idx = runtime_idx,
+                    .internal_id = internal_id,
+                    .generation = rt.generation,
+                    .active = true,
+                };
+                return .{
+                    .runtime_idx = runtime_idx,
+                    .module_idx = @intCast(i),
+                    .generation = rt.generation,
+                };
+            }
+        }
+
+        if (self.scripts.items.len >= std.math.maxInt(u16)) return error.TooManyScripts;
         const mod_idx: u16 = @intCast(self.scripts.items.len);
         try self.scripts.append(self.allocator, .{
             .runtime_idx = runtime_idx,
@@ -223,6 +280,7 @@ pub const ScriptingHost = struct {
 
 fn buildModule(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
+    try app.resources.insert(ScriptDrawQueue, ScriptDrawQueue.init(app.allocator));
     try app.resources.insert(ScriptingHost, ScriptingHost.init(app.allocator, app));
     const host = app.resources.get(ScriptingHost).?;
 
@@ -243,6 +301,10 @@ fn stopModule(raw_app: *anyopaque) void {
     if (app.resources.get(ScriptingHost)) |host| {
         host.deinit();
         _ = app.resources.remove(ScriptingHost);
+    }
+    if (app.resources.get(ScriptDrawQueue)) |q| {
+        q.deinit();
+        _ = app.resources.remove(ScriptDrawQueue);
     }
 }
 

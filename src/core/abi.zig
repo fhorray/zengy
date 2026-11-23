@@ -20,16 +20,16 @@ const world_mod = @import("world.zig");
 pub const NativeLib = if (builtin.os.tag == .windows) struct {
     handle: std.os.windows.HMODULE,
 
-    extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) ?std.os.windows.HMODULE;
+    extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) ?std.os.windows.HMODULE;
     extern "kernel32" fn GetProcAddress(hModule: std.os.windows.HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn FreeLibrary(hLibModule: std.os.windows.HMODULE) callconv(.winapi) std.os.windows.BOOL;
 
     pub fn open(path: []const u8) !NativeLib {
-        var buf: [4096]u8 = undefined;
-        if (path.len >= buf.len) return error.NameTooLong;
-        @memcpy(buf[0..path.len], path);
-        buf[path.len] = 0;
-        const h = LoadLibraryA(@ptrCast(buf[0..path.len :0])) orelse return error.FileNotFound;
+        var buf: [4096]u16 = undefined;
+        const len = std.unicode.utf8ToUtf16Le(&buf, path) catch return error.InvalidUtf8;
+        if (len >= buf.len) return error.NameTooLong;
+        buf[len] = 0;
+        const h = LoadLibraryW(@ptrCast(buf[0..len :0])) orelse return error.FileNotFound;
         return .{ .handle = h };
     }
 
@@ -271,6 +271,7 @@ pub const PluginHost = struct {
                 self.allocator.free(self.plugins.items[i].plugin_id);
             }
         }
+        _ = self.host_ctx.services.unregisterByOwner(1);
         self.plugins.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -371,6 +372,7 @@ pub const PluginHost = struct {
 
     pub fn startPlugin(self: *PluginHost, handle: PluginHandle) AEStatus {
         const plugin = self.getPluginMut(handle) orelse return .invalid_handle;
+        if (plugin.started) return .ok;
         const rc = plugin.api.start.?(plugin.state);
         const st = statusFromInt(rc);
         if (st != .ok) return st;
@@ -393,6 +395,11 @@ pub const PluginHost = struct {
         plugin.state = null;
         plugin.active = false;
         plugin.generation +%= 1;
+
+        if (plugin.plugin_id.len > 0) {
+            self.allocator.free(plugin.plugin_id);
+            plugin.plugin_id = &.{};
+        }
 
         if (plugin.lib) |*dynlib| {
             dynlib.close();

@@ -112,10 +112,35 @@ pub const Scheduler = struct {
         return self;
     }
 
+    fn dupeStringSlice(allocator: std.mem.Allocator, src: []const []const u8) ![]const []const u8 {
+        if (src.len == 0) return &.{};
+        const out = try allocator.alloc([]const u8, src.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |s| allocator.free(s);
+            allocator.free(out);
+        }
+        for (src, 0..) |s, i| {
+            out[i] = try allocator.dupe(u8, s);
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn freeStringSlice(allocator: std.mem.Allocator, slice: []const []const u8) void {
+        if (slice.len == 0) return;
+        for (slice) |s| allocator.free(s);
+        allocator.free(slice);
+    }
+
     pub fn deinit(self: *Scheduler) void {
         for (0..Stage.count) |i| {
             for (self.stages[i].items) |sys| {
                 self.allocator.free(sys.name);
+                freeStringSlice(self.allocator, sys.reads);
+                freeStringSlice(self.allocator, sys.writes);
+                freeStringSlice(self.allocator, sys.before);
+                freeStringSlice(self.allocator, sys.after);
             }
             self.stages[i].deinit(self.allocator);
             self.execution_order[i].deinit(self.allocator);
@@ -127,14 +152,23 @@ pub const Scheduler = struct {
         const name_copy = try self.allocator.dupe(u8, desc.name);
         errdefer self.allocator.free(name_copy);
 
+        const reads_copy = try dupeStringSlice(self.allocator, desc.reads);
+        errdefer freeStringSlice(self.allocator, reads_copy);
+        const writes_copy = try dupeStringSlice(self.allocator, desc.writes);
+        errdefer freeStringSlice(self.allocator, writes_copy);
+        const before_copy = try dupeStringSlice(self.allocator, desc.before);
+        errdefer freeStringSlice(self.allocator, before_copy);
+        const after_copy = try dupeStringSlice(self.allocator, desc.after);
+        errdefer freeStringSlice(self.allocator, after_copy);
+
         try self.stages[s_idx].append(self.allocator, .{
             .name = name_copy,
             .stage = desc.stage,
             .run = desc.run,
-            .reads = desc.reads,
-            .writes = desc.writes,
-            .before = desc.before,
-            .after = desc.after,
+            .reads = reads_copy,
+            .writes = writes_copy,
+            .before = before_copy,
+            .after = after_copy,
             .exclusive = desc.exclusive,
             .thread_affinity = desc.thread_affinity,
         });
@@ -242,9 +276,12 @@ pub const Scheduler = struct {
             try self.buildStageSchedule(stage);
         }
 
-        const systems = self.stages[s_idx].items;
-        for (self.execution_order[s_idx].items) |sys_idx| {
-            try systems[sys_idx].run(ctx);
+        {
+            errdefer ctx.commands.clear();
+            const systems = self.stages[s_idx].items;
+            for (self.execution_order[s_idx].items) |sys_idx| {
+                try systems[sys_idx].run(ctx);
+            }
         }
         try ctx.commands.apply(ctx.world, ctx.events);
     }
@@ -259,6 +296,9 @@ pub const Scheduler = struct {
     }
 
     pub fn stepFrame(self: *Scheduler, frame_dt: f64, ctx: *SystemContext) !u32 {
+        if (!std.math.isFinite(frame_dt) or frame_dt < 0.0) {
+            return error.InvalidDeltaTime;
+        }
         ctx.dt = @floatCast(frame_dt);
         ctx.fixed_dt = @floatCast(self.fixed_dt);
 

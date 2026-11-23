@@ -62,3 +62,49 @@ test "UiTree 1000+ nodes layout, hit testing, focus, click action, and paint lis
     try tree.paint(testing.allocator, &cmds);
     try testing.expect(cmds.items.len >= 1003);
 }
+
+test "UiTree textbox input, backspace, scrollNode, and clip_rect emission" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(window.module());
+    try app.registerModule(graphics.module());
+    try app.registerModule(ui_core.module());
+    try app.initialize();
+
+    const u_entry = try app.services.getService("engine.ui.tree", 1);
+    const tree: *ui_core.UiTree = @ptrCast(@alignCast(@constCast(u_entry.api_ptr)));
+
+    const tb = try tree.createNode(null, .{ .id = "tb", .kind = .textbox, .text = "hi" });
+    const list = try tree.createNode(null, .{
+        .id = "lst",
+        .kind = .virtual_list,
+        .style = .{ .height = 40.0, .clip_children = true },
+    });
+    _ = try tree.createNode(list, .{ .id = "c0", .kind = .label, .text = "row0" });
+
+    tree.layoutTree(400.0, 300.0);
+    const tb_rect = tree.nodes.items[tb].layout;
+    _ = tree.handlePointerClick(tb_rect.x + 2.0, tb_rect.y + 2.0, &app.events);
+
+    try testing.expect(try tree.handleTextInput("!"));
+    try testing.expectEqualStrings("hi!", tree.nodes.items[tb].text);
+    try testing.expect(try tree.handleBackspace());
+    try testing.expectEqualStrings("hi", tree.nodes.items[tb].text);
+
+    tree.scrollNode(list, 10.0);
+    try testing.expectEqual(@as(f32, 10.0), tree.nodes.items[list].scroll_y);
+
+    var cmds: std.ArrayList(graphics.DrawCommand) = .empty;
+    defer cmds.deinit(testing.allocator);
+    try tree.paint(testing.allocator, &cmds);
+
+    var saw_clip_open = false;
+    var saw_clip_close = false;
+    for (cmds.items) |cmd| {
+        if (cmd == .clip_rect) {
+            if (cmd.clip_rect != null) saw_clip_open = true else saw_clip_close = true;
+        }
+    }
+    try testing.expect(saw_clip_open and saw_clip_close);
+}

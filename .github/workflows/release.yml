@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Package Windows x64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Build Windows x64 (ReleaseSafe)
+        run: zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
+      - name: Stage Windows release archive
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          STAGE="dist/zigeng-${TAG}-x86_64-windows"
+          mkdir -p "$STAGE/include"
+          cp zig-out/bin/*.exe "$STAGE/"
+          cp include/engine_extension.h "$STAGE/include/"
+          cp README.md LICENSE "$STAGE/"
+          (cd dist && zip -r "zigeng-${TAG}-x86_64-windows.zip" "zigeng-${TAG}-x86_64-windows")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-bundle
+          path: dist/*.zip
+
+  build-linux:
+    name: Package Linux x64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Run tests & build Linux x64 headless/CLI/C-plugin (ReleaseSafe)
+        run: |
+          zig build test -Doptimize=ReleaseSafe
+          zig build install -Doptimize=ReleaseSafe || true
+      - name: Stage Linux release archive
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          STAGE="dist/zigeng-${TAG}-x86_64-linux"
+          mkdir -p "$STAGE/include" "$STAGE/lib"
+          cp zig-out/bin/headless-ecs zig-out/bin/engine-cli zig-out/bin/playground zig-out/bin/zigeng-bench "$STAGE/" 2>/dev/null || true
+          cp zig-out/lib/* "$STAGE/lib/" 2>/dev/null || true
+          cp include/engine_extension.h "$STAGE/include/"
+          cp README.md LICENSE "$STAGE/"
+          tar -czf "dist/zigeng-${TAG}-x86_64-linux.tar.gz" -C dist "zigeng-${TAG}-x86_64-linux"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-bundle
+          path: dist/*.tar.gz
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [ build-windows, build-linux ]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/windows-x64-bundle/*.zip
+            artifacts/linux-x64-bundle/*.tar.gz
