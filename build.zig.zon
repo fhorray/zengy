@@ -27,7 +27,7 @@
         "include",
         "src",
         "packages",
-        "projects",
+        "third_party",
         "examples",
         "benchmarks",
         "tools",
