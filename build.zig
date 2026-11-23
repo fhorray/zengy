@@ -544,17 +544,17 @@ pub fn build(b: *std.Build) void {
     const run_playground_step = b.step("run-playground", "Run the integrated engine playground");
     run_playground_step.dependOn(&run_playground.step);
 
-    // SDL 3.4.20 (zlib) vendored in third_party/sdl3 (Windows x64 binaries for D1).
+    // SDL 3.4.20 (zlib) vendored in packages/sdl3 (Windows x64 binaries).
     const sdl3_c_mod = blk: {
         const translate_sdl3 = b.addTranslateC(.{
             .root_source_file = b.path("packages/window-sdl3/src/sdl3_bundle.h"),
             .target = target,
             .optimize = optimize,
         });
-        translate_sdl3.addIncludePath(b.path("third_party/sdl3/include"));
+        translate_sdl3.addIncludePath(b.path("packages/sdl3/include"));
         const mod = translate_sdl3.createModule();
-        mod.addIncludePath(b.path("third_party/sdl3/include"));
-        mod.addLibraryPath(b.path("third_party/sdl3/lib/x64"));
+        mod.addIncludePath(b.path("packages/sdl3/include"));
+        mod.addLibraryPath(b.path("packages/sdl3/lib/x64"));
         mod.linkSystemLibrary("SDL3", .{});
         break :blk mod;
     };
@@ -586,8 +586,8 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(visual_hello_exe);
 
     // The SDL3 runtime DLL must sit next to the executable in zig-out/bin when present.
-    if (std.Io.Dir.cwd().access(b.graph.io, "third_party/sdl3/bin/x64/SDL3.dll", .{})) |_| {
-        const install_sdl3_dll = b.addInstallBinFile(b.path("third_party/sdl3/bin/x64/SDL3.dll"), "SDL3.dll");
+    if (std.Io.Dir.cwd().access(b.graph.io, "packages/sdl3/bin/x64/SDL3.dll", .{})) |_| {
+        const install_sdl3_dll = b.addInstallBinFile(b.path("packages/sdl3/bin/x64/SDL3.dll"), "SDL3.dll");
         b.getInstallStep().dependOn(&install_sdl3_dll.step);
     } else |_| {}
     // Run the installed copy: the cache copy has no SDL3.dll beside it (Windows exit 0xC0000135).

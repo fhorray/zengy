@@ -31,7 +31,6 @@
         "include",
         "src",
         "packages",
-        "third_party",
         "LICENSE",
         "README.md",
     },

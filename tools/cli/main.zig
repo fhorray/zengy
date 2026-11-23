@@ -68,7 +68,7 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
     const shell_cmd = if (pkg.third_party) |tp|
         try std.fmt.allocPrint(
             allocator,
-            "mkdir -p packages third_party && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s} zigeng-main/third_party/{s}",
+            "mkdir -p packages && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s} zigeng-main/packages/{s}",
             .{ pkg.name, tp },
         )
     else
