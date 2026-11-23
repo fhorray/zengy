@@ -430,3 +430,35 @@ test "World.registerDynamicComponent rolls back cleanly on OOM" {
     try testing.expectError(error.OutOfMemory, world.registerDynamicComponent("test.FailComp", 16));
     try testing.expectEqual(@as(usize, 0), world.pools.count());
 }
+
+test "event_subscribe_during_drain: subscribing during callback is safe and runs on next drain" {
+    var bus = engine.EventBus.init(testing.allocator, 16, .drop_newest);
+    defer bus.deinit();
+
+    const State = struct {
+        bus: *engine.EventBus,
+        second_calls: usize = 0,
+
+        fn onSecond(raw: ?*anyopaque, _: engine.EventEnvelope) void {
+            const st: *@This() = @ptrCast(@alignCast(raw.?));
+            st.second_calls += 1;
+        }
+
+        fn onFirst(raw: ?*anyopaque, _: engine.EventEnvelope) void {
+            const st: *@This() = @ptrCast(@alignCast(raw.?));
+            _ = st.bus.subscribe(2, "ping", onSecond, st) catch {};
+        }
+    };
+
+    var st = State{ .bus = &bus };
+    _ = try bus.subscribe(1, "ping", State.onFirst, &st);
+
+    try bus.post(.{ .name = "ping", .payload = "a" });
+    _ = bus.drain();
+    // Newly subscribed handler did not run on the current event mid-loop.
+    try testing.expectEqual(@as(usize, 0), st.second_calls);
+
+    try bus.post(.{ .name = "ping", .payload = "b" });
+    _ = bus.drain();
+    try testing.expectEqual(@as(usize, 1), st.second_calls);
+}

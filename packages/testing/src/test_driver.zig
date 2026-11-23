@@ -1,10 +1,11 @@
 //! Deterministic Test Driver & TOML Scenario Runner (`official.testing.driver`).
 //!
 //! Enables automated agents and tests to drive an `engine.App` deterministically:
-//! - Exact tick stepping (`stepFixed(count)`) without wall-clock `sleep()`.
+//! - `stepFixed(app, count)`: executes exact `.fixed_update` ticks (no accumulator).
+//! - `stepFrame(app, frame_dt)`: executes full application frames.
 //! - Input injection into `InputService` and `UiTree` (`clickUiById`).
-//! - Reflection-based component assertions (`assertFieldApprox`).
-//! - TOML scenario execution powered by `official.format.toml` (`z-toml`).
+//! - Reflection-based component assertions (`assertFieldApprox`) rejecting `NaN`/`Inf`.
+//! - Strict TOML scenario parsing powered by `official.format.toml` (`z-toml`).
 
 const std = @import("std");
 const engine = @import("engine");
@@ -43,10 +44,18 @@ pub const Scenario = struct {
 pub const TestDriver = struct {
     current_tick: u64 = 0,
 
-    /// Advances `app` by `count` fixed-timestep frames (`app.config.fixed_dt`).
+    /// Advances `app` by exactly `count` `.fixed_update` ticks deterministically.
     pub fn stepFixed(self: *TestDriver, app: *engine.App, count: u32) !void {
         for (0..count) |_| {
-            try app.tick(app.config.fixed_dt);
+            try app.tickFixed();
+            self.current_tick += 1;
+        }
+    }
+
+    /// Advances `app` by `count` full frames (`frame_dt` seconds each).
+    pub fn stepFrame(self: *TestDriver, app: *engine.App, count: u32, frame_dt: f64) !void {
+        for (0..count) |_| {
+            try app.tick(frame_dt);
             self.current_tick += 1;
         }
     }
@@ -72,7 +81,7 @@ pub const TestDriver = struct {
         return tree.handlePointerClick(cx, cy, events) orelse error.UiHitTestMissed;
     }
 
-    /// Asserts that a reflected `f32_t` field matches `expected` within `tolerance`.
+    /// Asserts that a reflected `f32_t` field is finite and within `tolerance` of `expected`.
     pub fn assertFieldApprox(
         world: *engine.World,
         types: *const engine.TypeRegistry,
@@ -85,12 +94,26 @@ pub const TestDriver = struct {
         const schema = types.getById(schema_id) orelse return error.SchemaNotFound;
         const bytes = world.getRaw(entity, schema.component_type_id) orelse return error.ComponentNotPresent;
         const val = try engine.TypeRegistry.getField(schema, bytes, field_name);
-        if (@abs(val.f32_t - expected) > tolerance) {
+
+        const actual: f32 = switch (val) {
+            .f32_t => |v| v,
+            else => return error.FieldTypeMismatch,
+        };
+
+        if (!std.math.isFinite(actual) or !std.math.isFinite(expected) or !std.math.isFinite(tolerance) or tolerance < 0.0) {
+            return error.InvalidAssertionValue;
+        }
+        if (@abs(actual - expected) > tolerance) {
             return error.AssertionFailed;
         }
     }
 
-    /// Parses a TOML test scenario document using `official.format.toml`.
+    fn parseNonNegativeU32(val: i64) !u32 {
+        if (val < 0 or val > std.math.maxInt(u32)) return error.InvalidTickValue;
+        return @intCast(val);
+    }
+
+    /// Parses a TOML test scenario document using `official.format.toml` with strict validation.
     pub fn parseScenarioToml(allocator: std.mem.Allocator, source: []const u8) !Scenario {
         const root = try toml_format.TomlService.parseTable(allocator, source);
         defer toml_format.TomlService.freeTable(allocator, root);
@@ -100,12 +123,12 @@ pub const TestDriver = struct {
 
         const name_str = if (scen_val.table.get("name")) |v| switch (v) {
             .string => |s| s,
-            else => "unnamed",
+            else => return error.InvalidScenarioName,
         } else "unnamed";
 
         const ticks_u32: u32 = if (scen_val.table.get("ticks")) |v| switch (v) {
-            .integer => |iv| @intCast(iv.value),
-            else => 1,
+            .integer => |iv| try parseNonNegativeU32(iv.value),
+            else => return error.InvalidTickValue,
         } else 1;
 
         var actions: std.ArrayList(ScenarioAction) = .empty;
@@ -115,37 +138,44 @@ pub const TestDriver = struct {
         }
 
         if (root.get("actions")) |acts_val| {
-            if (acts_val == .array) {
-                for (acts_val.array.items) |item| {
-                    if (item != .table) continue;
-                    const at_tick: u32 = if (item.table.get("at_tick")) |tv| switch (tv) {
-                        .integer => |iv| @intCast(iv.value),
-                        else => 0,
-                    } else 0;
+            if (acts_val != .array) return error.InvalidActionsSection;
+            for (acts_val.array.items) |item| {
+                if (item != .table) return error.InvalidActionEntry;
 
-                    const kind_str = if (item.table.get("type")) |kv| switch (kv) {
-                        .string => |s| s,
-                        else => "key_down",
-                    } else "key_down";
+                const at_tick: u32 = if (item.table.get("at_tick")) |tv| switch (tv) {
+                    .integer => |iv| try parseNonNegativeU32(iv.value),
+                    else => return error.InvalidTickValue,
+                } else return error.MissingActionTick;
 
-                    const kind: ScenarioActionKind = if (std.mem.eql(u8, kind_str, "ui_click"))
-                        .ui_click
-                    else if (std.mem.eql(u8, kind_str, "key_up"))
-                        .key_up
-                    else
-                        .key_down;
+                if (at_tick >= ticks_u32) return error.ActionOutOfRange;
 
-                    const target_str = if (item.table.get("target")) |tg| switch (tg) {
-                        .string => |s| s,
-                        else => "",
-                    } else "";
+                const kind_str = if (item.table.get("type")) |kv| switch (kv) {
+                    .string => |s| s,
+                    else => return error.InvalidActionType,
+                } else return error.MissingActionType;
 
-                    try actions.append(allocator, .{
-                        .at_tick = at_tick,
-                        .kind = kind,
-                        .target = try allocator.dupe(u8, target_str),
-                    });
-                }
+                const kind: ScenarioActionKind = if (std.mem.eql(u8, kind_str, "ui_click"))
+                    .ui_click
+                else if (std.mem.eql(u8, kind_str, "key_up"))
+                    .key_up
+                else if (std.mem.eql(u8, kind_str, "key_down"))
+                    .key_down
+                else
+                    return error.UnsupportedAction;
+
+                const target_str = if (item.table.get("target")) |tg| switch (tg) {
+                    .string => |s| s,
+                    else => return error.InvalidActionTarget,
+                } else "";
+
+                const target_copy = try allocator.dupe(u8, target_str);
+                errdefer allocator.free(target_copy);
+
+                try actions.append(allocator, .{
+                    .at_tick = at_tick,
+                    .kind = kind,
+                    .target = target_copy,
+                });
             }
         }
 
@@ -157,7 +187,7 @@ pub const TestDriver = struct {
         };
     }
 
-    /// Executes a parsed TOML `Scenario` tick-by-tick against `app`, `input`, and optional `ui_tree`.
+    /// Executes a parsed TOML `Scenario` tick-by-tick deterministically using `stepFixed`.
     pub fn runScenario(
         self: *TestDriver,
         scenario: *const Scenario,

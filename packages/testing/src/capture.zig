@@ -67,15 +67,29 @@ pub const CaptureService = struct {
                     }
                 },
                 .rect => |rc| {
+                    if (!std.math.isFinite(rc.x) or !std.math.isFinite(rc.y) or
+                        !std.math.isFinite(rc.width) or !std.math.isFinite(rc.height))
+                    {
+                        continue;
+                    }
+                    if (rc.width <= 0.0 or rc.height <= 0.0) continue;
+
                     const r = floatToU8(rc.color.r);
                     const g = floatToU8(rc.color.g);
                     const b = floatToU8(rc.color.b);
                     const a = floatToU8(rc.color.a);
 
-                    const x0: u32 = @intFromFloat(@max(@as(f32, 0), rc.x));
-                    const y0: u32 = @intFromFloat(@max(@as(f32, 0), rc.y));
-                    const x1: u32 = @min(self.width, @as(u32, @intFromFloat(@max(@as(f32, 0), rc.x + rc.width))));
-                    const y1: u32 = @min(self.height, @as(u32, @intFromFloat(@max(@as(f32, 0), rc.y + rc.height))));
+                    const fw: f32 = @floatFromInt(self.width);
+                    const fh: f32 = @floatFromInt(self.height);
+                    const cx0 = @max(@as(f32, 0.0), @min(fw, rc.x));
+                    const cy0 = @max(@as(f32, 0.0), @min(fh, rc.y));
+                    const cx1 = @max(@as(f32, 0.0), @min(fw, rc.x + rc.width));
+                    const cy1 = @max(@as(f32, 0.0), @min(fh, rc.y + rc.height));
+
+                    const x0: u32 = @intFromFloat(cx0);
+                    const y0: u32 = @intFromFloat(cy0);
+                    const x1: u32 = @intFromFloat(cx1);
+                    const y1: u32 = @intFromFloat(cy1);
 
                     var py = y0;
                     while (py < y1) : (py += 1) {
@@ -85,6 +99,7 @@ pub const CaptureService = struct {
                         }
                     }
                 },
+                // Limited software reference rasterizer: text glyphs are not rasterized yet.
                 .text => {},
             }
         }

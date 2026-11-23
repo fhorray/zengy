@@ -188,6 +188,21 @@ pub const App = struct {
         self.diagnostics.frame_count += 1;
     }
 
+    /// Advances the application by exactly one `.fixed_update` tick deterministically.
+    pub fn tickFixed(self: *App) !void {
+        if (self.state == .created or self.state == .configured) {
+            try self.initialize();
+        }
+        if (self.state == .initialized) {
+            self.state = .running;
+        }
+        if (self.state != .running) return error.InvalidAppState;
+
+        var ctx = self.makeSystemContext(@floatCast(self.scheduler.fixed_dt));
+        try self.scheduler.stepFixedTick(&ctx);
+        self.diagnostics.frame_count += 1;
+    }
+
     /// Initializes the app and runs the main loop until `quit()` or `config.max_frames` is reached.
     pub fn run(self: *App) !void {
         try self.initialize();

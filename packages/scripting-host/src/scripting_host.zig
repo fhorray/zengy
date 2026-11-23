@@ -153,6 +153,7 @@ pub const ScriptingHost = struct {
         }
         const rt = &self.runtimes.items[runtime_idx];
         const internal_id = try rt.vtable.load(rt.state, source_name, source);
+        errdefer rt.vtable.unload(rt.state, internal_id);
 
         const mod_idx: u16 = @intCast(self.scripts.items.len);
         try self.scripts.append(self.allocator, .{

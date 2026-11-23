@@ -55,10 +55,10 @@ const ComponentPool = struct {
     dense_entities: std.ArrayList(EntityHandle),
     dense_bytes: std.array_list.Aligned(u8, .@"64"),
 
-    fn init(allocator: std.mem.Allocator, type_id: ComponentTypeId, name: []const u8, elem_size: usize) !ComponentPool {
+    fn init(allocator: std.mem.Allocator, type_id: ComponentTypeId, name: []const u8, elem_size: usize, elem_align: usize) !ComponentPool {
         const name_copy = try allocator.dupe(u8, name);
-        // Align stride to 64 bytes so components up to align(64) are safely aligned.
-        const stride = if (elem_size == 0) 0 else std.mem.alignForward(usize, elem_size, 64);
+        const safe_align = if (elem_align == 0) 1 else elem_align;
+        const stride = if (elem_size == 0) 0 else std.mem.alignForward(usize, elem_size, safe_align);
         return .{
             .type_id = type_id,
             .name = name_copy,
@@ -222,7 +222,7 @@ pub const World = struct {
         const tid = comptimeTypeId(T);
         if (self.pools.contains(tid)) return tid;
 
-        var pool = try ComponentPool.init(self.allocator, tid, @typeName(T), @sizeOf(T));
+        var pool = try ComponentPool.init(self.allocator, tid, @typeName(T), @sizeOf(T), @alignOf(T));
         errdefer pool.deinit(self.allocator);
         try self.pools.ensureUnusedCapacity(self.allocator, 1);
         try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
@@ -237,7 +237,7 @@ pub const World = struct {
         const tid = dynamicTypeId(name);
         if (self.pools.contains(tid)) return tid;
 
-        var pool = try ComponentPool.init(self.allocator, tid, name, size);
+        var pool = try ComponentPool.init(self.allocator, tid, name, size, 16);
         errdefer pool.deinit(self.allocator);
         try self.pools.ensureUnusedCapacity(self.allocator, 1);
         try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
