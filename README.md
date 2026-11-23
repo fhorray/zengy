@@ -1,6 +1,8 @@
 # Zig Modular Engine (`zigeng`)
 
-A modular, extensible 2D/3D game & application engine written in Zig (`0.17.1`) with a **minimal headless core**, capability-based `ModuleRegistry` & `ServiceRegistry`, generational ECS facade, deterministic `Scheduler`, runtime reflection, C11 ABI (`include/engine_extension.h`), embedded **Lua 5.4** & **PocketPy (Python)** scripting, and a native **SDL3 + SDL_GPU** visual runtime.
+A modular, extensible 2D/3D game & application engine written in Zig (`0.17.1`) with a **minimal headless core** (`src/core/`), capability-based `ModuleRegistry` & `ServiceRegistry`, generational ECS facade, deterministic `Scheduler`, runtime reflection, and a versioned C11 ABI (`include/engine_extension.h`).
+
+Everything above the core—including **optional** scripting providers (such as Lua 5.4 or PocketPy/Python), UI, 2D/3D rendering, and the SDL3 + SDL_GPU visual backend—is a decoupled plugin/package that you can opt into, omit, or replace with your own implementation.
 
 > **Documentation Hub:** See [docs/README.md](docs/README.md) · **Getting Started:** [docs/getting-started.md](docs/getting-started.md) · **Releasing & CI:** [docs/releasing.md](docs/releasing.md)
 
