@@ -72,6 +72,79 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     run_tests.step.dependOn(&install_c_plugin.step);
 
+    // Optional packages (Phases 5, 6, 7, 9, 10)
+    const window_mod = b.addModule("window", .{
+        .root_source_file = b.path("packages/window/src/window.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    window_mod.addImport("engine", engine_mod);
+
+    const graphics_mod = b.addModule("graphics", .{
+        .root_source_file = b.path("packages/graphics/src/graphics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    graphics_mod.addImport("engine", engine_mod);
+
+    const ui_core_mod = b.addModule("ui_core", .{
+        .root_source_file = b.path("packages/ui-core/src/ui_core.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_core_mod.addImport("engine", engine_mod);
+    ui_core_mod.addImport("graphics", graphics_mod);
+
+    const ui_markup_mod = b.addModule("ui_markup", .{
+        .root_source_file = b.path("packages/ui-markup/src/ui_markup.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_markup_mod.addImport("ui_core", ui_core_mod);
+
+    const ui_novaui_mod = b.addModule("ui_novaui", .{
+        .root_source_file = b.path("packages/ui-novaui/src/novaui.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_novaui_mod.addImport("ui_core", ui_core_mod);
+
+    const ui_immediate_mod = b.addModule("ui_immediate", .{
+        .root_source_file = b.path("packages/ui-immediate/src/ui_immediate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_immediate_mod.addImport("engine", engine_mod);
+    ui_immediate_mod.addImport("window", window_mod);
+    ui_immediate_mod.addImport("graphics", graphics_mod);
+
+    const scripting_host_mod = b.addModule("scripting_host", .{
+        .root_source_file = b.path("packages/scripting-host/src/scripting_host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scripting_host_mod.addImport("engine", engine_mod);
+
+    const pkg_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/packages_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pkg_test_mod.addImport("engine", engine_mod);
+    pkg_test_mod.addImport("window", window_mod);
+    pkg_test_mod.addImport("graphics", graphics_mod);
+    pkg_test_mod.addImport("ui_core", ui_core_mod);
+    pkg_test_mod.addImport("ui_markup", ui_markup_mod);
+    pkg_test_mod.addImport("ui_novaui", ui_novaui_mod);
+    pkg_test_mod.addImport("ui_immediate", ui_immediate_mod);
+    pkg_test_mod.addImport("scripting_host", scripting_host_mod);
+
+    const pkg_tests = b.addTest(.{
+        .root_module = pkg_test_mod,
+    });
+    const run_pkg_tests = b.addRunArtifact(pkg_tests);
+
     const test_step = b.step("test", "Run all unit, integration, and C ABI tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_pkg_tests.step);
 }
