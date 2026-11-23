@@ -374,18 +374,22 @@ pub fn Query(comptime spec: anytype) type {
         pub const Row = struct {
             query_ptr: *const Self,
             entity: EntityHandle,
+            w_dense: [write_types.len]u32,
+            r_dense: [read_types.len]u32,
 
             pub fn read(self: Row, comptime T: type) *const T {
                 inline for (read_types, 0..) |RT, idx| {
                     if (RT == T) {
-                        const bytes = self.query_ptr.read_pools[idx].?.getBytesConst(self.entity).?;
-                        return @ptrCast(@alignCast(bytes.ptr));
+                        const pool = self.query_ptr.read_pools[idx].?;
+                        const start = @as(usize, self.r_dense[idx]) * pool.stride;
+                        return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
                     }
                 }
                 inline for (write_types, 0..) |WT, idx| {
                     if (WT == T) {
-                        const bytes = self.query_ptr.write_pools[idx].?.getBytesConst(self.entity).?;
-                        return @ptrCast(@alignCast(bytes.ptr));
+                        const pool = self.query_ptr.write_pools[idx].?;
+                        const start = @as(usize, self.w_dense[idx]) * pool.stride;
+                        return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
                     }
                 }
                 @compileError("Component type not present in Query spec");
@@ -394,8 +398,9 @@ pub fn Query(comptime spec: anytype) type {
             pub fn write(self: Row, comptime T: type) *T {
                 inline for (write_types, 0..) |WT, idx| {
                     if (WT == T) {
-                        const bytes = self.query_ptr.write_pools[idx].?.getBytes(self.entity).?;
-                        return @ptrCast(@alignCast(bytes.ptr));
+                        const pool = self.query_ptr.write_pools[idx].?;
+                        const start = @as(usize, self.w_dense[idx]) * pool.stride;
+                        return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
                     }
                 }
                 @compileError("Component type not declared as write in Query spec");
@@ -454,26 +459,55 @@ pub fn Query(comptime spec: anytype) type {
             const driver = self.driver_pool orelse return null;
 
             while (self.cursor < driver.dense_entities.items.len) {
+                const driver_dense: u32 = @intCast(self.cursor);
                 const entity = driver.dense_entities.items[self.cursor];
                 self.cursor += 1;
 
+                var w_dense: [write_types.len]u32 = undefined;
+                var r_dense: [read_types.len]u32 = undefined;
                 var matches = true;
+
                 inline for (0..write_types.len) |idx| {
-                    if (!self.write_pools[idx].?.has(entity)) {
+                    const pool = self.write_pools[idx].?;
+                    if (pool == driver) {
+                        w_dense[idx] = driver_dense;
+                    } else if (entity.index < pool.sparse.items.len) {
+                        const d = pool.sparse.items[entity.index];
+                        if (d == ABSENT_INDEX or pool.dense_entities.items[d].generation != entity.generation) {
+                            matches = false;
+                            break;
+                        }
+                        w_dense[idx] = d;
+                    } else {
                         matches = false;
                         break;
                     }
                 }
                 if (matches) {
                     inline for (0..read_types.len) |idx| {
-                        if (!self.read_pools[idx].?.has(entity)) {
+                        const pool = self.read_pools[idx].?;
+                        if (pool == driver) {
+                            r_dense[idx] = driver_dense;
+                        } else if (entity.index < pool.sparse.items.len) {
+                            const d = pool.sparse.items[entity.index];
+                            if (d == ABSENT_INDEX or pool.dense_entities.items[d].generation != entity.generation) {
+                                matches = false;
+                                break;
+                            }
+                            r_dense[idx] = d;
+                        } else {
                             matches = false;
                             break;
                         }
                     }
                 }
                 if (matches) {
-                    return .{ .query_ptr = self, .entity = entity };
+                    return .{
+                        .query_ptr = self,
+                        .entity = entity,
+                        .w_dense = w_dense,
+                        .r_dense = r_dense,
+                    };
                 }
             }
             return null;
