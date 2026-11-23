@@ -27,8 +27,12 @@ test "Phase 3: Load real compiled C shared library plugin and validate ABI rejec
 
     const host = try app.ensurePluginHost();
 
-    // Load compiled C plugin from zig-out/lib/libc_plugin.so
-    const handle = try host.loadSharedLibrary("zig-out/lib/libc_plugin.so");
+    // Load compiled C plugin. Windows installs DLLs to zig-out/bin; ELF shared objects go to zig-out/lib.
+    const plugin_path = if (@import("builtin").os.tag == .windows)
+        "zig-out/bin/c_plugin.dll"
+    else
+        "zig-out/lib/libc_plugin.so";
+    const handle = try host.loadSharedLibrary(plugin_path);
     try testing.expectEqual(engine.abi.AEStatus.ok, host.startPlugin(handle));
 
     // Verify C plugin logged through AEHostApi.log into Diagnostics
