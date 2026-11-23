@@ -53,6 +53,8 @@ jobs:
           STAGE="dist/zigeng-${TAG}-x86_64-windows"
           mkdir -p "$STAGE/include"
           cp zig-out/bin/*.exe "$STAGE/"
+          curl -sL "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20-win32-x64.zip" -o /tmp/sdl3.zip
+          unzip -j -o /tmp/sdl3.zip "SDL3.dll" -d "$STAGE/"
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
           (cd dist && zip -r "zigeng-${TAG}-x86_64-windows.zip" "zigeng-${TAG}-x86_64-windows")
