@@ -11,6 +11,7 @@
 //! mode = "2d"
 //! entry_script = "scripts/main.py"
 //! ui = "ui/hud.html"
+//! plugins = ["scene", "physics", "physics-jolt"]
 //! ```
 
 const std = @import("std");
@@ -19,6 +20,9 @@ const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
 const graphics_sdlgpu = @import("graphics_sdlgpu");
+const scene = @import("scene");
+const physics = @import("physics");
+const physics_jolt = @import("physics_jolt");
 const ui_core = @import("ui_core");
 const ui_markup = @import("ui_markup");
 const scripting_host = @import("scripting_host");
@@ -149,6 +153,34 @@ pub fn main(init: std.process.Init) !void {
     try app.registerModule(scripting_host.module());
     try app.registerModule(scripting_lua.module());
     try app.registerModule(scripting_python.module());
+
+    var has_scene = false;
+    var has_physics = false;
+    var has_physics_jolt = false;
+    for (manifest.plugins) |plugin_name| {
+        if (std.mem.eql(u8, plugin_name, "scene")) {
+            if (!has_scene) {
+                try app.registerModule(scene.module());
+                has_scene = true;
+            }
+        } else if (std.mem.eql(u8, plugin_name, "physics")) {
+            if (!has_physics) {
+                try app.registerModule(physics.module());
+                has_physics = true;
+            }
+        } else if (std.mem.eql(u8, plugin_name, "physics-jolt")) {
+            if (!has_physics) {
+                try app.registerModule(physics.module());
+                has_physics = true;
+            }
+            if (!has_physics_jolt) {
+                try app.registerModule(physics_jolt.module());
+                has_physics_jolt = true;
+            }
+        } else {
+            std.debug.print("[zigeng-runtime] unknown plugin in game.toml: '{s}'\n", .{plugin_name});
+        }
+    }
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
         .title = title,

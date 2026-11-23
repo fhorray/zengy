@@ -134,6 +134,13 @@ pub fn build(b: *std.Build) void {
     });
     scene_mod.addImport("engine", engine_mod);
 
+    const physics_mod = b.addModule("physics", .{
+        .root_source_file = b.path("packages/physics/src/physics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    physics_mod.addImport("engine", engine_mod);
+
     const editor_shell_mod = b.addModule("editor_shell", .{
         .root_source_file = b.path("packages/editor-shell/src/editor_shell.zig"),
         .target = target,
@@ -151,6 +158,181 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const yyjson_dep = b.dependency("yyjson", .{});
+    const jolt_dep = b.dependency("jolt", .{});
+
+    const jolt_c_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    jolt_c_mod.addIncludePath(jolt_dep.path("."));
+    jolt_c_mod.addIncludePath(b.path("packages/physics-jolt/src"));
+    const jolt_cpp_flags: []const []const u8 = &.{
+        "-std=c++17",
+        "-DJPH_OBJECT_STREAM",
+        "-fno-sanitize=undefined",
+    };
+    jolt_c_mod.addCSourceFile(.{
+        .file = b.path("packages/physics-jolt/src/jolt_c_api.cpp"),
+        .flags = jolt_cpp_flags,
+    });
+    jolt_c_mod.addCSourceFiles(.{
+        .root = jolt_dep.path("Jolt"),
+        .files = &.{
+            "AABBTree/AABBTreeBuilder.cpp",
+            "Compute/ComputeSystem.cpp",
+            "Compute/CPU/ComputeBufferCPU.cpp",
+            "Compute/CPU/ComputeQueueCPU.cpp",
+            "Compute/CPU/ComputeSystemCPU.cpp",
+            "Core/Color.cpp",
+            "Core/Factory.cpp",
+            "Core/IssueReporting.cpp",
+            "Core/JobSystemSingleThreaded.cpp",
+            "Core/JobSystemThreadPool.cpp",
+            "Core/JobSystemWithBarrier.cpp",
+            "Core/LinearCurve.cpp",
+            "Core/Memory.cpp",
+            "Core/Profiler.cpp",
+            "Core/RTTI.cpp",
+            "Core/Semaphore.cpp",
+            "Core/StringTools.cpp",
+            "Core/TickCounter.cpp",
+            "Geometry/ConvexHullBuilder2D.cpp",
+            "Geometry/ConvexHullBuilder.cpp",
+            "Geometry/Indexify.cpp",
+            "Geometry/OrientedBox.cpp",
+            "Math/Vec3.cpp",
+            "ObjectStream/ObjectStreamBinaryIn.cpp",
+            "ObjectStream/ObjectStreamBinaryOut.cpp",
+            "ObjectStream/ObjectStream.cpp",
+            "ObjectStream/ObjectStreamIn.cpp",
+            "ObjectStream/ObjectStreamOut.cpp",
+            "ObjectStream/ObjectStreamTextIn.cpp",
+            "ObjectStream/ObjectStreamTextOut.cpp",
+            "ObjectStream/SerializableObject.cpp",
+            "ObjectStream/TypeDeclarations.cpp",
+            "Physics/Body/Body.cpp",
+            "Physics/Body/BodyCreationSettings.cpp",
+            "Physics/Body/BodyInterface.cpp",
+            "Physics/Body/BodyManager.cpp",
+            "Physics/Body/MassProperties.cpp",
+            "Physics/Body/MotionProperties.cpp",
+            "Physics/Character/CharacterBase.cpp",
+            "Physics/Character/Character.cpp",
+            "Physics/Character/CharacterVirtual.cpp",
+            "Physics/Collision/BroadPhase/BroadPhaseBruteForce.cpp",
+            "Physics/Collision/BroadPhase/BroadPhase.cpp",
+            "Physics/Collision/BroadPhase/BroadPhaseQuadTree.cpp",
+            "Physics/Collision/BroadPhase/QuadTree.cpp",
+            "Physics/Collision/CastConvexVsTriangles.cpp",
+            "Physics/Collision/CastSphereVsTriangles.cpp",
+            "Physics/Collision/CollideConvexVsTriangles.cpp",
+            "Physics/Collision/CollideSphereVsTriangles.cpp",
+            "Physics/Collision/CollisionDispatch.cpp",
+            "Physics/Collision/CollisionGroup.cpp",
+            "Physics/Collision/EstimateCollisionResponse.cpp",
+            "Physics/Collision/GroupFilter.cpp",
+            "Physics/Collision/GroupFilterTable.cpp",
+            "Physics/Collision/ManifoldBetweenTwoFaces.cpp",
+            "Physics/Collision/NarrowPhaseQuery.cpp",
+            "Physics/Collision/NarrowPhaseStats.cpp",
+            "Physics/Collision/PhysicsMaterial.cpp",
+            "Physics/Collision/PhysicsMaterialSimple.cpp",
+            "Physics/Collision/Shape/BoxShape.cpp",
+            "Physics/Collision/Shape/CapsuleShape.cpp",
+            "Physics/Collision/Shape/CompoundShape.cpp",
+            "Physics/Collision/Shape/ConvexHullShape.cpp",
+            "Physics/Collision/Shape/ConvexShape.cpp",
+            "Physics/Collision/Shape/CylinderShape.cpp",
+            "Physics/Collision/Shape/DecoratedShape.cpp",
+            "Physics/Collision/Shape/EmptyShape.cpp",
+            "Physics/Collision/Shape/HeightFieldShape.cpp",
+            "Physics/Collision/Shape/MeshShape.cpp",
+            "Physics/Collision/Shape/MutableCompoundShape.cpp",
+            "Physics/Collision/Shape/OffsetCenterOfMassShape.cpp",
+            "Physics/Collision/Shape/PlaneShape.cpp",
+            "Physics/Collision/Shape/RotatedTranslatedShape.cpp",
+            "Physics/Collision/Shape/ScaledShape.cpp",
+            "Physics/Collision/Shape/Shape.cpp",
+            "Physics/Collision/Shape/SphereShape.cpp",
+            "Physics/Collision/Shape/StaticCompoundShape.cpp",
+            "Physics/Collision/Shape/TaperedCapsuleShape.cpp",
+            "Physics/Collision/Shape/TaperedCylinderShape.cpp",
+            "Physics/Collision/Shape/TriangleShape.cpp",
+            "Physics/Collision/TransformedShape.cpp",
+            "Physics/Constraints/ConeConstraint.cpp",
+            "Physics/Constraints/Constraint.cpp",
+            "Physics/Constraints/ConstraintManager.cpp",
+            "Physics/Constraints/ContactConstraintManager.cpp",
+            "Physics/Constraints/DistanceConstraint.cpp",
+            "Physics/Constraints/FixedConstraint.cpp",
+            "Physics/Constraints/GearConstraint.cpp",
+            "Physics/Constraints/HingeConstraint.cpp",
+            "Physics/Constraints/MotorSettings.cpp",
+            "Physics/Constraints/PathConstraint.cpp",
+            "Physics/Constraints/PathConstraintPath.cpp",
+            "Physics/Constraints/PathConstraintPathHermite.cpp",
+            "Physics/Constraints/PointConstraint.cpp",
+            "Physics/Constraints/PulleyConstraint.cpp",
+            "Physics/Constraints/RackAndPinionConstraint.cpp",
+            "Physics/Constraints/SixDOFConstraint.cpp",
+            "Physics/Constraints/SliderConstraint.cpp",
+            "Physics/Constraints/SpringSettings.cpp",
+            "Physics/Constraints/SwingTwistConstraint.cpp",
+            "Physics/Constraints/TwoBodyConstraint.cpp",
+            "Physics/DeterminismLog.cpp",
+            "Physics/IslandBuilder.cpp",
+            "Physics/LargeIslandSplitter.cpp",
+            "Physics/PhysicsScene.cpp",
+            "Physics/PhysicsSystem.cpp",
+            "Physics/PhysicsUpdateContext.cpp",
+            "Physics/Ragdoll/Ragdoll.cpp",
+            "Physics/SoftBody/SoftBodyCreationSettings.cpp",
+            "Physics/SoftBody/SoftBodyMotionProperties.cpp",
+            "Physics/SoftBody/SoftBodyShape.cpp",
+            "Physics/SoftBody/SoftBodySharedSettings.cpp",
+            "Physics/StateRecorderImpl.cpp",
+            "Physics/Vehicle/MotorcycleController.cpp",
+            "Physics/Vehicle/TrackedVehicleController.cpp",
+            "Physics/Vehicle/VehicleAntiRollBar.cpp",
+            "Physics/Vehicle/VehicleCollisionTester.cpp",
+            "Physics/Vehicle/VehicleConstraint.cpp",
+            "Physics/Vehicle/VehicleController.cpp",
+            "Physics/Vehicle/VehicleDifferential.cpp",
+            "Physics/Vehicle/VehicleEngine.cpp",
+            "Physics/Vehicle/VehicleTrack.cpp",
+            "Physics/Vehicle/VehicleTransmission.cpp",
+            "Physics/Vehicle/Wheel.cpp",
+            "Physics/Vehicle/WheeledVehicleController.cpp",
+            "RegisterTypes.cpp",
+            "Skeleton/SkeletalAnimation.cpp",
+            "Skeleton/Skeleton.cpp",
+            "Skeleton/SkeletonMapper.cpp",
+            "Skeleton/SkeletonPose.cpp",
+            "TriangleSplitter/TriangleSplitterBinning.cpp",
+            "TriangleSplitter/TriangleSplitter.cpp",
+            "TriangleSplitter/TriangleSplitterMean.cpp",
+        },
+        .flags = jolt_cpp_flags,
+    });
+    const jolt_c_lib = b.addLibrary(.{
+        .name = "jolt_c",
+        .linkage = .static,
+        .root_module = jolt_c_mod,
+    });
+
+    const physics_jolt_mod = b.addModule("physics_jolt", .{
+        .root_source_file = b.path("packages/physics-jolt/src/physics_jolt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    physics_jolt_mod.addImport("engine", engine_mod);
+    physics_jolt_mod.addImport("physics", physics_mod);
+    physics_jolt_mod.addIncludePath(b.path("packages/physics-jolt/src"));
+    physics_jolt_mod.linkLibrary(jolt_c_lib);
 
     const translate_yyjson = b.addTranslateC(.{
         .root_source_file = yyjson_dep.path("src/yyjson.h"),
@@ -609,6 +791,9 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("scripting_python", scripting_python_mod);
     runtime_mod.addImport("scripting_lua", scripting_lua_mod);
     runtime_mod.addImport("toml_format", toml_format_mod);
+    runtime_mod.addImport("scene", scene_mod);
+    runtime_mod.addImport("physics", physics_mod);
+    runtime_mod.addImport("physics_jolt", physics_jolt_mod);
 
     const runtime_exe = b.addExecutable(.{
         .name = "zigeng-runtime",
@@ -790,5 +975,16 @@ pub fn build(b: *std.Build) void {
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "scene", .mod = scene_mod },
         .{ .name = "render_2d", .mod = render_2d_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/physics/tests/physics_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "physics", .mod = physics_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/physics-jolt/tests/physics_jolt_tests.zig", target, optimize, true, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "physics", .mod = physics_mod },
+        .{ .name = "physics_jolt", .mod = physics_jolt_mod },
     }, null);
 }

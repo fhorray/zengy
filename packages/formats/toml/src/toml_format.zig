@@ -87,12 +87,15 @@ pub const TomlService = struct {
         mode: []const u8,
         entry_script: []const u8,
         ui: []const u8,
+        plugins: []const []const u8 = &.{},
 
         pub fn deinit(self: *GameManifest, allocator: std.mem.Allocator) void {
             allocator.free(self.title);
             allocator.free(self.mode);
             allocator.free(self.entry_script);
             allocator.free(self.ui);
+            for (self.plugins) |p| allocator.free(p);
+            if (self.plugins.len > 0) allocator.free(self.plugins);
         }
     };
 
@@ -115,6 +118,21 @@ pub const TomlService = struct {
         const w: u32 = if (tbl.get("width")) |v| (if (v == .integer and v.integer.value > 0) @intCast(v.integer.value) else 1280) else 1280;
         const h: u32 = if (tbl.get("height")) |v| (if (v == .integer and v.integer.value > 0) @intCast(v.integer.value) else 720) else 720;
 
+        var plugins_list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (plugins_list.items) |p| allocator.free(p);
+            plugins_list.deinit(allocator);
+        }
+        if (tbl.get("plugins")) |pv| {
+            if (pv == .array) {
+                for (pv.array.items) |item| {
+                    if (item == .string) {
+                        try plugins_list.append(allocator, try allocator.dupe(u8, item.string));
+                    }
+                }
+            }
+        }
+
         const title_copy = try allocator.dupe(u8, title_s);
         errdefer allocator.free(title_copy);
         const mode_copy = try allocator.dupe(u8, mode_s);
@@ -122,6 +140,7 @@ pub const TomlService = struct {
         const script_copy = try allocator.dupe(u8, script_s);
         errdefer allocator.free(script_copy);
         const ui_copy = try allocator.dupe(u8, ui_s);
+        errdefer allocator.free(ui_copy);
 
         return .{
             .title = title_copy,
@@ -130,6 +149,7 @@ pub const TomlService = struct {
             .mode = mode_copy,
             .entry_script = script_copy,
             .ui = ui_copy,
+            .plugins = try plugins_list.toOwnedSlice(allocator),
         };
     }
 };
