@@ -104,6 +104,18 @@ When you are ready to add graphics, simply register the optional modules you wan
 | **C / Native Plugins** | `include/engine_extension.h` | Load `.dll` / `.so` / `.dylib` plugins dynamically at runtime |
 | **Automated Testing** | `testing` + `engine-cli` | Deterministic TOML scenarios & offscreen framebuffer capture |
 
+### Installing Official Packages with `engine-cli`
+
+If you want local copies of official packages inside your project's `./packages/` folder (alongside any required `third_party/` headers/libs), use `engine-cli` (included in GitHub Releases):
+
+```bash
+# List all official packages
+engine-cli list-official
+
+# Download a specific package (e.g. render-2d, scripting-python, window-sdl3) into ./packages/
+engine-cli add scripting-python
+```
+
 ---
 
 ## Documentation & Next Steps
