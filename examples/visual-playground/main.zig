@@ -134,15 +134,17 @@ fn updatePlaygroundSystem(ctx: *engine.SystemContext) !void {
         if (st.input.isKeyDown(22) or st.input.isKeyDown(81)) cam.y += pan_speed;
     }
 
-    // Animate all spawned sprites.
-    var q = try ctx.query(.{ .read = .{SpawnedSprite}, .write = .{scene.Transform2D} });
-    defer q.deinit();
-    while (q.next()) |row| {
-        const sp = row.read(SpawnedSprite);
-        const t = row.write(scene.Transform2D);
-        t.rotation_rad += ctx.dt * sp.spin_speed;
-        t.x = sp.base_x + @cos(st.elapsed * sp.orbit_speed + sp.phase) * sp.orbit_radius;
-        t.y = sp.base_y + @sin(st.elapsed * sp.orbit_speed + sp.phase) * sp.orbit_radius;
+    // Animate all spawned sprites (scoped so active_queries == 0 before any spawn).
+    {
+        var q = try ctx.query(.{ .read = .{SpawnedSprite}, .write = .{scene.Transform2D} });
+        defer q.deinit();
+        while (q.next()) |row| {
+            const sp = row.read(SpawnedSprite);
+            const t = row.write(scene.Transform2D);
+            t.rotation_rad += ctx.dt * sp.spin_speed;
+            t.x = sp.base_x + @cos(st.elapsed * sp.orbit_speed + sp.phase) * sp.orbit_radius;
+            t.y = sp.base_y + @sin(st.elapsed * sp.orbit_speed + sp.phase) * sp.orbit_radius;
+        }
     }
 
     // Layout UI in logical coordinates.
@@ -314,6 +316,7 @@ pub fn main() !void {
         .cmds = .empty,
     });
     const st_ptr = app.resources.get(PlaygroundState).?;
+    defer st_ptr.cmds.deinit(allocator);
     _ = try app.events.subscribe(9002, "ui.action", onUiAction, st_ptr);
 
     // Seed 2 initial sprites.
@@ -321,8 +324,5 @@ pub fn main() !void {
     try spawnPlaygroundSprite(st_ptr, 220.0, 60.0);
 
     try window_sdl3.runVisualLoop(&app);
-    if (app.resources.get(PlaygroundState)) |st| {
-        st.cmds.deinit(allocator);
-    }
     std.debug.print("[visual-playground] closed after {d} frames\n", .{app.diagnostics.frame_count});
 }

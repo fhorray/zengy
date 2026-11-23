@@ -166,11 +166,9 @@ pub fn main() !void {
         .status_idx = tree.findById("status"),
     });
     const st_ptr = app.resources.get(UiDemoState).?;
+    defer st_ptr.cmds.deinit(allocator);
     _ = try app.events.subscribe(9001, "ui.action", onUiAction, st_ptr);
 
     try window_sdl3.runVisualLoop(&app);
-    if (app.resources.get(UiDemoState)) |st| {
-        st.cmds.deinit(allocator);
-    }
     std.debug.print("[visual-ui] closed after {d} frames\n", .{app.diagnostics.frame_count});
 }
