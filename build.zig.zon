@@ -1,0 +1,17 @@
+.{
+    .name = .zigeng,
+    .version = "0.1.0",
+    .fingerprint = 0x4f1cee9bb6b8157b,
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "include",
+        "src",
+        "examples",
+        "tests",
+        "LICENSE",
+        "README.md",
+    },
+}

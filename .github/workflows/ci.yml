@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Build & Test (${{ matrix.optimize }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        optimize: [ Debug, ReleaseSafe ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Run unit, integration, and ABI tests
+        run: zig build test -Doptimize=${{ matrix.optimize }}
+      - name: Run headless ECS example
+        run: zig build run-headless -Doptimize=${{ matrix.optimize }}
