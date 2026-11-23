@@ -200,6 +200,62 @@ pub fn build(b: *std.Build) void {
     testing_sdk_mod.addImport("ui_core", ui_core_mod);
     testing_sdk_mod.addImport("toml_format", toml_format_mod);
 
+    const lua_c_dep = b.dependency("lua_c", .{});
+    const translate_lua = b.addTranslateC(.{
+        .root_source_file = b.path("packages/scripting-lua/src/lua_bundle.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_lua.addIncludePath(lua_c_dep.path("."));
+    const lua_c_mod = translate_lua.createModule();
+    lua_c_mod.addIncludePath(lua_c_dep.path("."));
+    lua_c_mod.addCSourceFiles(.{
+        .root = lua_c_dep.path("."),
+        .files = &.{
+            "lapi.c",     "lauxlib.c", "lbaselib.c", "lcode.c",   "lcorolib.c",
+            "lctype.c",   "ldblib.c",  "ldebug.c",   "ldo.c",     "ldump.c",
+            "lfunc.c",    "lgc.c",     "linit.c",    "liolib.c",  "llex.c",
+            "lmathlib.c", "lmem.c",    "loadlib.c",  "lobject.c", "lopcodes.c",
+            "loslib.c",   "lparser.c", "lstate.c",   "lstring.c", "lstrlib.c",
+            "ltable.c",   "ltablib.c", "ltm.c",      "lundump.c", "lutf8lib.c",
+            "lvm.c",      "lzio.c",
+        },
+        .flags = &.{"-std=c99"},
+    });
+
+    const scripting_lua_mod = b.addModule("scripting_lua", .{
+        .root_source_file = b.path("packages/scripting-lua/src/scripting_lua.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    scripting_lua_mod.addImport("engine", engine_mod);
+    scripting_lua_mod.addImport("scripting_host", scripting_host_mod);
+    scripting_lua_mod.addImport("lua_c", lua_c_mod);
+
+    const scripting_python_mod = b.addModule("scripting_python", .{
+        .root_source_file = b.path("packages/scripting-python/src/scripting_python.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scripting_python_mod.addImport("engine", engine_mod);
+    scripting_python_mod.addImport("scripting_host", scripting_host_mod);
+
+    const default_plugins_mod = b.addModule("default_plugins", .{
+        .root_source_file = b.path("packages/default-plugins/src/default_plugins.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    default_plugins_mod.addImport("engine", engine_mod);
+    default_plugins_mod.addImport("window", window_mod);
+    default_plugins_mod.addImport("graphics", graphics_mod);
+    default_plugins_mod.addImport("ui_core", ui_core_mod);
+    default_plugins_mod.addImport("assets", assets_mod);
+    default_plugins_mod.addImport("scene", scene_mod);
+    default_plugins_mod.addImport("scripting_host", scripting_host_mod);
+    default_plugins_mod.addImport("toml_format", toml_format_mod);
+    default_plugins_mod.addImport("json_format", json_format_mod);
+
     const render_3d_mod = b.addModule("render_3d", .{
         .root_source_file = b.path("packages/render-3d/src/render_3d.zig"),
         .target = target,
@@ -406,5 +462,18 @@ pub fn build(b: *std.Build) void {
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "ui_core", .mod = ui_core_mod },
         .{ .name = "testing_sdk", .mod = testing_sdk_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/scripting-lua/tests/scripting_lua_tests.zig", target, optimize, true, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "scripting_host", .mod = scripting_host_mod },
+        .{ .name = "scripting_lua", .mod = scripting_lua_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/scripting-python/tests/scripting_python_tests.zig", target, optimize, true, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "scripting_host", .mod = scripting_host_mod },
+        .{ .name = "scripting_lua", .mod = scripting_lua_mod },
+        .{ .name = "scripting_python", .mod = scripting_python_mod },
     }, null);
 }

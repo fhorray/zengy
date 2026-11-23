@@ -16,6 +16,10 @@
             .url = "git+https://github.com/ibireme/yyjson#be9bd74bb3c96e00006c2075c330a6b8b90123dc",
             .hash = "N-V-__8AAJsIbwD0xnA1FiI2YEmbcx30OjSxx8mr3F_6vf_N",
         },
+        .lua_c = .{
+            .url = "git+https://github.com/lua/lua?ref=v5.4.7#1ab3208a1fceb12fca8f24ba57d6e13c5bff15e3",
+            .hash = "N-V-__8AAA2SGQDIowqfBdNuGGJ03b-aevlPIR3TaFV3knJ9",
+        },
     },
     .paths = .{
         "build.zig",
