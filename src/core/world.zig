@@ -222,12 +222,14 @@ pub const World = struct {
         const tid = comptimeTypeId(T);
         if (self.pools.contains(tid)) return tid;
 
-        const pool = try ComponentPool.init(self.allocator, tid, @typeName(T), @sizeOf(T));
-        try self.pools.put(self.allocator, tid, pool);
-
+        var pool = try ComponentPool.init(self.allocator, tid, @typeName(T), @sizeOf(T));
+        errdefer pool.deinit(self.allocator);
+        try self.pools.ensureUnusedCapacity(self.allocator, 1);
+        try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
         const key_copy = try self.allocator.dupe(u8, @typeName(T));
-        errdefer self.allocator.free(key_copy);
-        try self.name_to_type.put(self.allocator, key_copy, tid);
+
+        self.pools.putAssumeCapacity(tid, pool);
+        self.name_to_type.putAssumeCapacity(key_copy, tid);
         return tid;
     }
 
@@ -235,12 +237,14 @@ pub const World = struct {
         const tid = dynamicTypeId(name);
         if (self.pools.contains(tid)) return tid;
 
-        const pool = try ComponentPool.init(self.allocator, tid, name, size);
-        try self.pools.put(self.allocator, tid, pool);
-
+        var pool = try ComponentPool.init(self.allocator, tid, name, size);
+        errdefer pool.deinit(self.allocator);
+        try self.pools.ensureUnusedCapacity(self.allocator, 1);
+        try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
         const key_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(key_copy);
-        try self.name_to_type.put(self.allocator, key_copy, tid);
+
+        self.pools.putAssumeCapacity(tid, pool);
+        self.name_to_type.putAssumeCapacity(key_copy, tid);
         return tid;
     }
 

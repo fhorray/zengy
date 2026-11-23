@@ -49,7 +49,9 @@ pub const EventBus = struct {
     allocator: std.mem.Allocator,
     max_queue_len: usize,
     overflow_policy: OverflowPolicy,
-    queue: std.ArrayList(QueuedEvent),
+    queue: []QueuedEvent,
+    queue_head: usize,
+    queue_len: usize,
     subscriptions: std.ArrayList(Subscription),
     next_sub_id: SubscriptionId,
     dispatch_depth: u32,
@@ -58,11 +60,15 @@ pub const EventBus = struct {
     total_drained: u64,
 
     pub fn init(allocator: std.mem.Allocator, max_queue_len: usize, overflow_policy: OverflowPolicy) EventBus {
+        const cap = if (max_queue_len == 0) 1 else max_queue_len;
+        const ring: []QueuedEvent = allocator.alloc(QueuedEvent, cap) catch &[_]QueuedEvent{};
         return .{
             .allocator = allocator,
-            .max_queue_len = if (max_queue_len == 0) 1 else max_queue_len,
+            .max_queue_len = if (ring.len == 0) 0 else cap,
             .overflow_policy = overflow_policy,
-            .queue = .empty,
+            .queue = ring,
+            .queue_head = 0,
+            .queue_len = 0,
             .subscriptions = .empty,
             .next_sub_id = 1,
             .dispatch_depth = 0,
@@ -73,11 +79,14 @@ pub const EventBus = struct {
     }
 
     pub fn deinit(self: *EventBus) void {
-        for (self.queue.items) |ev| {
-            self.allocator.free(ev.name);
-            self.allocator.free(ev.payload);
+        for (0..self.queue_len) |i| {
+            const idx = (self.queue_head + i) % self.queue.len;
+            self.allocator.free(self.queue[idx].name);
+            self.allocator.free(self.queue[idx].payload);
         }
-        self.queue.deinit(self.allocator);
+        if (self.queue.len > 0) {
+            self.allocator.free(self.queue);
+        }
 
         for (self.subscriptions.items) |sub| {
             self.allocator.free(sub.event_name);
@@ -163,15 +172,21 @@ pub const EventBus = struct {
 
     pub fn post(self: *EventBus, envelope: EventEnvelope) !void {
         self.total_posted += 1;
+        if (self.queue.len == 0) {
+            self.dropped_events += 1;
+            return;
+        }
 
-        if (self.queue.items.len >= self.max_queue_len) {
+        if (self.queue_len >= self.queue.len) {
             self.dropped_events += 1;
             switch (self.overflow_policy) {
                 .drop_newest => return,
                 .drop_oldest => {
-                    const oldest = self.queue.orderedRemove(0);
+                    const oldest = self.queue[self.queue_head];
                     self.allocator.free(oldest.name);
                     self.allocator.free(oldest.payload);
+                    self.queue_head = (self.queue_head + 1) % self.queue.len;
+                    self.queue_len -= 1;
                 },
             }
         }
@@ -181,28 +196,19 @@ pub const EventBus = struct {
         const payload_copy = try self.allocator.dupe(u8, envelope.payload);
         errdefer self.allocator.free(payload_copy);
 
-        try self.queue.append(self.allocator, .{
+        const tail = (self.queue_head + self.queue_len) % self.queue.len;
+        self.queue[tail] = .{
             .name = name_copy,
             .payload = payload_copy,
             .world_id = envelope.world_id,
             .entity_handle = envelope.entity_handle,
-        });
+        };
+        self.queue_len += 1;
     }
 
     pub fn drain(self: *EventBus) usize {
-        const count = self.queue.items.len;
+        const count = self.queue_len;
         if (count == 0) return 0;
-
-        // Snapshot current queue so callbacks posting new events do not invalidate iteration.
-        var batch = self.queue;
-        self.queue = .empty;
-        defer {
-            for (batch.items) |ev| {
-                self.allocator.free(ev.name);
-                self.allocator.free(ev.payload);
-            }
-            batch.deinit(self.allocator);
-        }
 
         self.dispatch_depth += 1;
         defer {
@@ -212,15 +218,21 @@ pub const EventBus = struct {
             }
         }
 
-        for (batch.items) |ev| {
+        for (0..count) |_| {
+            const ev = self.queue[self.queue_head];
+            self.queue_head = (self.queue_head + 1) % self.queue.len;
+            self.queue_len -= 1;
+            defer {
+                self.allocator.free(ev.name);
+                self.allocator.free(ev.payload);
+            }
+
             const env = EventEnvelope{
                 .name = ev.name,
                 .payload = ev.payload,
                 .world_id = ev.world_id,
                 .entity_handle = ev.entity_handle,
             };
-            // Snapshot subscriber count so callbacks subscribing new handlers do not
-            // invalidate indices or execute on the current event mid-loop.
             const sub_len = self.subscriptions.items.len;
             for (0..sub_len) |idx| {
                 const sub = self.subscriptions.items[idx];
@@ -235,7 +247,7 @@ pub const EventBus = struct {
     }
 
     pub fn pendingCount(self: *const EventBus) usize {
-        return self.queue.items.len;
+        return self.queue_len;
     }
 
     pub fn subscriptionCount(self: *const EventBus) usize {

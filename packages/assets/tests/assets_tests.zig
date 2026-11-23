@@ -49,3 +49,28 @@ test "AssetService importer priority, caching, reload, and stale handle rejectio
     try testing.expect(svc.unload(h1));
     try testing.expect(svc.getBytes(h1) == null);
 }
+
+test "AssetService unregisters owned importers cleanly on module unload" {
+    const DummyImp = struct {
+        fn importFn(allocator: std.mem.Allocator, _: []const u8, raw: []const u8) !assets.AssetArtifact {
+            return .{ .kind = try allocator.dupe(u8, "raw"), .bytes = try allocator.dupe(u8, raw) };
+        }
+    };
+
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(assets.module());
+    try app.initialize();
+
+    const svc = app.resources.get(assets.AssetService).?;
+    try svc.registerImporter(.{
+        .id = "plugin.custom",
+        .extension = ".custom",
+        .owner_id = 777,
+        .import_fn = DummyImp.importFn,
+    });
+    try testing.expect(svc.resolveImporter("project://a.custom") != null);
+
+    try testing.expectEqual(@as(usize, 1), svc.unregisterImportersByOwner(777));
+    try testing.expect(svc.resolveImporter("project://a.custom") == null);
+}

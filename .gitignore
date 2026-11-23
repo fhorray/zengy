@@ -6,3 +6,4 @@ zig-out/
 *.dll
 *.a
 .DS_Store
+zig-pkg/

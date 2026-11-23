@@ -396,3 +396,37 @@ test "ZE-006: ComponentPool preserves align(64) across reallocations" {
         try testing.expectEqual(@as(u64, i), ptr.value);
     }
 }
+
+test "EventBus O(1) ring buffer drop_oldest preserves newest events across wrap-around" {
+    var bus = engine.EventBus.init(testing.allocator, 3, .drop_oldest);
+    defer bus.deinit();
+
+    const Recorder = struct {
+        sum: usize = 0,
+        fn onEv(raw: ?*anyopaque, ev: engine.EventEnvelope) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.sum += ev.entity_handle;
+        }
+    };
+    var rec = Recorder{};
+    _ = try bus.subscribe(1, "num", Recorder.onEv, &rec);
+
+    // Post 5 events into a capacity-3 ring: 1 and 2 are evicted; 3, 4, 5 remain.
+    for (1..6) |i| {
+        try bus.post(.{ .name = "num", .payload = "", .entity_handle = i });
+    }
+    try testing.expectEqual(@as(u64, 2), bus.dropped_events);
+    try testing.expectEqual(@as(usize, 3), bus.pendingCount());
+
+    _ = bus.drain();
+    try testing.expectEqual(@as(usize, 3 + 4 + 5), rec.sum);
+}
+
+test "World.registerDynamicComponent rolls back cleanly on OOM" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
+    var world = engine.World.init(failing.allocator(), .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+
+    try testing.expectError(error.OutOfMemory, world.registerDynamicComponent("test.FailComp", 16));
+    try testing.expectEqual(@as(usize, 0), world.pools.count());
+}
