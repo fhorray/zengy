@@ -6,6 +6,7 @@ Welcome to the `zigeng` documentation. This engine is built around a **minimal h
 
 - **Guides & Workflows**
   - [Getting Started](getting-started.md) — setup, first app, and running headless/visual examples
+  - [AI Agent Test Project Guide](ai-test-project-guide.md) — standalone test project with modules + PocketPy scripting
   - [Releasing, CI/CD & Distribution](releasing.md) — merging to `main`, tagging releases, and `engine-cli` scope
   - [Package Catalog](../packages/README.md) — all optional packages, including [PocketPy Python](../packages/scripting-python/README.md), [SDL_GPU](../packages/graphics-sdlgpu/README.md), [2D](../packages/render-2d/README.md), and [3D](../packages/render-3d/README.md)
 - **API Reference**
