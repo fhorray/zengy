@@ -1,0 +1,303 @@
+# Changelog
+
+All notable changes are documented here, following Keep a Changelog 1.1.0.
+
+## [Unreleased]
+
+### Breaking
+
+One release of the breaking cleanups an independent review (2026-10-28) asked for, so the family's wave cars adopt them once.
+
+- `own.Lent`, `Owned.Lending` and `Owned.lend()` are gone: lending is `borrow()`, the one way. A payload released through `*T` is lent as `*const T`, which cannot reach its release; a handle released by value (a file, a directory, a stream) is lent as `borrow().*`. `Lent.get()` handed back the whole releasable value, so the type named a role and enforced nothing; glint's lending rule, which ships in the same toolchain, enforces it: a body releases only what it acquired or took out of an owner, never a parameter or a borrow, through callee summaries. Migration: `x.lend().get()` is `x.borrow().*`, and `own.Lent(T)` in a signature is `T`.
+- One name each: `bounded.Queue` (use `Ring`), `bounded.QueueBuffer` (`RingBuffer`), `handle.typedIndex` (`Index`) and `handle.Dense` (`DenseSlotMap`) are gone; `aegis.sync` is no longer exported (its types are the root's: `aegis.Guarded`, `aegis.Atomic`, ...), and `secret.Secret` and `secret.SecretBytes` are the root's `aegis.Secret` and `aegis.SecretBytes` only.
+- `assert.pre` and `assert.post` are gone: they were `assert.invariant` under two more names, with no check of their own. `invariant` is the one always-on contract.
+- A condition wait is the guard's: `held.wait(&condition, io, timeout)` and `held.waitUncancelable(&condition, io, timeout)` on a `BlockingGuarded` guard and an `Order` ordered guard, where `Condition.wait(io, guard: anytype, timeout)` reached into the guard's owner for its mutex. `Condition.waitMutexUncancelable` is the kernel beside `waitMutex`; the ordered guard's `waitCondition` is `wait`.
+- `handle.SecondaryMap(Primary, V)` takes the primary map's type, where it took the key type, and `put`, `get`, `getConst` and `prune` take `*const Primary`, where they took `anytype`. `Key` is `Primary.Key`.
+- One pool engine on regions (the data-layout design, 2026-11-03): `handle.Pool` and `handle.SlotMap` are gone, folded into `handle.SlotPool(T, Tag, .{ .generation = u64 })`, which keeps their keys (instance, index, generation), their errors and their checks, on a `Region` the pool owns. A fixed pool is a pool on `Region.fixed(buffer)` (`Pool.initBuffer(&slots, instance)` is `SlotPool.init(.fixed(&bytes), instance)`); a growing map is a pool on `Region.reserve(limit)`, whose limit replaces `max_capacity`. Growth no longer moves a value, so a value borrow lives until its removal or the pool's end; `reserve` and `capacity` options are gone, `Full` and `CapacityExceeded` are the region's `LimitExceeded`, and an insert past a refused commit is `OutOfMemory` with every key, value and borrow kept. `DenseSlotMap.init(.{ .slots, .values, .keys }, instance)` takes its three regions, and `SecondaryMap.init(gpa, entries)` a region for its values (the index alone still allocates from `gpa`).
+- Every field a `governed` entry lists as internal is named `aegis_<name>` (`Secret`'s `aegis_material`, a pool's `aegis_count`): glint's convention for a package that declares rules, which makes the name aegis's alone, so glint names it even where it cannot resolve the value. Code outside aegis never touched these fields; one that wrote `.{ .material = ... }` or read `s.count` did what A001 bans, and now fails to compile.
+- `int.Checked.shl`, `Saturating.shl` and `Ranged.shl` take the amount as `std.math.Log2Int(Repr)`, as Zig's `<<` does, where they took `anytype` and checked it: `InvalidShift` is gone from `Checked.ShlError`, `Saturating.shl` returns its value with no error, and an amount read from input is narrowed with `int.cast` first.
+
+### Removed
+
+- Fields only aegis touches, renamed `aegis_<name>` (see Breaking), each container's required fields with them: `Condition.associated`, `Condition.count`, `Condition.first`, `Condition.limit`, `Condition.mutex`; `InitContext.owners`, `InitContext.used`; `SecretBytes`'s `SecretBytes.allocation`, `SecretBytes.used_len`; `secret.Choice`'s `secret.Choice.bit`; `bounded.Array(T, N).storage`, `bounded.Array(T, N).used`; `bounded.Budget(Repr)`'s `bounded.Budget(Repr).ceiling`, `bounded.Budget(Repr).taken`, `bounded.Budget(Repr).unsettled`, and `bounded.Budget(Repr).Reservation`'s `bounded.Budget(Repr).Reservation.amount`, `bounded.Budget(Repr).Reservation.budget`, `bounded.Budget(Repr).Reservation.live`; `bounded.Buffer(T)`'s `bounded.Buffer(T).gpa`, `bounded.Buffer(T).maximum`, `bounded.Buffer(T).storage`, `bounded.Buffer(T).used`; `bounded.Limit(Repr)`'s `bounded.Limit(Repr).maximum`; `bounded.Ring(T, N).head`, `bounded.Ring(T, N).storage`, `bounded.Ring(T, N).used`; `bounded.RingBuffer(T)`'s `bounded.RingBuffer(T).gpa`, `bounded.RingBuffer(T).head`, `bounded.RingBuffer(T).maximum`, `bounded.RingBuffer(T).storage`, `bounded.RingBuffer(T).used`; `input.Untrusted(T)`'s `input.Untrusted(T).value`; `own.MustUse(T)`'s `own.MustUse(T).data`, `own.MustUse(T).live`, `own.MustUse(T).pending`. Read a value through the type's own functions, as code outside aegis always had to.
+- The `sync` namespace, whose types are the root's (`aegis.Guarded`, `aegis.Condition`, ...): `sync`, `sync.Atomic`, `sync.BlockingGuarded`, `sync.Confined`, `sync.Guarded`, `sync.Lazy`, `sync.Once`, `sync.Order`, `sync.RwGuarded`, `sync.Shared`, `sync.SpinRwGuarded`, `sync.TaskIdentity`; `sync.InitContext` with `sync.InitContext.owners` and `sync.InitContext.used`; `sync.Condition` with `sync.Condition.UncancelableWaitError`, `sync.Condition.WaitError`, `sync.Condition.associated`, `sync.Condition.broadcast`, `sync.Condition.count`, `sync.Condition.first`, `sync.Condition.init`, `sync.Condition.initLimit`, `sync.Condition.limit`, `sync.Condition.mutex`, `sync.Condition.signal`, `sync.Condition.wait`, `sync.Condition.waitMutex` and `sync.Condition.waitUncancelable`.
+- The `secret` namespace's second names for the root's owners: `secret.Secret` (`aegis.Secret`), and `secret.SecretBytes` (`aegis.SecretBytes`) with `secret.SecretBytes.AdoptError`, `secret.SecretBytes.AppendError`, `secret.SecretBytes.InitError`, `secret.SecretBytes.ReplaceError`, `secret.SecretBytes.ReserveError`, `secret.SecretBytes.ResizeError`, `secret.SecretBytes.Writer` (`secret.SecretBytes.Writer.err`, `secret.SecretBytes.Writer.gpa`, `secret.SecretBytes.Writer.init`, `secret.SecretBytes.Writer.interface`, `secret.SecretBytes.Writer.owner`), `secret.SecretBytes.adopt`, `secret.SecretBytes.allocation`, `secret.SecretBytes.appendSlice`, `secret.SecretBytes.capacity`, `secret.SecretBytes.deinit`, `secret.SecretBytes.empty`, `secret.SecretBytes.expose`, `secret.SecretBytes.exposeMut`, `secret.SecretBytes.format`, `secret.SecretBytes.init`, `secret.SecretBytes.len`, `secret.SecretBytes.moveInto`, `secret.SecretBytes.replace`, `secret.SecretBytes.reserve`, `secret.SecretBytes.resizeWithinCapacity` and `secret.SecretBytes.used_len`.
+- `own.Lent(T)`, with `own.Lent(T).data` and `own.Lent(T).get`: lending is `borrow()` (see Breaking).
+- The shift's checked amount: `int.Checked(Repr).shl`, `int.Saturating(Repr).shl` and `int.Ranged(Repr, min, max).shl` take a `std.math.Log2Int(Repr)` (see Breaking); `int.Checked(Repr).ShlError` has no `InvalidShift`, and `int.Saturating(Repr).ShlError` is gone.
+- `Condition.wait` and `Condition.waitUncancelable`, which took any guard: a wait is the guard's (see Breaking).
+
+### Added
+
+- `id.Id(Tag, Repr).raws(ids)` (and `NonZero`'s): a slice of ids as their representations, the same memory, for code that compares and indexes ids in bulk without retyping it. Read only, since a representation written back need not be an id of the domain.
+- A span divides by a span: `Duration.ratio(by)` and `Duration.ratioFloor(by)` count the whole `by` in it, toward zero or toward negative infinity (a count, as `Bytes.ratio` gives), failing on a zero `by` and on the minimum by -1; `Duration.mod(by)` is what `ratioFloor` leaves, from zero toward `by` with `by`'s sign, failing only on a zero `by`. Days and the time of day of a nanosecond instant are `ratioFloor(day)` and `mod(day)` on either side of the epoch.
+- `Duration.negate()` and `Duration.abs()`, failing with `Overflow` on the minimum; an unsigned duration has neither (a compile error).
+- `int.Ranged.widen(Target)` and `units.Duration.fromRanged(value)`: a ranged value as an integer or a duration of any representation that holds its whole range, with no error and no check; a range the target does not hold whole is a compile error.
+- `Instant.epoch`, `Instant.sinceEpoch()` and `Instant.fromSinceEpoch(span)`: an instant as its span from the clock's zero and back, with no error, where code read and wrote the raw count.
+- `eql` and `compare` on `int.Checked`, `int.Saturating` and `int.Ranged`, as the units and ids have: A004 sends a governed value's comparison to the type's own operation, and these had none, so a caller compared `raw()`s.
+- `Secret.make(maker, args)`: an owner's material made in its own storage, the maker's result written through the owner's field, so the caller's frame holds no copy, as it does for a value handed to `init` (std's `KeyPair.generate` returns its pair by value). A maker that can fail makes `make` fail with its errors: its result is held in `make`'s frame and erased, and an error leaves the owner erased. A008's key and key pair entries name it beside `Secret`.
+- `aegis.Pulse`, a repeated wake: `bump(io)` advances a 32-bit generation and wakes every waiter; `current()` reads it; `waitPast(io, seen)`, `waitPastTimeout` and `waitPastUncancelable` return once the generation has moved past `seen`, never missing a bump made after it was read. No reset to race and no value carried. A007's `std.Io.Event` entry names it beside `Signal` (once) for a wake given again and again.
+- `own.Unowned(T)`, a std handle (`Io.File`, `Io.Dir`, `net.Stream`, `net.Server`, `process.Child`) held without ownership: made by `of`, read by `get`, with no `deinit` and no way to become an owner. A015's entries name it beside `own.OwnedIo` for a handle whose owner keeps and closes it.
+- `io.ReadEnd` and `io.WriteEnd`: stream ends that state why they failed, for code handed std's bare `*Io.Reader` or `*Io.Writer`, whose `ReadFailed` and `WriteFailed` hide the cause (a cancel among them). An end is the interface, a context and a required accessor; `fromFile`, `fromStream`, `causeless` and `init` (another package's end) are the only ways to make one. `failure()` is the cause, `settle(error.ReadFailed)` is `Canceled` for a cancel (cloak's session and parley's transport).
+- `Signal(T)`: a one-shot signal across tasks, for a completion, a shutdown or a peer's answer that one side sets and others wait for. `set(io, value)` publishes the value with a release store and wakes every waiter; a second `set` is `error.AlreadySet` with the first value kept. `wait`, `waitTimeout` and `waitUncancelable` return `*const T`, which lives as long as the Signal; `get` never waits. There is no reset. It is what `std.Io.Event` was used for across tasks, where `Once` and `Lazy` initialize on demand instead (reactor's pass, 2026-11-11).
+- `lint_rules` (root.zig, with `Order.zig`'s included): what each type and assertion means, for a linter that reads it by declaration (glint, design §12): each type's role, the fields only aegis touches, the obligations no body shows (a reservation, a guard and its hand-off, an ordered guard, a scope, a result that must be used) the std declarations aegis replaces (`Dir.readFileAlloc` and `readFileAllocOptions`, by `own.readFile`), and the operations whose meaning a linter reads by role: `Budget.reserve` (`charge`), `int.Checked`'s `add` and `mul` (`checked_growth`) and `raw` (`raw`), `Untrusted.parse` (`parse`) and `readForParse` (`peer_value`). Every entry names its declaration, so a rename breaks aegis's own build; a test compiles every reference.
+- `state.Machine.Carrying(Value)`: a machine whose states carry their own payloads, `Value` being a union tagged by the states. `step(event, next, context, release)` and `commit(edge, next, context, release)` take an edge only along the table, in every build mode, and release the payload being left in place before storing `next`, so an owner held in one state is released where it was used, never copied out; an event the state does not declare, or one leading elsewhere than `next`'s state, is `error.IllegalEvent` and changes nothing. `init`, `initFrom` (by the payload's `moveInto`), `at` and `atConst` (a state's payload, null at any other), `current`, `isTerminal` and `plan` complete it. For a parent directory a holder opened or was lent, which glint's A017 sent to `Runtime` and its single payload beside the state. Paired with a hand-written union in check-parity; its compile rejections are in check-a10.
+- `Region`: memory whose live part never moves, four words. `reserve(limit)` reserves the operation's own limit, rounded up to whole pages, as address space and commits as it grows (`mprotect` on POSIX, a commit on Windows, never charged when mapped, never a signal handler); `fixed(buffer)` is the same type on the caller's memory, for wasm and freestanding. `push`, `create` and `dupe` bump the top; `mark` and `release` free a scope at once (one store in ReleaseFast and ReleaseSmall); `tail(T)` is the region's one growing value, whose items never move as it grows; `trim` gives pages above the top back; `allocator()` is a bump allocator that grows and frees its top allocation in place. Past the limit is `LimitExceeded`, a refused commit `OutOfMemory` with the region unchanged. Debug and ReleaseSafe stop a second grower while a tail is open, a mark released twice, out of order or after an outer release, a release with a tail open, and a sealed tail's use.
+- `flat.Flat(T)`: one flat layout for a value, a block with no pointers in it. `size` and `write` lay a value out at its exact size; `builder` streams one into a region's tail (`flat.Image`); `verify(input.Untrusted([]const u8), flat.Limits)` checks every offset, count, tag, value and alignment before a `View` exists, and `view` takes an image the program wrote. A `View` is one pointer and reads in place: scalars by value, byte slices (and wider numbers on little-endian targets) as real slices, the rest as views; `materialize` makes a plain `T` again. A union read as a variant it does not hold, an element past its slice and a builder's misuse stop in every build.
+- `parts.Block(Parts)`: one block for a set of parts whose counts are known before any is placed. A struct declares the parts (slices, single items, optional ones, nested structs of parts, `.overlap` alternatives of which one is in use at a time, and `parts.Repeat(S)` copies at a stride); `plan(counts)` measures them, and past the address space `Plan.size()` is `Overflow`, as `flat`'s too large is an error; `Plan.alloc(gpa)` takes exactly the plan's size and `Plan.fit(buffer)` refuses a shorter buffer; `Block.parts()` places them and cannot fail, the measure and the placement being one walk of the declaration. `parts.Counts(S)` is a nested struct's counts, for a type whose parts another nests. A `void` field is a part absent at compile time (`if (pairs) []u32 else void`), of no bytes. `parts.Given(T)` is a value given with the counts and handed back with the parts, of no bytes, so an optional nest carries what decided it (a dictionary's bytes beside the tables that index it) and a type's core needs nothing paired from beside the block. For a type with `init` and `initBuffer`: both hand a block to one infallible core, where `init` asserted that `memory(options)` and a carving written apart agreed (warp's fourteen `initBuffer(...) catch unreachable`, glint A013). An `.overlap` alternative holds only types every bit pattern of which is a value (integers, floats, and arrays, vectors and extern or packed structs of them), so reading bytes another alternative wrote is never illegal behavior; any other is a compile error (check-negative). A `Repeat` read past its length stops in every build. Paired with a hand-written plan and carving in check-parity.
+- `handle.SlotPool(T, Tag, .{})`: slots of one type named by a four-byte `Index(Tag, u32)`; a stale index reads the slot's current `T`, a logic error and never another type's bytes. `alloc`, `create` (built in place, knowing its handle), `free`, `get`, `handleOf` and `recycleAll`; an index out of range stops in every build, a slot freed twice in Debug and ReleaseSafe.
+- `handle.RunPool(T, Tag)`: runs of one type (a start and a length) on a region of their own, contiguous and never moved while they live. `alloc` takes the first free span that fits, in index order, else grows at the end; `realloc` grows in place when the span after the run is free or the run ends the pool; `free` coalesces with free neighbours and moves the end back when the run was last; `slice`, `recycleAll` and `used` complete it. The free spans live in a B+ tree on a second region, reserved before each alloc so a free never fails. A run outside the pool, or freed twice, stops in every build.
+- `handle.OptionalIndex(Tag, Repr)`, a position or none in the same width (biased by one), and `handle.Offset(Tag, Repr)`, a byte position in a region as wide as the caller chooses, checked against the region's live memory in every build.
+- `units.Duration.toSeconds(Float)`: the span in seconds as any float type, for an interface that takes fractional seconds (macOS's `CFTimeInterval`, a `double` timeout). Lossy by nature, so no error: a count the float holds exactly gives the nearest float to the span (250 milliseconds is the `f64` 0.25), a float narrower than `f32` is computed in `f32`, and a span past the float's range is an infinity; a type that is no float is a compile error. lookout's FSEvents latency converted through `raw()` for want of it.
+- `units.Duration.toTimespec(Timespec)`: the span as a C `timespec` (`std.posix.timespec`, `std.c.timespec`, or any struct of integer `sec` and `nsec`) for `nanosleep` and the calls that take one: whole seconds toward negative infinity and the nanoseconds past them, `nsec` in 0 to 999_999_999 as POSIX keeps it. `ToTimespecError(Timespec)` is `Overflow` where some span's seconds may not fit `sec` on a supported target (an `isize` or `c_long` counts as 32 bits) and empty where none can; a type that is no timespec, or an `nsec` too narrow, is a compile error. conduit converted through `raw()` for want of it.
+- `units.Count.rem(rhs)`: a count's remainder by a plain divisor, with the count's sign, as `@rem`: the slot a round robin's turn falls on (`turn.rem(servers).raw()`, uplink's DNS servers and reactor's round robins, which took it through `raw()`). `RemError` is `DivisionByZero`; a signed minimum by -1 is zero.
+- `units.Bytes.divTrunc(rhs)`, a share of a size rounded toward zero, and `Bytes.ratio(other)`, how many times one size fits in another, each checked (`DivisionByZero`, and a signed minimum by -1 `Overflow`). relic divided a batch budget through `raw()` for want of it.
+- The design page documents lending by `borrow` and recovering a callback's context through the interface field with `@fieldParentPtr`, which glint reads as clean, so no erase-and-recover helper is needed (docs/design.md, "Lending, one way" and "Recovering a callback's context").
+
+## [0.2.4] - 2026-10-28
+
+### Added
+
+- `own.readOpened(io, file, gpa, limit)` and `readOpenedSentinel(..., sentinel)`: the bounded read to the end that `readFile` makes, of a file the caller opened and keeps. `readFile` and `readFileSentinel` are an open composed with it, their signatures unchanged. A caller that opens otherwise opens the file and calls it: git reads an in-tree `.gitignore` without following a symbolic link (`PATTERN_NOFOLLOW`), so sweep opens it with std's `.follow_symlinks = false`, which the open itself refuses (`SymLinkLoop` on POSIX), with no look at the path before it that the file could change under. `ReadOpenedError` is what it returns; `ReadFileError` is the same set as before, an open's errors and those. (sweep's ignore stacks; review-io's finding.)
+
+### Fixed
+
+- The README said `own.readFile` refuses a file past the limit before anything is allocated and reads only as long as the stated length. It reads to the end and judges the limit by what it reads (since 0.2.1).
+
+## [0.2.3] - 2026-10-27
+
+### Added
+
+- `Atomic(*T)` and `Atomic(?*T)`: a lock-free cell for one pointer, published and taken whole by `load`, `store`, `swap` and the compare-and-swaps, the size of the pointer (a lock-free list's head, a latest-value slot). It has no ordering or arithmetic: `fetchMax`, `fetchMin` and the adds refuse it at compile time. (shakedown's FaultIo kept its latest batch in a `std.atomic.Value(?*Batched)`, outside aegis.)
+
+### Fixed
+
+- `state.Machine.after` is evaluated at comptime wherever it is called. Called from a runtime function, it ran its lookup at run time and refused a declared edge with "no edge"; a caller no longer writes `comptime` before it (warp's inflate, brotli and gzip).
+
+## [0.2.2] - 2026-10-27
+
+### Added
+
+- `Shared.createWith(gpa, context, init_fn)`: a block whose value `init_fn(context, &value)` builds in place before any handle exists, so a value that must not be copied, such as key material, is never anywhere but in the block. On `init_fn`'s error the whole block is erased and then freed, without `cleanup`; releasing what `init_fn` acquired before it failed stays `init_fn`'s (its `errdefer`). `CreateWithError(init_fn)` is its error set; an `init_fn` that cannot fail adds none. (cloak's `PrivateKey` built its key on the stack and moved it in with `createFrom`.)
+
+## [0.2.1] - 2026-10-27
+
+### Added
+
+- `units.Instant.floor(tick)`: the start of the tick an instant falls in, ticks counted from the clock's zero, rounded toward negative infinity and saturating at the representation's minimum; `tick` is positive. For bucketing time by a span that is not a unit, such as a filesystem's two-second tick.
+- `units.Duration.divTrunc(count)` and `divFloor(count)`: a part of a span, such as a quarter of a wait, rounded toward zero or negative infinity. `DivError` is `DivisionByZero`, plus `Overflow` on a signed representation for its minimum by -1. (cloak's DTLS timers: RFC 9147's ACK timer is a quarter of the retransmission wait.)
+
+### Fixed
+
+- `own.readFile` and `readFileSentinel` read a file to its end and judge the limit by what they read. They refused a pseudo-file by the length it states: sysfs states 4096 and procfs 0 whatever they hold, so a 256-byte limit refused a 16-byte sysfs attribute as `StreamTooLong` before reading it (preflight 0.18's VM guest reading `/sys/class/virtio-ports/*/name`, which made the family's riscv64 nightly leg red; glyph's finding). The stated length is now only the first allocation's size. It is still read first, with its error returned, so a cancel there is still `Canceled`, and the reader never asks for it again. A file longer than the limit is `StreamTooLong` once the byte past the limit is read, no longer before anything is allocated, and bytes appended during the read are read.
+- `own.Owned` and `own.OwnedIo` bind their address once: Debug's witness stored the owner's address on every `borrow`, a data race when several tasks borrow one owner read-only at once (review-io's finding, chronicle under ThreadSanitizer). The first use binds it with one compare-and-swap, and every use after only reads it. A native test borrows one owner from 8 tasks at once, its first bind among them, and joins `test-native-races` (`-Dthread-sanitizer=true`), which reported the race before.
+
+## [0.2.0] - 2026-10-25
+
+### Breaking
+
+- `SecretBytes` holds no allocator: it is the allocation and its live length, 24 bytes where it was 40, as std's unmanaged containers are. The allocator that made it is passed where it allocates or frees: `init(gpa, capacity)` as before, `reserve(gpa, capacity)`, `appendSlice(gpa, bytes)`, `Writer.init(&owner, gpa)` and `deinit(gpa)`; `adopt(allocation, live_len)` no longer takes one. `SecretBytes.empty` is an owner of no allocation, to grow from, so a field that may hold none needs no optional. Before: `var key = try SecretBytes.init(gpa, 32); defer key.deinit(); try key.reserve(64);`. After: `var key = try SecretBytes.init(gpa, 32); defer key.deinit(gpa); try key.reserve(gpa, 64);`. (cloak's connection keeps its record and handshake-message buffers as owners: with an allocator in each, beside the one the connection holds, the idle client passed its 2 KiB budget.)
+
+## [0.1.18] - 2026-10-25
+
+### Added
+
+- `own.readFile(io, dir, sub_path, gpa, limit)` and `own.readFileSentinel(..., sentinel)` (source text a parser reads to its end): a whole file's bytes, at most `limit` (`units.Bytes(u64)`, which the caller must give), the caller owning them. It reads the file's length first and returns its error, so a cancel that lands there is `Canceled`; std 0.17's `Dir.readFileAlloc` takes a failed length as a guess and reads on, so that cancel is lost. A file longer than the limit is `StreamTooLong` before anything is allocated, and the read is as long as the length said (bytes appended after it are not read). Proved under shakedown's `everyFault` with every cancel, error, short read and allocation failure. (relic-c's finding; preflight's default policy names it as std's replacement.)
+- aegis's `build.zig` gives a build script `own` (`@import("aegis").own.readFile`), which takes no package module: the same spelling as in a program. Zig analyzes what a build script uses, so a build runner compiles the read and what it needs, not aegis. (preflight's build helpers read their files through it.)
+- `own.Owned.move` and `own.OwnedIo.move`: a used owner handed on by value, consumed as `moveInto` consumes it, the result binding at its first use, so a function that opens and uses a resource can return its owner. `own.Lent(T)` and `lend()`: a copy of a by-value payload (a file, a directory) with no `deinit`, what an accessor hands out of a handle its owner closes. Both refuse a payload that declares `moveInto`. (relic's repository moves its directories from discovery into its state, and its accessors hand them out.)
+- `SecretBytes.appendSlice` and `SecretBytes.Writer`: secret text built a piece at a time, grown only through `reserve`, which erases the storage it leaves. The writer is a `std.Io.Writer` whose buffer is the allocation itself, so what is printed is held nowhere else; `flush` publishes it as the live prefix, and `err` names the allocation failure behind `WriteFailed`. Overlapping input is refused as `replace` refuses it. (relic built such text in a `std.ArrayList` and wiped it by hand, where each growth left an unwiped copy.)
+- `bounded.Budget.settled()`, a Debug witness: whether every reservation the budget gave has been released or consumed (a move hands one on, still open). A reservation dropped without either leaves it false, which a test asserts after the work it charged; a build without diagnostics keeps no count and answers true. The count is a word in Debug, so a budget is larger there than in release builds, as its reservation already was.
+- Each scalar says what it is in one declaration, `aegis_scalar`: its `contract` (the declaration's version, 1), its `kind` (`.ranged`, `.duration`, …), its `representation`, and its bounds, unit, clock or domain. Generic code recognizes aegis's scalars by it and builds them only through their own checked functions, as README's contract 1 names them, refusing a contract it does not know by its number. Rebuilding a type from its published parameters and comparing, which README recommended, refuses a type made by another copy of aegis: a plain `zig build` whose dependencies pin two aegis versions builds two, so ensign refused bay's `int.Ranged` as a non-exhaustive enum, while the declaration reads the same in every copy.
+
+## [0.1.17] - 2026-10-24
+
+### Fixed
+
+- The hosted gate's `contracts-published` job ran the suite in each release mode outside preflight's runner, so with no watchdog or timing record, and preflight refused it (the nightly's red since 0.1.15). `test-release` is gone: the release tier runs the whole suite in ReleaseSafe and ReleaseFast under the runner, and ReleaseSmall, which keeps no check ReleaseFast drops, is held by the mode matrix.
+
+## [0.1.16] - 2026-10-22
+
+### Added
+
+- The catalogue names, for every module, the danger rule of glint's aegis pack that requires it at its danger sites, or the required module built on it, and refuses a module with neither (aegis's design §7, criterion 4); README's table shows it. `Order` is the answer to A021, a function holding two aegis guards at once without both ranked.
+
+## [0.1.15] - 2026-10-22
+
+### Added
+
+- A release contract for every module in the README: what it is in ReleaseFast and ReleaseSmall, what it keeps checking in every build and what Debug and ReleaseSafe add, each row held by the gate (layouts against hand-written storage on the portable profiles, paired kernels, a mode matrix of every deliberate violation, the whole suite in each release mode). An example of every module in `examples/`, which the build runs.
+
+### Changed
+
+- `secret.Timing.end` restores the mode only where `begin` set it, from what `begin` recorded, instead of asking a second time whether the processor has it: on AArch64 Linux a span is now the instructions of a hand-written one (it was 60 bytes larger).
+
+## [0.1.14] - 2026-10-17
+
+### Changed
+
+- `scope.Ref`'s private pointer is the field `pointer`, no longer `ptr`: a slice's own member has that name, so a read of `x.ptr` in generic code could not be told from a reference's private state. Reach the pointer through `get` as before.
+
+## [0.1.13] - 2026-10-17
+
+### Added
+
+- `Budget.Reservation.consume()`: ends a reservation with its amount kept as consumed work. A charge taken before an allocation is released if the allocation fails and consumed once it succeeds; before, a successful path could only drop the live reservation (strand's `Context.alloc`). glint's A003 reads it as the reservation's discharge.
+
+## [0.1.12] - 2026-10-17
+
+### Added
+
+- `Guarded(T).Guard.handOff()` and `Guarded(T).Handoff`: the release of a held lock, handed to code that runs it past the holder's frame (a scheduler releasing a lock once the holder's task is parked), released once with `release()`. glint's A003 reads it as a declared transfer, where a guard's address through an erased callback context stayed undecided.
+
+### Changed
+
+- The docs say that a `Choice` is constant-time on the hardware only under `secret.Timing`: on AArch64 without DIT set, a comparison's time depends on its operands (cloak road A's finding).
+
+## [0.1.11] - 2026-10-17
+
+### Fixed
+
+- `secret.Timing` compiles for every architecture again: 0.1.10's AArch64 instructions reached an unoptimized build's assembler on x86_64 (and any architecture without the mode), which refused `mrs`, so a Debug build of any program using `Timing` failed outside AArch64. They are now behind a compile-time check, and `zig build check-timing` (in the gate) builds `Timing`'s span as an object for x86_64, AArch64 and wasm32, Debug and ReleaseFast.
+
+## [0.1.10] - 2026-10-17
+
+### Fixed
+
+- `secret.Timing` sets data-independent timing on AArch64 Linux too: it was decided at compile time from the target's features, so a baseline AArch64 build (Linux distributions' default) never set it on a processor that has it. Where the target does not say, `Timing.supported()` asks the kernel once (HWCAP_DIT); the mode is set only where the processor has it, since setting it on one without traps. `Timing.available` now says the build can set it, `supported()` that this processor does. cloak's timing campaign found std's X25519 timed apart by its secret on an Apple M3 without the mode.
+
+## [0.1.9] - 2026-10-15
+
+The change first tagged v0.2.0 the same day, released on the 0.1 line: it breaks no caller (only builds that failed to compile now compile), and a family resolves aegis within one line, so a new minor would have split every package that also reaches aegis through shakedown. v0.2.0 was withdrawn and its tag removed; 0.1.9 is the same tree.
+
+### Changed
+
+- `secret.Choice` and its kernels compile for every target, backend and CPU instead of failing outside the checked profiles: a build that relied on the compile error to keep unaudited lowering out asserts `secret.Choice.audited` instead.
+
+### Added
+
+- `secret.Choice.audited`: whether this build (compiler, backend, target, CPU model and features, mitigation level) is one whose lowering `zig build check-choices` inspects; `secret.audited_profiles` lists them.
+- check-choices covers x86_64-linux-gnu at x86_64_v2/v3/v4, aarch64-linux-gnu at neoverse_n1/v2, aarch64-macos at apple_m2/m3/m4, x86_64 FreeBSD, OpenBSD, NetBSD and DragonFly, and wasm32-freestanding: 20 profiles, 240 builds.
+
+## [0.1.8] - 2026-10-14
+
+### Changed
+
+- Pins preflight 0.5.4, shakedown 0.4.3.
+
+## [0.1.7] - 2026-10-14
+
+### Fixed
+
+- The `secret.scrubStack` and `secret.scrubbed` tests measure the dead stack with instrumentation off: under ThreadSanitizer the hook each read calls ran in the bytes being read and erased the residue the control expects.
+
+## [0.1.6] - 2026-10-13
+
+### Added
+
+- `secret.scrubStack(bytes)`: zeroes the stack below the caller after a secret computation returns, where the compiler's spills, saved registers and by-value copies of its callees lie and no owner can name them; `secret.stackReach(bytes, function, args)` measures how deep a call writes, to choose the depth with; `secret.scrubbed(bytes, function, args)` runs a secret computation in a frame of its own under `secret.Timing`, then scrubs.
+- `secret.Timing`: data-independent timing for the span of a secret computation (`begin`, `end` in a `defer`, `active`). On AArch64 with FEAT_DIT it sets PSTATE.DIT, under which the architecture guarantees operand-independent timing of data-processing instructions and Apple's cores turn off the data memory-dependent prefetcher; elsewhere it does nothing.
+
+## [0.1.5] - 2026-10-13
+
+### Added
+
+- `units.Duration.literal` and `units.Bytes.literal`: a value written in the text form and read at compile time, `.literal("250ms")` or `.literal("64KiB")`, for defaults and constants; text `parse` refuses is a compile error naming why.
+- `bounded.Array.constItems`, the prefix through a `const` array or a copy of one, and `appendSlice` and `fromSlice`, which copy a slice in whole or fail with `Full` and change nothing, for a payload that is copied rather than moved: a value that owns a short string by value, such as a host name.
+
+## [0.1.4] - 2026-10-13
+
+### Added
+
+- `units.Duration` and `units.Bytes` have a text form, the same for a command line, a configuration file and a log: `parse(text)` and `format` (`{f}`), exact both ways, with `ParseError` (`Malformed`, `Overflow`, `Inexact`) and `max_text_len`. A duration reads `30s`, `1m30s`, `250ms`, `1.5h` or `2d12h` and writes its nonzero components from days down; a size reads `4096`, `64MiB` or `1.5GB`, binary (`KiB`, powers of 1024) and decimal (`kB`, powers of 1000) units spelled exactly, and writes the largest unit that divides it. A value finer than the type holds is `Inexact` and one past the representation `Overflow`, never rounded.
+- Each scalar publishes the parameters it was made from, so generic code can recognize it by rebuilding it: `Representation` on `int.Checked`, `Saturating` and `Ranged`, every unit and `id.Id`, `NonZero` and `Counter`; `minimum` and `maximum` on `Ranged`; `Scale` on `Duration`; `Domain` on `Counter`.
+- `int.Ranged.literal(value)`: a value known at compile time, range-checked there, so a default or a constant is `.literal(8)` where `init` needs a `catch`.
+
+## [0.1.3] - 2026-10-12
+
+### Changed
+
+- The benchmarks take shakedown from preflight, which adds the one the package declares, where their imports gave it a second time; the tests' module states that it is shakedown's aegis only while shakedown asks for aegis with the same target and mode.
+
+## [0.1.2] - 2026-10-12
+
+### Changed
+
+- The tests run in aegis's own module, which bay gives shakedown as its aegis, where they built a second module from `src/root.zig` and bound shakedown to it.
+
+## [0.1.1] - 2026-10-12
+
+### Changed
+
+- Pins preflight 0.3.4 and shakedown 0.2.5.
+
+## [0.1.0] - 2026-10-11
+
+### Added
+
+- `int.narrow(Target, source) ?Target`: the one checked narrowing for generic code. It is null where `cast` fails with `Overflow` and the value where it fits, whatever the pair of integer types, where `cast` returns a value for a conversion that cannot fail and an error union otherwise.
+- `SpinRwGuarded(T)`: the reader-writer form of `Guarded`, a spin lock with no Io for many readers or one writer (`read`, `write`, `tryRead`, `tryWrite`, `isHeld`, `teardown`). A waiting writer holds off new readers.
+- `Guarded.acquireScheduling`: acquire for a section a few system calls long on OS threads with no `Io` to wait through (a reap, a fork gap). A contended waiter yields the thread between tries, where `acquire` pauses, so a holder that was descheduled can run.
+
+### Breaking
+
+- aegis is developed with [bay](https://github.com/pedronaugusto/bay): preflight and shakedown are dev dependencies, and the tests, examples, contract gates and benchmarks are the development build's (`bay test`, `bay contracts`). aegis ships with no dependencies; what a project that depends on it builds is unchanged.
+- A conversion that cannot fail carries no error set and no range check. `int.cast`, `Count.convert`, `Bytes.convert`, `Bits.convert`, `Duration.convert`, `Instant.convert`, `Duration.fromIoDuration`, `Instant.fromTimestamp` and `Instant.fromIoTimestamp` return the value where every source value converts and keep exactly the errors that can occur otherwise, so `try` and `catch` on a conversion that cannot fail no longer compile. The decision is portable: `usize` and `isize` count as 32 bits as a target and 64 as a source, so `u32` into `usize` and `usize` into `u64` cannot fail and `u64` into `usize` can, on every target. `Bytes.ConvertError` and `Bits.ConvertError` are `int.CastError`.
+- The `rounding` argument of `Duration.convert`, `Instant.convert`, `Duration.fromIoDuration`, `Instant.fromTimestamp` and `Instant.fromIoTimestamp` is comptime, so `.down` and `.up` carry no `Inexact`: only `.exact` can be inexact. A caller that chose its rounding at run time switches on it.
+- aegis is one build module, `aegis`. The per-namespace modules (`aegis.int`, `aegis.id`, `aegis.units`, `aegis.assert`, `aegis.secret`, `aegis.sync`, `aegis.handle`, `aegis.input`, `aegis.err`, `aegis.bounded`, `aegis.own`, `aegis.state`, `aegis.scope`) are gone: import `aegis` and use the namespace, `@import("aegis").handle` in place of `@import("aegis.handle")`, and drop the `addImport` and `module("aegis.<namespace>")` lines. Zig compiles only what a program uses, so the split bought nothing at run time or in build time. The layers it protected (the base, then `secret`, which imports only the base, then the rest) are checked at file level by the lint instead.
+- The std adapters of `units.Duration` and `units.Instant` (`toIoDuration`, `fromIoDuration`, `toIoTimestamp`, `fromIoTimestamp`) return what the representation and unit allow: a conversion that cannot fail returns its value with no error and no range check, so `try` on it no longer compiles, and one that can fail returns only the errors it can have. Their `*Error` declarations narrow to match, and are empty where the conversion cannot fail. A millisecond `i64` widens into std's nanoseconds, a nanosecond `i128` takes any std duration or timestamp, and a nanosecond `i64` still checks the narrowing.
+- Replace A3 scalar extern structs with non-exhaustive enum(Repr) values; factory APIs and checks stay the same. Reflective field construction/access no longer applies.
+
+### Changed
+
+- The move rule (`moveInto` when a type declares it, else assignment) is one file in the base layer, `move.zig`, in place of five copies in `Shared`, `bounded`, `own`, the handle pools and the typestate stages. The handle pools keep their one difference, a copied source is set to `undefined`, as the named `intoPoisoning`.
+- The lowered-generation retirement cases run as ordinary tests in every release mode instead of as a separately compiled fixture.
+
+### Fixed
+
+- `Guarded` acquires with one swap, as a hand-written lock does, instead of a weak compare-and-swap loop that cost about 10% more per uncontended acquire; a contended waiter spins on a plain load rather than rewriting the lock line. The paired assembly and timing parity fixtures now use the swap form.
+- Unit scale conversions reduce their ratio once per distinct scale with a bounded remainder loop, so many conversions in one caller's inline loops no longer exhaust the comptime branch quota.
+- Replace matching typed ABI prototypes with calls to separately compiled raw-integer exports. Retain the failing x86 hidden-return-pointer regression. The C ABI guarantee covers 8–64-bit and usize/isize representations on every configured target. 128-bit representations remain usable Zig types but are not promised C ABI types and are excluded from this ABI fixture/audit.
+
+### Added
+
+- `handle.Index` has `eql` and `compare`.
+- `assert.never(message)`: a path that must not run, returning `noreturn` and stopping in every build, so an `unreachable` prong or an `orelse unreachable` can be a checked contract.
+- `own.OwnedIo(T, cleanup)`: `Owned` for a resource released through `Io`; cleanup is `fn (*T, std.Io) void` and `deinit(io)` takes the releaser's Io. Same size and Debug witness as `Owned`.
+- `Condition.waitUncancelable`, and `acquireOrderedUncancelable`, `readOrderedUncancelable` and `writeOrderedUncancelable` on `Order.Ordered`: waits and acquires for cleanup paths that cancellation cannot interrupt, with the rank check unchanged.
+- `Atomic(T)`: a lock-free cell for an id, count, unit or plain enum, with `load`, `store`, `swap`, the exchanges, `fetchMax`, `fetchMin`, checked `fetchAdd` and `fetchSub` (the domain's own `add` and `sub` in a compare-and-swap loop, the cell untouched on overflow) and the hardware `fetchAddWrapping` and `fetchSubWrapping`.
+- `Budget.maximum`, `charged` and `reserveKeeping(amount, kept)`, an ordinary reservation that leaves room for a control path that takes plain `reserve`.
+- `capacity` and `isFull` on `bounded.Array`, `Ring`, `Buffer` and `RingBuffer`.
+- `Guarded.isHeld`, `BlockingGuarded.isHeld` and `Order.Ordered.isHeld`: a read of the lock without taking it, for lock tests.
+- `Duration.saturatingAdd`, `saturatingSub` and `saturatingMul`, `Instant.saturatingAdd`, `saturatingSub` and `saturatingDurationTo`: clamped at the representation's bounds. For an unsigned clock `saturatingDurationTo` gives a zero span where the clock stepped back and `durationTo` reports `error.Underflow`.
+- `Id` and `NonZero` relations for unsigned representations: `successor`, `predecessor`, `advance`, `retreat` and `distanceTo`, with `IdExhausted`, `IdUnderflow` and `Backwards` instead of a wrap, and `Id.Step`, the `units.Count` they move by (the domain's own, or `pub const Step` on the tag).
+- `units.Duration` and `units.Instant` take any whole-byte integer representation up to 128 bits, so `Duration(.nanosecond, i96)` and `Instant(.awake, .nanosecond, i96)` hold std's nanoseconds exactly, with failure-free adapters. The same-scale conversion is the value itself, with no wide product to narrow.
+- A12 `scope`: scope lifetimes. `Table(Brand)` keeps a generation per scope in slots the creator owns; `open` gives a scope, `Scope.ref(pointer)` a `Ref(Brand, P)`, `Scope.reborrow` rebinds a reference from another scope or brand, and `Scope.end` moves the generation on. In Debug and ReleaseSafe `Ref.get` stops the program on a reference whose scope ended, and ending a scope twice, using an ended scope and a table torn down with a scope open stop too; in ReleaseFast and ReleaseSmall a reference is exactly its pointer and nothing is kept. 64-bit generations, retirement of a slot that used them all, `error.Full` and `error.Exhausted`. Paired assembly (x86-64 and aarch64, ReleaseFast and ReleaseSafe) and timing against hand-written code, per-mode stop and no-stop contract, compiler-rejection and portable-profile gates (`check-a12`, `test-a12`), and a worked example.
+- A10 `state`: comptime typestate machines. `Machine(States, Events, spec)` validates its specification when analyzed (one edge per state and event, every state reachable, terminal states with no edge out) and answers `next` with one table load. `At(state, Payload)` stages a payload by state, with `transition`, `transitionWith` (a fallible preparation that leaves the stage and destination untouched on failure) and `take` from a terminal stage; outside Debug a stage is exactly its payload. `Runtime(Payload)` pairs a payload with its state and checks every event against the table in all build modes: `step`, `plan` and `commit` (`error.IllegalEvent`, `error.Stale`). Paired assembly (x86-64 and aarch64, ReleaseFast and ReleaseSafe) against a hand-written table, timing against it and against a nested switch, mode-matrix, compiler-rejection and portable-profile gates (`check-a10`, `test-a10`), and a worked example.
+- `Guarded`: `tryAcquire`, `acquireYielding(io)` (parks through Io between attempts, cancelable, grants no guard on cancellation) and `acquireYieldingUncancelable(io)` and `teardown`; `BlockingGuarded` and `RwGuarded` get an Io-free `teardown` for a sole owner. Debug and ReleaseSafe assert the lock is free.
+- `interior_lock`: a declaration that a type is safe to share through a mutable pointer because all of its mutation is behind its own lock. The guards declare it.
+- `Lazy(T)`: leaf initialization under the election mutex, with no `InitContext`, the initializer's own errors only and a mutable handout for an `interior_lock` type.
+- `Shared(T, cleanup)`: counted shared ownership of one allocated value with `create`, `createFrom`, `retain`, `get` and `release`, a fail-stop count limit and Debug detection of a handle released twice.
+- `eql` and `compare` for `Count`, `Bytes`, `Bits`, `Duration` and `Instant`.
+- `Instant.toTimestamp` and `fromTimestamp` for the clock-free `Io.Timestamp` that `Clock.now` returns.
+- `id.Counter.last`, `bounded.Limit.exceeds` and `own.Owned.initFrom`, which takes its payload by `moveInto` and consumes the source, so a Budget reservation is owned once.
+- Paired assembly (x86-64 and aarch64, ReleaseFast and ReleaseSafe) and timing fixtures for each of these against hand-written code, native contention and Io-schedule tests, and release/Debug contract cases for the fail-stop limits.
+
+- A8 generational domains, fixed/growing/dense storage, primary-witness secondary associations and checked typed indices.
+- A9 nonowning refined-input adapters and bounded pointer-free public error context with explicit text classification.
+
+- A6 std.Io blocking and bounded read/write guards, bounded condition registration, stable Once publication/retry, explicit logical-task ordering and checked Confined handoff.
+- A7 fixed arrays, queues/rings, explicit bounded buffers, finite limits/reservations and static nonblocking Owned/MustUse contracts.
+- A5 (work in progress): one-bit Choice, explicit verdict disclosure, byte equality, endian order and fixed-width selection with public length/overlap errors.
+- Separate A5 caller/codegen, unsupported-profile/type, disclosure/format and native property tests; own manual paired benchmarks.
+- Latest published green preflight/shakedown pins and preflight-generated CI. The contract gates run as `zig build contracts`, in three groups that hosted CI shards across jobs.
+
+- A4 SecretBytes: full-capacity byte ownership, explicit adoption/exposure/reserve/transfer, overlap-rejecting replacement, shrink erasure, zeroed growth and fail-closed formatting. All cleanup wipes full capacity before free, including slack; errors retain promised ownership and borrows. No remap, implicit growth or slice ownership escape API.
+- Pre-free observing-allocator regressions, NoResize allocation-failure coverage, shrinking resize properties, portable/all-mode move contracts and paired enclosing dead-use erasure/codegen fixtures with a full-wipe handwritten baseline.
+
+- A3 checked, saturating and ranged integers, failing integer casts, distinct IDs and checked nonwrapping counters.
+- Tagged counts, byte/bit conversions, durations and clock-tagged instants with explicit checked scaling, rounding, endian encoding and std.Io adapters.
+- Always-on invariant/pre/post contracts, optional Debug predicates and test-only maybe coverage.
+- Scalar contract properties, compile rejection fixtures, portable profile/layout checks, strict paired release codegen and own A/B benchmarks.
+- Inline Secret(T) with full-region unconditional erasure, explicit exposure/transfer and fail-closed formatting.
+- Guarded(T) with cloak's acquire/release spin semantics and explicit borrowed guards.
+
+[Unreleased]: https://github.com/pedronaugusto/aegis/commits/main

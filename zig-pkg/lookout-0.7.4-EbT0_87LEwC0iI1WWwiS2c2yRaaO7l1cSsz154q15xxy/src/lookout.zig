@@ -1,0 +1,2229 @@
+//! lookout — one file-system watching API over FSEvents, `kqueue`,
+//! `inotify`, `ReadDirectoryChangesW` and polling.
+//!
+//! A `Watcher` owns a set of watches. Each watch is a path — a file or a
+//! directory — added with `Watcher.add`, changed with `Watcher.refilter`,
+//! and dropped with `Watcher.remove`.
+//! `Watcher.poll` blocks until something happens and hands back the events
+//! that happened, one per path, coalesced.
+//!
+//! The library starts no threads and calls nothing back. Everything happens
+//! on the thread that calls `poll`, and a program with a loop of its own can
+//! take `Watcher.fd` and wait on the watcher alongside its other descriptors.
+//!
+//! `poll` is a `std.Io` cancellation point on every backend, and a
+//! cancellation never costs an event: see `Watcher.poll`. Its waits are
+//! reactor's, so on a reactor runtime a blocked `poll` holds no thread and a
+//! cancellation ends it, and on any other `std.Io` the calling thread waits.
+//! `Watcher.wake` ends a blocked `poll` from another thread on every backend.
+
+const std = @import("std");
+const aegis = @import("aegis");
+const builtin = @import("builtin");
+const reactor = @import("reactor");
+
+const Allocator = std.mem.Allocator;
+const assert = aegis.assert.invariant;
+const Io = std.Io;
+
+const Batch = @import("Batch.zig");
+const ChangeLog = @import("ChangeLog.zig");
+const Links = @import("Links.zig");
+const Tree = @import("Tree.zig");
+const walk = @import("walk.zig");
+const path_cmp = @import("path.zig");
+const fs_type = @import("filesystem.zig");
+const contract = @import("watch_contract.zig");
+const backends = @import("backend.zig");
+const options_mod = @import("options.zig");
+const timing = @import("timing.zig");
+
+/// The filesystem fact measured at each watch registration.
+pub const Filesystem = fs_type.Kind;
+/// Explicit filesystem matching policy, separate from probed facts.
+pub const NamePolicy = @import("identity.zig").Policy;
+const identity = @import("identity.zig");
+
+/// Helpers for canonical kernel paths. Resolve caller spellings before use.
+pub const path = struct {
+    /// The part of `p` below `base`, as a slice of `p`: empty when they
+    /// name the same place, null when `p` is outside `base`.
+    pub const relative = path_cmp.relative;
+    /// Whether `p` is `base` or under it.
+    pub const within = path_cmp.within;
+};
+
+test "public path helpers use watch path comparisons" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("file", path.relative("/watch", "/watch/file").?);
+    try testing.expect(path.within("/watch", "/watch"));
+    try testing.expect(!path.within("/watch", "/watcher/file"));
+    try testing.expect(path.relative("/WATCH", "/watch/file") == null);
+}
+
+test "failed overflow reporting leaves the lost watch queued for retry" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", gpa);
+    defer gpa.free(root);
+    var watcher = try Watcher.init(gpa, std.testing.io, .{ .backend = .poll });
+    defer watcher.deinit(io);
+    const id = try watcher.add(io, root, .{});
+    try watcher.batch.dropped.put(gpa, id, {});
+    var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    {
+        watcher.gpa = failing.allocator();
+        defer watcher.gpa = gpa;
+        try testing.expectError(error.OutOfMemory, watcher.collect(io));
+        try testing.expect(watcher.batch.dropped.contains(id));
+    }
+    try watcher.collect(io);
+    try testing.expectEqual(@as(usize, 0), watcher.batch.dropped.count());
+    try testing.expectEqual(@as(usize, 1), watcher.batch.events.items.len);
+    try testing.expectEqual(Kind.overflow, watcher.batch.events.items[0].kind);
+}
+
+/// Which paths under a watch the caller wants. See `Watcher.AddOptions.filter`.
+pub const Filter = @import("Filter.zig");
+const CompiledFilter = @import("CompiledFilter.zig");
+
+/// What a tree looked like, and what has changed in it since. This is
+/// what `Kind.overflow` asks a caller to work out, made answerable:
+/// seed one where the watch is taken, and diff it when the watcher says
+/// its record is incomplete.
+pub const Baseline = @import("Baseline.zig");
+
+/// The mechanism a `Watcher` uses to learn that something changed.
+///
+/// Which of these this target was built with is `supported`; which one
+/// `auto` picks is `default_backend`. `poll` is built everywhere.
+pub const Backend = @import("types.zig").Backend;
+
+/// Whether this target was built with `backend`.
+///
+/// Asking `Watcher.init` for one that was not fails with
+/// `error.BackendUnavailable` rather than failing to compile, so a
+/// program may ask and fall back at run time; this is how it asks first.
+pub const supported = @import("types.zig").supported;
+
+/// Whether `backend` pairs a rename, reporting one `Kind.renamed` event
+/// carrying `Event.from`, or cannot and reports `Kind.removed` on the old
+/// path and `Kind.created` on the new one.
+///
+/// Both shapes describe the same thing happening. A program that only
+/// wants to know that a path needs re-reading can ignore the difference;
+/// one that follows a file across a rename needs this.
+///
+/// Where renames are paired, a name the watch's filter excludes is
+/// treated exactly as a name outside the watch. Both names kept is
+/// `renamed`; only the new one kept is `created` there, as a rename in
+/// from outside is; only the old one kept is `removed` there, as a
+/// rename out of the watch is; neither is nothing. So a file saved by
+/// writing an excluded temporary name and renaming it over a watched one
+/// is `created` at the watched name, and an event never names an
+/// excluded path, as `Event.path` or as `Event.from`.
+pub const pairsRenames = @import("types.zig").pairsRenames;
+
+/// What a backend reports when the watched path itself is moved. See
+/// `reportsRootMove`.
+pub const RootMove = @import("types.zig").RootMove;
+
+/// How `backend` reports the watched path itself being moved.
+///
+/// The watched path being *deleted* is `Kind.removed` on every backend.
+/// A move is the one that differs, so this is how a program asks which
+/// of the three shapes to expect instead of discovering it.
+///
+/// `kqueue` and `inotify` watch the object and are told that it moved,
+/// so both say `renamed`. `poll` compares listings, in which a move and
+/// a deletion are the same absence, and FSEvents reports both with one
+/// flag that does not say which; both say `removed`. `windows` holds a
+/// directory handle that a rename leaves valid, and the rename happens
+/// in the parent directory, which the watch was not put on: nothing is
+/// delivered, and `silent` says so rather than leaving a caller waiting
+/// for an event that is not coming.
+///
+/// The answer is absolute: a backend gives the shape named here and
+/// never one of the other two, so a caller may switch on it without a
+/// fallback arm.
+pub const reportsRootMove = @import("types.zig").reportsRootMove;
+
+/// Whether `backend` is told that a file open for writing has been
+/// closed, and can report `Kind.closed`.
+///
+/// Only `inotify` is: `IN_CLOSE_WRITE` is the one signal any of these
+/// mechanisms gets that a writer has actually finished rather than
+/// paused. FSEvents, `kqueue`, `ReadDirectoryChangesW` and a listing
+/// comparison all see writes and none of them sees a close.
+///
+/// This is why `Watcher.Options.report_closes` is off by default and why this
+/// predicate exists beside it: a kind that silently means nothing on
+/// four backends out of five is worse than no kind at all. A program
+/// that wants the end of a write everywhere uses `Watcher.Options.settle`,
+/// which estimates it from a quiet window and works on all five.
+pub const reportsCloses = @import("types.zig").reportsCloses;
+
+/// Whether `backend` can leave an excluded directory unregistered, or
+/// only drop the events coming out of it.
+///
+/// `Watcher.AddOptions.filter` means the same thing to a caller on every backend:
+/// the excluded paths are not reported. What differs is what it saves.
+/// `inotify`, `kqueue` and `poll` recurse in lookout, so an excluded
+/// directory is never opened, never registered, and costs neither a
+/// kernel watch nor a descriptor nor a listing. FSEvents and
+/// `ReadDirectoryChangesW` recurse in the kernel, which was never told
+/// about the filter, so the tree is walked whatever the filter says and
+/// only the events are dropped.
+///
+/// A program that filters to save resources rather than noise wants this
+/// answer; one that filters to save itself the events does not care.
+pub const prunesIgnored = @import("types.zig").prunesIgnored;
+
+/// The backend `Backend.auto` resolves to on this target: the kernel one
+/// where there is a kernel one, and `poll` where there is not.
+///
+/// On Apple targets this is `fsevents` rather than `kqueue`, because
+/// FSEvents recurses without a descriptor per directory and pairs
+/// renames. `kqueue` remains explicitly selectable when lower latency on
+/// a small tree matters more than either property; it reports a rename as
+/// a removal and a creation.
+pub const default_backend = @import("types.zig").default_backend;
+
+/// The backend every target has. Named here rather than inside `Impl`
+/// because every one of that union's shapes has it.
+const Poll = backends.Poll;
+
+/// Where a watcher had got to, so that a later one can carry on from
+/// there.
+///
+/// An owned resume snapshot, including changes poll has not handed out.
+pub const Checkpoint = @import("Checkpoint.zig");
+
+/// Whether the backend has a persistent log that checkpoints can resume.
+/// Other backends return null from Watcher.checkpoint and ignore the option.
+pub const tracksCheckpoint = @import("types.zig").tracksCheckpoint;
+
+/// Identifies one watch within one `Watcher`.
+///
+/// `add` never issues the same value twice for the lifetime of the
+/// `Watcher`, so an event carrying the id of a removed watch cannot be
+/// confused with a later one.
+///
+/// One id is registered with a backend twice, and only one: a watch taken
+/// with `Watcher.AddOptions.pending` is registered on an ancestor while it waits
+/// and registered again on the path itself when that appears, under the
+/// id the caller already holds. A backend that keeps state past a
+/// `remove` -- a buffer the kernel may still be writing into, say --
+/// therefore cannot key that state on the id alone.
+pub const WatchId = @import("types.zig").WatchId;
+
+/// What happened to a path.
+///
+/// Coalescing within one `Watcher.poll` keeps the most significant kind
+/// observed, in this order: `attributes` < `modified` < `closed` <
+/// `created` < `renamed` < `removed` < `overflow` < `unwatched`. A path
+/// created and then written inside one window reports `created`; a path
+/// written and then deleted reports `removed`.
+/// With `Watcher.Options.debounce`, ordinary changes report the kind seen last.
+/// `overflow` and `unwatched` bypass holding in every mode and keep the
+/// precedence above: neither can be replaced by an ordinary change, and
+/// `unwatched` wins when both loss notices name the same watch and path.
+/// A loss notice clears any held change on that path; later changes in
+/// the same batch cannot start another hold there.
+pub const Kind = @import("types.zig").Kind;
+
+/// What an event's path is, where the backend knows.
+pub const Target = @import("types.zig").Target;
+
+/// One thing that happened to one path during one `Watcher.poll` window.
+pub const Event = @import("types.zig").Event;
+
+/// A moment in a watcher's history: see `Watcher.clock`.
+pub const Clock = ChangeLog.Clock;
+/// One path `Watcher.since` says changed.
+pub const Change = ChangeLog.Change;
+/// `Watcher.since`'s answer.
+pub const Changes = ChangeLog.Changes;
+
+/// A set of watches and the events they have produced.
+///
+/// Not thread-safe: one `Watcher` belongs to one thread, save `wake`,
+/// `clock`, `since` and `sync`, which any thread may call. Several may
+/// exist in one process.
+/// Whether `wake` was called since the last `poll` answered it.
+const Wakened = enum(u8) { quiet, woken };
+
+pub const Watcher = struct {
+    /// How a `Watcher` behaves, fixed for its lifetime.
+    pub const Options = options_mod.Options;
+
+    /// How one watch behaves, fixed for its lifetime.
+    pub const AddOptions = options_mod.AddOptions;
+
+    gpa: Allocator,
+    options: Options,
+    batch: Batch,
+    /// The last id issued; never reissued, and refused rather than wrapped.
+    ids: aegis.id.Counter(WatchId.Domain, u32),
+    impl: Impl,
+    /// Polling registrations selected per watch beside the native backend.
+    polling: Poll,
+    /// Every watch `add` has issued an id for, in the order it issued
+    /// them. Kept here rather than in the backends because all five had
+    /// the same table and the same linear scan over it, and because a
+    /// watch's root is what `Kind.overflow` is reported against.
+    table: std.array_hash_map.Auto(WatchId, Held),
+    /// Watches whose path does not exist yet. See `AddOptions.pending`.
+    pending: std.ArrayList(*Pending),
+    /// The links each watch with `AddOptions.follow_symlinks` follows.
+    /// Heap-allocated: the registrations on the links' targets point
+    /// into them.
+    following: std.ArrayList(*Links),
+    /// What each `Links` asks of the watcher, embedded so its functions
+    /// find the watcher from it. See `linkHost`.
+    link_host: Links.Host = LinkHost.answers,
+    /// Set by `wake` and cleared by the `poll` that answers it. One of
+    /// the fields of a `Watcher` another thread may touch.
+    woken: aegis.Atomic(Wakened),
+    /// What `wake` sets to end the backend's wait, and what every
+    /// backend's wait includes beside its own descriptor. It only ends a
+    /// sleep: `woken` is the fact. Another field a thread that is not the
+    /// poller may touch, and the only way it reaches a blocked `poll`;
+    /// `wake` never touches `impl`, which is the polling thread's to
+    /// write.
+    wakeup: reactor.Wake,
+    /// Whether the events in `batch` were handed to the caller by the last
+    /// `poll`, and so are the caller's until the next one begins. A `poll`
+    /// that returned an error handed nothing out, and what it had gathered
+    /// is still the next one's to return.
+    handed_out: bool,
+    /// Whether a wait has read into `batch` what no `collect` has yet
+    /// looked at: a `poll` that failed between the two left it, and the
+    /// next one collects it before anything else.
+    uncollected: bool = false,
+    /// Overflow notices `poll` has handed out. See `Stats.overflows`.
+    overflows: u64 = 0,
+    /// What `poll` has handed out, with `Options.history`. Heap-allocated
+    /// and set once, by `init`: the threads that read it hold this
+    /// pointer, not the watcher.
+    history: ?*ChangeLog,
+
+    /// What the watcher remembers about one watch.
+    const Held = struct {
+        /// The path the caller asked for, absolute and canonical as far
+        /// as it exists. Owned here.
+        path: []u8,
+        /// The path the backend currently holds a registration on: the
+        /// same path, or an ancestor while a pending watch waits, or
+        /// `null` when nothing could be registered at all. Owned here.
+        ///
+        /// Where it is registered has no say in what it claims. `path` is
+        /// the watch's whether it is registered there, on an ancestor, or
+        /// nowhere yet, and an ancestor is never taken by a wait in it --
+        /// see `claimed`.
+        registered: ?[]u8,
+        requested: ?[]u8 = null,
+        identity_override: ?NamePolicy = null,
+        /// The type of the caller's root, retained for root-level events
+        /// after the path can no longer be stat-ed.
+        target: Target,
+        /// `AddOptions.recursive`.
+        recursive: bool,
+        /// An allocation failure may have interrupted this watch's delivery.
+        /// Set without allocation and cleared only after its notice is handed out.
+        incomplete: bool = false,
+        capabilities: Capabilities = .{ .backend = .auto, .filesystem = .unknown },
+    };
+
+    /// Facts for one watch; use the backend with the global capability queries.
+    pub const Capabilities = struct { backend: Backend, filesystem: Filesystem, names: identity.Capabilities = .{}, policy: NamePolicy = .{} };
+
+    /// Returns facts measured on registration, including for an explicitly
+    /// selected backend. Pending watches report their current ancestor facts.
+    pub fn capabilities(w: *const Watcher, id: WatchId) ?Capabilities {
+        return (w.table.get(id) orelse return null).capabilities;
+    }
+
+    /// Fresh facts for a canonical directory under this watch. Caller policy
+    /// stays separate and never changes the reported capability.
+    pub fn directoryCapabilities(w: *const Watcher, io: Io, id: WatchId, directory: []const u8) ?Capabilities {
+        const held = w.table.get(id) orelse return null;
+        if (!path_cmp.within(held.path, directory)) return null;
+        const names = identity.read(io, directory);
+        return .{ .backend = held.capabilities.backend, .filesystem = fs_type.read(w.gpa, io, directory), .names = names, .policy = names.policy(held.identity_override) };
+    }
+
+    /// One watch, as `watches` reports it.
+    pub const WatchInfo = contract.WatchInfo;
+
+    /// A watch waiting for its path to appear.
+    ///
+    /// Heap-allocated and never moved: the ancestor watch's filter points
+    /// at it, and that filter is asked from inside a backend.
+    const Pending = struct {
+        /// The id `add` returned, which the ancestor watch is registered
+        /// under and which the real watch takes over.
+        id: WatchId,
+        /// The absolute path the caller asked for, canonical as far as it
+        /// exists. Owned here, and the two slices below point into it.
+        target: []u8,
+        /// The ancestor currently watched, or `null` when none could be
+        /// registered.
+        anchor: ?[]const u8,
+        /// The id the ancestor's registration is under while there is one:
+        /// an id of its own, issued as a followed link's is and in no
+        /// table, so the real watch registers under `id` beside it and the
+        /// ancestor goes only once the real watch stands.
+        anchor_id: ?WatchId = null,
+        /// The one entry of `anchor` that leads to `target`, which is the
+        /// only thing the ancestor watch is about.
+        next: []const u8,
+        /// `AddOptions.recursive`, applied at the promotion.
+        recursive: bool,
+        /// `AddOptions.follow_symlinks` and `max_followed_links`, applied
+        /// at the promotion.
+        follow: bool,
+        max_followed_links: usize,
+        identity_override: ?NamePolicy = null,
+        /// `AddOptions.filter`, copied: the patterns it borrowed are long
+        /// gone by the time the watch is promoted.
+        filter: CompiledFilter,
+        /// The ancestor watch's filter, answered by `onlyNext`.
+        allowing: Filter.Allow = .{ .allowFn = onlyNext },
+
+        /// The ancestor watch's filter. Everything but the next step down
+        /// is somebody else's business.
+        fn onlyNext(allow: *const Filter.Allow, subject: []const u8) bool {
+            const p: *const Pending = @alignCast(@fieldParentPtr("allowing", allow));
+            return path_cmp.eql(subject, p.next);
+        }
+    };
+
+    /// Every backend this target was built with, and the one the watcher
+    /// chose. See `backend.zig`.
+    const Impl = backends.Impl;
+
+    /// Errors `init` can return when creating the backend's resources.
+    /// FSEvents also allocates its delivery sink and `Options.buffer_bytes`
+    /// buffer here, even with no watches. Allocator failures are
+    /// `OutOfMemory`. Other backends allocate as watches are added.
+    pub const InitError = contract.InitError;
+
+    /// Errors `add` can return, on top of the file-system errors of
+    /// resolving and opening the path.
+    pub const AddError = contract.AddError;
+
+    /// Errors changing a live watch's filter.
+    pub const RefilterError = contract.RefilterError;
+
+    /// Errors `poll` can return, on top of the file-system errors of
+    /// re-reading watched directories.
+    ///
+    /// One set for every backend, and true for every one of them.
+    /// `error.Canceled` is in it because `poll` is a cancellation point on
+    /// all five: see `poll` for where. The backend is chosen when the
+    /// watcher is made, not when the program is compiled, so a set per
+    /// backend would be a set per value of `Options.backend` — and every
+    /// backend re-reads directories through `std.Io`, whose file-system
+    /// errors carry `error.Canceled` anyway.
+    pub const PollError = contract.PollError;
+
+    /// A system call failed with a code lookout does not model. This is
+    /// the escape hatch every backend shares, so that an error set is a
+    /// promise about the whole API rather than about one platform.
+    pub const UnexpectedError = contract.UnexpectedError;
+
+    /// Creates a watcher that holds no watches.
+    ///
+    /// `gpa` is kept for the watch tables and for the event buffer handed
+    /// out by `poll`. Every call that reaches the file system takes the
+    /// `std.Io` it goes through; none is kept, and the `io` given here
+    /// makes the object `wake` sets and opens CoreServices for FSEvents,
+    /// the first time a watcher in the process needs it. Call `deinit` to
+    /// release both the allocations and the descriptors.
+    pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Watcher {
+        const resolved: Backend = switch (options.backend) {
+            .auto => default_backend,
+            else => |b| b,
+        };
+        var wakeup: reactor.Wake = try .init(io);
+        errdefer wakeup.deinit(io);
+        const impl: Impl = switch (resolved) {
+            .auto => unreachable,
+            inline else => |tag| impl: {
+                const name = @tagName(tag);
+                if (!@hasField(Impl, name)) return error.BackendUnavailable;
+                break :impl @unionInit(Impl, name, try @FieldType(Impl, name).init(gpa, io, options));
+            },
+        };
+        var kept_options = options;
+        kept_options.checkpoint = null; // Only the resuming backend owns the copy.
+        const history: ?*ChangeLog = if (options.history) |limit| try ChangeLog.create(gpa, io, limit) else null;
+        return .{
+            .gpa = gpa,
+            .options = kept_options,
+            .batch = .init(options),
+            .ids = .init(0),
+            .impl = impl,
+            .polling = Poll.init(gpa, io, options) catch |err| switch (err) {},
+            .table = .empty,
+            .pending = .empty,
+            .following = .empty,
+            .woken = .init(.quiet),
+            .wakeup = wakeup,
+            .handed_out = false,
+            .history = history,
+        };
+    }
+
+    /// Releases every watch, every descriptor, and the events handed out
+    /// by the last `poll`. `io` closes the descriptors.
+    pub fn deinit(w: *Watcher, io: Io) void {
+        while (w.following.items.len != 0) w.stopFollowing(io, w.following.items[0].owner);
+        w.following.deinit(w.gpa);
+        w.polling.deinit(io);
+        switch (w.impl) {
+            inline else => |*impl| impl.deinit(io),
+        }
+        w.wakeup.deinit(io);
+        for (w.pending.items) |p| w.destroyPending(p);
+        w.pending.deinit(w.gpa);
+        for (w.table.values()) |*held| w.release(held);
+        w.table.deinit(w.gpa);
+        w.batch.deinit(w.gpa);
+        if (w.history) |h| h.destroy();
+        w.* = undefined;
+    }
+
+    /// Starts watching `path`, which may be a file or a directory and may
+    /// be relative to the current directory.
+    ///
+    /// The path is resolved to a canonical absolute path once, here; the
+    /// watch follows that path and the events it produces are spelled
+    /// against it.
+    ///
+    /// One watcher watches a path once: a second `add` of a path already
+    /// watched fails with `error.PathAlreadyWatched`, on every backend.
+    /// The rule exists because `inotify` returns the same kernel watch
+    /// descriptor for the same inode, so a second registration would
+    /// quietly take the first one's events over; refusing it is the same
+    /// answer everywhere instead of a difference to discover.
+    ///
+    /// Changes made after `add` returns are reported, subject to the
+    /// watch's scope, filters and coalescing.
+    ///
+    /// The returned id is valid until `remove` is called with it or the
+    /// watcher is deinitialized.
+    ///
+    /// A cancellation already requested is `error.Canceled`, and nothing is
+    /// added. One requested while the `add` runs is left for the next
+    /// cancellation point: a recursive watch is registered directory by
+    /// directory, and one stopped half way would be neither a watch nor a
+    /// failure to take one.
+    pub fn add(w: *Watcher, io: Io, requested: []const u8, options: AddOptions) AddError!WatchId {
+        try io.checkCancel();
+        const spelling = try w.gpa.dupe(u8, requested);
+        errdefer w.gpa.free(spelling);
+        const id = try w.addResolved(io, requested, options);
+        if (w.history) |h| h.added(io, id, w.table.getPtr(id).?.path) catch |err| {
+            w.remove(io, id);
+            return err;
+        };
+        w.table.getPtr(id).?.requested = spelling;
+        w.table.getPtr(id).?.identity_override = options.identity;
+        return id;
+    }
+    fn addResolved(w: *Watcher, io: Io, requested: []const u8, options: AddOptions) AddError!WatchId {
+        try io.checkCancel();
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+
+        // The backend copies what it keeps, so this resolution is scratch
+        // and a failed `add` leaves nothing behind.
+        const abs = identity.canonical(w.gpa, io, requested) catch |err| switch (err) {
+            error.FileNotFound => if (options.pending)
+                return w.addPending(io, requested, options)
+            else
+                return err,
+            else => |e| return e,
+        };
+        defer w.gpa.free(abs);
+        return w.register(io, abs, options);
+    }
+
+    /// Registers an absolute path that exists, and issues its id.
+    fn register(w: *Watcher, io: Io, abs: []const u8, options: AddOptions) AddError!WatchId {
+        if (w.claimed(abs)) return error.PathAlreadyWatched;
+        const stat = try Io.Dir.cwd().statFile(io, abs, .{ .follow_symlinks = false });
+        var ids = w.ids;
+        const id = try ids.next();
+        const owned = try w.gpa.dupe(u8, abs);
+        errdefer w.gpa.free(owned);
+        const mirror = try w.gpa.dupe(u8, abs);
+        errdefer w.gpa.free(mirror);
+        try w.table.ensureUnusedCapacity(w.gpa, 1);
+        w.table.putAssumeCapacity(id, .{
+            .path = owned,
+            .registered = mirror,
+            .target = .of(stat.kind),
+            .recursive = options.recursive,
+            .identity_override = options.identity,
+        });
+        errdefer _ = w.table.swapRemove(id);
+        try w.addBackend(io, id, abs, abs, options);
+        w.ids = ids;
+        if (options.follow_symlinks and options.recursive and stat.kind == .directory) {
+            w.follow(io, id, abs, options.filter, options.max_followed_links, false) catch |err| {
+                w.removeBackend(io, id);
+                w.batch.discardFuture(w.gpa, id);
+                return err;
+            };
+        }
+        assert(w.table.contains(id), "w.table.contains(id)");
+        return id;
+    }
+
+    /// Backend registrations may live on an ancestor; resume identity is
+    /// always the caller's root, owned by Watcher.
+    fn addBackend(w: *Watcher, io: Io, id: WatchId, physical: []const u8, requested: []const u8, options: AddOptions) AddError!void {
+        return w.addBackendFor(io, id, id, physical, requested, options);
+    }
+
+    /// `addBackend` under `id`, its facts recorded as the watch `holder`'s:
+    /// a pending watch's ancestor registers under an id of its own and
+    /// reports its facts as the pending watch's.
+    fn addBackendFor(w: *Watcher, io: Io, id: WatchId, holder: WatchId, physical: []const u8, requested: []const u8, options: AddOptions) AddError!void {
+        const filesystem = fs_type.read(w.gpa, io, physical);
+        const names = identity.read(io, physical);
+        const use_poll = w.options.backend == .auto and (filesystem == .network or filesystem == .fuse) and w.backend() != .poll;
+        added: {
+            if (use_poll) {
+                try w.polling.add(io, id, physical, options, &w.batch);
+                break :added;
+            }
+            if (comptime @hasField(Impl, "fsevents")) {
+                if (w.impl == .fsevents) {
+                    try w.impl.fsevents.addFor(io, id, physical, requested, options, &w.batch);
+                    break :added;
+                }
+            }
+            switch (w.impl) {
+                inline else => |*impl| try impl.add(io, id, physical, options, &w.batch),
+            }
+        }
+        // Recorded once the registration stands: one refused leaves the
+        // holder's facts as they were.
+        if (w.table.getPtr(holder)) |held| held.capabilities = .{ .backend = if (use_poll) .poll else w.backend(), .filesystem = filesystem, .names = names, .policy = names.policy(options.identity) };
+    }
+
+    /// Whether some watch already watches `abs` itself, or waits for it.
+    ///
+    /// Every watch claims the path it was asked for, and nothing else. A
+    /// pending watch claims the path it waits for from the moment it is
+    /// added, so that a second watch of that path is refused whether or
+    /// not a `poll` has promoted the first yet; allowing it until then
+    /// left two registrations on one path once the promotion came.
+    ///
+    /// The ancestor a pending watch is parked on is not claimed. It holds
+    /// a registration there, but that ancestor is not what anybody asked
+    /// to watch: a caller who then asks for it gets a watch of their own,
+    /// and a second pending watch may park on it as well. The backends
+    /// keep such watches apart -- `inotify` by giving one kernel watch
+    /// several owners, the others by registering each one separately.
+    fn claimed(w: *const Watcher, abs: []const u8) bool {
+        return w.claimedBesides(abs, null);
+    }
+
+    /// `claimed`, leaving out the watch `own`.
+    fn claimedBesides(w: *const Watcher, abs: []const u8, own: ?WatchId) bool {
+        for (w.table.keys(), w.table.values()) |id, held| {
+            if (own == id) continue;
+            if (path_cmp.eql(held.path, abs)) return true;
+        }
+        return false;
+    }
+
+    fn release(w: *Watcher, held: *Held) void {
+        w.gpa.free(held.path);
+        if (held.requested) |requested| w.gpa.free(requested);
+        if (held.registered) |registered| w.gpa.free(registered);
+        held.* = undefined;
+    }
+
+    /// The root `Kind.overflow` is reported against for a watch.
+    fn rootOf(w: *const Watcher, id: WatchId) ?[]const u8 {
+        return (w.table.get(id) orelse return null).path;
+    }
+
+    fn rootTarget(w: *const Watcher, id: WatchId) Target {
+        return (w.table.get(id) orelse return .unknown).target;
+    }
+
+    /// Takes a watch on a path that is not there, parks it on the nearest
+    /// existing ancestor, and issues its id. See `AddOptions.pending`.
+    fn addPending(w: *Watcher, io: Io, requested: []const u8, options: AddOptions) AddError!WatchId {
+        const target = try w.absentPath(io, requested);
+        var owns_target = true;
+        defer if (owns_target) w.gpa.free(target);
+        // It may have appeared while its name was being spelled, in which
+        // case there is nothing to wait for.
+        if (try exists(io, target)) {
+            return w.register(io, target, options);
+        }
+
+        if (w.claimed(target)) return error.PathAlreadyWatched;
+        const p = try w.gpa.create(Pending);
+        errdefer w.gpa.destroy(p);
+        var filter = try CompiledFilter.compilePolicy(w.gpa, options.filter, options.identity orelse .{});
+        errdefer filter.deinit();
+
+        var ids = w.ids;
+        const id = try ids.next();
+        const owned = try w.gpa.dupe(u8, target);
+        errdefer w.gpa.free(owned);
+        try w.table.put(w.gpa, id, .{
+            .path = owned,
+            .registered = null,
+            .target = .unknown,
+            .recursive = options.recursive,
+            .identity_override = options.identity,
+        });
+        errdefer _ = w.table.swapRemove(id);
+        p.* = .{
+            .id = id,
+            .target = target,
+            .anchor = null,
+            .next = target,
+            .recursive = options.recursive,
+            .follow = options.follow_symlinks,
+            .max_followed_links = options.max_followed_links,
+            .identity_override = options.identity,
+            .filter = filter,
+        };
+        try w.pending.append(w.gpa, p);
+        errdefer _ = w.pending.pop();
+        try w.anchorPending(io, p, &ids);
+        w.ids = ids;
+        owns_target = false;
+        assert(w.table.contains(id), "w.table.contains(id)");
+        assert(w.waiting(id), "w.waiting(id)");
+        return id;
+    }
+
+    /// The absolute path of something that is not there: canonical as far
+    /// as it exists, and taken as written past that, because a name that
+    /// does not exist has no symbolic links to resolve.
+    fn absentPath(w: *Watcher, io: Io, requested: []const u8) AddError![]u8 {
+        const lexical = lexical: {
+            if (std.Io.Dir.path.isAbsolute(requested)) break :lexical try std.Io.Dir.path.resolveAlloc(w.gpa, &.{requested});
+            const here = try Io.Dir.cwd().realPathFileAlloc(io, ".", w.gpa);
+            defer w.gpa.free(here);
+            break :lexical try std.Io.Dir.path.resolveAlloc(w.gpa, &.{ here, requested });
+        };
+        errdefer w.gpa.free(lexical);
+
+        const present = (try existingPrefix(io, lexical)) orelse return lexical;
+        const real = identity.canonical(w.gpa, io, present) catch return lexical;
+        defer w.gpa.free(real);
+
+        var rest = lexical[present.len..];
+        while (rest.len != 0 and std.Io.Dir.path.isSep(rest[0])) rest = rest[1..];
+        const joined = if (rest.len == 0)
+            try w.gpa.dupe(u8, real)
+        else
+            try std.Io.Dir.path.join(w.gpa, &.{ real, rest });
+        w.gpa.free(lexical);
+        return joined;
+    }
+
+    /// The longest prefix of `path` that is there, as a slice of it.
+    fn existingPrefix(io: Io, requested: []const u8) Io.Cancelable!?[]const u8 {
+        var candidate = requested;
+        while (true) {
+            if (try exists(io, candidate)) return candidate;
+            candidate = std.Io.Dir.path.dirname(candidate) orelse return null;
+        }
+    }
+
+    /// Whether `requested` is there. Whatever stops a look at it is its
+    /// absence, but a cancel, which is the caller's.
+    fn exists(io: Io, requested: []const u8) Io.Cancelable!bool {
+        _ = Io.Dir.cwd().statFile(io, requested, .{}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
+        };
+        return true;
+    }
+
+    /// Puts the watch on the nearest existing ancestor of a path that is
+    /// not there yet, narrowed to the one entry that leads to it.
+    ///
+    /// An ancestor gone again before it could be registered is not an
+    /// error: the watch stays parked and the next `poll` tries again. Any
+    /// other refusal is the caller's to hear, as it would be for a path
+    /// that was there -- otherwise the watch would wait on nothing and
+    /// never hear its path appear.
+    ///
+    /// The ancestor may be a path this watcher already watches, or one
+    /// another pending watch is parked on. The registration is this
+    /// watch's own either way, under its own id and its own filter, so
+    /// neither watch hears the other's events or loses its own.
+    ///
+    /// Make before break: the new ancestor is registered under an id of
+    /// its own, drawn from `ids`, and the old one is removed only once it
+    /// stands. A refusal, a cancel or a failure leaves the watch parked
+    /// where it was.
+    fn anchorPending(w: *Watcher, io: Io, p: *Pending, ids: *@FieldType(Watcher, "ids")) AddError!void {
+        const present = (try existingPrefix(io, p.target)) orelse return w.dropAnchor(io, p);
+        // The path itself is there: the promotion takes the watch off the
+        // ancestor once the real watch stands.
+        if (present.len == p.target.len) return;
+        // The ancestor and the one step down from it are both the start
+        // of the path the watch waits for, the step the longer.
+        assert(std.mem.startsWith(u8, p.target, present), "std.mem.startsWith(u8, p.target, present)");
+        const anchor_id = try ids.next();
+        const mirror = try w.gpa.dupe(u8, present);
+        errdefer w.gpa.free(mirror);
+        // The filter the new registration asks is the new step; the old
+        // one'"'"'s events are dropped whatever it asks.
+        const before = p.next;
+        p.next = p.target[0..nextStep(p.target, present.len)];
+        assert(p.next.len > present.len, "p.next.len > present.len");
+        w.addBackendFor(io, anchor_id, p.id, present, p.target, .{
+            .filter = .{ .allow = &p.allowing },
+        }) catch |err| {
+            p.next = before;
+            switch (err) {
+                // Gone again before it could be registered: the next
+                // `poll` looks again.
+                error.FileNotFound, error.NotDir => {
+                    w.gpa.free(mirror);
+                    return;
+                },
+                else => |e| return e,
+            }
+        };
+        w.dropAnchor(io, p);
+        p.anchor_id = anchor_id;
+        p.anchor = present;
+        if (w.table.getPtr(p.id)) |held| held.registered = mirror else w.gpa.free(mirror);
+    }
+
+    /// Takes the watch off the ancestor it is parked on, if any: its
+    /// registration and what it has gathered.
+    fn dropAnchor(w: *Watcher, io: Io, p: *Pending) void {
+        const anchor_id = p.anchor_id orelse return;
+        w.removeBackend(io, anchor_id);
+        w.batch.discard(w.gpa, anchor_id);
+        p.anchor_id = null;
+        p.anchor = null;
+        w.unregister(p.id);
+    }
+
+    /// Registration initiated by poll cannot return an add error. A
+    /// rejected checkpoint becomes explicit loss followed by a fresh watch.
+    /// An ancestor the system will not register ends the wait with
+    /// `Kind.unwatched` against the path, and `false`: the caller stops
+    /// waiting for it, as for a path another watch turned out to have.
+    fn reanchorPending(w: *Watcher, io: Io, p: *Pending) PollError!bool {
+        var ids = w.ids;
+        w.anchorPending(io, p, &ids) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            error.InvalidCheckpoint => {
+                try w.resetCheckpoint(io, p);
+                w.anchorPending(io, p, &ids) catch |again| switch (again) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Canceled => return error.Canceled,
+                    // A token names a root once (Checkpoint.parse), and
+                    // resetCheckpoint used it.
+                    error.InvalidCheckpoint => unreachable,
+                    else => return w.abandonPending(io, p),
+                };
+            },
+            else => return w.abandonPending(io, p),
+        };
+        w.ids = ids;
+        return true;
+    }
+
+    /// Stops waiting for a path whose way down could not be watched.
+    fn abandonPending(w: *Watcher, io: Io, p: *Pending) Allocator.Error!bool {
+        try w.batch.pushDetail(w.gpa, io, p.id, p.target, .unwatched, null, .unknown);
+        return false;
+    }
+
+    fn resetCheckpoint(w: *Watcher, io: Io, p: *Pending) Allocator.Error!void {
+        if (comptime @hasField(Impl, "fsevents")) {
+            if (w.impl == .fsevents) w.impl.fsevents.discardCheckpoint(p.target);
+        }
+        try w.batch.push(w.gpa, io, p.id, p.target, .overflow, .unknown);
+    }
+
+    /// Forgets what the backend was registered on for `id`, without
+    /// touching the backend itself.
+    fn unregister(w: *Watcher, id: WatchId) void {
+        const held = w.table.getPtr(id) orelse return;
+        if (held.registered) |registered| w.gpa.free(registered);
+        held.registered = null;
+    }
+
+    /// Where the component after the prefix of length `at` ends.
+    fn nextStep(target: []const u8, at: usize) usize {
+        assert(at <= target.len, "at <= target.len");
+        var i = at;
+        while (i < target.len and std.Io.Dir.path.isSep(target[i])) i += 1;
+        while (i < target.len and !std.Io.Dir.path.isSep(target[i])) i += 1;
+        return i;
+    }
+
+    /// Keeps the watches whose path is not there yet: drops the events of
+    /// the ancestor each one is parked on, steps the parked ones down or
+    /// up as the tree changes, and promotes any whose path has appeared.
+    fn settlePending(w: *Watcher, io: Io) PollError!void {
+        if (w.pending.items.len == 0) return;
+        for (w.pending.items) |p| if (p.anchor_id) |anchor_id| w.batch.discard(w.gpa, anchor_id);
+
+        var i: usize = 0;
+        while (i < w.pending.items.len) {
+            const p = w.pending.items[i];
+            if (try exists(io, p.target)) {
+                if (try w.promotePending(io, p)) {
+                    _ = w.pending.orderedRemove(i);
+                    continue;
+                }
+            } else if (try exists(io, p.next) or !try anchorStands(io, p)) {
+                // Something appeared on the way down, or the ancestor the
+                // watch was parked on is itself gone. Either way the
+                // parking place is no longer the right one; it is left
+                // once the new one stands.
+                if (!try w.reanchorPending(io, p)) {
+                    w.dropAnchor(io, p);
+                    w.destroyPending(p);
+                    _ = w.pending.orderedRemove(i);
+                    continue;
+                }
+                // What appeared between the look and the new registration
+                // has no event of its own — `mkdir -p` makes the next step
+                // and the path in one breath — so this one is looked at
+                // again now: promoted if the path is there, moved again if
+                // another step is. A wait with no deadline would otherwise
+                // hold it parked on nothing until some other change.
+                if (try exists(io, p.target)) {
+                    if (try w.promotePending(io, p)) {
+                        _ = w.pending.orderedRemove(i);
+                        continue;
+                    }
+                } else if (p.anchor != null and try exists(io, p.next)) continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn anchorStands(io: Io, p: *const Pending) Io.Cancelable!bool {
+        const anchor = p.anchor orelse return false;
+        return exists(io, anchor);
+    }
+
+    /// Swaps the ancestor watch for the real one and reports the path
+    /// appearing. `false` when the path could not be watched after all,
+    /// which parks it again -- unless the way down cannot be watched
+    /// either, which ends the wait with `Kind.unwatched` and is `true`.
+    ///
+    /// A path that is, once it is there, one another watch already has
+    /// -- reached through a symbolic link that appeared on the way -- is
+    /// not registered a second time: the watch stops waiting and says
+    /// `Kind.unwatched`, as an `add` of that path would have been
+    /// refused. `true` then too, because it is no longer waiting.
+    ///
+    /// Make before break: the real watch registers under the watch's id
+    /// beside the ancestor's, follows its links and reports what it was
+    /// made with, and only then is the ancestor removed and the watch's
+    /// path, registration and target taken as the real watch's. A cancel
+    /// or a failure on the way removes what the real watch had taken and
+    /// leaves the watch pending on its ancestor, as it was.
+    fn promotePending(w: *Watcher, io: Io, p: *Pending) PollError!bool {
+        // Once present, ask the kernel for spelling instead of folding an
+        // uncreated caller name into an identity key.
+        const canonical = identity.canonical(w.gpa, io, p.target) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => {
+                _ = try w.reanchorPending(io, p);
+                return false;
+            },
+        };
+        defer w.gpa.free(canonical);
+        const policy = identity.read(io, canonical).policy(p.identity_override);
+        if (w.claimedBesides(canonical, p.id)) {
+            // The watch ends here, spelled as the path it found.
+            const spelled = try w.gpa.dupe(u8, canonical);
+            errdefer w.gpa.free(spelled);
+            try w.batch.pushDetail(w.gpa, io, p.id, canonical, .unwatched, null, .unknown);
+            const held = w.table.getPtr(p.id).?;
+            w.gpa.free(held.path);
+            held.path = spelled;
+            w.dropAnchor(io, p);
+            w.destroyPending(p);
+            return true;
+        }
+        const target = target: {
+            const stat = Io.Dir.cwd().statFile(io, canonical, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => break :target Target.unknown,
+            };
+            break :target Target.of(stat.kind);
+        };
+        // Owned here until the table takes it with the registration.
+        const mirror = try w.gpa.dupe(u8, canonical);
+        var owns_mirror = true;
+        defer if (owns_mirror) w.gpa.free(mirror);
+        const held_path: ?[]u8 = if (std.mem.eql(u8, canonical, p.target)) null else try w.gpa.dupe(u8, canonical);
+        var owns_held_path = held_path != null;
+        defer if (owns_held_path) w.gpa.free(held_path.?);
+        // What the real watch is made with, as it will be: its policy is
+        // the path's, which `reportMade` reads. Put back if it falls.
+        const policy_before = p.filter.policy;
+        p.filter.policy = policy;
+        errdefer p.filter.policy = policy_before;
+        w.addBackend(io, p.id, canonical, canonical, .{
+            .recursive = p.recursive,
+            .filter = p.filter.spec(),
+            .identity = p.identity_override,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => |refused| {
+                p.filter.policy = policy_before;
+                if (refused == error.InvalidCheckpoint) try w.resetCheckpoint(io, p);
+                if (try w.reanchorPending(io, p)) return false;
+                w.dropAnchor(io, p);
+                w.destroyPending(p);
+                return true;
+            },
+        };
+        errdefer {
+            w.removeBackend(io, p.id);
+            w.batch.discard(w.gpa, p.id);
+        }
+        const promoted: Pending = promoted: {
+            var copy = p.*;
+            copy.target = canonical;
+            break :promoted copy;
+        };
+        if (p.follow and p.recursive and target == .directory) {
+            try w.follow(io, p.id, canonical, p.filter.spec(), p.max_followed_links, true);
+        }
+        errdefer w.stopFollowing(io, p.id);
+        try w.batch.pushDetail(w.gpa, io, p.id, canonical, .created, null, target);
+        if (target == .directory) try w.reportMade(io, &promoted);
+
+        // The real watch stands: the ancestor goes, and the watch is it.
+        w.dropAnchor(io, p);
+        const held = w.table.getPtr(p.id).?;
+        if (held_path) |spelled| {
+            w.gpa.free(held.path);
+            held.path = spelled;
+            owns_held_path = false;
+        }
+        if (held.registered) |registered| w.gpa.free(registered);
+        held.registered = mirror;
+        owns_mirror = false;
+        held.target = target;
+        w.destroyPending(p);
+        return true;
+    }
+
+    /// Reports as created what a promoted directory already holds: what
+    /// was made in it between its appearing and the watch taken on it,
+    /// which no watch was there to see -- `mkdir -p` and a write into the
+    /// new folder are one breath. Only what the watch would report: its
+    /// filter, and below the first level only when it recurses. The batch
+    /// keeps one event per path, so a backend that reports the same entry
+    /// itself reports it once.
+    fn reportMade(w: *Watcher, io: Io, p: *const Pending) PollError!void {
+        const Made = struct {
+            w: *Watcher,
+            io: Io,
+            p: *const Pending,
+
+            const Self = @This();
+
+            fn visit(m: Self, entry: walk.Entry) !walk.Step {
+                const parent = Io.Dir.path.dirname(entry.path) orelse m.p.target;
+                const policy = if (m.p.filter.isEmpty()) m.p.filter.policy else identity.read(m.io, parent).policy(m.p.identity_override);
+                if (m.p.filter.prunesPolicy(policy, m.p.target, entry.path)) return .over;
+                if (!m.p.filter.excludesPolicy(policy, m.p.target, entry.path)) {
+                    try m.w.batch.pushDetail(m.w.gpa, m.io, m.p.id, entry.path, .created, null, Target.of(entry.kind));
+                }
+                return if (entry.kind == .directory and m.p.recursive) .into else .over;
+            }
+        };
+        walk.tree(Made, Made.visit, w.gpa, io, p.target, Made{ .w = w, .io = io, .p = p }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            // gone again, or not ours to read: the watch says the rest
+            else => {},
+        };
+    }
+
+    fn destroyPending(w: *Watcher, p: *Pending) void {
+        w.gpa.free(p.target);
+        p.filter.deinit();
+        w.gpa.destroy(p);
+    }
+
+    fn removeBackend(w: *Watcher, io: Io, id: WatchId) void {
+        w.polling.remove(io, id);
+        switch (w.impl) {
+            inline else => |*impl| impl.remove(io, id),
+        }
+    }
+
+    /// Stops watching `id`, releasing its descriptors. Events already
+    /// collected for it by the last `poll` stay valid until the next one;
+    /// no further events are produced for it.
+    ///
+    /// Removing an id that is not currently watched — one already
+    /// removed — does nothing.
+    pub fn remove(w: *Watcher, io: Io, id: WatchId) void {
+        if (w.history) |h| h.removed(io, id);
+        w.stopFollowing(io, id);
+        w.removeBackend(io, id);
+        // Ordered, so that `watches` lists what is left in the order it
+        // was added.
+        if (w.table.fetchOrderedRemove(id)) |entry| {
+            var held = entry.value;
+            w.release(&held);
+        }
+        for (w.pending.items, 0..) |p, i| {
+            if (p.id != id) continue;
+            _ = w.pending.orderedRemove(i);
+            w.dropAnchor(io, p);
+            w.destroyPending(p);
+            break;
+        }
+        w.batch.discardFuture(w.gpa, id);
+        assert(!w.table.contains(id), "!w.table.contains(id)");
+        assert(!w.waiting(id), "!w.waiting(id)");
+        assert(w.followingOf(id) == null, "w.followingOf(id) == null");
+    }
+
+    /// Replaces the filter of a live watch without changing its id, root or
+    /// recursion. Patterns are copied; the predicate context remains the
+    /// caller's and must outlive this filter. An unknown id is an error.
+    ///
+    /// On return, every collected event not yet returned by `poll`,
+    /// including an event held for debouncing or settling, is reconciled
+    /// with the new filter: an excluded path is dropped, and a rename
+    /// from an excluded path into an included one becomes a creation.
+    /// Events already returned by `poll` stay valid and are not replayed.
+    /// Queued backend records are tested against the new filter when read;
+    /// changes completed after return use it too, subject to the backend's
+    /// usual event-loss limits.
+    /// There is no snapshot boundary for a write overlapping this call:
+    /// a short-lived file in a newly admitted directory may be gone
+    /// before that directory is registered, as during recursive `add`.
+    /// Existing newly admitted directories are registered before return
+    /// where the backend registers directories individually. A pending
+    /// watch keeps the replacement filter for its eventual promotion.
+    pub fn refilter(w: *Watcher, io: Io, id: WatchId, filter: Filter) RefilterError!void {
+        if (!w.table.contains(id)) return error.UnknownWatch;
+        try io.checkCancel();
+        // What the new filter admits had no changes kept; forgetting before
+        // a refusal too only asks the caller to look again.
+        if (w.history) |h| h.refiltered(io, id);
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        // A pattern refused is refused before anything changes.
+        for (w.pending.items) |p| {
+            if (p.id != id) continue;
+            var compiled: CompiledFilter = try .compilePolicy(w.gpa, filter, p.filter.policy);
+            defer compiled.deinit();
+            std.mem.swap(CompiledFilter, &p.filter, &compiled);
+            return;
+        }
+        var compiled: CompiledFilter = try .compilePolicy(w.gpa, filter, w.table.get(id).?.capabilities.policy);
+        defer compiled.deinit();
+        if (w.table.get(id).?.capabilities.backend == .poll and w.backend() != .poll) {
+            try w.polling.refilter(io, id, filter, &w.batch);
+        } else switch (w.impl) {
+            inline else => |*impl| try impl.refilter(io, id, filter, &w.batch),
+        }
+        if (w.followingOf(id)) |links| try w.refollow(io, links, filter);
+        const Query = struct {
+            watcher: *Watcher,
+            io: Io,
+            filter: *const CompiledFilter,
+            override: ?NamePolicy,
+            pub const Self = @This();
+            pub fn excludes(q: Self, root: []const u8, subject: []const u8) bool {
+                if (q.filter.isEmpty()) return false;
+                const parent = Io.Dir.path.dirname(subject) orelse root;
+                const policy = identity.read(q.io, parent).policy(q.override);
+                return q.filter.excludesPolicy(policy, root, subject);
+            }
+        };
+        const held = w.table.get(id).?;
+        w.batch.refilter(w.gpa, id, held.path, Query{ .watcher = w, .io = io, .filter = &compiled, .override = held.identity_override }, w.handed_out);
+    }
+
+    /// Waits for something to happen and returns what did.
+    ///
+    /// Blocks until at least one event arrives or `timeout` runs out;
+    /// `.none` blocks indefinitely, and a timeout already run out, a zero
+    /// duration among them, performs a single non-blocking check and
+    /// returns. Waits are kept to the millisecond, rounded up. Once the
+    /// first event of a batch arrives, collection continues for
+    /// `Options.latency` more so that a burst on one path becomes one
+    /// event; a timeout already run out skips that wait.
+    /// `overflow` and `unwatched` bypass settling and debouncing and remain
+    /// in the batch until handed out, even if later ordinary changes name
+    /// the same path. See `Kind` for precedence.
+    ///
+    /// The returned slice, and every path in it, is owned by the watcher
+    /// and is invalidated by the next call to `poll` or by `deinit`. An
+    /// empty slice means the timeout expired with nothing to report.
+    ///
+    /// **Allocation failure.** An `OutOfMemory` hands nothing out. Retry
+    /// `poll`: backends keep unread deliveries where possible, and the
+    /// retry reports `overflow` against every still-live watch root before
+    /// it can return successfully, even after a wake. Rescan those roots.
+    /// Recovery notices survive further allocation failures and bypass
+    /// settling and debouncing. Events already gathered remain available.
+    ///
+    /// **Cancellation.** `poll` is a `std.Io` cancellation point on every
+    /// backend: a cancellation requested before it is called, or while it
+    /// waits, is `error.Canceled`. It is looked for on entry, while the
+    /// backend waits for its descriptor to have something, and each time
+    /// that wait comes back, and nowhere else — never half way through
+    /// reading what the kernel reported, which runs under `std.Io`'s cancel
+    /// protection. So a cancellation costs no event: a `poll` that returns
+    /// an error has handed nothing out, and whatever it had gathered is
+    /// returned by the next one.
+    ///
+    /// The wait is reactor's `waitAny` on the backend's descriptor and the
+    /// watcher's `Wake`. On a reactor runtime it is an operation of the
+    /// task's own loop, which holds no thread and which a cancellation
+    /// ends at once. On any other `std.Io` the calling thread waits and
+    /// looks for a cancellation every few milliseconds. The one wait a
+    /// cancellation cannot end is Windows': a completion port is waited on
+    /// by a call nothing can interrupt, so there the cancellation is
+    /// reported when something happens, when the timeout runs out, or when
+    /// `wake` is called. `wake` is the one way to end a blocked poll from
+    /// another thread, on every backend; see it for how to stop a task
+    /// that is polling.
+    pub fn poll(w: *Watcher, io: Io, timeout: Io.Timeout) PollError![]const Event {
+        // What the last `poll` handed out is the caller's until now. What a
+        // `poll` that failed gathered was never handed out, and is this
+        // one's to return.
+        if (w.handed_out) w.batch.reset(w.gpa);
+        w.handed_out = false;
+        try io.checkCancel();
+        const events = w.gather(io, timeout.toDeadline(io)) catch |err| {
+            if (err == error.OutOfMemory) {
+                // A shared delivery can touch several roots, and a failed
+                // operation may already have changed backend bookkeeping.
+                // Conservatively include every live watch; no allocation
+                // or backend-owned path is needed to remember the loss.
+                for (w.table.values()) |*held| held.incomplete = true;
+            }
+            return err;
+        };
+        for (w.table.values()) |*held| held.incomplete = false;
+        w.handed_out = true;
+        const handed = if (w.history) |h| handed: {
+            h.record(io, events);
+            w.batch.discardWhere(w.gpa, h);
+            break :handed w.batch.events.items;
+        } else events;
+        for (handed) |event| {
+            if (event.kind == .overflow) w.overflows += 1;
+        }
+        return handed;
+    }
+
+    /// `poll`, less the bookkeeping of what has been handed out.
+    fn gather(w: *Watcher, io: Io, until: Io.Timeout) PollError![]const Event {
+        // Report before a wake or an indefinite wait can return or block.
+        try w.recover(io);
+        _ = try w.gatherWindow(io, until);
+        // Pending-watch reconciliation can discard ancestor events. The
+        // recovery obligation is the caller's root, and ends only when
+        // poll actually hands the notice out, never during reconciliation.
+        try w.recover(io);
+        return w.batch.events.items;
+    }
+
+    fn recover(w: *Watcher, io: Io) Allocator.Error!void {
+        for (w.table.keys(), w.table.values()) |id, held| {
+            if (!held.incomplete) continue;
+            try w.batch.push(w.gpa, io, id, held.path, .overflow, held.target);
+        }
+    }
+
+    fn gatherWindow(w: *Watcher, io: Io, until: Io.Timeout) PollError![]const Event {
+        // Before anything blocks: a watch that came back half
+        // registered says so at once rather than when the tree next
+        // happens to change.
+        try w.batch.flush(w.gpa, io);
+        // A failed poll's wait may have read what its collect never saw:
+        // a parked watch's ancestor changing, a link to follow. It is
+        // collected now, as the failed poll would have.
+        if (w.uncollected) try w.collect(io);
+        const immediate = timing.expired(io, until);
+        if (w.woken.swap(.quiet, .acquire) == .woken) return w.batch.events.items;
+
+        while (w.batch.events.items.len == 0) {
+            // A path that is settling has a deadline of its own, so the
+            // wait is the shorter of the caller's timeout and the next
+            // one due; otherwise a `poll` with no timeout would sleep through a
+            // deadline the watcher set itself.
+            const bound = if (w.batch.nextDueMs(io)) |due| timing.soonest(io, until, timing.within(due)) else until;
+
+            try w.wait(io, bound);
+            try w.collect(io);
+            if (w.woken.swap(.quiet, .acquire) == .woken) return w.batch.events.items;
+            if (w.batch.events.items.len == 0 and timing.expired(io, until)) return &.{};
+        }
+        // Debouncing has already waited for the path to be quiet, so
+        // there is nothing left for a coalescing tail to merge.
+        const latency_ms = options_mod.milliseconds(w.options.latency);
+        if (immediate or latency_ms == 0 or options_mod.milliseconds(w.options.debounce) > 0)
+            return w.batch.events.items;
+
+        // The coalescing tail: keep reading for `latency` past the first
+        // event so that an editor writing a file in four chunks is one
+        // `modified` and not four.
+        const tail = timing.within(latency_ms).toDeadline(io);
+        while (!timing.expired(io, tail)) {
+            try w.wait(io, tail);
+            try w.collect(io);
+            // A wake that arrives now is answered by this poll, which
+            // returns what it has rather than waiting out the tail.
+            if (w.woken.swap(.quiet, .acquire) == .woken) break;
+        }
+        return w.batch.events.items;
+    }
+
+    /// One wait of the backend's, and the cancellation point after it.
+    ///
+    /// Each backend waits for its descriptor and for `wakeup` through
+    /// `reactor.waitAny`, and a cancellation ends that wait: nothing has
+    /// been taken off the descriptor yet. What it reads afterwards it reads
+    /// under cancel protection, because an event read and not yet recorded
+    /// would be lost, and the `poll` backend protects its scans the same
+    /// way. Here is where a cancellation that arrived during any of that is
+    /// reported, with everything the wait read already in the batch.
+    fn wait(w: *Watcher, io: Io, until: Io.Timeout) PollError!void {
+        w.uncollected = true;
+        const mixed = w.polling.registrationCount() != 0;
+        if (mixed) {
+            const before = w.batch.revision;
+            try w.polling.scan(io, &w.batch);
+            if (w.batch.revision != before) {
+                try io.checkCancel();
+                return;
+            }
+        }
+        const bounded = if (mixed) timing.soonest(io, until, timing.within(w.polling.interval_ms)) else until;
+        switch (w.impl) {
+            inline else => |*impl| try impl.wait(io, &w.batch, &w.wakeup, bounded),
+        }
+        if (mixed) try w.polling.scan(io, &w.batch);
+        try io.checkCancel();
+    }
+
+    /// What every round of `poll` does with what a backend has just
+    /// pushed: promote what has gone quiet, keep the parked watches
+    /// current, and turn a batch that hit its ceiling into the overflow
+    /// that says so.
+    fn collect(w: *Watcher, io: Io) PollError!void {
+        // Parked watches are re-examined and promoted here, a registration
+        // at a time: nothing in it is a place to stop.
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        try w.batch.flush(w.gpa, io);
+        try w.batch.promote(w.gpa, io);
+        try w.settlePending(io);
+        try w.followNoted(io);
+        while (w.batch.dropped.count() != 0) {
+            const id = w.batch.dropped.keys()[0];
+            // The batch knows it had to stop holding names; only the
+            // watcher knows which root to say so against.
+            const root = w.rootOf(id) orelse {
+                w.batch.dropped.swapRemoveAt(0);
+                continue;
+            };
+            try w.batch.push(w.gpa, io, id, root, .overflow, w.rootTarget(id));
+            w.batch.dropped.swapRemoveAt(0);
+        }
+        w.uncollected = false;
+    }
+
+    /// Makes a `poll` blocked on this watcher come back, from another
+    /// thread.
+    ///
+    /// This is the one thing a `Watcher` will take from a thread that is
+    /// not its own. Everything else about a watcher belongs to one
+    /// thread; this is how that thread is let go of, so that a program
+    /// shutting down, or one that has decided it wants to watch
+    /// something else, does not have to have left itself a timeout to
+    /// discover it through.
+    ///
+    /// The `poll` returns whatever it had, which is usually nothing. It
+    /// is not a cancellation: the watcher is still good and the next
+    /// `poll` carries on. Calling it while nothing is polling makes the
+    /// next `poll` return at once, and calling it many times is the same
+    /// as calling it once.
+    ///
+    /// The wait it ends is the backend's, so it returns at once on every
+    /// backend, the `poll` backend's sleep between scans included.
+    ///
+    /// A task that polls in a loop is stopped the same way on every
+    /// backend, with a flag it reads between polls, and a cancellation
+    /// works too wherever `poll` says it does:
+    ///
+    /// ```
+    /// // The task.
+    /// while (!stopping.load(.acquire)) {
+    ///     for (try watcher.poll(io, .none)) |event| handle(event);
+    /// }
+    /// // Stopping it, from another thread.
+    /// stopping.store(true, .release);
+    /// watcher.wake();
+    /// future.await(io); // or `cancel`: the task is already on its way out
+    /// ```
+    ///
+    /// The flag is what makes it certain. A `wake` alone can be answered by
+    /// the poll that is running when it arrives, and a wake that lands
+    /// between two polls is kept for the next one, so the flag is always
+    /// read.
+    pub fn wake(w: *Watcher) void {
+        w.woken.store(.woken, .release);
+        w.wakeup.signal();
+    }
+
+    /// Where the watcher's history stands: everything `poll` has handed out
+    /// so far, as a clock `since` answers for later. Null without
+    /// `Options.history`. Any thread may ask.
+    ///
+    /// It is what a program that answers git's file-monitor question
+    /// keeps as its token (`Clock.format`): relic's `ChangeSource`, or a
+    /// `core.fsmonitor` hook. The history is in memory: a clock outlives
+    /// neither the watcher nor the process, and another watcher's is
+    /// answered with null.
+    pub fn clock(w: *const Watcher, io: Io) ?Clock {
+        const h = w.history orelse return null;
+        return h.clock(io);
+    }
+
+    /// What the watch `id` saw change after `since`, in `arena`, with the
+    /// clock the answer reaches; or null where the history cannot say,
+    /// which tells the caller to look at everything: no `Options.history`,
+    /// another watcher's clock, a clock from before the watch was added or
+    /// its filter changed, from before it lost changes (`Kind.overflow`,
+    /// an allocation failure) or the history forgot them for want of room,
+    /// and every clock once the watch has stopped (its root removed or
+    /// moved) or has a hole (`Kind.unwatched`). Any thread may ask.
+    ///
+    /// It answers for what `poll` has handed out. A change the kernel has
+    /// not delivered yet, or `poll` is still coalescing, is not in it:
+    /// `sync` first, for an answer that reaches the question.
+    pub fn since(w: *const Watcher, io: Io, arena: Allocator, id: WatchId, from: Clock) Allocator.Error!?Changes {
+        const h = w.history orelse return null;
+        return h.changes(io, arena, id, from);
+    }
+
+    pub const SyncError = ChangeLog.SyncError || error{
+        /// `sync` on a watcher made without `Options.history`.
+        NoHistory,
+    };
+
+    /// Makes `since` reach now: writes a file of the watcher's own in
+    /// `dir` (absolute, in a watch, not excluded by its filter: a git
+    /// directory inside the working tree does, as git's daemon writes its
+    /// cookies there) and waits until `poll` has handed out its creation
+    /// and then its removal. By then everything the watch reported before
+    /// the file was written has been handed out: on a kernel backend,
+    /// which delivers in order, and on a polling registration, by a scan
+    /// begun after the file was seen. It vouches for the watch `dir` is in.
+    ///
+    /// Called from any thread but the polling one, which must be polling
+    /// meanwhile; `error.SyncTimeout` when nothing was handed out by
+    /// `timeout`. The file is never handed out, and one a timed-out wait
+    /// leaves is taken out of every later batch.
+    pub fn sync(w: *const Watcher, io: Io, dir: []const u8, timeout: Io.Timeout) SyncError!void {
+        const h = w.history orelse return error.NoHistory;
+        return h.sync(io, dir, timeout);
+    }
+
+    /// Copies the boundary of what poll has handed out. The snapshot owns
+    /// each watch's volume and log identity, cursor and drained changes
+    /// waiting for debounce or settling, so resuming restores those changes without
+    /// replaying the delivery represented by this checkpoint.
+    ///
+    /// Call Checkpoint.deinit to free it. null means the backend has no
+    /// persistent log, a watched volume has no unchanged persistent log, a
+    /// watch follows a symbolic link, or a failed delivery must first be
+    /// retried by poll.
+    /// Persist the token after processing the returned events. A crash
+    /// before persistence replays work since the previously saved snapshot;
+    /// processing and persistence need a caller transaction for exactly once.
+    pub fn checkpoint(w: *const Watcher, gpa: Allocator) Allocator.Error!?Checkpoint {
+        if (w.batch.dropped.count() != 0 or w.polling.registrationCount() != 0) return null;
+        for (w.table.values()) |held| if (held.incomplete) return null;
+        for (w.following.items) |links| if (links.followed.items.len != 0) return null;
+        if (comptime @hasField(Impl, "fsevents")) {
+            if (w.impl == .fsevents) {
+                const roots = try w.watches(gpa);
+                defer gpa.free(roots);
+                // A pending watch is captured under the id its ancestor's
+                // registration stands under; the root it names is its own.
+                for (roots) |*root| {
+                    for (w.pending.items) |p| if (p.id == root.id) {
+                        if (p.anchor_id) |anchor_id| root.id = anchor_id;
+                    };
+                }
+                return w.impl.fsevents.capture(gpa, &w.batch, !w.handed_out, roots);
+            }
+        }
+        return null;
+    }
+
+    /// Starts following the links of a recursive watch on a directory,
+    /// in place of any it followed before. See `AddOptions.follow_symlinks`.
+    ///
+    /// An allocation failure while walking leaves the links to the next
+    /// `poll` to look at again when `keep` is set, as for a watch already
+    /// handed out, and stops following otherwise.
+    fn follow(w: *Watcher, io: Io, id: WatchId, root: []const u8, filter: Filter, max: usize, keep: bool) Links.Error!void {
+        w.stopFollowing(io, id);
+        const links = try Links.create(w.gpa, io, id, root, filter, w.table.get(id).?.capabilities.policy, w.table.get(id).?.identity_override, max) orelse return;
+        {
+            errdefer links.destroy(io, w.linkHost());
+            try w.following.ensureUnusedCapacity(w.gpa, 1);
+            try w.batch.noting.put(w.gpa, id, {});
+            w.following.appendAssumeCapacity(links);
+        }
+        links.followBelow(io, w.linkHost(), &w.batch, links.root) catch |err| {
+            if (keep) links.stale = true else w.stopFollowing(io, id);
+            return err;
+        };
+    }
+
+    /// Lets go of every link `id` follows, and of what they lead to.
+    fn stopFollowing(w: *Watcher, io: Io, id: WatchId) void {
+        for (w.following.items, 0..) |links, i| {
+            if (links.owner != id) continue;
+            _ = w.following.swapRemove(i);
+            _ = w.batch.noting.swapRemove(id);
+            links.destroy(io, w.linkHost());
+            return;
+        }
+    }
+
+    fn followingOf(w: *const Watcher, id: WatchId) ?*Links {
+        for (w.following.items) |links| if (links.owner == id) return links;
+        return null;
+    }
+
+    /// Judges the links of a watch by its new filter: the registrations
+    /// on their targets are reconciled with it, and the links it now
+    /// prunes are let go while those it now admits are followed.
+    fn refollow(w: *Watcher, io: Io, links: *Links, filter: Filter) RefilterError!void {
+        errdefer links.stale = true;
+        try links.refilter(filter);
+        for (links.followed.items) |link| try w.refilterLink(io, link);
+        try links.refresh(io, w.linkHost(), &w.batch);
+    }
+
+    /// Follows what changed under the watches that follow links.
+    fn followNoted(w: *Watcher, io: Io) Links.Error!void {
+        if (w.following.items.len == 0) return;
+        var notes = w.batch.takeNotes();
+        defer notes.deinit(w.gpa);
+        // Notes taken and not read are gone: every link is looked at
+        // again on the next round instead.
+        errdefer for (w.following.items) |links| {
+            links.stale = true;
+        };
+        for (w.following.items) |links| {
+            if (notes.lost) links.stale = true;
+            try links.settle(io, w.linkHost(), &w.batch, notes.items.items);
+        }
+    }
+
+    /// What `Links` asks of the watcher: ids for, and registrations on,
+    /// the directories followed links lead to. See `Links.Host`.
+    fn linkHost(w: *Watcher) *Links.Host {
+        return &w.link_host;
+    }
+
+    /// The functions behind `link_host`, private to the watcher.
+    const LinkHost = struct {
+        const answers: Links.Host = .{ .issue_fn = LinkHost.issue, .register_fn = LinkHost.register, .unregister_fn = LinkHost.unregister };
+
+        fn of(h: *Links.Host) *Watcher {
+            return @alignCast(@fieldParentPtr("link_host", h));
+        }
+
+        fn issue(h: *Links.Host) Links.Host.IssueError!WatchId {
+            return of(h).ids.next();
+        }
+
+        /// The alias goes in first: a backend may report while it
+        /// registers, and what it reports is the link's watch's.
+        fn register(io: Io, h: *Links.Host, link: *Links.Link) Links.Host.RegisterError!void {
+            const w = of(h);
+            try w.batch.aliases.put(w.gpa, link.id, &link.alias);
+            errdefer _ = w.batch.aliases.swapRemove(link.id);
+            w.addBackend(io, link.id, link.target, link.target, .{ .recursive = true, .filter = link.filter() }) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Refused,
+            };
+        }
+
+        fn unregister(io: Io, h: *Links.Host, id: WatchId) void {
+            const w = of(h);
+            w.removeBackend(io, id);
+            _ = w.batch.aliases.swapRemove(id);
+        }
+    };
+
+    fn refilterLink(w: *Watcher, io: Io, link: *Links.Link) RefilterError!void {
+        if (w.polling.tree.watches.contains(link.id)) {
+            return w.polling.refilter(io, link.id, link.filter(), &w.batch);
+        }
+        switch (w.impl) {
+            inline else => |*impl| try impl.refilter(io, link.id, link.filter(), &w.batch),
+        }
+    }
+
+    /// Every watch this watcher holds, in the order they were added.
+    ///
+    /// The slice is allocated with `gpa` and is the caller's to free;
+    /// the paths inside it belong to the watcher and are valid until the
+    /// next `add`, `remove` or `deinit`. A program that keeps its own
+    /// idea of what it asked to watch can check it against this.
+    pub fn watches(w: *const Watcher, gpa: Allocator) Allocator.Error![]WatchInfo {
+        const list = try gpa.alloc(WatchInfo, w.table.count());
+        for (w.table.keys(), w.table.values(), list) |id, held, *slot| {
+            slot.* = .{
+                .id = id,
+                .path = held.path,
+                .requested = held.requested orelse held.path,
+                .recursive = held.recursive,
+                .waiting = w.waiting(id),
+            };
+        }
+        return list;
+    }
+
+    fn waiting(w: *const Watcher, id: WatchId) bool {
+        for (w.pending.items) |p| if (p.id == id) return true;
+        return false;
+    }
+
+    /// What a watcher is currently holding. See `stats`.
+    pub const Stats = struct {
+        /// Watches `add` has returned an id for and `remove` has not
+        /// taken back.
+        watches: usize,
+        /// Paths the operating system has been told about on this
+        /// watcher's behalf: one per kernel watch on `inotify`, one per
+        /// open descriptor on `kqueue`, one per stream on `fsevents`, one
+        /// per directory handle on `windows`, and one per path scanned
+        /// on `poll`.
+        ///
+        /// This is the number that runs into the limits — the per-user
+        /// cap on `inotify` watches, the per-process cap on descriptors —
+        /// and the reason a recursive watch on a deep tree is not free on
+        /// every backend.
+        registrations: usize,
+        /// Paths held back by `Options.settle` or
+        /// `Options.debounce` and not yet reported.
+        held: usize,
+        /// Events the last `poll` returned, which the next one drops.
+        events: usize,
+        /// Overflow notices `poll` has handed out since `init`: each says
+        /// the system lost track of a tree (a kernel queue that
+        /// overflowed, FSEvents' dropped or must-rescan flags, a delivery
+        /// lost to allocation failure) and that the tree was to be read
+        /// again. A program that logs losses, or a test asking why an
+        /// event it waited for never came, reads it here.
+        overflows: u64,
+    };
+
+    /// What this watcher currently holds, for a program that wants to log
+    /// it, cap it, or notice it growing.
+    ///
+    /// Cheap: every field is a count already kept, and nothing here asks
+    /// the operating system anything.
+    pub fn stats(w: *const Watcher) Stats {
+        return .{
+            .watches = w.table.count(),
+            .registrations = switch (w.impl) {
+                inline else => |*impl| impl.registrationCount() + w.polling.registrationCount(),
+            },
+            .held = w.batch.held.count(),
+            .events = w.batch.events.items.len,
+            .overflows = w.overflows,
+        };
+    }
+
+    /// The descriptor the watcher waits on, for a program that runs a
+    /// wait loop of its own: it becomes readable when there is something
+    /// for `poll` to report.
+    ///
+    /// `null` where the backend has no descriptor to give: the `poll`
+    /// backend, which has nothing to wait on, and the Windows backend,
+    /// which waits on an I/O completion port rather than on a handle
+    /// anything else can wait for. Such a watcher is driven by calling
+    /// `poll`.
+    ///
+    /// The descriptor belongs to the watcher. Reading from it, closing it,
+    /// or registering it for anything other than readability is illegal
+    /// behavior; use it to decide when to call `poll`, and nothing else.
+    pub fn fd(w: *const Watcher) ?std.posix.fd_t {
+        if (w.polling.registrationCount() != 0) return null;
+        return switch (w.impl) {
+            inline else => |*impl| impl.fd(),
+        };
+    }
+
+    /// The backend this watcher actually uses, with `Backend.auto`
+    /// resolved. Individual auto watches may use polling: see capabilities.
+    pub fn backend(w: *const Watcher) Backend {
+        return switch (w.impl) {
+            inline else => |_, tag| @field(Backend, @tagName(tag)),
+        };
+    }
+};
+
+test {
+    _ = options_mod;
+    _ = Baseline;
+    _ = Batch;
+    _ = Filter;
+    _ = Links;
+    _ = Tree;
+    _ = timing;
+    _ = fs_type;
+    _ = @import("Snapshot.zig");
+    _ = @import("stamp.zig");
+    _ = @import("Budget.zig");
+    _ = @import("buffer.zig");
+    _ = @import("path.zig");
+    _ = @import("walk.zig");
+    _ = backends;
+    _ = @import("trace.zig");
+    // The backends this target was built with, each of which carries
+    // tests of its own. They are found when the backend is analysed,
+    // which the suite causes and a filtered run does not, so they are
+    // named here for `zig test --test-filter` to find them.
+    inline for (@typeInfo(Watcher.Impl).@"union".field_types) |Built| _ = Built;
+}
+
+test "the Apple default preserves paired renames" {
+    switch (builtin.target.os.tag) {
+        .driverkit,
+        .ios,
+        .maccatalyst,
+        .macos,
+        .tvos,
+        .visionos,
+        .watchos,
+        => {
+            try std.testing.expectEqual(Backend.fsevents, default_backend);
+            try std.testing.expect(pairsRenames(.auto));
+        },
+        else => return error.SkipZigTest,
+    }
+}
+
+test "a failed pending promotion keeps each registered path owned" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(root);
+        const target = try std.Io.Dir.path.join(testing.allocator, &.{ root, "later" });
+        defer testing.allocator.free(target);
+        // Keep freed storage mapped so a duplicate release can be counted
+        // without dereferencing freed memory or crashing the test runner.
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var failing = testing.FailingAllocator.init(arena.allocator(), .{});
+        var failed = false;
+        {
+            var watcher = try Watcher.init(failing.allocator(), std.testing.io, .{ .backend = .poll });
+            defer watcher.deinit(io);
+            _ = try watcher.add(io, target, .{ .pending = true, .recursive = true });
+            try tmp.dir.createDirPath(testing.io, "later/child");
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = "later/child/file", .data = "x" });
+            failing.fail_index = failing.alloc_index + fail_index;
+            const answer = watcher.promotePending(io, watcher.pending.items[0]);
+            failing.fail_index = std.math.maxInt(usize);
+            if (answer) |promoted| {
+                try testing.expect(promoted);
+                // promotePending destroys the object; its caller removes
+                // the list entry only after that successful return.
+                _ = watcher.pending.orderedRemove(0);
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+            }
+        }
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failed) break;
+    }
+    try testing.expect(fail_index > 0);
+}
+
+test "a pending promotion refused its checkpoint releases its path once under allocation failure" {
+    const io = std.testing.io;
+    if (comptime !supported(.fsevents)) return error.SkipZigTest;
+    const testing = std.testing;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const root = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(root);
+        const target = try std.Io.Dir.path.join(testing.allocator, &.{ root, "later" });
+        defer testing.allocator.free(target);
+        var first = try Watcher.init(testing.allocator, std.testing.io, .{ .backend = .fsevents });
+        defer first.deinit(io);
+        _ = try first.add(io, target, .{ .pending = true });
+        try first.impl.fsevents.seedWhole(io, &first.batch);
+        var saved = (try first.checkpoint(testing.allocator)).?;
+        defer saved.deinit();
+        // Freed storage stays mapped, so a second release of the mirror
+        // is counted rather than crashing the runner.
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var failing = testing.FailingAllocator.init(arena.allocator(), .{});
+        var failed = false;
+        {
+            var watcher = try Watcher.init(failing.allocator(), std.testing.io, .{ .backend = .fsevents, .checkpoint = saved });
+            defer watcher.deinit(io);
+            _ = try watcher.add(io, target, .{ .pending = true });
+            // The log the token names is not the one the path appears on.
+            const backend = &watcher.impl.fsevents;
+            backend.resume_used[0] = false;
+            @constCast(backend.restarting.?.state.value.watches)[0].identity.log[0] ^= 1;
+            try tmp.dir.createDirPath(testing.io, "later");
+            failing.fail_index = failing.alloc_index + fail_index;
+            const answer = watcher.promotePending(io, watcher.pending.items[0]);
+            failing.fail_index = std.math.maxInt(usize);
+            if (answer) |promoted| {
+                try testing.expect(!promoted);
+            } else |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                failed = true;
+            }
+        }
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (!failed) break;
+    }
+    try testing.expect(fail_index > 0);
+}
+
+test "a pending watch whose way down cannot be watched says so" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "locked");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const locked = try std.Io.Dir.path.join(gpa, &.{ root, "locked" });
+    defer gpa.free(locked);
+    const target = try std.Io.Dir.path.join(gpa, &.{ locked, "later" });
+    defer gpa.free(target);
+    try tmp.dir.setFilePermissions(io, "locked", .fromMode(0o300), .{});
+    defer tmp.dir.setFilePermissions(io, "locked", .fromMode(0o755), .{}) catch {};
+    // Searchable, so the path resolves as absent rather than refused,
+    // and not readable, so the folder cannot be listed or opened for
+    // events. A user the permissions do not stop has nothing to show.
+    if (tmp.dir.openDir(io, "locked", .{ .iterate = true })) |opened| {
+        opened.close(io);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    inline for (.{ Backend.poll, Backend.auto }) |choice| {
+        // The ancestor refused at `add`: an error, not an id that waits on
+        // nothing.
+        var watcher = try Watcher.init(gpa, std.testing.io, .{ .backend = choice });
+        defer watcher.deinit(io);
+        if (watcher.add(io, target, .{ .pending = true })) |_| {
+            // A backend that registers a folder it cannot list -- FSEvents
+            // watches by path -- still hears the path appear.
+            try testing.expect(watcher.backend() == .fsevents);
+        } else |err| {
+            try testing.expectEqual(error.AccessDenied, err);
+            try testing.expectEqual(@as(usize, 0), watcher.stats().watches);
+        }
+    }
+
+    // Refused later, from a poll: the watch parked on `root` steps down
+    // to `locked` once it appears, cannot register it, and says so.
+    try tmp.dir.setFilePermissions(io, "locked", .fromMode(0o755), .{});
+    try tmp.dir.deleteDir(io, "locked");
+    var watcher = try Watcher.init(gpa, std.testing.io, .{ .backend = .poll });
+    defer watcher.deinit(io);
+    const id = try watcher.add(io, target, .{ .pending = true });
+    try tmp.dir.createDirPath(io, "locked");
+    try tmp.dir.setFilePermissions(io, "locked", .fromMode(0o300), .{});
+    const events = try watcher.poll(io, .{ .duration = .{ .raw = .zero, .clock = .awake } });
+    try testing.expectEqual(@as(usize, 1), events.len);
+    try testing.expectEqual(Kind.unwatched, events[0].kind);
+    try testing.expectEqual(id, events[0].id);
+    try testing.expectEqualStrings(target, events[0].path);
+    try testing.expectEqual(@as(usize, 0), watcher.pending.items.len);
+}
+
+test "auto chooses polling per network or FUSE watch and explicit backends retain their choice" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const Fake = struct {
+        fn read(_: Allocator, _: Io, subject: []const u8) Filesystem {
+            if (std.mem.endsWith(u8, subject, "remote")) return .network;
+            if (std.mem.endsWith(u8, subject, "fuse")) return .fuse;
+            return .local;
+        }
+    };
+    fs_type.test_access.source = Fake.read;
+    defer fs_type.test_access.source = null;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "local", "remote", "fuse" }) |name| try tmp.dir.createDirPath(io, name);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    for ([_]Backend{ .auto, default_backend, .poll }) |selected| {
+        var w = try Watcher.init(gpa, std.testing.io, .{ .backend = selected, .latency = .fromMilliseconds(0), .poll_interval = .fromMilliseconds(1) });
+        defer w.deinit(io);
+        var ids: [3]WatchId = undefined;
+        for ([_][]const u8{ "local", "remote", "fuse" }, 0..) |name, index| {
+            const absolute = try std.Io.Dir.path.join(gpa, &.{ root, name });
+            defer gpa.free(absolute);
+            ids[index] = try w.add(io, absolute, .{ .recursive = true });
+            const caps = w.capabilities(ids[index]).?;
+            try testing.expectEqual(if (index == 0) Filesystem.local else if (index == 1) Filesystem.network else Filesystem.fuse, caps.filesystem);
+            try testing.expectEqual(if (selected == .auto and index != 0) Backend.poll else if (selected == .auto) default_backend else selected, caps.backend);
+        }
+        if (selected == .auto) try testing.expect(w.fd() == null);
+        // Polling selection still uses the same batching, filtering and removal.
+        try w.refilter(io, ids[1], .{ .ignore = &.{"*.tmp"} });
+        try tmp.dir.writeFile(io, .{ .sub_path = "remote/kept", .data = "one" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "remote/excluded.tmp", .data = "one" });
+        var found = false;
+        const deadline = timing.within(5_000).toDeadline(io);
+        while (!found and !timing.expired(io, deadline)) {
+            for (try w.poll(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } })) |event| {
+                try testing.expect(!std.mem.endsWith(u8, event.path, "excluded.tmp"));
+                if (event.id == ids[1] and std.mem.endsWith(u8, event.path, "kept")) found = true;
+            }
+        }
+        try testing.expect(found);
+        w.remove(io, ids[1]);
+        try testing.expect(w.capabilities(ids[1]) == null);
+        try tmp.dir.deleteFile(io, "remote/kept");
+        try tmp.dir.deleteFile(io, "remote/excluded.tmp");
+    }
+}
+
+test "a watcher that has issued every id refuses another instead of reusing one" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a", "b", "c" }) |name| try tmp.dir.createDirPath(io, name);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    var w = try Watcher.init(gpa, std.testing.io, .{ .backend = .poll });
+    defer w.deinit(io);
+    // Two ids are left: the last two this watcher can ever issue.
+    w.ids = .init(std.math.maxInt(u32) - 2);
+    var ids: [2]WatchId = undefined;
+    for (&ids, [_][]const u8{ "a", "b" }) |*id, name| {
+        const absolute = try std.Io.Dir.path.join(gpa, &.{ root, name });
+        defer gpa.free(absolute);
+        id.* = try w.add(io, absolute, .{});
+    }
+    try testing.expect(ids[0] != ids[1]);
+    const c = try std.Io.Dir.path.join(gpa, &.{ root, "c" });
+    defer gpa.free(c);
+    try testing.expectError(error.IdExhausted, w.add(io, c, .{}));
+    // A watch parked on a path that is not there needs an id as well.
+    const later = try std.Io.Dir.path.join(gpa, &.{ root, "c", "later" });
+    defer gpa.free(later);
+    try testing.expectError(error.IdExhausted, w.add(io, later, .{ .pending = true }));
+    // Removing a watch gives nothing back: its id may still be in an event.
+    w.remove(io, ids[0]);
+    try testing.expectError(error.IdExhausted, w.add(io, c, .{}));
+    const held = try w.watches(gpa);
+    defer gpa.free(held);
+    try testing.expectEqual(@as(usize, 1), held.len);
+    try testing.expectEqual(ids[1], held[0].id);
+}
+
+test "a followed link the watcher has no id left for is a hole in the watch" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "watched");
+    try tmp.dir.createDirPath(io, "elsewhere");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const watched = try std.Io.Dir.path.join(gpa, &.{ root, "watched" });
+    defer gpa.free(watched);
+    const elsewhere = try std.Io.Dir.path.join(gpa, &.{ root, "elsewhere" });
+    defer gpa.free(elsewhere);
+    const link = try std.Io.Dir.path.join(gpa, &.{ watched, "link" });
+    defer gpa.free(link);
+    try tmp.dir.symLink(io, elsewhere, "watched/link", .{ .is_directory = true });
+    var w = try Watcher.init(gpa, std.testing.io, .{ .backend = .poll, .latency = .fromMilliseconds(0), .poll_interval = .fromMilliseconds(1) });
+    defer w.deinit(io);
+    // One id is left, and the watch itself takes it.
+    w.ids = .init(std.math.maxInt(u32) - 1);
+    const id = try w.add(io, watched, .{ .recursive = true, .follow_symlinks = true });
+    var told = false;
+    const deadline = timing.within(5_000).toDeadline(io);
+    while (!told and !timing.expired(io, deadline)) {
+        for (try w.poll(io, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } })) |event| {
+            if (event.id == id and event.kind == .unwatched and std.mem.eql(u8, event.path, link)) told = true;
+        }
+    }
+    try testing.expect(told);
+}
+
+test "pending watches recheck filesystem facts when they move to their root" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const Fake = struct {
+        fn read(_: Allocator, _: Io, subject: []const u8) Filesystem {
+            return if (std.mem.endsWith(u8, subject, "appeared")) .network else .local;
+        }
+    };
+    fs_type.test_access.source = Fake.read;
+    defer fs_type.test_access.source = null;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const absent = try std.Io.Dir.path.join(gpa, &.{ root, "appeared" });
+    defer gpa.free(absent);
+    var w = try Watcher.init(gpa, std.testing.io, .{ .latency = .fromMilliseconds(0) });
+    defer w.deinit(io);
+    const id = try w.add(io, absent, .{ .pending = true });
+    try testing.expectEqual(Filesystem.local, w.capabilities(id).?.filesystem);
+    try tmp.dir.createDirPath(io, "appeared");
+    _ = try w.poll(io, .{ .duration = .{ .raw = .zero, .clock = .awake } });
+    try testing.expectEqual(Filesystem.network, w.capabilities(id).?.filesystem);
+    try testing.expectEqual(Backend.poll, w.capabilities(id).?.backend);
+    w.remove(io, id);
+    try testing.expectEqual(@as(usize, 0), w.polling.registrationCount());
+}
+
+test "filesystem identity keeps requested roots and explicit policy separate from facts" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Stored");
+    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base);
+    const asked = try std.Io.Dir.path.join(gpa, &.{ base, ".", "Stored" });
+    defer gpa.free(asked);
+    const kernel = try identity.canonical(gpa, io, asked);
+    defer gpa.free(kernel);
+    var w = try Watcher.init(gpa, std.testing.io, .{ .backend = .poll });
+    defer w.deinit(io);
+    const policy: NamePolicy = .{ .case_sensitive = false, .normalization = .nfc };
+    const id = try w.add(io, asked, .{ .recursive = true, .identity = policy });
+    const info = try w.watches(gpa);
+    defer gpa.free(info);
+    try testing.expectEqualStrings(asked, info[0].requested);
+    try testing.expectEqualStrings(kernel, info[0].path);
+    try testing.expectEqual(policy, w.capabilities(id).?.policy);
+    try testing.expectEqual(identity.read(io, kernel), w.capabilities(id).?.names);
+    const missing = try std.Io.Dir.path.join(gpa, &.{ kernel, "missing" });
+    defer gpa.free(missing);
+    const unknown = w.directoryCapabilities(io, id, missing).?;
+    try testing.expectEqual(@as(?bool, null), unknown.names.case_sensitive);
+    try testing.expectEqual(policy, unknown.policy);
+    try testing.expect(w.directoryCapabilities(io, id, base) == null);
+    try testing.expectError(error.PathAlreadyWatched, w.add(io, kernel, .{}));
+}
+
+test "normalized pending refilter retains explicit policy before promotion" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const missing = try Io.Dir.path.join(testing.allocator, &.{ root, "later" });
+    defer testing.allocator.free(missing);
+    var watcher = try Watcher.init(testing.allocator, std.testing.io, .{ .backend = .poll });
+    defer watcher.deinit(io);
+    const id = try watcher.add(io, missing, .{ .pending = true, .identity = .{ .normalization = .nfc } });
+    try testing.expectError(error.InvalidPattern, watcher.refilter(io, id, .{ .ignore = &.{"[x\u{301}]"} }));
+    try watcher.refilter(io, id, .{ .ignore = &.{"[é]"} });
+    const pending = watcher.pending.items[0];
+    try testing.expectEqual(NamePolicy.Normalization.nfc, pending.filter.policy.normalization);
+    const composed = try Io.Dir.path.join(testing.allocator, &.{ missing, "e\u{301}" });
+    defer testing.allocator.free(composed);
+    try testing.expect(pending.filter.excludes(missing, composed));
+}
+
+/// What a watcher holds, as the cancel sweep compares it: every watch and
+/// its registration, every pending watch and the ancestor it is parked
+/// on, the links followed, and the backend's registrations.
+fn describeForTest(w: *const Watcher, gpa: Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (w.table.keys(), w.table.values()) |id, held| {
+        try out.print(gpa, "watch {d} {s} {s} {t} {}\n", .{ id.raw(), held.path, held.registered orelse "-", held.target, held.recursive });
+    }
+    for (w.pending.items) |p| {
+        try out.print(gpa, "pending {d} {s} {s} {d} {s}\n", .{ p.id.raw(), p.target, p.anchor orelse "-", if (p.anchor_id) |a| a.raw() else 0, p.next });
+    }
+    for (w.following.items) |links| try out.print(gpa, "following {d} {d}\n", .{ links.owner.raw(), links.followed.items.len });
+    try out.print(gpa, "registrations {d}\n", .{w.stats().registrations});
+    return out.toOwnedSlice(gpa);
+}
+
+/// A cancel at every point of an `add`, a `refilter` and a `poll` that
+/// promotes a pending watch and follows a link in it (shakedown's
+/// `everyFault`, cancels only). A cancel that lands is `Canceled` and
+/// leaves the watcher holding what it held; the same call made again
+/// without one does what it would have.
+const CancelSweep = struct {
+    const shakedown = @import("shakedown");
+    const Scenario = enum { add_present, add_pending, refilter, poll_promotes };
+
+    scenario: Scenario,
+    /// The sweep's directory, made once: every run is set up at the same
+    /// paths below it, since a path is part of the calls each run must
+    /// repeat.
+    tmp: std.testing.TmpDir,
+    root: []const u8,
+    here: []u8 = undefined,
+    later: []u8 = undefined,
+    watcher: Watcher = undefined,
+    id: ?WatchId = null,
+    before: []u8 = undefined,
+
+    pub fn setUp(s: *CancelSweep, fio: *shakedown.FaultIo) !void {
+        _ = fio;
+        const gpa = std.testing.allocator;
+        const io = std.testing.io;
+        // What the last run left goes first; the sweep's own cleanup takes
+        // what the last run of all leaves.
+        try s.tmp.dir.deleteTree(io, "run");
+        try s.tmp.dir.createDirPath(io, "run/here/inner");
+        s.here = try Io.Dir.path.join(gpa, &.{ s.root, "run", "here" });
+        errdefer gpa.free(s.here);
+        s.later = try Io.Dir.path.join(gpa, &.{ s.root, "run", "later" });
+        errdefer gpa.free(s.later);
+        s.watcher = try .init(gpa, io, .{ .backend = .poll });
+        errdefer s.watcher.deinit(io);
+        s.id = null;
+        switch (s.scenario) {
+            .add_present, .add_pending => {},
+            .refilter => s.id = try s.watcher.add(io, s.here, .{ .recursive = true }),
+            .poll_promotes => {
+                s.id = try s.watcher.add(io, s.later, .{ .pending = true, .recursive = true, .follow_symlinks = true });
+                try s.tmp.dir.createDirPath(io, "run/later/child");
+                try s.tmp.dir.writeFile(io, .{ .sub_path = "run/later/child/file", .data = "x" });
+                try s.tmp.dir.symLink(io, "../here", "run/later/link", .{ .is_directory = true });
+            },
+        }
+        s.before = try describeForTest(&s.watcher, gpa);
+    }
+
+    pub fn tearDown(s: *CancelSweep) void {
+        const gpa = std.testing.allocator;
+        gpa.free(s.before);
+        s.watcher.deinit(std.testing.io);
+        gpa.free(s.later);
+        gpa.free(s.here);
+    }
+
+    fn operate(s: *CancelSweep, io: Io) !void {
+        switch (s.scenario) {
+            .add_present => _ = try s.watcher.add(io, s.here, .{ .recursive = true }),
+            .add_pending => _ = try s.watcher.add(io, s.later, .{ .pending = true }),
+            .refilter => try s.watcher.refilter(io, s.id.?, .{ .ignore = &.{"*.tmp"} }),
+            .poll_promotes => _ = try s.watcher.poll(io, .{ .duration = .{ .raw = .zero, .clock = .awake } }),
+        }
+    }
+
+    pub fn run(s: *CancelSweep, io: Io) !void {
+        return s.operate(io);
+    }
+
+    pub fn check(s: *CancelSweep, base: Io, result: anyerror!void, injected: ?shakedown.Injected) !void {
+        _ = base;
+        _ = injected;
+        const gpa = std.testing.allocator;
+        if (result) |_| {} else |err| {
+            if (err != error.Canceled) return err;
+            const now = try describeForTest(&s.watcher, gpa);
+            defer gpa.free(now);
+            try std.testing.expectEqualStrings(s.before, now);
+            // Made again without a cancel, the call does what it would have.
+            try s.operate(std.testing.io);
+        }
+        if (s.scenario == .poll_promotes) {
+            try std.testing.expectEqual(@as(usize, 0), s.watcher.pending.items.len);
+            try std.testing.expect(s.watcher.followingOf(s.id.?) != null);
+        }
+    }
+};
+
+fn sweepCancels(scenario: CancelSweep.Scenario) !void {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(root);
+    var ctx: CancelSweep = .{ .scenario = scenario, .tmp = tmp, .root = root };
+    var report: CancelSweep.shakedown.EveryFaultReport = .{};
+    defer report.deinit();
+    const result = CancelSweep.shakedown.everyFault(std.testing.allocator, std.testing.io, &ctx, .{
+        .errors = &.{},
+        .short = false,
+        .alloc = false,
+        .cancel = true,
+        .diagnostics = &report,
+    });
+    const done = result catch |err| {
+        if (report.failure) |f| std.log.scoped(.cancel_sweep).err("cancel sweep {t}: {t} at {any}\n{s}\n", .{ scenario, f.err, f.injected, f.trace });
+        return err;
+    };
+    try std.testing.expect(done.runs > 1);
+}
+
+test "a cancel at any point of add, of a pending add, of refilter and of a promoting poll leaves the watcher as it was" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+    inline for (.{ .add_present, .add_pending, .refilter, .poll_promotes }) |scenario| try sweepCancels(scenario);
+}

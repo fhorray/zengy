@@ -14,6 +14,7 @@ const engine = @import("engine");
 const graphics = @import("graphics");
 const ui_core = @import("ui_core");
 const scene = @import("scene");
+const json_format = @import("json_format");
 
 const Position = struct { x: f32 = 0, y: f32 = 0 };
 const Velocity = struct { x: f32 = 1, y: f32 = 2 };
@@ -133,4 +134,38 @@ pub fn main(init: std.process.Init) !void {
         "5. Scene2D propagate (1k entities x 10 frames): {d:.3} ms ({d:.3} ms/frame)\n",
         .{ @as(f64, @floatFromInt(sc_ns)) / 1_000_000.0, @as(f64, @floatFromInt(sc_ns)) / 10_000_000.0 },
     );
+
+    // 6. JSON benchmark: std.json vs yyjson (small ~5KB, medium ~500KB, large ~5MB)
+    const sizes = [_]usize{ 100, 10_000, 100_000 };
+    const labels = [_][]const u8{ "~5 KB", "~500 KB", "~5 MB" };
+    for (sizes, labels) |count, lbl| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "{\"entities\":[");
+        for (0..count) |idx| {
+            if (idx > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "{\"id\":123,\"x\":1.5,\"y\":2.5,\"name\":\"entity_item\"}");
+        }
+        try buf.appendSlice(allocator, "]}");
+
+        const t_std0 = std.Io.Clock.now(.awake, io);
+        const s_std = try json_format.JsonService.inspectStdJson(allocator, buf.items);
+        const std_ns = elapsedNs(io, t_std0);
+        std.mem.doNotOptimizeAway(s_std);
+
+        const t_yy0 = std.Io.Clock.now(.awake, io);
+        const s_yy = try json_format.JsonService.inspectYyjson(buf.items);
+        const yy_ns = elapsedNs(io, t_yy0);
+        std.mem.doNotOptimizeAway(s_yy);
+
+        std.debug.print(
+            "6. JSON ({s}, {d} KB): std.json={d:.3} ms vs yyjson={d:.3} ms\n",
+            .{
+                lbl,
+                buf.items.len / 1024,
+                @as(f64, @floatFromInt(std_ns)) / 1_000_000.0,
+                @as(f64, @floatFromInt(yy_ns)) / 1_000_000.0,
+            },
+        );
+    }
 }

@@ -1,0 +1,49 @@
+//! How an extension tells reactor's runtime from any other `Io`, and how
+//! often it could not: an `Io` wrapping a runtime (a tracing layer,
+//! shakedown's `Layer`) takes the path every other `Io` takes.
+const std = @import("std");
+const aegis = @import("aegis");
+const Io = std.Io;
+
+const Core = @import("../runtime/Core.zig");
+const slots = @import("../runtime/slots.zig");
+const Scheduler = @import("../Scheduler.zig");
+const Task = @import("../scheduler/Task.zig");
+
+/// Times an extension met an `Io` that is not a runtime.
+const Fallbacks = aegis.units.Count(Io, u64);
+
+var taken: aegis.Atomic(Fallbacks) = .init(.fromRaw(0));
+
+/// The runtime `io` is; null for any other `Io`, which is counted.
+pub fn runtimeOf(io: Io) ?*Core {
+    if (slots.isRuntime(io.vtable)) return Core.of(io.userdata);
+    _ = taken.fetchAddWrapping(.fromRaw(1), .monotonic);
+    return null;
+}
+
+/// From a task's own code into the runtime, as the slots come in: the
+/// calling thread takes back the processor it lent, or the task rejoins one
+/// (`Scheduler.fromUser`). Before anything that reads the processor;
+/// `leave` with what it returned on the way out.
+pub fn enter() ?*Task {
+    return Scheduler.fromUser();
+}
+
+/// Back to the task's own code, after `enter`.
+pub fn leave(entered: ?*Task) void {
+    if (entered) |t| Scheduler.toUser(t);
+}
+
+/// The runtime `io` is when the calling thread is running one of its
+/// tasks, which the native paths need: they wait on the task's processor.
+pub fn taskRuntime(core: *Core) bool {
+    const p = Scheduler.processor() orelse return false;
+    return p.scheduler == &core.scheduler and p.current != null;
+}
+
+/// Times an extension took the path for an `Io` that is not a runtime,
+/// process-wide.
+pub fn fallbacks() u64 {
+    return taken.load(.monotonic).raw();
+}

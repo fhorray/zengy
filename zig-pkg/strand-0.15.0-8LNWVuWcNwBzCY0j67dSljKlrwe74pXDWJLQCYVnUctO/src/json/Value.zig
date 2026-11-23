@@ -1,0 +1,52 @@
+//! JSON-native dynamic values retain validated numeric lexemes and object order.
+const json5_tokens = @import("json5.zig");
+const WireDecoder = @import("Decoder.zig").Dialect(.json);
+const core = @import("../core.zig");
+/// An object's member: the core's key and value pair, so the pairs an object
+/// is read as are its members, with no copy.
+pub const Member = core.Pair([]const u8, Value);
+pub const Value = union(enum) {
+    /// Null is one of its values: it reads null itself.
+    pub const strand_nullable = true;
+    /// Any JSON value: its schema admits everything.
+    pub const strand_json_schema = "true";
+    null_value,
+    boolean: bool,
+    number: []const u8,
+    string: []const u8,
+    array: []const Value,
+    object: []const Member,
+    pub fn strandDeserialize(access: anytype) @TypeOf(access.*).Error!Value {
+        return switch (try access.peek()) {
+            .none => blk: {
+                _ = try access.read(?bool);
+                break :blk .null_value;
+            },
+            .boolean => .{ .boolean = try access.read(bool) },
+            .number => .{ .number = try access.number() },
+            .text => .{ .string = try access.read([]const u8) },
+            .begin => |header| if (header.kind == .sequence)
+                .{ .array = try access.read([]const Value) }
+            else
+                .{ .object = (try access.read(core.Pairs([]const u8, Value))).items },
+            else => error.UnexpectedType,
+        };
+    }
+    pub fn strandSerialize(self: Value, access: anytype) @TypeOf(access.*).Error!void {
+        switch (self) {
+            .null_value => try access.write(@as(?bool, null)),
+            .boolean => |v| try access.write(v),
+            .string => |v| try access.write(v),
+            .array => |v| try access.writeSequence(v),
+            .object => |v| try access.writePairs(v),
+            .number => |v| {
+                // One number, as JSON5 spells one, which takes in JSON's: the
+                // writer checks it as its dialect reads it, so a JSON5 spelling
+                // is refused as JSON.
+                try access.chargeWork(v.len);
+                if (!json5_tokens.validNumber(v)) return error.InvalidRaw;
+                try access.raw(WireDecoder.Format, v);
+            },
+        }
+    }
+};

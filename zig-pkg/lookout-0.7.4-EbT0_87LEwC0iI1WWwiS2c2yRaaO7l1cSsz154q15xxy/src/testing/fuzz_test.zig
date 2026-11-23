@@ -1,0 +1,1040 @@
+//! Fuzz targets, one per decoder.
+//!
+//! Three of lookout's backends are handed bytes by the operating system
+//! and have to find the changes in them: a run of `struct inotify_event`,
+//! a chain of `FILE_NOTIFY_INFORMATION`, and the flags-and-paths buffer
+//! the FSEvents delivery thread fills. Walking those is parsing, and the
+//! fourth target is the matching that decides which two records of a
+//! delivery are the two halves of one rename.
+//!
+//! Each target holds the same contract: any input yields records or a
+//! named error, never a crash and never a read past the end of the
+//! input; every name a record carries is a slice of the input it was
+//! decoded from; and the work and the memory are bounded by the input's
+//! length. The two over the FSEvents records hold one more, being the
+//! two that pair: the matching is symmetric -- if this record is that
+//! one's other half, that one is this one's.
+//!
+//! The decoders are out of the backends, in files that compile on every
+//! target, so all four run on whatever host is in front of the change.
+//! They are shakedown `check` properties: `zig build test` runs seeded cases
+//! of each, and `zig build test --fuzz` searches.
+
+const std = @import("std");
+const testing = std.testing;
+
+const fsevents_records = @import("../backend/fsevents/records.zig");
+const inotify_records = @import("../backend/inotify/records.zig");
+const windows_records = @import("../backend/windows/records.zig");
+const lookout = @import("../lookout.zig");
+const WatchId = lookout.WatchId;
+const shakedown = @import("shakedown");
+const gen = shakedown.gen;
+const Case = shakedown.Case;
+const Source = shakedown.Source;
+
+/// How much of one read a target builds. Large enough for a run of
+/// records and small enough that a failing input is readable.
+const buffer_len = 512;
+
+/// Whether `needle` is a slice of `haystack` -- the invariant that a
+/// decoded name points into the input and not past it or beside it.
+fn inside(haystack: []const u8, needle: []const u8) bool {
+    @disableInstrumentation();
+    const start = @intFromPtr(haystack.ptr);
+    const at = @intFromPtr(needle.ptr);
+    return at >= start and at + needle.len <= start + haystack.len;
+}
+
+/// Fills `out` with either bytes of the fuzzer's own choosing or a
+/// record written the way the kernel writes one, and answers how much
+/// of `out` was used.
+///
+/// Records alone would never reach the error paths and raw bytes alone
+/// would almost never reach the decoding, so the two are spliced: a
+/// well-formed run with a damaged record in the middle of it is the
+/// input that matters.
+fn splice(
+    s: *Source,
+    out: []u8,
+    room: usize,
+    encoder: *const fn (*Source, []u8) usize,
+) usize {
+    var len: usize = 0;
+    while (s.more(4)) {
+        if (out.len - len < room) break;
+        len += if (s.chance(750_000))
+            encoder(s, out[len..])
+        else
+            gen.bytesInto(s, out[len..][0..@min(room, out.len - len)]).len;
+    }
+    return len;
+}
+
+test "the inotify read buffer decodes or says why" {
+    try shakedown.check(testing.allocator, {}, fuzzInotify, .{});
+}
+
+fn writeInotify(s: *Source, out: []u8) usize {
+    var name: [24]u8 = undefined;
+    const name_len = gen.bytesInto(s, &name).len;
+    return inotify_records.encode(out, .{
+        .wd = gen.int(s, i8),
+        .mask = gen.int(s, u32),
+        .cookie = gen.int(s, u8),
+        .name = name[0..name_len],
+    });
+}
+
+fn fuzzInotify(_: void, c: *Case) !void {
+    const s = c.source;
+    var buffer: [buffer_len]u8 = undefined;
+    const bytes = buffer[0..splice(s, &buffer, 64, writeInotify)];
+
+    var it = inotify_records.iterate(bytes);
+    var seen: usize = 0;
+    while (true) {
+        const record = (it.next() catch |err| switch (err) {
+            error.TruncatedRecord => break,
+        }) orelse break;
+        seen += 1;
+        // A record costs at least a header, so a read cannot hold more
+        // of them than its own length allows. Asserted inside the loop
+        // rather than after it, so that a decoder that stopped making
+        // progress fails rather than hangs.
+        try testing.expect(seen <= bytes.len / inotify_records.header_len);
+        const name = record.name orelse continue;
+        try testing.expect(inside(bytes, name));
+        try testing.expect(name.len != 0);
+        // The kernel pads the name with NULs and the length counts the
+        // padding; what comes back is the name without it.
+        try testing.expect(std.mem.findScalar(u8, name, 0) == null);
+    }
+}
+
+test "the ReadDirectoryChangesW chain decodes or says why" {
+    try shakedown.check(testing.allocator, {}, fuzzWindows, .{});
+}
+
+fn writeWindows(s: *Source, out: []u8) usize {
+    var name: [24]u8 = undefined;
+    // An even length, because a whole number of UTF-16 code units is
+    // what the kernel writes; the fuzzer reaches the odd ones by
+    // damaging a header rather than by being handed one.
+    const name_len = gen.bytesInto(s, &name).len / 2 * 2;
+    return windows_records.encode(
+        out,
+        gen.int(s, u3),
+        name[0..name_len],
+        s.chance(750_000),
+    );
+}
+
+fn fuzzWindows(_: void, c: *Case) !void {
+    const s = c.source;
+    const gpa = testing.allocator;
+    var buffer: [buffer_len]u8 = undefined;
+    const bytes = buffer[0..splice(s, &buffer, 64, writeWindows)];
+
+    var it = windows_records.iterate(bytes);
+    var seen: usize = 0;
+    while (true) {
+        const record = (it.next() catch |err| switch (err) {
+            error.TruncatedRecord, error.OddNameLength, error.OverlappingRecords => break,
+        }) orelse break;
+        seen += 1;
+        try testing.expect(seen <= bytes.len / windows_records.header_len);
+        try testing.expect(inside(bytes, record.name));
+        try testing.expect(record.name.len % 2 == 0);
+
+        const name = try record.wtf8Alloc(gpa);
+        defer gpa.free(name);
+        // The transcoding is bounded by the name: three bytes per code
+        // unit at most, and a surrogate pair is two units for four.
+        try testing.expect(name.len <= record.name.len / 2 * 3);
+    }
+}
+
+test "the FSEvents delivery decodes or says why" {
+    try shakedown.check(testing.allocator, {}, fuzzDelivery, .{});
+}
+
+fn writeDelivery(s: *Source, out: []u8) usize {
+    var path: [24]u8 = undefined;
+    const path_len = gen.bytesInto(s, &path).len;
+    return fsevents_records.encode(
+        out,
+        .fromRaw(gen.int(s, u2)),
+        flagsOf(s),
+        gen.int(s, u16),
+        path[0..path_len],
+    );
+}
+
+/// A combination of the flags FSEvents sets, weighted towards the ones
+/// the backend reads rather than spread over thirty-two bits that mean
+/// nothing to it.
+fn flagsOf(s: *Source) u32 {
+    const flag = fsevents_records.flag;
+    const named = [_]u32{
+        flag.must_scan_sub_dirs,  flag.user_dropped,   flag.kernel_dropped,
+        flag.history_done,        flag.root_changed,   flag.item_created,
+        flag.item_removed,        flag.item_renamed,   flag.item_modified,
+        flag.item_inode_meta_mod, flag.item_xattr_mod, flag.item_is_dir,
+    };
+    var flags: u32 = gen.int(s, u8);
+    while (s.more(2)) {
+        flags |= named[gen.intRange(s, usize, 0, named.len - 1)];
+    }
+    return flags;
+}
+
+fn fuzzDelivery(_: void, c: *Case) !void {
+    const s = c.source;
+    const gpa = testing.allocator;
+    var buffer: [buffer_len]u8 = undefined;
+    const bytes = buffer[0..splice(s, &buffer, 64, writeDelivery)];
+
+    var delivered: std.ArrayList(fsevents_records.Record) = .empty;
+    defer delivered.deinit(gpa);
+    var it = fsevents_records.iterate(bytes);
+    while (true) {
+        const record = (it.next() catch |err| switch (err) {
+            error.TruncatedRecord => break,
+        }) orelse break;
+        try testing.expect(delivered.items.len <= bytes.len / fsevents_records.header_len);
+        try testing.expect(inside(bytes, record.path));
+        // Every flag combination has an answer to both of these, and
+        // neither is allowed to be a third thing.
+        _ = record.target();
+        _ = record.renamed();
+        try delivered.append(gpa, record);
+    }
+
+    const fake: Fake = .{ .seed = gen.int(s, u32) };
+    const used = try gpa.alloc(bool, delivered.items.len);
+    defer gpa.free(used);
+    @memset(used, false);
+
+    for (delivered.items) |a| {
+        for (delivered.items) |b| {
+            // The matching is a relation between two records and not a
+            // question one of them answers about the other.
+            try testing.expectEqual(
+                try fsevents_records.pairs(a, b, fake),
+                try fsevents_records.pairs(b, a, fake),
+            );
+        }
+    }
+    for (delivered.items, 0..) |record, at| {
+        const partner = (try fsevents_records.partnerOf(record, delivered.items, used, at + 1, fake)) orelse
+            continue;
+        try testing.expect(partner > at);
+        try testing.expect(try fsevents_records.pairs(record, delivered.items[partner], fake));
+    }
+}
+
+test "a rename pairs across the boundary of a delivery" {
+    try shakedown.check(testing.allocator, {}, fuzzCarry, .{});
+}
+
+/// Drives `fsevents_records.Pairing` over a run of deliveries the way
+/// the backend drives it, and counts what went in and what came back.
+fn fuzzCarry(_: void, c: *Case) !void {
+    const s = c.source;
+    const gpa = testing.allocator;
+    const fake: Fake = .{ .seed = gen.int(s, u32) };
+
+    var pairing: fsevents_records.Pairing = .{};
+    defer if (pairing.held) |half| gpa.free(half.path);
+
+    // A half is either joined to a partner, given back alone, or still
+    // waiting when the run ends. Nothing else may become of one.
+    var carried: usize = 0;
+    var joined: usize = 0;
+    var alone: usize = 0;
+
+    var deliveries: usize = 0;
+    while (s.more(3) and deliveries < 8) : (deliveries += 1) {
+        var buffer: [buffer_len]u8 = undefined;
+        const bytes = buffer[0..splice(s, &buffer, 64, writeDelivery)];
+
+        var delivered: std.ArrayList(fsevents_records.Record) = .empty;
+        defer delivered.deinit(gpa);
+        var it = fsevents_records.iterate(bytes);
+        while (true) {
+            const record = (it.next() catch |err| switch (err) {
+                error.TruncatedRecord => break,
+            }) orelse break;
+            try delivered.append(gpa, record);
+        }
+
+        const used = try gpa.alloc(bool, delivered.items.len);
+        defer gpa.free(used);
+        @memset(used, false);
+
+        if (try pairing.take(delivered.items, used, fake)) |taken| {
+            defer gpa.free(taken.half.path);
+            try testing.expectEqual(@as(?fsevents_records.Half, null), pairing.held);
+            if (taken.partner) |at| {
+                try testing.expect(at < delivered.items.len);
+                try testing.expect(used[at]);
+                try testing.expect(try fsevents_records.pairs(taken.half.record(), delivered.items[at], fake));
+                try testing.expect(try fsevents_records.pairs(delivered.items[at], taken.half.record(), fake));
+                joined += 1;
+            } else {
+                alone += 1;
+            }
+        }
+
+        for (delivered.items, 0..) |record, at| {
+            if (used[at]) continue;
+            if (!record.renamed() or !fake.wanted(record.id, record.path)) continue;
+            if ((try fsevents_records.partnerOf(record, delivered.items, used, at + 1, fake))) |partner| {
+                used[partner] = true;
+                continue;
+            }
+            // The half a delivery could not settle, copied because the
+            // buffer it points into is gone by the next one.
+            const owned = try gpa.dupe(u8, record.path);
+            carried += 1;
+            if (pairing.carry(.{
+                .id = record.id,
+                .path = owned,
+                .flags = record.flags,
+                .event = record.event,
+            })) |stale| {
+                gpa.free(stale.path);
+                alone += 1;
+            }
+        }
+    }
+
+    try testing.expectEqual(carried, joined + alone + @intFromBool(pairing.held != null));
+}
+
+/// A file system and a filter, answered from the path itself.
+///
+/// The matching must be a pure function of what it is told, or the
+/// symmetry it is held to would be a property of the order it asked
+/// its questions in. A hash of the path gives the same answer however
+/// often it is asked.
+pub const Fake = struct {
+    seed: u32,
+
+    pub fn wanted(f: Fake, id: WatchId, subject: []const u8) bool {
+        @disableInstrumentation();
+        _ = id;
+        return f.bit(subject, 1) != 0;
+    }
+
+    pub fn exists(f: Fake, subject: []const u8) std.Io.Cancelable!?bool {
+        @disableInstrumentation();
+        return f.bit(subject, 2) != 0;
+    }
+
+    fn bit(f: Fake, subject: []const u8, mask: u64) u64 {
+        @disableInstrumentation();
+        return std.hash.Wyhash.hash(f.seed, subject) & mask;
+    }
+};
+
+//=========================================================================
+// Paths, patterns, a tree compared with its baseline, and a checkpoint
+// token. None of these is handed bytes by a kernel, but each is handed a
+// spelling it did not choose: a root as the caller wrote it, a pattern
+// from a configuration file, a tree somebody else changed, and a token
+// that spent a restart on a disk.
+//=========================================================================
+
+const path_cmp = @import("../path.zig");
+const CompiledFilter = @import("../CompiledFilter.zig");
+const Baseline = @import("../Baseline.zig");
+const Checkpoint = @import("../Checkpoint.zig");
+const builtin = @import("builtin");
+const baseline_format = @import("../Baseline/format.zig");
+const Snapshot = @import("../Snapshot.zig");
+
+/// A path out of the pieces two spellings of one path differ by: case,
+/// composition, both separators and runs of them, the dot components, a
+/// drive and the Windows prefixes, a NUL and bytes that are not UTF-8.
+fn generatePath(s: *Source, buf: []u8) []u8 {
+    const pieces = [_][]const u8{
+        "/",        "\\",   "a",       "B",       "\u{e9}",  "e\u{301}", "\u{c9}", "E\u{301}",
+        "\xff",     "\xc3", "..",      ".",       "C:",      "\\\\?\\",  "//",     "\u{65e5}",
+        "\u{df}",   "\x00", "\u{301}", "\u{416}", "\u{436}", "\u{d7}",   "*",      "?",
+        "\\\\h\\s", "a/",   "/a",      "\u{c5}",
+    };
+    var end: usize = 0;
+    while (s.more(4)) {
+        const piece = pieces[gen.intRange(s, usize, 0, pieces.len - 1)];
+        if (end + piece.len > buf.len) break;
+        @memcpy(buf[end..][0..piece.len], piece);
+        end += piece.len;
+    }
+    return buf[0..end];
+}
+
+/// Canonical path bytes and their original offsets, including the end.
+const Spelled = struct {
+    points: std.ArrayList(u21) = .empty,
+    cuts: std.ArrayList(?usize) = .empty,
+
+    fn of(gpa: std.mem.Allocator, p: []const u8) !Spelled {
+        @disableInstrumentation();
+        var s: Spelled = .{};
+        for (p, 0..) |byte, i| {
+            try s.cuts.append(gpa, i);
+            try s.points.append(gpa, byte);
+        }
+        try s.cuts.append(gpa, p.len);
+        return s;
+    }
+
+    fn deinit(s: *Spelled, gpa: std.mem.Allocator) void {
+        s.points.deinit(gpa);
+        s.cuts.deinit(gpa);
+        s.* = undefined;
+    }
+};
+
+/// `path_cmp.relative`, said the long way round: the root's code points are
+/// the path's first ones, the path can be cut there, and what is left is
+/// empty or starts at a separator.
+fn referenceRelative(gpa: std.mem.Allocator, root: []const u8, p: []const u8) !?[]const u8 {
+    @disableInstrumentation();
+    var r = try Spelled.of(gpa, root);
+    defer r.deinit(gpa);
+    var s = try Spelled.of(gpa, p);
+    defer s.deinit(gpa);
+    if (s.points.items.len < r.points.items.len) return null;
+    if (!std.mem.eql(u21, r.points.items, s.points.items[0..r.points.items.len])) return null;
+    const split = s.cuts.items[r.points.items.len] orelse return null;
+    var rest = p[split..];
+    if (rest.len == 0) return rest;
+    if ((root.len == 0 or !path_cmp.isSep(root[root.len - 1])) and !path_cmp.isSep(rest[0])) return null;
+    while (rest.len != 0 and path_cmp.isSep(rest[0])) rest = rest[1..];
+    return rest;
+}
+
+fn trimSeparators(p: []const u8) []const u8 {
+    var end = p.len;
+    while (end != 0 and path_cmp.isSep(p[end - 1])) end -= 1;
+    return p[0..end];
+}
+
+fn checkPaths(a: []const u8, b: []const u8) !void {
+    const gpa = testing.allocator;
+    var sa = try Spelled.of(gpa, a);
+    defer sa.deinit(gpa);
+    var sb = try Spelled.of(gpa, b);
+    defer sb.deinit(gpa);
+
+    // One spelling, one answer, from every function that compares.
+    const same = path_cmp.eql(a, b);
+    try testing.expectEqual(std.mem.eql(u21, sa.points.items, sb.points.items), same);
+    try testing.expectEqual(same, path_cmp.eql(b, a));
+    try testing.expect(path_cmp.eql(a, a));
+    if (same) try testing.expectEqual(path_cmp.hash(a), path_cmp.hash(b));
+    try testing.expectEqual(std.mem.eql(u8, a, b), same);
+
+    for ([_][2][]const u8{ .{ a, b }, .{ b, a }, .{ a, a } }) |pair| {
+        const root = pair[0];
+        const p = pair[1];
+        const rest = path_cmp.relative(root, p);
+        const expected = try referenceRelative(gpa, root, p);
+        try testing.expectEqual(expected == null, rest == null);
+        try testing.expectEqual(rest != null, path_cmp.within(root, p));
+        const r = rest orelse continue;
+        // A slice of the path, its tail, and never starting at a
+        // separator.
+        try testing.expectEqual(@intFromPtr(p.ptr) + p.len, @intFromPtr(r.ptr) + r.len);
+        try testing.expectEqualStrings(expected.?, r);
+        if (r.len != 0) try testing.expect(!path_cmp.isSep(r[0]));
+        // And what was cut off it is the root: the rest never begins
+        // above it.
+        try testing.expect(path_cmp.eql(trimSeparators(root), trimSeparators(p[0 .. p.len - r.len])));
+    }
+}
+
+test "canonical paths compare, hash and cut their original bytes" {
+    try shakedown.check(testing.allocator, {}, fuzzPaths, .{});
+}
+
+fn fuzzPaths(_: void, c: *Case) !void {
+    const s = c.source;
+    var left: [96]u8 = undefined;
+    var right: [96]u8 = undefined;
+    const a = generatePath(s, &left);
+    // Often the same path in another spelling, or one under it.
+    const b = switch (gen.intRange(s, u8, 0, 2)) {
+        0 => generatePath(s, &right),
+        1 => respelled: {
+            var end: usize = 0;
+            for (a) |byte| {
+                right[end] = if (std.ascii.isAlphabetic(byte) and gen.boolean(s)) byte ^ 0x20 else byte;
+                end += 1;
+            }
+            break :respelled right[0..end];
+        },
+        else => under: {
+            @memcpy(right[0..a.len], a);
+            const tail = generatePath(s, right[a.len..]);
+            break :under right[0 .. a.len + tail.len];
+        },
+    };
+    try checkPaths(a, b);
+}
+
+/// A pattern as git reads it: exact scalars and explicit separators,
+/// with `*` and `?` taken out, and `**` taken out as a globstar
+/// where it stands as a whole component and as `*` everywhere else.
+const Token = union(enum) { any_depth, any, one, literal: u21 };
+
+/// Exact UTF-8 scalars with both separator spellings represented by `/`.
+/// Invalid bytes remain distinct from valid scalars.
+fn units(gpa: std.mem.Allocator, text: []const u8, alternate_separator: ?u8) !std.ArrayList(u21) {
+    @disableInstrumentation();
+    var out: std.ArrayList(u21) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const decoded: ?u21 = if (i + len > text.len) null else switch (len) {
+            1 => text[i],
+            2 => std.unicode.utf8Decode2(text[i..][0..2].*) catch null,
+            3 => std.unicode.utf8Decode3(text[i..][0..3].*) catch null,
+            4 => std.unicode.utf8Decode4(text[i..][0..4].*) catch null,
+            else => null,
+        };
+        if (decoded) |c| {
+            try out.append(gpa, if (alternate_separator != null and c == alternate_separator.?) '/' else c);
+            i += len;
+        } else {
+            try out.append(gpa, @as(u21, 0x110000) + text[i]);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+fn tokenize(gpa: std.mem.Allocator, pattern: []const u8, alternate_separator: ?u8) !std.ArrayList(Token) {
+    @disableInstrumentation();
+    var points = try units(gpa, pattern, alternate_separator);
+    defer points.deinit(gpa);
+    const p = points.items;
+    var tokens: std.ArrayList(Token) = .empty;
+    errdefer tokens.deinit(gpa);
+    var i: usize = 0;
+    while (i < p.len) : (i += 1) {
+        try tokens.append(gpa, switch (p[i]) {
+            '*' => star: {
+                var end = i + 1;
+                while (end < p.len and p[end] == '*') end += 1;
+                const whole = (i == 0 or p[i - 1] == '/') and (end == p.len or p[end] == '/');
+                const run = end - i;
+                i = end - 1;
+                break :star if (run >= 2 and whole) .any_depth else .any;
+            },
+            '?' => .one,
+            else => .{ .literal = p[i] },
+        });
+    }
+    return tokens;
+}
+
+/// git's wildmatch with `WM_PATHNAME`, for patterns of `*`, `**`, `?` and
+/// literals, over every pair of positions once rather than by
+/// backtracking.
+fn referenceMatches(gpa: std.mem.Allocator, pattern: []const u8, name: []const u8) !bool {
+    return referenceMatchesSeparators(gpa, pattern, name, if (builtin.target.os.tag == .windows) '\\' else null);
+}
+
+fn referenceMatchesSeparators(gpa: std.mem.Allocator, pattern: []const u8, name: []const u8, alternate_separator: ?u8) !bool {
+    @disableInstrumentation();
+    var tokens = try tokenize(gpa, pattern, alternate_separator);
+    defer tokens.deinit(gpa);
+    var points = try units(gpa, name, alternate_separator);
+    defer points.deinit(gpa);
+    const t = tokens.items;
+    const n = points.items;
+    // `can[i][j]`: the tokens from `i` match the name from `j`.
+    const can = try gpa.alloc(bool, (t.len + 1) * (n.len + 1));
+    defer gpa.free(can);
+    const w = n.len + 1;
+    var i = t.len + 1;
+    while (i > 0) {
+        i -= 1;
+        var j = n.len + 1;
+        while (j > 0) {
+            j -= 1;
+            can[i * w + j] = if (i == t.len) j == n.len else switch (t[i]) {
+                .literal => |c| j < n.len and n[j] == c and can[(i + 1) * w + j + 1],
+                .one => j < n.len and n[j] != '/' and can[(i + 1) * w + j + 1],
+                .any => can[(i + 1) * w + j] or (j < n.len and n[j] != '/' and can[i * w + j + 1]),
+                .any_depth => any: {
+                    // At the end: everything left. Before a separator: no
+                    // directory at all, or whole directories, each ending
+                    // at a separator.
+                    if (i + 1 == t.len) break :any true;
+                    const after = i + 2;
+                    if (can[after * w + j]) break :any true;
+                    var k = j;
+                    while (k < n.len) : (k += 1) {
+                        if (n[k] == '/' and can[after * w + k + 1]) break :any true;
+                    }
+                    break :any false;
+                },
+            };
+        }
+    }
+    return can[0];
+}
+
+test "the filter reference respects both separator spellings" {
+    const gpa = testing.allocator;
+    try testing.expect(!try referenceMatchesSeparators(gpa, "a*a", "a\\a", '\\'));
+    try testing.expect(try referenceMatchesSeparators(gpa, "a*a", "a\\a", null));
+    try testing.expect(!try referenceMatchesSeparators(gpa, "a?b", "a\\b", '\\'));
+    try testing.expect(try referenceMatchesSeparators(gpa, "a\\*\\b", "a/x/b", '\\'));
+    try testing.expect(try referenceMatchesSeparators(gpa, "a\\**\\b", "a/b", '\\'));
+    try testing.expect(try referenceMatchesSeparators(gpa, "a/**/b", "a\\x/y\\b", '\\'));
+    try testing.expect(!try referenceMatchesSeparators(gpa, "a/*/b", "a\\x/y\\b", '\\'));
+}
+
+/// `CompiledFilter.excludes` for an ignore list of one pattern, said the long
+/// way round: the pattern names the path or a directory above it,
+/// relative to the root or absolute as the pattern is, or names the last
+/// component of one of them when it holds no separator.
+fn referenceExcludes(gpa: std.mem.Allocator, root: []const u8, pattern: []const u8, subject: []const u8) !bool {
+    @disableInstrumentation();
+    if (pattern.len == 0) return false;
+    const rest = path_cmp.relative(root, subject) orelse return false;
+    const base = subject.len - rest.len;
+    const bare = std.mem.findAny(u8, pattern, path_cmp.separators) == null;
+    var end: usize = 0;
+    while (end < rest.len) {
+        end = std.mem.findAnyPos(u8, rest, end + 1, path_cmp.separators) orelse rest.len;
+        const named = if (std.Io.Dir.path.isAbsolute(pattern)) subject[0 .. base + end] else rest[0..end];
+        if (try referenceMatches(gpa, pattern, named)) return true;
+        if (bare and try referenceMatches(gpa, pattern, std.Io.Dir.path.basename(named))) return true;
+    }
+    return false;
+}
+
+test "an ignore list agrees with the reference over every short pattern and path" {
+    const gpa = testing.allocator;
+    const root = if (builtin.target.os.tag == .windows) "C:\\w" else "/w";
+    const pieces = [_][]const u8{ "a", "*", "**", "?", "/" };
+    // `/` is the digit 0, which a number never ends in, and no path ends
+    // in a separator.
+    const letters = "/ab";
+    var pattern_buf: [8]u8 = undefined;
+    var native_buf: [8]u8 = undefined;
+    var subject_buf: [16]u8 = undefined;
+    // Every pattern of up to three pieces, by counting in base 6 with 0
+    // for no piece.
+    var code: usize = 0;
+    while (code < 6 * 6 * 6) : (code += 1) {
+        var len: usize = 0;
+        var rest = code;
+        while (rest != 0) : (rest /= 6) {
+            const digit = rest % 6;
+            if (digit == 0) continue;
+            const piece = pieces[digit - 1];
+            @memcpy(pattern_buf[len..][0..piece.len], piece);
+            len += piece.len;
+        }
+        const pattern = native(&native_buf, pattern_buf[0..len]);
+        var ignore: CompiledFilter = try .compile(gpa, .{ .ignore = &.{pattern} });
+        defer ignore.deinit();
+        // Every path below the root of up to four characters, with no
+        // empty component.
+        var name: usize = 0;
+        while (name < 3 * 3 * 3 * 3) : (name += 1) {
+            @memcpy(subject_buf[0..root.len], root);
+            subject_buf[root.len] = std.Io.Dir.path.sep;
+            var end = root.len + 1;
+            var digits = name;
+            var valid = true;
+            while (digits != 0) : (digits /= 3) {
+                const c = letters[digits % 3];
+                const previous = subject_buf[end - 1];
+                if (c == '/' and (previous == std.Io.Dir.path.sep or end == root.len + 1)) valid = false;
+                subject_buf[end] = if (c == '/') std.Io.Dir.path.sep else c;
+                end += 1;
+            }
+            if (!valid or end == root.len + 1 or subject_buf[end - 1] == std.Io.Dir.path.sep) continue;
+            const subject = subject_buf[0..end];
+            testing.expectEqual(try referenceExcludes(gpa, root, pattern, subject), ignore.excludes(root, subject)) catch |err| {
+                std.debug.print("pattern '{s}' subject '{s}'\n", .{ pattern, subject });
+                return err;
+            };
+        }
+    }
+}
+
+/// A pattern built from wildcards, separators and the letters the paths
+/// below are made of.
+fn generatePattern(s: *Source, buf: []u8) []u8 {
+    const pieces = [_][]const u8{ "*", "**", "?", "/", "a", "b", "A", "\u{e9}", "e\u{301}", "**/", "/**", "." };
+    var end: usize = 0;
+    while (s.more(3)) {
+        const piece = pieces[gen.intRange(s, usize, 0, pieces.len - 1)];
+        if (end + piece.len > buf.len) break;
+        @memcpy(buf[end..][0..piece.len], piece);
+        end += piece.len;
+    }
+    return buf[0..end];
+}
+
+/// A path below `/w`, one to four components of the same letters.
+fn generateBelow(s: *Source, buf: []u8) []u8 {
+    const root = if (builtin.target.os.tag == .windows) "C:\\w" else "/w";
+    const names = [_][]const u8{ "a", "b", "ab", "ba", "A", "\u{e9}", "e\u{301}", "a.b", "aa" };
+    @memcpy(buf[0..root.len], root);
+    var end: usize = root.len;
+    const depth = gen.intRange(s, u8, 1, 4);
+    for (0..depth) |_| {
+        buf[end] = std.Io.Dir.path.sep;
+        end += 1;
+        const parts = gen.intRange(s, u8, 1, 2);
+        for (0..parts) |_| {
+            const name = names[gen.intRange(s, usize, 0, names.len - 1)];
+            @memcpy(buf[end..][0..name.len], name);
+            end += name.len;
+        }
+    }
+    return buf[0..end];
+}
+
+/// The pattern with `/` as the platform spells a separator.
+fn native(buf: []u8, pattern: []const u8) []const u8 {
+    @memcpy(buf[0..pattern.len], pattern);
+    if (builtin.target.os.tag == .windows) std.mem.replaceScalar(u8, buf[0..pattern.len], '/', '\\');
+    return buf[0..pattern.len];
+}
+
+test "a filter keeps what its patterns name and walks to it" {
+    try shakedown.check(testing.allocator, {}, fuzzFilter, .{});
+}
+
+fn fuzzFilter(_: void, c: *Case) !void {
+    const s = c.source;
+    const gpa = testing.allocator;
+    const root = if (builtin.target.os.tag == .windows) "C:\\w" else "/w";
+    var pattern_buf: [48]u8 = undefined;
+    var native_buf: [48]u8 = undefined;
+    const pattern = native(&native_buf, generatePattern(s, &pattern_buf));
+    var subject_buf: [128]u8 = undefined;
+    const subject = generateBelow(s, &subject_buf);
+    const rel = path_cmp.relative(root, subject).?;
+    errdefer std.debug.print("pattern '{s}' subject '{s}'\n", .{ pattern, subject });
+
+    // The matcher is the reference's answer for the path and for the
+    // name alone.
+    var ignore: CompiledFilter = try .compile(gpa, .{ .ignore = &.{pattern} });
+    defer ignore.deinit();
+    var only: CompiledFilter = try .compile(gpa, .{ .only = &.{pattern} });
+    defer only.deinit();
+    const bare = std.mem.findAny(u8, pattern, path_cmp.separators) == null;
+    const named = pattern.len != 0 and (try referenceMatches(gpa, pattern, rel) or
+        (bare and try referenceMatches(gpa, pattern, std.Io.Dir.path.basename(rel))));
+
+    // An ignore list excludes exactly what the reference names, on the
+    // path or on any directory above it.
+    try testing.expectEqual(try referenceExcludes(gpa, root, pattern, subject), ignore.excludes(root, subject));
+
+    // The root is what was asked for, whatever the patterns say.
+    try testing.expect(!ignore.excludes(root, root));
+    try testing.expect(!only.excludes(root, root));
+    try testing.expect(!only.prunes(root, root));
+
+    // A path a pattern names is left out by `ignore` and kept by `only`;
+    // and kept means reachable: no directory on the way to it is pruned.
+    if (named) {
+        try testing.expect(ignore.excludes(root, subject));
+        try testing.expect(!only.excludes(root, subject));
+    }
+    var end: usize = root.len + 1;
+    while (std.mem.findAnyPos(u8, subject, end, path_cmp.separators)) |at| : (end = at + 1) {
+        const ancestor = subject[0..at];
+        // An excluded directory takes everything below it.
+        if (ignore.excludes(root, ancestor)) try testing.expect(ignore.excludes(root, subject));
+        if (only.prunes(root, ancestor)) try testing.expect(only.excludes(root, subject));
+        if (named) try testing.expect(!only.prunes(root, ancestor));
+    }
+    // Pruning a directory is a stronger claim than not reporting it.
+    if (only.prunes(root, subject)) try testing.expect(only.excludes(root, subject));
+    if (ignore.prunes(root, subject)) try testing.expect(ignore.excludes(root, subject));
+}
+
+test "a baseline of an arbitrary tree diffs to what changed in it" {
+    try shakedown.check(testing.allocator, {}, fuzzBaseline, .{ .cases = 64 });
+}
+
+/// A tree: relative path to a file's contents, or to null for a directory.
+const Model = std.array_hash_map.String(?[]const u8);
+
+fn applyModel(dir: std.Io.Dir, model: *const Model) !void {
+    const io = testing.io;
+    for (model.keys(), model.values()) |key, value| {
+        if (value) |contents| {
+            try dir.writeFile(io, .{ .sub_path = key, .data = contents });
+        } else try dir.createDirPath(io, key);
+    }
+}
+
+/// Names that stay distinct on a volume that folds case and composition,
+/// so the model and the disk agree on what is there.
+const model_names = [_][]const u8{ "a", "b", "c d", "\u{65e5}", "e.txt" };
+
+/// What `Baseline.diff` says about one path, as the models predict it.
+const Expected = struct { kind: lookout.Kind, target: lookout.Target };
+
+fn fuzzBaseline(_: void, c: *Case) !void {
+    const s = c.source;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+
+    const before = try generateModel(a, s);
+    try applyModel(tmp.dir, &before);
+
+    const recursive = s.chance(750_000);
+    var base = try Baseline.seed(gpa, io, root, .{ .recursive = recursive });
+    defer base.deinit();
+
+    var after: Model = .empty;
+    for (before.keys(), before.values()) |key, value| try after.put(a, key, value);
+    try changeModel(a, s, tmp.dir, &after);
+
+    const expected = try expectDiff(a, &before, &after, recursive);
+    const found = try base.diff(io);
+    try matchDiff(root, &expected, found);
+    // And the tree is now the baseline: nothing more to say.
+    try testing.expectEqual(@as(usize, 0), (try base.diff(io)).len);
+}
+
+/// Up to a dozen paths, each a file or a directory below an existing
+/// directory or at the top.
+fn generateModel(a: std.mem.Allocator, s: *Source) !Model {
+    var model: Model = .empty;
+    var generated: usize = 0;
+    while (generated < 12 and s.more(3)) : (generated += 1) {
+        const dirs = blk: {
+            var list: std.ArrayList([]const u8) = .empty;
+            try list.append(a, "");
+            for (model.keys(), model.values()) |key, value| if (value == null) try list.append(a, key);
+            break :blk list.items;
+        };
+        const parent = dirs[gen.intRange(s, usize, 0, dirs.len - 1)];
+        const name = model_names[gen.intRange(s, usize, 0, model_names.len - 1)];
+        const key = if (parent.len == 0) try a.dupe(u8, name) else try std.Io.Dir.path.join(a, &.{ parent, name });
+        if (model.contains(key)) continue;
+        const contents: ?[]const u8 = if (s.chance(666_667)) null else try a.dupe(u8, "xxx");
+        try model.put(a, key, contents);
+    }
+    return model;
+}
+
+/// Changes some of the tree in `dir` and in `model` alike: removes a path
+/// and what is below it, rewrites a file to another length, turns one kind
+/// into the other, adds new ones.
+fn changeModel(a: std.mem.Allocator, s: *Source, dir: std.Io.Dir, model: *Model) !void {
+    const io = testing.io;
+    var changes: usize = 0;
+    while (changes < 6 and model.count() != 0 and s.more(2)) : (changes += 1) {
+        const at = gen.intRange(s, usize, 0, model.count() - 1);
+        const key = model.keys()[at];
+        switch (gen.intRange(s, u8, 0, 3)) {
+            0, 2 => {
+                // Gone, with everything below it; or gone and back as the
+                // other kind.
+                const was_dir = model.values()[at] == null;
+                if (was_dir) try dir.deleteTree(io, key) else try dir.deleteFile(io, key);
+                var i: usize = 0;
+                while (i < model.count()) {
+                    const other = model.keys()[i];
+                    if (std.mem.eql(u8, other, key) or (std.mem.startsWith(u8, other, key) and path_cmp.isSep(other[key.len]))) {
+                        model.swapRemoveAt(i);
+                    } else i += 1;
+                }
+                if (gen.boolean(s)) {
+                    const contents: ?[]const u8 = if (was_dir) "y" else null;
+                    try model.put(a, key, contents);
+                    if (contents) |c| try dir.writeFile(io, .{ .sub_path = key, .data = c }) else try dir.createDirPath(io, key);
+                }
+            },
+            1 => if (model.values()[at]) |old| {
+                const contents = try std.mem.concat(a, u8, &.{ old, "z" });
+                model.values()[at] = contents;
+                try dir.writeFile(io, .{ .sub_path = key, .data = contents });
+            },
+            else => if (model.values()[at] == null) {
+                const name = model_names[gen.intRange(s, usize, 0, model_names.len - 1)];
+                const child = try std.Io.Dir.path.join(a, &.{ key, name });
+                if (!model.contains(child)) {
+                    try model.put(a, child, "new");
+                    try dir.writeFile(io, .{ .sub_path = child, .data = "new" });
+                }
+            },
+        }
+    }
+}
+
+/// The diff, against the two models: what is in one and not the other,
+/// and the files whose contents changed. A path below the root is in a
+/// non-recursive baseline's view only when it is the root's child.
+fn expectDiff(a: std.mem.Allocator, before: *const Model, after: *const Model, recursive: bool) !std.array_hash_map.String(Expected) {
+    @disableInstrumentation();
+    var expected: std.array_hash_map.String(Expected) = .empty;
+    const visible = struct {
+        fn f(key: []const u8, deep: bool) bool {
+            return deep or std.mem.findAny(u8, key, path_cmp.separators) == null;
+        }
+    }.f;
+    for (after.keys(), after.values()) |key, value| {
+        if (!visible(key, recursive)) continue;
+        const target: lookout.Target = if (value == null) .directory else .file;
+        const old = before.get(key) orelse {
+            try expected.put(a, key, .{ .kind = .created, .target = target });
+            continue;
+        };
+        if ((old == null) != (value == null)) {
+            try expected.put(a, key, .{ .kind = .created, .target = target });
+            // What a directory held, gone with it when it became a file.
+            if (old == null) for (before.keys(), before.values()) |inner, inner_value| {
+                if (visible(inner, recursive) and std.mem.startsWith(u8, inner, key) and inner.len > key.len and path_cmp.isSep(inner[key.len]) and !after.contains(inner))
+                    try expected.put(a, inner, .{ .kind = .removed, .target = if (inner_value == null) .directory else .file });
+            };
+        } else if (value != null and !std.mem.eql(u8, old.?, value.?)) {
+            try expected.put(a, key, .{ .kind = .modified, .target = .file });
+        }
+    }
+    for (before.keys(), before.values()) |key, value| {
+        if (!visible(key, recursive) or after.contains(key) or expected.contains(key)) continue;
+        try expected.put(a, key, .{ .kind = .removed, .target = if (value == null) .directory else .file });
+    }
+    return expected;
+}
+
+/// Whether `found` is exactly `expected`: every change predicted, of the
+/// predicted kind and target, and none missed.
+fn matchDiff(root: []const u8, expected: *const std.array_hash_map.String(Expected), found: []const Baseline.Change) !void {
+    @disableInstrumentation();
+    for (found) |change| {
+        const rel = path_cmp.relative(root, change.path) orelse return error.TestChangeOutsideRoot;
+        const wanted = expected.get(rel) orelse {
+            std.debug.print("unexpected {t} {s}\n", .{ change.kind, rel });
+            return error.TestUnexpectedChange;
+        };
+        try testing.expectEqual(wanted.kind, change.kind);
+        try testing.expectEqual(wanted.target, change.target);
+    }
+    for (expected.keys()) |key| {
+        for (found) |change| {
+            if (std.mem.eql(u8, path_cmp.relative(root, change.path).?, key)) break;
+        } else {
+            std.debug.print("missed {t} {s}\n", .{ expected.get(key).?.kind, key });
+            return error.TestMissedChange;
+        }
+    }
+    try testing.expectEqual(expected.count(), found.len);
+}
+
+test "a checkpoint token reads back as itself or not at all" {
+    try shakedown.check(testing.allocator, {}, fuzzCheckpoint, .{});
+}
+
+fn fuzzCheckpoint(_: void, c: *Case) !void {
+    const s = c.source;
+    const gpa = testing.allocator;
+    const absolute = if (builtin.target.os.tag == .windows) "\"C:\\\\w\"" else "\"/w\"";
+    const pieces = [_][]const u8{
+        "{\"version\":3,\"backend\":\"fsevents\",\"watches\":[",                                                             "]}",
+        "{\"root\":" ++ absolute ++ ",\"cursor\":1,\"recursive\":true,\"baseline\":[],\"identity\":{\"volume\":[",           "],\"log\":[",
+        "]}",                                                                                                                "}",
+        "48,",                                                                                                               "48",
+        ",\"changes\":[{\"path\":" ++ absolute ++ ",\"kind\":\"renamed\",\"from\":" ++ absolute ++ ",\"target\":\"file\"}]", ",\"half\":{\"path\":" ++ absolute ++ ",\"flags\":2048,\"event\":3}",
+        ",",                                                                                                                 "\"\\u0000\"",
+        "\"\\ud800\"",                                                                                                       "18446744073709551615",
+        "-1",                                                                                                                "null",
+        " ",
+    };
+    var buf: [1024]u8 = undefined;
+    var end: usize = 0;
+    while (s.more(8)) {
+        var chunk: [16]u8 = undefined;
+        const piece = if (s.chance(857_143)) gen.bytesInto(s, &chunk) else pieces[gen.intRange(s, usize, 0, pieces.len - 1)];
+        if (end + piece.len > buf.len) break;
+        @memcpy(buf[end..][0..piece.len], piece);
+        end += piece.len;
+    }
+    var parsed = Checkpoint.parse(gpa, buf[0..end]) catch |err| {
+        try testing.expectEqual(error.InvalidCheckpoint, err);
+        return;
+    };
+    defer parsed.deinit();
+    // What was accepted writes a token that is accepted, and reads back
+    // to the same token.
+    const token = try parsed.token(gpa);
+    defer gpa.free(token);
+    var again = try Checkpoint.parse(gpa, token);
+    defer again.deinit();
+    const second = try again.token(gpa);
+    defer gpa.free(second);
+    try testing.expectEqualStrings(token, second);
+}
+
+test "a persisted baseline loader accepts only intact validated storage" {
+    try shakedown.check(testing.allocator, {}, fuzzBaselineStorage, .{});
+}
+
+fn fuzzBaselineStorage(_: void, c: *Case) !void {
+    const s = c.source;
+    const gpa = testing.allocator;
+    var buf: [2048]u8 = undefined;
+    const bytes = gen.bytesInto(s, &buf);
+    // Generate a structured checksummed input as well: mutation alone cannot
+    // find a cryptographic checksum or the whole JSON schema.
+    if (gen.boolean(s)) {
+        const root = if (builtin.target.os.tag == .windows) "C:\\tree" else "/tree";
+        const meta: Snapshot.Meta = .{ .size = gen.int(s, u64), .mtime = .fromRaw(gen.int(s, i96)), .ctime = .fromRaw(gen.int(s, i96)), .file_kind = .file };
+        const wrapped = try baseline_format.encode(gpa, .{ .platform = baseline_format.platform, .root = root, .recursive = true, .max_dir_entries = 4096, .ignore = &.{}, .only = &.{}, .dirs = &.{.{ .path = root, .truncated = false, .check_contents = false, .entries = &.{.{ .name = bytes, .meta = .of(meta) }} }} });
+        defer gpa.free(wrapped);
+        var structured = baseline_format.parse(gpa, wrapped) catch |err| {
+            try testing.expectEqual(error.InvalidBaseline, err);
+            return;
+        };
+        defer structured.deinit();
+        const encoded = try baseline_format.encode(gpa, structured.value);
+        defer gpa.free(encoded);
+        var again = try baseline_format.parse(gpa, encoded);
+        defer again.deinit();
+        return;
+    }
+    var parsed = baseline_format.parse(gpa, bytes) catch |err| {
+        try testing.expect(err == error.InvalidBaseline or err == error.UnsupportedBaselineVersion or err == error.ForeignBaseline);
+        // Exercise the JSON parser behind a valid checksum as well.
+        const wrapped = try gpa.alloc(u8, 44 + bytes.len);
+        defer gpa.free(wrapped);
+        @memcpy(wrapped[0..8], "LOOKBASE");
+        std.mem.writeInt(u32, wrapped[8..12], 1, .little);
+        std.crypto.hash.sha2.Sha256.hash(bytes, wrapped[12..44], .{});
+        @memcpy(wrapped[44..], bytes);
+        var inner = baseline_format.parse(gpa, wrapped) catch return;
+        defer inner.deinit();
+        return;
+    };
+    defer parsed.deinit();
+    const encoded = try baseline_format.encode(gpa, parsed.value);
+    defer gpa.free(encoded);
+    var again = try baseline_format.parse(gpa, encoded);
+    defer again.deinit();
+}

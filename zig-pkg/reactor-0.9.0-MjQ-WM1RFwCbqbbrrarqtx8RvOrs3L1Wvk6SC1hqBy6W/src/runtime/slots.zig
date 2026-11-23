@@ -1,0 +1,481 @@
+//! The runtime's `std.Io.VTable`: every slot native where the kernel has
+//! an evented form, std's own code on a lane where a call may block, and
+//! std's own code borrowed on the worker where it never blocks and never
+//! calls back into its `Io` (vtable/route.zig).
+const builtin = @import("builtin");
+const std = @import("std");
+const crash = @import("../sys/crash.zig");
+const Io = std.Io;
+const Alignment = std.mem.Alignment;
+
+const Core = @import("Core.zig");
+const route = @import("route.zig");
+const clock = @import("../clock.zig");
+const Task = @import("../scheduler/Task.zig");
+const Scheduler = @import("../Scheduler.zig");
+const tasks = @import("../ops/tasks.zig");
+const futex = @import("../ops/futex.zig");
+const batch = @import("../ops/batch.zig");
+const perform = @import("../ops/perform.zig");
+const lane_call = @import("../ops/lane_call.zig");
+const io_ops = @import("io_ops.zig");
+const send_file = @import("send_file.zig");
+
+const general = .general;
+const is_windows = builtin.os.tag == .windows;
+
+/// The slots as they work, before the brackets `vtable` puts around them.
+pub const raw: Io.VTable = .{
+    .crashHandler = crashHandler,
+
+    .async = async,
+    .concurrent = concurrent,
+    .await = await,
+    .cancel = cancel,
+
+    .groupAsync = groupAsync,
+    .groupConcurrent = groupConcurrent,
+    .groupAwait = groupAwait,
+    .groupCancel = groupCancel,
+
+    .recancel = recancel,
+    .swapCancelProtection = swapCancelProtection,
+    .checkCancel = checkCancel,
+
+    .futexWait = futexWait,
+    .futexWaitUncancelable = futexWaitUncancelable,
+    .futexWake = futexWake,
+
+    .operate = io_ops.operate,
+    .batchAwaitAsync = batchAwaitAsync,
+    .batchAwaitConcurrent = batchAwaitConcurrent,
+    .batchCancel = batchCancel,
+
+    .dirCreateDir = route.files("dirCreateDir"),
+    .dirCreateDirPath = route.files("dirCreateDirPath"),
+    .dirCreateDirPathOpen = route.onLane(general, "dirCreateDirPathOpen"),
+    .dirOpenDir = route.files("dirOpenDir"),
+    .dirStat = route.files("dirStat"),
+    .dirStatFile = route.files("dirStatFile"),
+    .dirAccess = route.files("dirAccess"),
+    .dirCreateFile = route.opening("dirCreateFile", route.files("dirCreateFile")),
+    .dirCreateFileAtomic = route.opening("dirCreateFileAtomic", route.onLane(general, "dirCreateFileAtomic")),
+    .dirOpenFile = route.opening("dirOpenFile", route.files("dirOpenFile")),
+    .dirClose = route.borrowed("dirClose"),
+    .dirRead = route.files("dirRead"),
+    .dirRealPath = route.files("dirRealPath"),
+    .dirRealPathFile = route.files("dirRealPathFile"),
+    .dirDeleteFile = route.files("dirDeleteFile"),
+    .dirDeleteDir = route.files("dirDeleteDir"),
+    .dirRename = route.files("dirRename"),
+    .dirRenamePreserve = route.files("dirRenamePreserve"),
+    .dirSymLink = route.files("dirSymLink"),
+    .dirReadLink = route.files("dirReadLink"),
+    .dirSetOwner = route.files("dirSetOwner"),
+    .dirSetFileOwner = route.files("dirSetFileOwner"),
+    .dirSetPermissions = route.files("dirSetPermissions"),
+    .dirSetFilePermissions = route.files("dirSetFilePermissions"),
+    .dirSetTimestamps = route.files("dirSetTimestamps"),
+    .dirHardLink = route.files("dirHardLink"),
+
+    .fileStat = route.files("fileStat"),
+    .fileLength = route.files("fileLength"),
+    .fileClose = io_ops.fileClose,
+    .fileWritePositional = io_ops.fileWritePositional,
+    .fileWriteFileStreaming = route.files("fileWriteFileStreaming"),
+    .fileWriteFilePositional = route.files("fileWriteFilePositional"),
+    .fileReadPositional = io_ops.fileReadPositional,
+    .fileSeekBy = route.borrowed("fileSeekBy"),
+    .fileSeekTo = route.borrowed("fileSeekTo"),
+    .fileSync = io_ops.fileSync,
+    .fileIsTty = route.borrowed("fileIsTty"),
+    .fileEnableAnsiEscapeCodes = route.borrowed("fileEnableAnsiEscapeCodes"),
+    .fileSupportsAnsiEscapeCodes = route.borrowed("fileSupportsAnsiEscapeCodes"),
+    .fileSetLength = route.files("fileSetLength"),
+    .fileSetOwner = route.files("fileSetOwner"),
+    .fileSetPermissions = route.files("fileSetPermissions"),
+    .fileSetTimestamps = route.files("fileSetTimestamps"),
+    .fileLock = route.onLane(.wait, "fileLock"),
+    .fileTryLock = route.borrowed("fileTryLock"),
+    .fileUnlock = route.borrowed("fileUnlock"),
+    .fileDowngradeLock = route.borrowed("fileDowngradeLock"),
+    .fileRealPath = route.files("fileRealPath"),
+    .fileHardLink = route.files("fileHardLink"),
+
+    .fileMemoryMapCreate = route.files("fileMemoryMapCreate"),
+    .fileMemoryMapDestroy = route.borrowed("fileMemoryMapDestroy"),
+    .fileMemoryMapSetLength = route.files("fileMemoryMapSetLength"),
+    .fileMemoryMapRead = route.files("fileMemoryMapRead"),
+    .fileMemoryMapWrite = route.files("fileMemoryMapWrite"),
+
+    .processExecutableOpen = route.onLane(general, "processExecutableOpen"),
+    .processExecutablePath = route.onLane(general, "processExecutablePath"),
+    .lockStderr = lockStderr,
+    .tryLockStderr = tryLockStderr,
+    .unlockStderr = unlockStderr,
+    .processCurrentPath = route.borrowed("processCurrentPath"),
+    .processSetCurrentDir = route.borrowed("processSetCurrentDir"),
+    .processSetCurrentPath = route.borrowed("processSetCurrentPath"),
+    .processReplace = route.borrowed("processReplace"),
+    .processSpawn = route.onLane(general, "processSpawn"),
+    .childWait = io_ops.childWait,
+    .childKill = io_ops.childKill,
+
+    .progressParentFile = route.borrowed("progressParentFile"),
+    .inheritParentDir = route.borrowed("inheritParentDir"),
+    .inheritParentFile = route.borrowed("inheritParentFile"),
+
+    .now = now,
+    .clockResolution = clockResolution,
+    .sleep = sleep,
+
+    .random = random,
+    .randomSecure = route.borrowed("randomSecure"),
+
+    .netListenIp = if (is_windows) io_ops.netListenIpWindows else route.borrowed("netListenIp"),
+    .netAccept = io_ops.netAccept,
+    .netBindIp = if (is_windows) io_ops.netBindIpWindows else route.borrowed("netBindIp"),
+    .netConnectIp = io_ops.netConnectIp,
+    .netListenUnix = route.borrowed("netListenUnix"),
+    .netConnectUnix = io_ops.netConnectUnix,
+    .netSocketCreatePair = route.borrowed("netSocketCreatePair"),
+    .netWriteFile = send_file.netWriteFile,
+    .netClose = io_ops.netClose,
+    .netShutdown = route.borrowed("netShutdown"),
+    .netInterfaceNameResolve = route.borrowed("netInterfaceNameResolve"),
+    .netInterfaceName = route.borrowed("netInterfaceName"),
+    .netLookup = io_ops.netLookup,
+};
+
+/// The runtime's table: `raw` with each slot taking the calling thread's
+/// processor back from lending on the way in and lending it again on the
+/// way out (`Scheduler.fromUser`, `toUser`), so a task that computes
+/// between calls costs its thread the processor, never the processor its
+/// queue. The processor is the calling thread's, whichever runtime it is
+/// (a task of one runtime may call another's), so every runtime's slots
+/// take it back; where the thread lends nothing it is one read of its seat.
+/// The slots that never touch the calling thread's processor stay `raw`'s:
+/// the crash handler, which must not move a crashing task, and the clocks.
+pub const vtable: Io.VTable = table: {
+    var table = raw;
+    const info = @typeInfo(Io.VTable).@"struct";
+    for (info.field_names) |name| {
+        if (std.mem.eql(u8, name, "crashHandler") or std.mem.eql(u8, name, "now") or std.mem.eql(u8, name, "clockResolution")) continue;
+        @field(table, name) = lent(name);
+    }
+    break :table table;
+};
+
+/// Whether `table` is a runtime's.
+pub fn isRuntime(table: *const Io.VTable) bool {
+    return table == &vtable;
+}
+
+fn SlotFn(comptime name: []const u8) type {
+    return @typeInfo(@FieldType(Io.VTable, name)).pointer.child;
+}
+
+fn records(comptime name: []const u8) bool {
+    for ([_][]const u8{ "async", "concurrent", "groupAsync", "groupConcurrent" }) |slot| if (std.mem.eql(u8, name, slot)) return true;
+    return false;
+}
+
+/// `raw`'s slot `name`, bracketed by `fromUser` and `toUser`.
+fn lent(comptime name: []const u8) *const SlotFn(name) {
+    const info = @typeInfo(SlotFn(name)).@"fn";
+    const P = info.param_types;
+    const R = info.return_type.?;
+    const inner = @field(raw, name);
+    const Bracket = struct {
+        inline fn call(args: anytype) R {
+            const entered = Scheduler.fromUser();
+            defer if (entered) |t| Scheduler.toUser(t);
+            // A slot that records its caller (`concurrent`, `async`, the
+            // group calls) is inlined, so it sees the task's call site, not
+            // this one; the rest are called, where inlining would make a
+            // bracket's frame as large as the largest slot's.
+            return @call(if (records(name)) .always_inline else .auto, inner, args);
+        }
+    };
+    return switch (P.len) {
+        1 => &struct {
+            fn f(u: P[0].?) R {
+                return Bracket.call(.{u});
+            }
+        }.f,
+        2 => &struct {
+            fn f(u: P[0].?, a: P[1].?) R {
+                return Bracket.call(.{ u, a });
+            }
+        }.f,
+        3 => &struct {
+            fn f(u: P[0].?, a: P[1].?, b: P[2].?) R {
+                return Bracket.call(.{ u, a, b });
+            }
+        }.f,
+        4 => &struct {
+            fn f(u: P[0].?, a: P[1].?, b: P[2].?, c: P[3].?) R {
+                return Bracket.call(.{ u, a, b, c });
+            }
+        }.f,
+        5 => &struct {
+            fn f(u: P[0].?, a: P[1].?, b: P[2].?, c: P[3].?, d: P[4].?) R {
+                return Bracket.call(.{ u, a, b, c, d });
+            }
+        }.f,
+        6 => &struct {
+            fn f(u: P[0].?, a: P[1].?, b: P[2].?, c: P[3].?, d: P[4].?, e: P[5].?) R {
+                return Bracket.call(.{ u, a, b, c, d, e });
+            }
+        }.f,
+        else => @compileError("a slot with more arguments than expected: " ++ name),
+    };
+}
+
+// Tasks.
+
+fn crashHandler(userdata: ?*anyopaque) void {
+    const r = Core.running(userdata);
+    // The crashing task may call the Io again while the panic is printed:
+    // nothing it waits on may be cancelled under it. Not through the
+    // processor, which the crashing thread may have lent.
+    if (Scheduler.runningTask()) |t| {
+        t.execution.protection = .{ .user = .blocked, .acknowledged = true };
+        var buffer: [256]u8 = undefined;
+        const summary = std.mem.print(&buffer, "reactor: worker={d} task=0x{x} start=0x{x} operation={s} lane={s}\n", .{
+            Scheduler.processor().?.index,
+            @intFromPtr(t), // safe: the task address identifies it in the output
+            t.spawned_at,
+            if (t.operation) |operation| @tagName(operation) else "none",
+            if (t.lane) |lane| @tagName(lane) else "none",
+        }) catch "reactor: crash summary exceeded its buffer\n";
+        crash.write(summary);
+    }
+    const io = r.lanes.borrowedIo();
+    io.vtable.crashHandler(io.userdata);
+}
+
+fn async(userdata: ?*anyopaque, result: []u8, result_alignment: Alignment, context: []const u8, context_alignment: Alignment, start: *const fn (*const anyopaque, *anyopaque) void) ?*Io.AnyFuture {
+    const r = Core.running(userdata);
+    const t = tasks.concurrent(&r.scheduler, result.len, result_alignment, context, context_alignment, start, @returnAddress()) catch {
+        if (Scheduler.current()) |t| Scheduler.callOut(t, start, .{ context.ptr, result.ptr }) else start(context.ptr, result.ptr);
+        return null;
+    };
+    // std.Io implementation contract: the future is opaque; this runtime's futures are its tasks
+    return @ptrCast(t);
+}
+
+fn concurrent(userdata: ?*anyopaque, result_len: usize, result_alignment: Alignment, context: []const u8, context_alignment: Alignment, start: *const fn (*const anyopaque, *anyopaque) void) Io.ConcurrentError!*Io.AnyFuture {
+    const r = Core.running(userdata);
+    // std.Io implementation contract: the future is opaque; this runtime's futures are its tasks
+    return @ptrCast(try tasks.concurrent(&r.scheduler, result_len, result_alignment, context, context_alignment, start, @returnAddress()));
+}
+
+fn taskOf(future: *Io.AnyFuture) *Task {
+    // std.Io implementation contract: the future is opaque; `async` and `concurrent` hand out tasks as futures
+    return @ptrCast(@alignCast(future));
+}
+
+fn await(userdata: ?*anyopaque, future: *Io.AnyFuture, result: []u8, result_alignment: Alignment) void {
+    _ = result_alignment;
+    tasks.await(&Core.running(userdata).scheduler, taskOf(future), result);
+}
+
+fn cancel(userdata: ?*anyopaque, future: *Io.AnyFuture, result: []u8, result_alignment: Alignment) void {
+    _ = result_alignment;
+    tasks.cancel(&Core.running(userdata).scheduler, taskOf(future), result);
+}
+
+fn groupAsync(userdata: ?*anyopaque, group: *Io.Group, context: []const u8, context_alignment: Alignment, start: *const fn (*const anyopaque) void) void {
+    const r = Core.running(userdata);
+    tasks.groupConcurrent(&r.scheduler, group, context, context_alignment, start, @returnAddress()) catch if (Scheduler.current()) |t| Scheduler.callOut(t, start, .{context.ptr}) else start(context.ptr);
+}
+
+fn groupConcurrent(userdata: ?*anyopaque, group: *Io.Group, context: []const u8, context_alignment: Alignment, start: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
+    const r = Core.running(userdata);
+    return tasks.groupConcurrent(&r.scheduler, group, context, context_alignment, start, @returnAddress());
+}
+
+fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Cancelable!void {
+    _ = token;
+    return tasks.groupAwait(&Core.running(userdata).scheduler, group);
+}
+
+fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
+    _ = token;
+    tasks.groupCancel(&Core.running(userdata).scheduler, group);
+}
+
+fn recancel(userdata: ?*anyopaque) void {
+    _ = Core.running(userdata);
+    tasks.recancel();
+}
+
+fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
+    _ = Core.running(userdata);
+    return tasks.swapCancelProtection(new);
+}
+
+fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
+    return tasks.checkCancel(&Core.running(userdata).scheduler);
+}
+
+// Futexes.
+
+fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
+    const r = Core.running(userdata);
+    return futex.wait(&r.scheduler, &r.futex, ptr, expected, timeout, true);
+}
+
+fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
+    const r = Core.running(userdata);
+    futex.wait(&r.scheduler, &r.futex, ptr, expected, .none, false);
+}
+
+fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
+    futex.wake(&Core.running(userdata).futex, ptr, max_waiters);
+}
+
+// Batches.
+
+/// On IOCP a thread outside the runtime cannot run std's batch code on the
+/// runtime's sockets: std's calls complete by APC, refused on a handle
+/// bound to a port. Its operations run through the runtime, one by one.
+fn outsideOnPorts(r: *Core) bool {
+    return Scheduler.current() == null and r.backendKind() == .iocp;
+}
+
+fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
+    const r = Core.running(userdata);
+    if (outsideOnPorts(r)) return batch.awaitEach(r.io(), b);
+    return batch.awaitAsync(&r.scheduler, r.lanes.borrowedIo(), b);
+}
+
+fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+    const r = Core.running(userdata);
+    if (outsideOnPorts(r)) {
+        // Each operation runs to its end: no deadline can be kept.
+        if (timeout != .none) return error.ConcurrencyUnavailable;
+        return batch.awaitEach(r.io(), b);
+    }
+    return batch.awaitConcurrent(&r.scheduler, r.lanes.borrowedIo(), b, timeout);
+}
+
+fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
+    const r = Core.running(userdata);
+    batch.cancel(&r.scheduler, r.lanes.borrowedIo(), b);
+}
+
+// Time.
+
+fn now(userdata: ?*anyopaque, c: Io.Clock) Io.Timestamp {
+    const r = Core.running(userdata);
+    return r.processors[0].loop.clock.now(c);
+}
+
+fn clockResolution(userdata: ?*anyopaque, c: Io.Clock) Io.Clock.ResolutionError!Io.Duration {
+    const r = Core.running(userdata);
+    return switch (r.processors[0].loop.clock) {
+        .system => clock.resolution(c),
+        .virtual => .fromNanoseconds(1),
+    };
+}
+
+fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+    const r = Core.running(userdata);
+    const p = Scheduler.processor() orelse return r.lanes.borrowedIo().vtable.sleep(r.lanes.borrowedIo().userdata, timeout);
+    const deadline = perform.deadline(p, timeout) orelse return futexWaitForever(r);
+    switch (deadline.clock) {
+        .cpu_process, .cpu_thread => {
+            const lane_io = r.lanes.executor(.wait);
+            return lane_call.call(&r.lanes, .wait, lane_io.vtable.sleep, .{ lane_io.userdata, timeout });
+        },
+        else => perform.sleep(&r.scheduler, deadline) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            // No room on the loop: a sleep may always end early.
+            error.SystemResources => return,
+        },
+    }
+}
+
+/// `sleep(.none)`: until cancelled.
+fn futexWaitForever(r: *Core) Io.Cancelable!void {
+    var word: u32 = 0;
+    while (true) try futex.wait(&r.scheduler, &r.futex, &word, 0, .none, true);
+}
+
+// Randomness: a CSPRNG per processor, seeded from the system's.
+
+fn random(userdata: ?*anyopaque, buffer: []u8) void {
+    const r = Core.running(userdata);
+    const borrowed = r.lanes.borrowedIo();
+    const p = Scheduler.processor() orelse return borrowed.vtable.random(borrowed.userdata, buffer);
+    const csprng = &r.csprngs[p.index];
+    if (!csprng.isInitialized()) {
+        var seed: [Io.Threaded.Csprng.seed_len]u8 = undefined;
+        borrowed.vtable.random(borrowed.userdata, &seed);
+        csprng.rng = .init(seed);
+    }
+    csprng.rng.fill(buffer);
+}
+
+// Standard error: a mutex tasks wait on, and a writer over the runtime's
+// own `Io`. The holder is a task, which may move between threads.
+
+fn holderId() Core.Holder {
+    if (Scheduler.current()) |t| return @fromBackingInt(@intFromPtr(t)); // safe: an identity, never dereferenced
+    return @fromBackingInt((@as(usize, std.Thread.getCurrentId()) << 1) | 1);
+}
+
+fn lockStderr(userdata: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
+    const r = Core.running(userdata);
+    const me = holderId();
+    if (r.stderr.holder.load(.acquire) != me) {
+        try r.stderr.mutex.lock(r.io());
+        r.stderr.holder.store(me, .release);
+    }
+    r.stderr.depth += 1;
+    return lockedStderr(r, mode);
+}
+
+fn tryLockStderr(userdata: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!?Io.LockedStderr {
+    const r = Core.running(userdata);
+    const me = holderId();
+    if (r.stderr.holder.load(.acquire) != me) {
+        if (!r.stderr.mutex.tryLock()) return null;
+        r.stderr.holder.store(me, .release);
+    }
+    r.stderr.depth += 1;
+    const locked = try lockedStderr(r, mode);
+    return locked;
+}
+
+fn lockedStderr(r: *Core, mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
+    const s = &r.stderr;
+    if (!s.ready) {
+        s.writer.io = r.io();
+        s.writer.file = .stderr();
+        s.ready = true;
+        const environ = r.options.environ;
+        s.mode = mode orelse try .detect(r.io(), s.writer.file, environ.containsConstant("NO_COLOR"), environ.containsConstant("CLICOLOR_FORCE"));
+    }
+    return .{ .file_writer = &s.writer, .terminal_mode = mode orelse s.mode };
+}
+
+fn unlockStderr(userdata: ?*anyopaque) void {
+    const r = Core.running(userdata);
+    const s = &r.stderr;
+    const failed: ?Io.File.Writer.Error = if (s.writer.err) |err| err else if (s.writer.interface.flush()) |_| null else |err| switch (err) {
+        // The file writer keeps the cause in `err`.
+        error.WriteFailed => s.writer.err,
+    };
+    if (failed) |err| if (err == error.Canceled) tasks.recancel();
+    s.writer.err = null;
+    s.writer.interface.end = 0;
+    s.writer.interface.buffer = &.{};
+    s.depth -= 1;
+    if (s.depth == 0) {
+        s.holder.store(.none, .release);
+        s.mutex.unlock(r.io());
+    }
+}

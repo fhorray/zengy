@@ -1,0 +1,372 @@
+//! A set against a loop over its entries compiled one by one: `any`,
+//! `first`, `last`, `all`, `ancestors` and `leadsTo`, with `dir_only` and
+//! both kinds of subject.
+const std = @import("std");
+const sweep = @import("../glob.zig");
+const gen = @import("gen.zig");
+const shake = @import("shakedown");
+const scan = @import("../scan.zig");
+const repeat = @import("shakedown").corpus.repeat;
+
+// The property loops build thousands of patterns; the testing allocator's
+// bookkeeping would dominate them. Leaks and failures are allocation_test's.
+const gpa = std.heap.smp_allocator;
+const Set = sweep.Set;
+const Pattern = sweep.Pattern;
+
+/// Entries and their patterns compiled alone.
+const Fixture = struct {
+    set: Set,
+    patterns: std.ArrayList(Pattern) = .empty,
+    dir_only: std.ArrayList(bool) = .empty,
+    /// Each entry's pattern and options, for a failure's report.
+    texts: std.ArrayList(u8) = .empty,
+
+    fn deinit(f: *Fixture) void {
+        for (f.patterns.items) |*p| p.deinit();
+        f.patterns.deinit(gpa);
+        f.dir_only.deinit(gpa);
+        f.texts.deinit(gpa);
+        f.set.deinit();
+        f.* = undefined;
+    }
+
+    fn matches(f: *const Fixture, index: usize, subject: []const u8, kind: sweep.Kind) bool {
+        if (f.dir_only.items[index] and kind == .file) return false;
+        return f.patterns.items[index].matches(subject);
+    }
+};
+
+fn fixture(s: *shake.Source, count: usize, pieces: []const []const u8) !Fixture {
+    var builder: Set.Builder = .init(gpa);
+    defer builder.deinit();
+    var patterns: std.ArrayList(Pattern) = .empty;
+    errdefer {
+        for (patterns.items) |*p| p.deinit();
+        patterns.deinit(gpa);
+    }
+    var dir_only: std.ArrayList(bool) = .empty;
+    errdefer dir_only.deinit(gpa);
+    var texts: std.ArrayList(u8) = .empty;
+    errdefer texts.deinit(gpa);
+    // One separator for the whole set.
+    const first = gen.options(s);
+    for (0..count) |_| {
+        var buf: [16]u8 = undefined;
+        var options = gen.options(s);
+        options.syntax.separator = first.syntax.separator;
+        const pattern = gen.string(s, &buf, pieces);
+        const entry: Set.Entry = .{ .options = options, .dir_only = gen.oneIn(s, 4) };
+        const index = builder.add(pattern, entry) catch |err| switch (err) {
+            error.InvalidPattern => continue,
+            else => return err,
+        };
+        try std.testing.expectEqual(patterns.items.len, index.raw());
+        try patterns.append(gpa, try .compile(gpa, pattern, options));
+        try dir_only.append(gpa, entry.dir_only);
+        try texts.print(gpa, "  {d}: \"{f}\" {any} dir_only={}\n", .{ index.raw(), std.zig.fmtString(pattern), options, entry.dir_only });
+    }
+    return .{ .set = try builder.build(), .patterns = patterns, .dir_only = dir_only, .texts = texts };
+}
+
+fn queriesOne(_: void, c: *shake.Case) anyerror!void {
+    const s = c.source;
+    var f = try fixture(s, 1 + gen.index(s, 8), &gen.any_pattern);
+    defer f.deinit();
+    var cache: Set.Cache = try .init(gpa, &f.set, .{ .capacity = .fromRaw(if (gen.oneIn(s, 2)) 0 else 1 << 17) });
+    defer cache.deinit();
+    for (0..4) |_| {
+        var text_buf: [16]u8 = undefined;
+        const text = gen.string(s, &text_buf, &gen.any_text);
+        const kind: sweep.Kind = if (gen.value(s, bool)) .dir else .file;
+        // As built, these entries are scanned.
+        try agrees(&f, &cache, text, kind);
+        // The same set with its scans set aside answers from the hashed
+        // tables and the automaton.
+        var aside: [16]@TypeOf(f.set.parts[0].scan) = undefined;
+        for (f.set.parts, aside[0..f.set.parts.len]) |*part, *kept| {
+            kept.* = part.scan;
+            part.scan = null;
+        }
+        defer for (f.set.parts, aside[0..f.set.parts.len]) |*part, kept| {
+            part.scan = kept;
+        };
+        try agrees(&f, &cache, text, kind);
+    }
+}
+
+fn agrees(f: *Fixture, cache: *Set.Cache, text: []const u8, kind: sweep.Kind) !void {
+    var out: std.ArrayList(Set.Index) = .empty;
+    defer out.deinit(gpa);
+    var want_first: ?Set.Index = null;
+    var want_last: ?Set.Index = null;
+    var want_all: std.ArrayList(Set.Index) = .empty;
+    defer want_all.deinit(gpa);
+    for (0..f.patterns.items.len) |i| if (f.matches(i, text, kind)) {
+        if (want_first == null) want_first = .fromRaw(@intCast(i));
+        want_last = .fromRaw(@intCast(i));
+        try want_all.append(gpa, .fromRaw(@intCast(i)));
+    };
+    try f.set.all(gpa, cache, text, kind, &out);
+    const ok = f.set.any(cache, text, kind) == (want_first != null) and
+        f.set.first(cache, text, kind) == want_first and
+        f.set.last(cache, text, kind) == want_last and
+        std.mem.eql(Set.Index, out.items, want_all.items);
+    if (!ok) {
+        std.debug.print("set vs \"{f}\" ({t}): want {any}, all {any}, first {?}, last {?}\n", .{ std.zig.fmtString(text), kind, want_all.items, out.items, f.set.first(cache, text, kind), f.set.last(cache, text, kind) });
+        std.debug.print("{s}", .{f.texts.items});
+        return error.TestUnexpectedResult;
+    }
+    try ancestorsAgree(f, cache, text, kind);
+}
+
+fn ancestorsAgree(f: *const Fixture, cache: *Set.Cache, text: []const u8, kind: sweep.Kind) !void {
+    var it = f.set.ancestors(cache, text, kind);
+    var at: usize = 0;
+    const sep = if (f.set.parts.len > 0) f.set.separator else null;
+    while (true) {
+        const end = if (sep) |x| std.mem.findScalarPos(u8, text, at, x) orelse text.len else text.len;
+        const whole = end == text.len;
+        const prefix = text[0..end];
+        const step_kind: sweep.Kind = if (whole) kind else .dir;
+        var want_last: ?Set.Index = null;
+        var want_leads = false;
+        for (f.patterns.items, 0..) |*p, i| {
+            if (f.matches(i, prefix, step_kind)) want_last = .fromRaw(@intCast(i));
+            if (p.leadsTo(prefix)) want_leads = true;
+        }
+        const step = it.next() orelse return error.TestUnexpectedResult;
+        if (step.end != end or step.last != want_last or step.leads != want_leads) {
+            std.debug.print("ancestors of \"{f}\" at {d}: want last {?} leads {}, got end {d} last {?} leads {}\n", .{ std.zig.fmtString(text), end, want_last, want_leads, step.end, step.last, step.leads });
+            std.debug.print("{s}", .{f.texts.items});
+            return error.TestUnexpectedResult;
+        }
+        // leadsTo on its own agrees with the pass.
+        try std.testing.expectEqual(want_leads, f.set.leadsTo(cache, prefix));
+        if (whole) break;
+        at = end + 1;
+    }
+    try std.testing.expect(it.next() == null);
+}
+
+test "a set equals its entries one by one" {
+    try shake.check(std.testing.allocator, {}, queriesOne, .{ .cases = 1500 });
+}
+
+/// gitignore-shaped entries, where every strategy applies.
+const ignore_pieces = [_][]const u8{ "a", "b", "/", "*", "**/", "/**", ".", "c", "*.c", "x", "a/b", "?" };
+
+fn strategiesOne(_: void, c: *shake.Case) anyerror!void {
+    const s = c.source;
+    var f = try fixture(s, 1 + gen.index(s, 12), &ignore_pieces);
+    defer f.deinit();
+    var cache: Set.Cache = try .init(gpa, &f.set, .{ .capacity = .fromRaw(1 << 16) });
+    defer cache.deinit();
+    for (0..6) |_| {
+        var text_buf: [16]u8 = undefined;
+        const text = gen.string(s, &text_buf, &[_][]const u8{ "a", "b", "/", ".", "c", "x", "A", ".c" });
+        const kind: sweep.Kind = if (gen.value(s, bool)) .dir else .file;
+        var want_last: ?Set.Index = null;
+        for (0..f.patterns.items.len) |i| if (f.matches(i, text, kind)) {
+            want_last = .fromRaw(@intCast(i));
+        };
+        if (f.set.last(&cache, text, kind) != want_last) {
+            std.debug.print("strategies vs \"{f}\": want {?}, got {?}\n", .{ std.zig.fmtString(text), want_last, f.set.last(&cache, text, kind) });
+            return error.TestUnexpectedResult;
+        }
+        try ancestorsAgree(&f, &cache, text, kind);
+    }
+}
+
+test "hashed strategies equal the automaton" {
+    try shake.check(std.testing.allocator, {}, strategiesOne, .{ .cases = 2000 });
+}
+
+test "gitignore lines through a set: the last match decides" {
+    const lines = [_][]const u8{ "*.log", "!keep.log", "build/", "/root.txt", "doc/**/*.md", "# comment", "" };
+    var builder: Set.Builder = .init(gpa);
+    defer builder.deinit();
+    var negated: [lines.len]bool = undefined;
+    for (lines) |line| {
+        const parsed = sweep.gitignore.parseLine(line) orelse continue;
+        const index = try builder.add(parsed.pattern, parsed.entry);
+        negated[index.raw()] = parsed.negated;
+    }
+    var set = try builder.build();
+    defer set.deinit();
+    var cache: Set.Cache = try .init(gpa, &set, .{});
+    defer cache.deinit();
+    const Case = struct { path: []const u8, kind: sweep.Kind, ignored: bool };
+    const cases = [_]Case{
+        .{ .path = "a.log", .kind = .file, .ignored = true },
+        .{ .path = "x/y/a.log", .kind = .file, .ignored = true },
+        .{ .path = "x/keep.log", .kind = .file, .ignored = false },
+        .{ .path = "build", .kind = .dir, .ignored = true },
+        .{ .path = "build", .kind = .file, .ignored = false },
+        .{ .path = "src/build", .kind = .dir, .ignored = true },
+        .{ .path = "root.txt", .kind = .file, .ignored = true },
+        .{ .path = "x/root.txt", .kind = .file, .ignored = false },
+        .{ .path = "doc/a/b.md", .kind = .file, .ignored = true },
+        .{ .path = "doc/b.md", .kind = .file, .ignored = true },
+        .{ .path = "src/doc/b.md", .kind = .file, .ignored = false },
+    };
+    for (cases) |case| {
+        const ignored = if (set.last(&cache, case.path, case.kind)) |i| !negated[i.raw()] else false;
+        try std.testing.expectEqual(case.ignored, ignored);
+    }
+    // A file below an ignored directory: the parent decides first.
+    var it = set.ancestors(&cache, "build/x/keep.log", .file);
+    const top = it.next().?;
+    try std.testing.expectEqual(@as(usize, 5), top.end);
+    try std.testing.expect(top.last != null and !negated[top.last.?.raw()]);
+}
+
+test "a set whose cache keeps clearing still answers within the bound" {
+    var builder: Set.Builder = .init(gpa);
+    defer builder.deinit();
+    var patterns: std.ArrayList(Pattern) = .empty;
+    defer {
+        for (patterns.items) |*p| p.deinit();
+        patterns.deinit(gpa);
+    }
+    var prng: std.Random.DefaultPrng = .init(7);
+    const r = prng.random();
+    var buf: [32]u8 = undefined;
+    for (0..1000) |i| {
+        // Stars between letters, so the states multiply.
+        var len: usize = 0;
+        for (0..1 + r.uintLessThan(usize, 6)) |_| {
+            buf[len] = '*';
+            buf[len + 1] = "abcd"[r.uintLessThan(usize, 4)];
+            len += 2;
+        }
+        buf[len] = "xyz"[i % 3];
+        len += 1;
+        _ = try builder.add(buf[0..len], .{});
+        try patterns.append(gpa, try .compile(gpa, buf[0..len], .{}));
+    }
+    // An `a` some fixed distance from the end: the states remember a
+    // window of the subject, so a long subject keeps building new ones
+    // and the query finishes on the NFA.
+    for (8..14) |width| {
+        var window: [16]u8 = undefined;
+        window[0] = '*';
+        window[1] = 'a';
+        @memset(window[2..][0..width], '?');
+        _ = try builder.add(window[0 .. 2 + width], .{});
+        try patterns.append(gpa, try .compile(gpa, window[0 .. 2 + width], .{}));
+    }
+    var set = try builder.build();
+    defer set.deinit();
+    var cache: Set.Cache = try .init(gpa, &set, .{ .capacity = .fromRaw(0) });
+    defer cache.deinit();
+    var long: [4096]u8 = undefined;
+    for (&long) |*c| c.* = "ab"[r.uintLessThan(usize, 2)];
+    const subjects = [_][]const u8{ "abcdabcdabcdabcdx", repeat("aaaabbbbccccdddd", 4) ++ "y", repeat("dcbadcbadcba", 8) ++ "z", &long };
+    var out: std.ArrayList(Set.Index) = .empty;
+    defer out.deinit(gpa);
+    for (subjects) |subject| {
+        var want: std.ArrayList(Set.Index) = .empty;
+        defer want.deinit(gpa);
+        for (patterns.items, 0..) |*p, i| if (p.matches(subject)) try want.append(gpa, .fromRaw(@intCast(i)));
+        const last: ?Set.Index = if (want.items.len > 0) want.items[want.items.len - 1] else null;
+        try std.testing.expectEqual(last, set.last(&cache, subject, .file));
+        out.clearRetainingCapacity();
+        try set.all(gpa, &cache, subject, .file, &out);
+        try std.testing.expectEqualSlices(Set.Index, want.items, out.items);
+    }
+    const stats = cache.stats();
+    try std.testing.expect(stats.clears > 0);
+    try std.testing.expect(stats.fallbacks > 0);
+}
+
+test "eight threads share one set, each with its own cache" {
+    var builder: Set.Builder = .init(gpa);
+    defer builder.deinit();
+    const lines = [_][]const u8{ "*.o", "build/**", "src/**/test_*.zig", "**/node_modules", "*.{c,h}", "a?c/*" };
+    for (lines) |line| _ = try builder.add(line, .{ .options = .{ .syntax = .glob, .anywhere = true } });
+    var set = try builder.build();
+    defer set.deinit();
+    const Worker = struct {
+        fn run(s: *const Set, failed: *std.atomic.Value(bool)) void {
+            var cache = Set.Cache.init(std.heap.page_allocator, s, .{ .capacity = .fromRaw(1 << 16) }) catch return failed.store(true, .monotonic);
+            defer cache.deinit();
+            const subjects = [_]struct { []const u8, ?u32 }{
+                .{ "x/y/z.o", 0 },        .{ "build/a/b", 1 }, .{ "src/a/test_b.zig", 2 },
+                .{ "q/node_modules", 3 }, .{ "lib/x.h", 4 },   .{ "abc/d", 5 },
+                .{ "nothing", null },
+            };
+            for (0..2000) |_| for (subjects) |case| {
+                if (s.last(&cache, case[0], .file) != (if (case[1]) |i| Set.Index.fromRaw(i) else null)) failed.store(true, .monotonic);
+            };
+        }
+    };
+    var failed: std.atomic.Value(bool) = .init(false);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &set, &failed });
+    for (threads) |t| t.join();
+    try std.testing.expect(!failed.load(.monotonic));
+}
+
+fn setOf(lines: []const []const u8, options: sweep.Options) !Set {
+    var builder: Set.Builder = .init(gpa);
+    defer builder.deinit();
+    for (lines) |line| _ = try builder.add(line, .{ .options = options });
+    return builder.build();
+}
+
+test "a few entries are scanned and many are not" {
+    var names: [scan.max_entries + 1][8]u8 = undefined;
+    var lines: [names.len][]const u8 = undefined;
+    for (&names, &lines, 0..) |*name, *line, i| line.* = std.mem.print(name, "*.e{d}", .{i}) catch unreachable;
+    var at_limit = try setOf(lines[0..scan.max_entries], .{ .anywhere = true });
+    defer at_limit.deinit();
+    try std.testing.expect(at_limit.parts[0].scan != null);
+    var past_limit = try setOf(&lines, .{ .anywhere = true });
+    defer past_limit.deinit();
+    try std.testing.expect(past_limit.parts[0].scan == null);
+}
+
+test "an entry only the automaton reads keeps its reading out of the scan" {
+    var plain = try setOf(&.{ "*.c", "src/**", "[Mm]akefile" }, .{ .anywhere = true });
+    defer plain.deinit();
+    try std.testing.expect(plain.parts[0].scan != null);
+    var braces = try setOf(&.{ "*.c", "{a,b}.h" }, .{ .syntax = .glob, .anywhere = true });
+    defer braces.deinit();
+    try std.testing.expect(braces.parts[0].scan == null);
+    var cache: Set.Cache = try .init(gpa, &braces, .{});
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(?Set.Index, .fromRaw(1)), braces.last(&cache, "x/a.h", .file));
+}
+
+test "a set takes a cache the size of its entries" {
+    // Literal strategies only: no automaton, so no cache to hold.
+    var literal = try setOf(&.{ "*.c", "src/**", "node_modules" }, .{ .anywhere = true });
+    defer literal.deinit();
+    var empty: Set.Cache = try .init(gpa, &literal, .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.parts[0].lazy.memory.len);
+    try std.testing.expectEqual(@as(?Set.Index, .fromRaw(2)), literal.last(&empty, "a/node_modules", .file));
+    var it = literal.ancestors(&empty, "src/a/b.c", .file);
+    try std.testing.expect(it.next().?.leads);
+    // A dozen entries with an automaton: far less than the default capacity.
+    var dozen = try setOf(&.{ "*", "*.c", "*.h", "*.min.js", "[Mm]akefile", "**/test/**", "docs/**", "vendor/**", "a?c/*.o", "*.[ch]pp", "lib/**/x*", "tmp*/" }, .{ .anywhere = true });
+    defer dozen.deinit();
+    var small: Set.Cache = try .init(gpa, &dozen, .{});
+    defer small.deinit();
+    try std.testing.expect(small.parts[0].lazy.memory.len > 0);
+    try std.testing.expect(small.parts[0].lazy.memory.len <= 32 * 1024);
+    // The capacity a caller names is a limit, not a floor.
+    var named: Set.Cache = try .init(gpa, &dozen, .{ .capacity = .fromRaw(1 << 12) });
+    defer named.deinit();
+    try std.testing.expect(named.parts[0].lazy.memory.len <= 8 * 1024);
+    // Many entries still get what they are allowed.
+    var lines: [1000][12]u8 = undefined;
+    var texts: [lines.len][]const u8 = undefined;
+    for (&lines, &texts, 0..) |*buffer, *text, i| text.* = std.mem.print(buffer, "d{d}/**/x*?", .{i}) catch unreachable;
+    var large = try setOf(&texts, .{});
+    defer large.deinit();
+    var big: Set.Cache = try .init(gpa, &large, .{});
+    defer big.deinit();
+    try std.testing.expect(big.parts[0].lazy.memory.len > 1 << 20);
+}

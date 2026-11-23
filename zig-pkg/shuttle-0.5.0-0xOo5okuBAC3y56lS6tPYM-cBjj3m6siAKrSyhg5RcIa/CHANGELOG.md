@@ -1,0 +1,189 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Breaking
+
+- `Panic.describe` returns `std.Io.Writer.Error!void`, the failure to write a panic's traces, where it gave up silently: the panic handler goes on to std's when they cannot be written, and the stack overflow handler ends the process at once when its report cannot be.
+- `Pool.classes` is a slice of the public `Pool.Shelf`, one class's stacks, and a shelf's `free` and `unmade` of the public `Pool.List`, where both types were private: the pool's own state, read through its functions.
+
+### Added
+
+- Properties for what the README promises of a pool's books (`inUse`, `reached`, `number` and `stackOf`, `takeExactly`), of a generator (its values in order, then null or its error, and ending it early cancels the body once), and of carving (aligned pieces from the top down, refused only below the lowest byte the stack can make usable), each checked against a planted fault.
+
+- Contexts run under CET shadow stacks on Linux x86_64 (with the LLVM backend): a stack made on a thread that has a shadow stack gets one of its own (`Stack.shadow`; a pool keeps each of its stacks' for the pool's life), the switch saves the shadow stack pointer of the context it leaves and takes the restore token of the one it resumes, and a new context on a reused stack starts its shadow stack at the end again. A context made on such a thread on a stack without one panics, where its returns would fault far from it.
+- The resume address and a new context's trampoline are landing pads (`endbr64` on x86_64, `bti j` on aarch64), for indirect branch tracking and branch target identification; both are no-ops where those are off.
+
+### Changed
+
+- Development on preflight's ci-standard 158c176.
+- Pins aegis f52eabe, still 0.2.4 (its addition: `id.raws`), the one aegis the family builds on; development on preflight's ci-standard f991816 and shakedown 327bc61. Nothing this package calls changed.
+- Pins aegis dc3ed602, still 0.2.4; development on preflight's ci-standard 0990716 and glint 0.8, and shakedown ed5a873. The machine boundary (the switch on each architecture, the pages stacks live in, the Windows thread block, a stack's layout) is declared as glint seams; a new context's headroom is zeroed through an array pointer.
+- Pins aegis c8982a8, still 0.2.4: six additive commits after 3c0b13e (the role declarations a linter reads, `lint_rules`), the aegis the development build's preflight selects. Nothing shuttle calls changed.
+- The README states shuttle's stability policy (0.x, tracking Zig 0.17.x; a breaking change only in a minor release, with its CHANGELOG entry; a patch release never breaks), where it said work was in progress.
+- Development: handoff_test's counters and stack holders are `aegis.Atomic` cells of a `units.Count` and an `id.Id`, where they were raw `std.atomic.Value`s.
+- `memory.commit`'s one contract left on `std.debug.assert` (a guard page is committed only on Windows) is `aegis.assert.invariant`: it holds in every build.
+- Pins aegis breaking-0.3 (a34e694), the 0.3.0 line the family is on, where it pinned aegis 0.2.3, and shakedown main (4979fa9) for the tests. shuttle builds on it unchanged.
+
+### Fixed
+
+- A trace of code built with return-address signing (`-mbranch-protection=pac-ret`) on aarch64 reported signed addresses: a walk strips the pointer authentication code (XPACLRI, a no-op without it).
+
+## [0.5.0] - 2026-10-28
+
+### Breaking
+
+- A context's argument and its switches' message are typed: `Context.Entry(Arg, Message)` is `*const fn (arg: Arg, message: ?Message) callconv(.c) noreturn`, `Context.init(&stack, Arg, Message, entry, arg)` makes a context whose switches carry `Message`s, and `switchTo(from, to, Message, message)` returns a `?Message`, where each took and gave `?*anyopaque` and every caller cast it back. `Arg` is a pointer or an optional one, a function's address only under `callconv(.c)`, refused otherwise by name (`Context.argRefusal` says why), where a Zig function's address reached a C parameter the compiler refuses deep inside shuttle; `Message` a mutable single pointer, `Context.Nothing` for switches that carry none. The one conversion left is shuttle's, at the swap, and every build checks what it rests on: a context records the message type its switches carry (`Context.Kind`, from `init`, or the first switch for a thread's own context), and a switch carrying another, to it or from it, panics naming both types (`kindOf`, `carriesKind`). A coroutine's entry is handed its frame typed, without a cast.
+- `handoff.init(&stack, Arg, body, arg)` makes a context that takes part in the handoff, running `body(arg)`, where `Context.init(&stack, handoff.entry(body), arg)` did and `body` took `?*anyopaque`; `handoff.entry` is gone. `handoff.After` is kept in the record of the work it does and handed itself, `run(after, from)`, which finds the record by `@fieldParentPtr`; `switchTo` takes a `?*After`. It was a function and a `?*anyopaque` the function cast back.
+
+### Added
+
+- `Stack.usable()`: the stack's usable bytes, `bottom` to `end`, for code that reads or fills a stack nothing runs on, as a scheduler measuring how deep its tasks went does. On Windows only the bytes from `limit` up are committed. Valgrind's registration reads them through it.
+
+### Changed
+
+- Pins aegis 0.2.3.
+
+## [0.4.2] - 2026-10-27
+
+### Added
+
+- `Stack.carveBytes(len, alignment)`: `carve` for a size and an alignment known only at run time, as a runtime's task context and result are (reactor's `Io.async` and `concurrent`). The alignment is at least 16, as `carve`'s is; `carve(T)` is built on it.
+
+## [0.4.1] - 2026-10-27
+
+### Fixed
+
+- A switch on Windows no longer runs code on a stack the thread information block does not describe. It set the next stack's bounds, then made calls on the stack it was leaving; a call that first touched that stack's guard page was not grown by the system but raised a guard page violation no handler took, which ended the process with no message (0xC0000005 or a bare exit code). It took a switch from a stack to one below it, at the depth in a page where the switch's own calls reached a page nothing above it had: uplink's HTTP/2 server tests on reactor's Windows runtime, Debug builds, ended so. The switch's assembly now exchanges the bounds as it moves the stack pointer (`teb.Exchange`), on x86_64 and aarch64.
+
+## [0.4.0] - 2026-10-27
+
+### Breaking
+
+- `Context.inside` and `Context.runningInside()` are a `?*Context`, where they were an erased pointer: the context of the coroutine whose code runs on a context, which names itself. A coroutine finds itself from it with `@fieldParentPtr`.
+- `Stack.carve(T)` takes a type and returns a `*T` aligned for it, where it took a length and an alignment and returned bytes.
+- `Pool.in_use` is an aegis atomic cell of a count of stacks; `inUse()` reads it as before.
+
+### Changed
+
+- On aegis 0.2.1, under the aegis pack: a coroutine's life (fresh, running, suspended, returned, panicked) is an aegis state machine; its body is handed a `Yielder` that holds the coroutine, and its arguments sit beside it in one frame carved from the stack, so the entry is told where both are in its one argument; the pool's counters, its lists' heads and links are aegis atomic cells; a panic's trace is copied out rather than cast to the mutable slice std's writer names. The processor's and the system's seams (the switch, the first frame's entry, the control registers, the thread information block, the system's pages, ThreadSanitizer's fibers, frame records) carry their contract where they are.
+
+## [0.3.4] - 2026-10-27
+
+### Fixed
+
+- A switch on Windows no longer runs code on a stack the thread information block does not describe. It set the next stack's bounds, then made calls on the stack it was leaving; a call that first touched that stack's guard page was not grown by the system but raised a guard page violation no handler took, which ended the process with no message (0xC0000005 or a bare exit code). It took a switch from a stack to one below it, at the depth in a page where the switch's own calls reached a page nothing above it had: uplink's HTTP/2 server tests on reactor's Windows runtime, Debug builds, ended so. The switch's assembly now exchanges the bounds as it moves the stack pointer (`teb.Exchange`), on x86_64 and aarch64. This line's hosted CI no longer builds its toolchain, so the Windows evidence is from runs of the test exe on the runners: the reproducer (`context_test`, a switch from any depth to a stack below its own) ended with the guard page violation 3 times in 3 unfixed on windows-latest and passed 3 times in 3 fixed, and passed fixed on windows-11-arm; uplink's two HTTP/2 tests on reactor with the fix passed 5 times in 5 on windows-latest.
+
+## [0.3.3] - 2026-10-24
+
+### Changed
+
+- Pins aegis 0.1.17.
+
+## [0.3.2] - 2026-10-21
+
+### Fixed
+
+- A coroutine whose code moved threads (its body suspended in a runtime's `Io` call and resumed on another thread, as reactor moves tasks) is the running coroutine on the thread it runs on: its panic is handed to the code that ran it, where it ended the process with std's handler, and an overflow of its stack is named as the coroutine's. What the running code runs inside now belongs to the context: every switch saves the thread's into the context it leaves and installs the one it resumes (`Context.inside`, read by `Context.runningInside`). A switch round trip costs about 1 ns more through `handoff` (7.2 to 8.4 ns on an M3); `coroutine/next` is 3 ns faster, as `enter` no longer sets and restores the slot itself.
+
+## [0.3.1] - 2026-10-21
+
+### Changed
+
+- aegis 0.1.14 (from 0.1.12), which preflight 0.12.1 selects.
+- Development: preflight 0.12.1, and the lint gates the aegis pack, glint's A001-A005 (A004 already).
+
+### Fixed
+
+- Development: the test of a context resumed on another thread no longer keeps a pointer to a thread's frame after it returns (glint's E001); the pointer was not read after, so nothing failed.
+
+## [0.3.0] - 2026-10-17
+
+### Breaking
+
+- A pool makes a stack usable the first time it hands it out, not at `init`: `Pool.init` reserves every stack's address space in one mapping that faults on any access and does nothing per stack, so a pool of 16,384 stacks is one mapping with no page tables, where guarding each took 9 ms on a Mac and 16.5 ms on Linux, about 8 MiB of page tables, and as long again to release (reactor's `init` on its defaults: 7 ms to 0.7 on a Mac, 18 ms to 0.8 on Linux). A stack made usable (committed as touched, its guard below it) stays so for the pool's life. `take` and `takeExactly` return `TakeError!?Stack`: null when no stack is free, as before, and `error.SystemResources` when the system refused to make a fresh one usable (strict overcommit, `vm.max_map_count`, the Windows commit limit); the stack stays in the pool and a later `take` tries it again.
+- `Stack.prepare(commit, guard)` takes what guards the stack (`Stack.Guard`: the reservation's no-access pages, or a Linux guard region); a stack's reservation is no-access until prepared, everywhere.
+- `Pool.per_slab` is gone: a pool's stacks are one reservation.
+
+### Added
+
+- `Pool.reached()`: how many stacks were ever handed out, the ones that cost more than address space.
+
+### Changed
+
+- Pins preflight 0.8.2 for development, and aegis 0.1.12.
+
+## [0.2.4] - 2026-10-17
+
+### Fixed
+
+- The trace test expected a frame below a context's entry, which the trampoline's call leaves everywhere but on Windows, where it branches in: a suspended context's trace is now held to be the running one less the frame that called `trace` (the windows-11-arm nightly's red).
+
+## [0.2.3] - 2026-10-15
+
+### Fixed
+
+- A coroutine's `enter` takes its thread's slot afresh after the switch back: the compiler could reuse the slot's address computed before the switch, which on aarch64 is a register read it merges, so a runtime that moved the task running the coroutine to another thread meanwhile (reactor's) wrote the thread it left. The slot now passes through an assembly statement, as reactor's seat does; `running` reads it the same way.
+
+## [0.2.2] - 2026-10-14
+
+### Changed
+
+- Pins aegis 0.1.8.
+
+## [0.2.1] - 2026-10-14
+
+### Changed
+
+- Pins aegis 0.1.6.
+
+## [0.2.0] - 2026-10-13
+
+### Breaking
+
+- A `Context` is what a switch saves and no more: its registers, on Windows the stack bounds, under ThreadSanitizer its fiber. 40 bytes on aarch64 where it was 112, 32 on x86_64 where it was 104, 56 on Windows x64 where it was 128: a scheduler that keeps a context in each task's record keeps 72 bytes less of it hot. The stack it runs on is its maker's, and the calls that need it are given it: `Context.init(&stack, entry, arg)` (on Windows `stack` learns what was committed for the first frame), `context.deinit(&stack)`, which returns nothing (on Windows `stack` learns what the context's code committed), `context.trace(&stack, out)` and `context.traceFrom(&stack, first, out)`. A coroutine's stack is its `Core.stack` field, where it was `Core.stack()`.
+
+### Added
+
+- `Pool.stackOf(n)`: the stack a number (`Pool.number`) names, as `take` handed it out, so a holder keeps only the number and describes the stack again to give it back.
+
+### Changed
+
+- A pool tells Valgrind of each of its stacks once, for the pool's life, where it did at each `take` and `give`: a stack described again by its number carries no registration.
+- The tests run in the `shuttle` module itself, which gets shakedown for them: a shakedown that links shuttle takes this copy, so a test binary holds one shuttle.
+
+## [0.1.1] - 2026-10-13
+
+### Added
+
+- `Pool.takeExactly`: a stack of the smallest class that fits and of no other, for a scheduler that keeps its larger stacks for the work that asked for them.
+- `Pool.number`, `Pool.count` and `Pool.inUse`: each stack's number among all the pool's, stable for the pool's life, for tables kept beside it; how many it holds; how many are handed out.
+- `Context.traceFrom`: a context's trace from a call site the caller kept.
+
+### Changed
+
+- `handoff.switchTo` is inline, as `switchTo` is: a call returned to from another context costs the return predictor a miss.
+
+### Fixed
+
+- `Pool.sizes` reads each class in place: it copied them, their free lists' atomic heads included, which a take or a give on another thread could be writing.
+- The 0.1.0 section of this changelog listed the first release under Breaking; it is Added.
+
+## [0.1.0] - 2026-10-13
+
+### Added
+
+- `Context` and `switchTo`: a symmetric switch with a message each way, inline, keeping what a call keeps on x86_64 (System V and Windows), aarch64 (Linux, Apple and Windows) and riscv64, the floating-point control state included (MXCSR and the x87 control word, FPCR, fcsr). The vector registers are named as LLVM takes them without AVX-512 (`xmm`, `ymm`, `zmm`); the aarch64 link register is kept by the assembly. On Windows the switch moves the thread information block's stack bounds.
+- A first frame whose unwind table ends every walk there, under zeroed bytes; `Context.trace`, a frame walk bounded by the context's stack, running or suspended.
+- `Stack`: a guard below every stack (a guard region on Linux 6.13 and later), Windows pages committed as the stack grows, Valgrind told of each stack; `carve`, `reach`, `discard`.
+- `Pool`: stacks in size classes, each with its own guard, taken and given back from any thread without allocating; refuses a count that would reach Linux's `vm.max_map_count`.
+- `handoff`: a switch whose `after` runs on the side switched to once the side that switched is saved, for publishing a context to another thread or giving back a finished one's stack.
+- `Coroutine(Input, Yield, Return)`: values both ways, its state and arguments at the top of its stack, cancellation through the body's defers when a suspended one is ended, and a panic handed to the code that ran it (`next` panics with it, `tryNext` returns `error.Panicked`).
+- `Generator(Yield, Error)`: a coroutine read as an iterator.
+- `panic` and `handleSegfault`: the handlers that hand a coroutine's panic over, with each coroutine's trace, and name a stack overflow.
+- ThreadSanitizer told of every context and switch.
+- Pins aegis 0.1.3.

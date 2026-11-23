@@ -1,0 +1,103 @@
+//! Owned encoding bytes and the allocation failure behind a writer error.
+//!
+//! The writer's buffer and end are the storage and length; no second list
+//! keeps them in sync. A bound belongs to the caller measuring these bytes.
+
+const std = @import("std");
+const aegis = @import("aegis");
+
+const Self = @This();
+
+gpa: std.mem.Allocator,
+writer: std.Io.Writer,
+allocation_failed: bool = false,
+
+pub fn init(gpa: std.mem.Allocator) Self {
+    return .{
+        .gpa = gpa,
+        .writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain, .flush = flush, .rebase = rebase } },
+    };
+}
+
+pub fn deinit(self: *Self) void {
+    self.gpa.free(self.writer.buffer);
+    self.* = undefined;
+}
+
+pub fn reset(self: *Self) void {
+    self.writer.end = 0;
+    self.allocation_failed = false;
+}
+
+/// The writer reports WriteFailed for both causes; this owner knows which.
+pub fn diagnose(self: *const Self, err: std.Io.Writer.Error) (std.Io.Writer.Error || std.mem.Allocator.Error) {
+    return if (self.allocation_failed) error.OutOfMemory else err;
+}
+
+/// Transfer the bytes as one allocation of exactly their length.
+pub fn toOwnedSlice(self: *Self) std.mem.Allocator.Error![]u8 {
+    aegis.assert.invariant(self.writer.end <= self.writer.buffer.len, "the buffered bytes are inside the buffer");
+    var storage: std.ArrayList(u8) = .{
+        .items = self.writer.buffered(),
+        .capacity = self.writer.buffer.len,
+        .pointer_stability = .{},
+    };
+    const bytes = try storage.toOwnedSlice(self.gpa);
+    self.writer.buffer = &.{};
+    self.writer.end = 0;
+    aegis.assert.invariant(self.writer.buffer.len == 0, "the buffer is handed over whole");
+    aegis.assert.invariant(self.writer.end == 0, "nothing is left buffered");
+    return bytes;
+}
+
+fn grow(self: *Self, additional: usize) std.Io.Writer.Error!void {
+    aegis.assert.invariant(self.writer.end <= self.writer.buffer.len, "the buffered bytes are inside the buffer");
+    var storage: std.ArrayList(u8) = .{
+        .items = self.writer.buffered(),
+        .capacity = self.writer.buffer.len,
+        .pointer_stability = .{},
+    };
+    storage.ensureUnusedCapacity(self.gpa, additional) catch {
+        self.allocation_failed = true;
+        return error.WriteFailed;
+    };
+    self.writer.buffer = storage.allocatedSlice();
+    aegis.assert.invariant(self.writer.buffer.len - self.writer.end >= additional, "the growth leaves room for what was asked");
+}
+
+fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    const self: *Self = @fieldParentPtr("writer", writer);
+    aegis.assert.invariant(data.len > 0, "a drain is given at least the splat slice");
+    const start = writer.end;
+    defer aegis.assert.invariant(writer.end <= writer.buffer.len, "the buffered bytes are inside the buffer");
+    for (data[0 .. data.len - 1]) |bytes| {
+        try self.grow(bytes.len);
+        @memcpy(writer.buffer[writer.end..][0..bytes.len], bytes);
+        writer.end += bytes.len;
+    }
+    const pattern = data[data.len - 1];
+    const total = (aegis.int.Checked(usize).init(pattern.len).mul(splat) catch {
+        self.allocation_failed = true;
+        return error.WriteFailed;
+    }).raw();
+    try self.grow(total);
+    switch (pattern.len) {
+        0 => {},
+        1 => {
+            @memset(writer.buffer[writer.end..][0..total], pattern[0]);
+            writer.end += total;
+        },
+        else => for (0..splat) |_| {
+            @memcpy(writer.buffer[writer.end..][0..pattern.len], pattern);
+            writer.end += pattern.len;
+        },
+    }
+    return writer.end - start;
+}
+
+fn flush(_: *std.Io.Writer) std.Io.Writer.Error!void {}
+
+fn rebase(writer: *std.Io.Writer, _: usize, capacity: usize) std.Io.Writer.Error!void {
+    const self: *Self = @fieldParentPtr("writer", writer);
+    try self.grow(capacity);
+}

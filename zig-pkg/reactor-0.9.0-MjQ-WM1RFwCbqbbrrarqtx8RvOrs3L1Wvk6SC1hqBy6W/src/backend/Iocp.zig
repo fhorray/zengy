@@ -1,0 +1,826 @@
+//! IOCP over AFD: each socket call is AFD's own request, issued overlapped
+//! on the socket and finished through a completion port; files and pipes
+//! opened for overlapped calls the same way; waits on kernel objects and
+//! timers through wait completion packets.
+//!
+//! - **One port per loop**, or the host's (`Options.port`), whose entries
+//!   the host hands back through `complete`. A handle is bound to the port
+//!   of the first loop that uses it, for the handle's life: an entry that
+//!   reaches a loop for another loop's operation is posted on to that
+//!   loop's port, so a task may use a socket from any processor. A loop
+//!   whose thread may be away from it binds to another loop's port
+//!   instead (`binds_to`), so no other loop's completion waits for it.
+//! - **Skip on success**: a handle is bound with the port skipped for calls
+//!   that complete at once, so a receive with data waiting is one call and
+//!   no entry; `submit` reports it finished. A call that fails at once
+//!   queues no entry either; a pending one, or one finished with a warning
+//!   (a datagram too long), queues one. Requests leave AFD its fast path on
+//!   (std's turn it off): a call served there completed at once, and the
+//!   path is worth 7-11% on a loopback echo.
+//! - **Precise waits**: a wait with a deadline arms a high-resolution
+//!   waitable timer whose wait packet wakes the port; the port's own
+//!   timeout has the system tick's resolution (15.6 ms by default).
+//! - `real` and `boot` timers are waitable timers of their own: an absolute
+//!   one for `real`, so a wall-clock change moves it.
+//!
+//! An entry's context is an operation's address, or a batch slot's, with a
+//! tag in its three low bits; its key is reactor's on every port.
+const Iocp = @This();
+
+const std = @import("std");
+const Raised = @import("../sync/Raised.zig");
+const Io = std.Io;
+const net = Io.net;
+const Allocator = std.mem.Allocator;
+const windows = std.os.windows;
+const Handle = windows.HANDLE;
+const Status = windows.NTSTATUS;
+const Threaded = Io.Threaded;
+
+const op = @import("op.zig");
+const pending = @import("pending.zig");
+const Wait = @import("wait.zig").Wait;
+const timeline = @import("../clock.zig");
+const kernel_time = @import("kernel_time.zig");
+const Notifications = @import("iocp/Notifications.zig");
+const results = @import("iocp/results.zig");
+const sys = @import("../sys/windows.zig");
+const afd = @import("../sys/afd.zig");
+const aegis = @import("aegis");
+const scratch = @import("iocp/scratch.zig");
+
+pub const Options = struct {
+    /// The host's port: entries reach the loop through `complete`, and the
+    /// loop never waits on the port itself.
+    port: ?Handle = null,
+    /// Batch operations in flight at once.
+    slots: u32,
+};
+
+pub const InitError = error{ SystemResources, Unexpected } || Allocator.Error;
+
+/// reactor's completion key on any port: an address no key of a host's can
+/// be.
+const key_anchor: u8 = 0;
+
+/// One entry taken from a port: Win32's `OVERLAPPED_ENTRY`.
+pub const Entry = sys.Entry;
+
+pub fn key() usize {
+    return @intFromPtr(&key_anchor); // safe: an address used as a number nobody else can have
+}
+
+/// From 1601, where Windows' clock starts, to 1970, where the real clock's
+/// zero is.
+const windows_epoch: timeline.Span = .fromRaw(11_644_473_600 * 1_000_000_000);
+
+/// The APC context of a `wake`'s entry, and of the precise timer's: no
+/// status block's address, which is aligned, is either.
+const wake_context: usize = 2;
+const timer_context: usize = 3;
+
+/// What an operation keeps while the kernel holds it.
+pub const Scratch = scratch.Scratch;
+const DatagramIn = scratch.DatagramIn;
+const DatagramOut = scratch.DatagramOut;
+const Request = scratch.Status;
+
+/// A batch operation while the kernel holds it: the batch's storage has
+/// no room for a status block beside the operation it keeps.
+pub const Slot = struct {
+    status: Request = .{ .owner = .batch },
+    /// Its place in the backend's slots, kept in the batch's own word.
+    index: u32,
+    owner: *Iocp,
+    token: pending.Token = undefined,
+    target: Handle = undefined,
+    next: ?*Slot = null,
+    request: SlotRequest = .{ .none = {} },
+};
+
+pub const SlotRequest = union {
+    none: void,
+    receive: struct { info: windows.AFD.RECV_INFO, buffer: [1]windows.AFD.WSABUF(.@"var") },
+    send: struct { info: windows.AFD.SEND_INFO, buffer: [1]windows.AFD.WSABUF(.@"const") },
+    datagram_in: DatagramIn,
+    datagram_out: DatagramOut,
+};
+
+port: Handle,
+notifications: ?*Notifications = null,
+/// The port is the host's: never waited on, never closed here.
+hosted: bool,
+/// The precise timer a wait with a deadline arms, and its packet.
+timer: Handle,
+precise: bool,
+timer_packet: Handle,
+/// The timer's packet is armed and its entry not taken yet.
+timer_armed: bool = false,
+/// When the armed timer fires, on the awake clock (ns).
+timer_at: timeline.Awake = .fromRaw(0),
+/// Set by `wake` until its entry is taken: later wakes post nothing.
+wake_pending: Raised = .{},
+/// The port the handles this loop uses first are bound to, when not its
+/// own. Every loop's entries for a handle arrive on its port, and that
+/// port's loop passes them on: a runtime's home loop runs only while the
+/// root waits in the runtime (its thread is the host's otherwise, in a
+/// join or a call of its own), so with workers it binds to a worker's.
+binds_to: ?Handle = null,
+slots: []Slot,
+free: ?*Slot = null,
+
+pub fn init(gpa: Allocator, options: Options) InitError!Iocp {
+    const port = options.port orelse try sys.createPort();
+    errdefer if (options.port == null) sys.close(port);
+    const timer, const precise = try sys.createTimer();
+    errdefer sys.close(timer);
+    const timer_packet = try sys.createWaitPacket();
+    errdefer sys.close(timer_packet);
+    var b: Iocp = .{
+        .port = port,
+        .hosted = options.port != null,
+        .timer = timer,
+        .precise = precise,
+        .timer_packet = timer_packet,
+        .slots = try gpa.alloc(Slot, options.slots),
+    };
+    // Every slot free, the first one first out.
+    var i = b.slots.len;
+    while (i > 0) {
+        i -= 1;
+        b.slots[i] = .{ .owner = undefined, .index = @intCast(i), .next = b.free };
+        b.free = &b.slots[i];
+    }
+    return b;
+}
+
+pub fn deinit(b: *Iocp, gpa: Allocator) void {
+    if (b.timer_armed) _ = sys.disarmWaitPacket(b.timer_packet);
+    sys.close(b.timer_packet);
+    sys.close(b.timer);
+    if (!b.hosted) sys.close(b.port);
+    gpa.free(b.slots);
+    b.* = undefined;
+}
+
+/// Binds `handle` to `bindingPort` unless it is bound already.
+fn bindHandle(b: *Iocp, handle: Handle) bool {
+    return sys.bindOnce(handle, b.bindingPort(), key());
+}
+
+/// The port this loop binds handles to: its own, or `binds_to`. A port a
+/// job reports on is chosen the same way.
+pub fn bindingPort(b: *const Iocp) Handle {
+    return b.binds_to orelse b.port;
+}
+
+// Submission.
+
+/// Hands `o` to the kernel. True when it finished at once: its result is
+/// set, and no entry follows.
+pub fn submit(b: *Iocp, o: *op.Op) error{ SystemResources, Unexpected }!bool {
+    o.state.storage.scratch = .{ .iocp = .{ .owner = &b.port } };
+    const s = &o.state.storage.scratch.iocp;
+    const context: *anyopaque = &s.status;
+    switch (o.kind) {
+        .raw => |raw| switch (raw) {
+            .uring => unreachable, // unreachable: kernel.submit requires io_uring
+            .windows => |request| {
+                if (!b.bindHandle(request.handle)) return b.refuse(o);
+                s.target = request.handle;
+                return b.settle(o, request.start(request, &s.status.iosb, context));
+            },
+        },
+        .io => |*operation| return b.submitIo(o, operation, context),
+        .accept => |listener| {
+            if (!b.bindHandle(listener)) return b.refuse(o);
+            s.target = listener;
+            s.stage = .listen;
+            s.request = .{ .accept = .{ .response = undefined, .info = undefined, .socket = undefined } };
+            const a = &s.request.accept;
+            const status = windows.ntdll.NtDeviceIoControlFile(listener, null, null, context, &s.status.iosb, windows.IOCTL.AFD.WAIT_FOR_LISTEN, null, 0, &a.response, @sizeOf(afd.ListenResponse));
+            return b.settle(o, status);
+        },
+        .connect => |c| {
+            if (!b.bindHandle(c.socket)) return b.refuse(o);
+            s.target = c.socket;
+            const status = switch (c.address) {
+                .ip => |*ip| status: {
+                    s.request = .{ .connect_ip = .{ .address = undefined } };
+                    const info = &s.request.connect_ip;
+                    const len = Threaded.addressToPosix(ip, &info.address);
+                    break :status windows.ntdll.NtDeviceIoControlFile(c.socket, null, null, context, &s.status.iosb, windows.IOCTL.AFD.CONNECT, info, @intCast(@offsetOf(@TypeOf(info.*), "address") + len), null, 0);
+                },
+                // The system refuses an AF_UNIX endpoint AFD is driven for
+                // directly: a Unix socket on Windows is Winsock's, connected
+                // by `unix_windows.connectUnix`, and no connect op names one.
+                .unix => aegis.assert.never("a Unix connect on Windows is Winsock's: unix_windows.connectUnix"),
+            };
+            return b.settle(o, status);
+        },
+        .read_at => |r| {
+            const len: u32 = @intCast(@min(r.buffer.len, std.math.maxInt(u32)));
+            s.request = .{ .offset = @intCast(r.offset) };
+            if (!b.bindHandle(r.file)) {
+                // A handle opened for synchronous calls: the call waits here.
+                const status = windows.ntdll.NtReadFile(r.file, null, null, null, &s.status.iosb, r.buffer.ptr, len, &s.request.offset, null);
+                return b.advance(o, status, s.status.iosb.Information);
+            }
+            s.target = r.file;
+            return b.settle(o, windows.ntdll.NtReadFile(r.file, null, null, context, &s.status.iosb, r.buffer.ptr, len, &s.request.offset, null));
+        },
+        .write_at => |w| {
+            const len: u32 = @intCast(@min(w.bytes.len, std.math.maxInt(u32)));
+            s.request = .{ .offset = @intCast(w.offset) };
+            if (!b.bindHandle(w.file)) {
+                const status = windows.ntdll.NtWriteFile(w.file, null, null, null, &s.status.iosb, w.bytes.ptr, len, &s.request.offset, null);
+                return b.advance(o, status, s.status.iosb.Information);
+            }
+            s.target = w.file;
+            return b.settle(o, windows.ntdll.NtWriteFile(w.file, null, null, context, &s.status.iosb, w.bytes.ptr, len, &s.request.offset, null));
+        },
+        .sync => |file| {
+            // No flush is overlapped: it waits here (the runtime sends file
+            // syncs to its `sync` lane instead).
+            const status = windows.ntdll.NtFlushBuffersFile(file, &s.status.iosb);
+            return b.advance(o, status, 0);
+        },
+        .close => |handle| {
+            sys.cancel(handle, null);
+            sys.close(handle);
+            o.result = .{ .close = {} };
+            return true;
+        },
+        .abort => |handle| {
+            sys.cancel(handle, null);
+            o.result = .{ .abort = 0 };
+            return true;
+        },
+        .timer => |deadline| return b.submitTimer(o, deadline, context),
+        .wait => |w| switch (w) {
+            .readable, .writable => |socket| {
+                if (!b.bindHandle(socket)) {
+                    o.result = .{ .wait = error.Unsupported };
+                    return true;
+                }
+                s.target = socket;
+                s.stage = .poll;
+                const wanted = if (w == .readable) afd.events.readable else afd.events.writable;
+                s.request = .{ .poll = .{ .timeout = std.math.maxInt(i64), .count = 1, .exclusive = 0, .handles = .{.{ .handle = socket, .events = wanted, .status = .SUCCESS }} } };
+                const info = &s.request.poll;
+                const status = windows.ntdll.NtDeviceIoControlFile(socket, null, null, context, &s.status.iosb, windows.IOCTL.AFD.POLL, info, @sizeOf(afd.PollInfo), info, @sizeOf(afd.PollInfo));
+                return b.settle(o, status);
+            },
+            .priority => {
+                o.result = .{ .wait = error.Unsupported };
+                return true;
+            },
+            .object => |object| {
+                const packet = try sys.createWaitPacket();
+                s.stage = .packet;
+                s.request = .{ .packet = .{ .packet = packet, .timer = null } };
+                sys.armWaitPacket(packet, b.port, object, key(), @intFromPtr(context)) catch |err| { // safe: the context, as a number
+                    sys.close(packet);
+                    return err;
+                };
+                return false;
+            },
+        },
+    }
+}
+
+fn submitIo(b: *Iocp, o: *op.Op, operation: *const Io.Operation, context: ?*anyopaque) error{ SystemResources, Unexpected }!bool {
+    const s = &o.state.storage.scratch.iocp;
+    switch (operation.*) {
+        .net_read => |r| {
+            if (!b.bindHandle(r.socket_handle)) return b.refuse(o);
+            s.target = r.socket_handle;
+            s.request = .{ .receive = .{ .info = undefined, .buffers = undefined } };
+            const q = &s.request.receive;
+            var n: u32 = 0;
+            for (r.data) |d| addBuffer(.@"var", &q.buffers, &n, d);
+            q.info = .{ .BufferArray = &q.buffers, .BufferCount = n, .AfdFlags = .{ .OVERLAPPED = true }, .TdiFlags = .{ .NORMAL = true } };
+            return b.settle(o, windows.ntdll.NtDeviceIoControlFile(r.socket_handle, null, null, context, &s.status.iosb, windows.IOCTL.AFD.RECEIVE, &q.info, @sizeOf(windows.AFD.RECV_INFO), null, 0));
+        },
+        .net_write => |w| {
+            if (!b.bindHandle(w.socket_handle)) return b.refuse(o);
+            s.target = w.socket_handle;
+            s.request = .{ .send = .{ .info = undefined, .buffers = undefined, .splat = undefined } };
+            const q = &s.request.send;
+            const n = gatherWrite(&q.buffers, &q.splat, w.header, w.data, w.splat);
+            q.info = .{ .BufferArray = &q.buffers, .BufferCount = n, .AfdFlags = .{ .OVERLAPPED = true }, .TdiFlags = .{} };
+            return b.settle(o, windows.ntdll.NtDeviceIoControlFile(w.socket_handle, null, null, context, &s.status.iosb, windows.IOCTL.AFD.SEND, &q.info, @sizeOf(windows.AFD.SEND_INFO), null, 0));
+        },
+        .net_receive => |r| {
+            if (!b.bindHandle(r.socket_handle)) return b.refuse(o);
+            s.target = r.socket_handle;
+            s.request = .{ .datagram_in = undefined };
+            const q = &s.request.datagram_in;
+            const status = receiveDatagram(r.socket_handle, q, r.data_buffer, r.flags, &s.status.iosb, context);
+            return b.settle(o, status);
+        },
+        .net_send => |m| {
+            if (!b.bindHandle(m.socket_handle)) return b.refuse(o);
+            s.target = m.socket_handle;
+            s.stage = .send;
+            s.request = .{ .datagram_out = undefined };
+            return b.settle(o, sendDatagram(m.socket_handle, &s.request.datagram_out, &m.messages[0], &s.status.iosb, context));
+        },
+        .file_read_streaming => |f| {
+            const buffer = firstBuffer(f.data);
+            if (!b.bindHandle(f.file.handle)) {
+                const status = windows.ntdll.NtReadFile(f.file.handle, null, null, null, &s.status.iosb, buffer.ptr, @intCast(buffer.len), null, null);
+                return b.advance(o, status, s.status.iosb.Information);
+            }
+            s.target = f.file.handle;
+            return b.settle(o, windows.ntdll.NtReadFile(f.file.handle, null, null, context, &s.status.iosb, buffer.ptr, @intCast(buffer.len), null, null));
+        },
+        .file_write_streaming => |f| {
+            const bytes = firstChunk(f.header, f.data, f.splat);
+            if (!b.bindHandle(f.file.handle)) {
+                const status = windows.ntdll.NtWriteFile(f.file.handle, null, null, null, &s.status.iosb, bytes.ptr, @intCast(bytes.len), null, null);
+                return b.advance(o, status, s.status.iosb.Information);
+            }
+            s.target = f.file.handle;
+            return b.settle(o, windows.ntdll.NtWriteFile(f.file.handle, null, null, context, &s.status.iosb, bytes.ptr, @intCast(bytes.len), null, null));
+        },
+        .device_io_control => |d| {
+            const control = switch (d.code.DeviceType) {
+                .FILE_SYSTEM, .NAMED_PIPE => &windows.ntdll.NtFsControlFile,
+                else => &windows.ntdll.NtDeviceIoControlFile,
+            };
+            const in: ?*const anyopaque = if (d.in.len > 0) d.in.ptr else null;
+            const out: ?*anyopaque = if (d.out.len > 0) d.out.ptr else null;
+            if (!b.bindHandle(d.file.handle)) {
+                const status = control(d.file.handle, null, null, null, &s.status.iosb, d.code, in, @intCast(d.in.len), out, @intCast(d.out.len));
+                return b.advance(o, status, s.status.iosb.Information);
+            }
+            s.target = d.file.handle;
+            return b.settle(o, control(d.file.handle, null, null, context, &s.status.iosb, d.code, in, @intCast(d.in.len), out, @intCast(d.out.len)));
+        },
+    }
+}
+
+/// A `real` or `boot` timer: a waitable timer of its own, absolute for
+/// `real`, whose packet completes the operation.
+fn submitTimer(b: *Iocp, o: *op.Op, deadline: Io.Clock.Timestamp, context: ?*anyopaque) error{ SystemResources, Unexpected }!bool {
+    const s = &o.state.storage.scratch.iocp;
+    const timer, _ = try sys.createTimer();
+    errdefer sys.close(timer);
+    const packet = try sys.createWaitPacket();
+    errdefer sys.close(packet);
+    const at = kernel_time.of(deadline.raw);
+    const due: i64 = switch (deadline.clock) {
+        // 100 ns since 1601: the timer follows changes to the clock.
+        .real => @intCast(std.math.clamp(@divTrunc(kernel_time.sinceZero(at).saturatingAdd(windows_epoch).raw(), 100), 1, std.math.maxInt(i64))),
+        // Relative, rounded up: never early.
+        else => -@as(i64, @intCast(std.math.clamp(hectoNanoseconds(kernel_time.until(kernel_time.now(deadline.clock, system()), at)), 1, std.math.maxInt(i64)))),
+    };
+    try sys.setTimer(timer, due);
+    try sys.armWaitPacket(packet, b.port, timer, key(), @intFromPtr(context)); // safe: the context, as a number
+    s.stage = .packet;
+    s.request = .{ .packet = .{ .packet = packet, .timer = timer } };
+    return false;
+}
+
+fn system() Io {
+    return Threaded.global_single_threaded.io();
+}
+
+/// A handle that cannot be bound to the port: the operation ends at once.
+fn refuse(b: *Iocp, o: *op.Op) bool {
+    _ = b;
+    o.result = results.of(o, .INVALID_HANDLE, 0);
+    return true;
+}
+
+/// After a call returned `status`: true when the operation is over (its
+/// result set); false when an entry follows.
+fn settle(b: *Iocp, o: *op.Op, status: Status) bool {
+    if (results.entryFollows(status)) return false;
+    // The status block is written for a call that succeeded at once, and
+    // left alone for one that failed at once.
+    const information = if (status == .SUCCESS or @backingInt(status) >> 30 == 0b01) o.state.storage.scratch.iocp.status.iosb.Information else 0;
+    return b.advance(o, status, information);
+}
+
+/// The current request of `o` ended with `status`: true when the
+/// operation is over (its result set); false when its next request is
+/// under way.
+fn advance(b: *Iocp, o: *op.Op, first_status: Status, first_information: usize) bool {
+    const s = &o.state.storage.scratch.iocp;
+    const context: *anyopaque = &s.status;
+    var status = first_status;
+    var information = first_information;
+    while (true) switch (s.stage) {
+        .main, .poll => {
+            o.result = results.of(o, status, information);
+            return true;
+        },
+        .packet => {
+            const p = s.request.packet;
+            sys.close(p.packet);
+            if (p.timer) |timer| sys.close(timer);
+            o.result = results.of(o, status, 0);
+            return true;
+        },
+        .listen => {
+            const a = &s.request.accept;
+            if (status != .SUCCESS) {
+                o.result = results.of(o, status, 0);
+                return true;
+            }
+            // Reported, not taken yet: a cancel puts it back for the next
+            // accept, so nothing is lost.
+            if (o.state.canceled) {
+                afd.deferAccept(s.target, a.response.info.Sequence);
+                o.result = .{ .accept = error.Canceled };
+                return true;
+            }
+            const family = a.response.address.ip.any.family;
+            a.socket = afd.open(family, .stream, null) catch |err| {
+                afd.deferAccept(s.target, a.response.info.Sequence);
+                o.result = .{ .accept = switch (err) {
+                    error.SystemResources => error.SystemResources,
+                    else => error.Unexpected,
+                } };
+                return true;
+            };
+            a.info = .{ .UseSAN = .FALSE, .Sequence = a.response.info.Sequence, .AcceptHandle = a.socket };
+            s.stage = .accept;
+            status = windows.ntdll.NtDeviceIoControlFile(s.target, null, null, context, &s.status.iosb, windows.IOCTL.AFD.ACCEPT, &a.info, @sizeOf(windows.AFD.ACCEPT_INFO), null, 0);
+            if (results.entryFollows(status)) return false;
+            information = 0;
+        },
+        .accept => {
+            const a = &s.request.accept;
+            if (status != .SUCCESS) {
+                sys.close(a.socket);
+                afd.deferAccept(s.target, a.response.info.Sequence);
+                o.result = results.of(o, status, 0);
+                return true;
+            }
+            // The new socket's calls finish on the port of the loop that
+            // accepted it.
+            _ = b.bindHandle(a.socket);
+            o.result = .{ .accept = .{ .handle = a.socket, .address = Threaded.addressFromPosix(&a.response.address.ip) } };
+            return true;
+        },
+        .send => {
+            const m = o.kind.io.net_send;
+            if (status != .SUCCESS) {
+                o.result = .{ .io = sendEnded(o, status) };
+                return true;
+            }
+            m.messages[s.sent].data_len = information;
+            s.sent += 1;
+            // The rest one by one; a cancel keeps what was sent.
+            if (s.sent == m.messages.len or o.state.canceled) {
+                o.result = .{ .io = .{ .net_send = .{ null, s.sent } } };
+                return true;
+            }
+            status = sendDatagram(m.socket_handle, &s.request.datagram_out, &m.messages[s.sent], &s.status.iosb, context);
+            if (results.entryFollows(status)) return false;
+            information = if (status == .SUCCESS) s.status.iosb.Information else 0;
+        },
+    };
+}
+
+/// A multi-message send whose current message ended with `status`: what
+/// went is kept. A cancel that ended it before any went is the
+/// cancelation point's; after some went, the send reports them and the
+/// cancel stays for the next point, as std's does.
+fn sendEnded(o: *op.Op, status: Status) Io.Cancelable!Io.Operation.Result {
+    const sent = o.state.storage.scratch.iocp.sent;
+    const ended = results.ended(status);
+    if (ended and o.state.canceled) {
+        if (sent == 0) return error.Canceled;
+        return .{ .net_send = .{ null, sent } };
+    }
+    return .{ .net_send = .{ if (ended) error.SocketUnconnected else results.send(status), sent } };
+}
+
+/// Asks the kernel to end `o`. True when it ended here: its result is set
+/// and no entry follows.
+pub fn cancel(b: *Iocp, o: *op.Op) bool {
+    _ = b;
+    const s = &o.state.storage.scratch.iocp;
+    switch (s.stage) {
+        .packet => switch (sys.disarmWaitPacket(s.request.packet.packet)) {
+            .removed => {
+                const p = s.request.packet;
+                sys.close(p.packet);
+                if (p.timer) |timer| sys.close(timer);
+                o.result = results.of(o, .CANCELLED, 0);
+                return true;
+            },
+            .delivered, .arriving => return false,
+        },
+        else => {
+            sys.cancel(s.target, &s.status.iosb);
+            return false;
+        },
+    }
+}
+
+// Batches.
+
+/// Whether a batch operation can wait in the kernel here: the rest run
+/// as std's own code.
+pub fn canPend(operation: Io.Operation) bool {
+    return switch (operation) {
+        .file_read_streaming => |f| f.file.flags.nonblocking,
+        .file_write_streaming => |f| f.file.flags.nonblocking,
+        .device_io_control => |d| d.file.flags.nonblocking,
+        .net_read, .net_write, .net_receive, .net_send => true,
+    };
+}
+
+/// A batch's operation: null when the kernel holds it (its outcome comes
+/// to the sink under `token`), else its outcome now.
+pub fn submitPending(b: *Iocp, token: pending.Token, operation: Io.Operation) error{ SystemResources, Unexpected }!?pending.Outcome {
+    const handle = handleOf(operation);
+    if (!b.bindHandle(handle)) return error.Unexpected;
+    const slot = b.free orelse return error.SystemResources;
+    b.free = slot.next;
+    slot.* = .{ .owner = b, .index = slot.index, .token = token, .target = handle };
+    pending.backendWord(token.pending()).* = slot.index;
+    const context: *anyopaque = &slot.status;
+    const status = switch (operation) {
+        .net_read => |r| status: {
+            slot.request = .{ .receive = .{ .info = undefined, .buffer = .{toBuffer(.@"var", firstBuffer(r.data))} } };
+            const q = &slot.request.receive;
+            q.info = .{ .BufferArray = &q.buffer, .BufferCount = 1, .AfdFlags = .{ .OVERLAPPED = true }, .TdiFlags = .{ .NORMAL = true } };
+            break :status windows.ntdll.NtDeviceIoControlFile(handle, null, null, context, &slot.status.iosb, windows.IOCTL.AFD.RECEIVE, &q.info, @sizeOf(windows.AFD.RECV_INFO), null, 0);
+        },
+        .net_write => |w| status: {
+            slot.request = .{ .send = .{ .info = undefined, .buffer = .{toBuffer(.@"const", firstChunk(w.header, w.data, w.splat))} } };
+            const q = &slot.request.send;
+            q.info = .{ .BufferArray = &q.buffer, .BufferCount = 1, .AfdFlags = .{ .OVERLAPPED = true }, .TdiFlags = .{} };
+            break :status windows.ntdll.NtDeviceIoControlFile(handle, null, null, context, &slot.status.iosb, windows.IOCTL.AFD.SEND, &q.info, @sizeOf(windows.AFD.SEND_INFO), null, 0);
+        },
+        .net_receive => |r| status: {
+            slot.request = .{ .datagram_in = undefined };
+            break :status receiveDatagram(handle, &slot.request.datagram_in, r.data_buffer, r.flags, &slot.status.iosb, context);
+        },
+        .net_send => |m| status: {
+            slot.request = .{ .datagram_out = undefined };
+            break :status sendDatagram(handle, &slot.request.datagram_out, &m.messages[0], &slot.status.iosb, context);
+        },
+        .file_read_streaming => |f| status: {
+            const buffer = firstBuffer(f.data);
+            break :status windows.ntdll.NtReadFile(handle, null, null, context, &slot.status.iosb, buffer.ptr, @intCast(buffer.len), null, null);
+        },
+        .file_write_streaming => |f| status: {
+            const bytes = firstChunk(f.header, f.data, f.splat);
+            break :status windows.ntdll.NtWriteFile(handle, null, null, context, &slot.status.iosb, bytes.ptr, @intCast(bytes.len), null, null);
+        },
+        .device_io_control => |d| status: {
+            const control = switch (d.code.DeviceType) {
+                .FILE_SYSTEM, .NAMED_PIPE => &windows.ntdll.NtFsControlFile,
+                else => &windows.ntdll.NtDeviceIoControlFile,
+            };
+            break :status control(handle, null, null, context, &slot.status.iosb, d.code, if (d.in.len > 0) d.in.ptr else null, @intCast(d.in.len), if (d.out.len > 0) d.out.ptr else null, @intCast(d.out.len));
+        },
+    };
+    if (results.entryFollows(status)) return null;
+    const information = if (status == .SUCCESS or @backingInt(status) >> 30 == 0b01) slot.status.iosb.Information else 0;
+    const done = outcome(slot, operation, status, information);
+    b.release(slot);
+    return done;
+}
+
+pub fn cancelPending(b: *Iocp, token: pending.Token) void {
+    const slot = &b.slots[pending.backendWord(token.pending()).*];
+    sys.cancel(slot.target, &slot.status.iosb);
+}
+
+fn release(b: *Iocp, slot: *Slot) void {
+    slot.next = b.free;
+    b.free = slot;
+}
+
+fn outcome(slot: *Slot, operation: Io.Operation, status: Status, information: usize) pending.Outcome {
+    const address: ?*const Threaded.PosixAddress = if (operation == .net_receive) &slot.request.datagram_in.address else null;
+    return results.ofPending(operation, status, information, address);
+}
+
+fn handleOf(operation: Io.Operation) Handle {
+    return switch (operation) {
+        .net_read => |r| r.socket_handle,
+        .net_write => |w| w.socket_handle,
+        .net_receive => |r| r.socket_handle,
+        .net_send => |s| s.socket_handle,
+        .file_read_streaming => |f| f.file.handle,
+        .file_write_streaming => |f| f.file.handle,
+        .device_io_control => |d| d.file.handle,
+    };
+}
+
+// Completion.
+
+pub fn poll(b: *Iocp, wait: Wait, sink: anytype) error{ SystemResources, Unexpected }!void {
+    // A host's port: the host takes its entries and hands reactor's to
+    // `complete`.
+    if (b.hosted) return;
+    var timeout: ?u64 = switch (wait) {
+        .nowait => 0,
+        .forever => null,
+        .up_to => |span| b.timeoutFor(span),
+    };
+    var entries: [64]sys.Entry = undefined;
+    while (true) {
+        const taken = try sys.remove(b.port, &entries, timeout);
+        for (taken) |e| b.dispatch(e, sink);
+        if (taken.len < entries.len) return;
+        timeout = 0;
+    }
+}
+
+/// The entries a host took from its own port that carry reactor's key.
+pub fn complete(b: *Iocp, entries: []const sys.Entry, sink: anytype) void {
+    for (entries) |e| b.dispatch(e, sink);
+}
+
+/// How long the port's own wait may last for a wait of `span`, in 100 ns
+/// units: none when the precise timer's entry ends it.
+fn timeoutFor(b: *Iocp, span: timeline.Span) ?u64 {
+    if (span.eql(.fromRaw(0))) return 0;
+    const units = hectoNanoseconds(span);
+    if (b.precise and b.armTimer(span)) return null;
+    return units;
+}
+
+/// `span` in the 100 ns units of Windows timers, rounded up.
+fn hectoNanoseconds(span: timeline.Span) u64 {
+    return std.math.divCeil(u64, span.raw(), 100) catch aegis.assert.never("the divisor is a nonzero constant");
+}
+
+/// A timer armed this close before the deadline asked for is kept: the
+/// early wake costs a pass, re-arming costs two calls.
+const timer_slack: timeline.Span = .literal("50us");
+
+/// Arms the precise timer to fire in `span`; false when it cannot be now
+/// (its last entry is on its way).
+fn armTimer(b: *Iocp, span: timeline.Span) bool {
+    const now = timeline.awakeOf(Io.Clock.awake.now(system()));
+    const at = now.add(span) catch timeline.Awake.fromRaw(std.math.maxInt(u64)); // a wait past the timeline's end is its end
+    if (b.timer_armed) {
+        if (b.timer_at.compare(at) != .gt) {
+            const early = b.timer_at.durationTo(at) catch aegis.assert.never("the timer is not later than `at`, checked above");
+            if (early.compare(timer_slack) != .gt) return true;
+        }
+        switch (sys.disarmWaitPacket(b.timer_packet)) {
+            .removed, .delivered => b.timer_armed = false,
+            .arriving => return false,
+        }
+    }
+    const due = -@as(i64, @intCast(@min(hectoNanoseconds(span), std.math.maxInt(i63))));
+    sys.setTimer(b.timer, due) catch return false;
+    sys.armWaitPacket(b.timer_packet, b.port, b.timer, key(), timer_context) catch return false;
+    b.timer_armed = true;
+    b.timer_at = at;
+    return true;
+}
+
+fn dispatch(b: *Iocp, e: sys.Entry, sink: anytype) void {
+    if (b.notifications) |table| if (table.dispatch(e.key, e.context, e.iosb.Information)) {
+        sink.notified();
+        return;
+    };
+    if (e.key != key()) return;
+    switch (e.context) {
+        wake_context => return b.wake_pending.clear(.release),
+        timer_context => {
+            b.timer_armed = false;
+            return;
+        },
+        else => {},
+    }
+    const status: *Request = @ptrFromInt(e.context);
+    switch (status.owner) {
+        .operation => {
+            const s: *Scratch = @alignCast(@fieldParentPtr("status", status));
+            const storage: *op.State.Storage = @alignCast(@fieldParentPtr("scratch", @as(*op.Scratch, @alignCast(@fieldParentPtr("iocp", s)))));
+            const state: *op.State = @alignCast(@fieldParentPtr("storage", storage));
+            const o: *op.Op = @alignCast(@fieldParentPtr("state", state));
+            if (s.owner != &b.port) return forward(s.owner.*, e);
+            if (b.advance(o, e.iosb.u.Status, e.iosb.Information)) sink.complete(o);
+        },
+        .batch => {
+            const slot: *Slot = @alignCast(@fieldParentPtr("status", status));
+            if (slot.owner != b) return forward(slot.owner.port, e);
+            const token = slot.token;
+            const result = outcome(slot, pending.unpack(token.pending()), e.iosb.u.Status, e.iosb.Information);
+            b.release(slot);
+            sink.completePending(token, result);
+        },
+    }
+}
+
+/// An entry for an operation this loop did not submit: its handle is bound
+/// to this loop's port. It goes to the loop that did.
+fn forward(port: Handle, e: sys.Entry) void {
+    sys.post(port, e.key, e.context, e.iosb.u.Status, e.iosb.Information) catch |err|
+        std.debug.panic("reactor: an entry could not be passed on to its loop: {t}", .{err});
+}
+
+/// From any thread: ends a waiting `poll`.
+pub fn wake(b: *Iocp) void {
+    if (b.wake_pending.raise(.acq_rel)) return;
+    sys.post(b.port, key(), wake_context, .SUCCESS, 0) catch b.wake_pending.clear(.release);
+}
+
+/// The port: what a host waits on, or its own.
+pub fn waitHandle(b: *Iocp) Handle {
+    return b.port;
+}
+
+// Requests.
+
+fn receiveDatagram(socket: Handle, q: *DatagramIn, buffer: []u8, flags: net.ReceiveFlags, iosb: *windows.IO_STATUS_BLOCK, context: ?*anyopaque) Status {
+    q.* = .{ .info = undefined, .buffer = .{toBuffer(.@"var", buffer)}, .address = undefined, .address_len = @sizeOf(Threaded.PosixAddress) };
+    q.info = .{
+        .BufferArray = &q.buffer,
+        .BufferCount = 1,
+        .AfdFlags = .{ .OVERLAPPED = true },
+        .TdiFlags = .{ .NORMAL = !flags.oob, .EXPEDITED = flags.oob, .PEEK = flags.peek },
+        .Address = &q.address,
+        .AddressLength = &q.address_len,
+    };
+    return windows.ntdll.NtDeviceIoControlFile(socket, null, null, context, iosb, windows.IOCTL.AFD.RECEIVE_DATAGRAM, &q.info, @sizeOf(windows.AFD.RECV_DATAGRAM_INFO), null, 0);
+}
+
+fn sendDatagram(socket: Handle, q: *DatagramOut, message: *const net.OutgoingMessage, iosb: *windows.IO_STATUS_BLOCK, context: ?*anyopaque) Status {
+    q.* = .{ .info = undefined, .buffer = .{.{ .buf = message.data_ptr, .len = @intCast(@min(message.data_len, std.math.maxInt(u32))) }}, .address = undefined };
+    const len = Threaded.addressToPosix(message.address, &q.address);
+    q.info = .{
+        .BufferArray = &q.buffer,
+        .BufferCount = 1,
+        .AfdFlags = .{ .OVERLAPPED = true },
+        .TdiRequest = undefined,
+        .TdiConnInfo = .{
+            .UserDataLength = undefined,
+            .UserData = undefined,
+            .OptionsLength = undefined,
+            .Options = undefined,
+            .RemoteAddressLength = @bitCast(len),
+            .RemoteAddress = &q.address,
+        },
+    };
+    return windows.ntdll.NtDeviceIoControlFile(socket, null, null, context, iosb, windows.IOCTL.AFD.SEND_DATAGRAM, &q.info, @sizeOf(windows.AFD.SEND_DATAGRAM_INFO), null, 0);
+}
+
+fn toBuffer(comptime mutability: windows.AFD.Mutability, bytes: switch (mutability) {
+    .@"const" => []const u8,
+    .@"var" => []u8,
+}) windows.AFD.WSABUF(mutability) {
+    return .{ .buf = bytes.ptr, .len = @intCast(@min(bytes.len, std.math.maxInt(u32))) };
+}
+
+fn addBuffer(comptime mutability: windows.AFD.Mutability, buffers: []windows.AFD.WSABUF(mutability), n: *u32, bytes: switch (mutability) {
+    .@"const" => []const u8,
+    .@"var" => []u8,
+}) void {
+    if (bytes.len == 0 or n.* == buffers.len) return;
+    buffers[n.*] = toBuffer(mutability, bytes);
+    n.* += 1;
+}
+
+/// A write's buffers as `Threaded` lays them out: the header, the data,
+/// and the splat (a one-byte pattern expanded through `splat_buffer`).
+fn gatherWrite(buffers: []windows.AFD.WSABUF(.@"const"), splat_buffer: *[Threaded.splat_buffer_size]u8, header: []const u8, data: []const []const u8, splat: usize) u32 {
+    var n: u32 = 0;
+    addBuffer(.@"const", buffers, &n, header);
+    for (data[0 .. data.len - 1]) |d| addBuffer(.@"const", buffers, &n, d);
+    const pattern = data[data.len - 1];
+    switch (splat) {
+        0 => {},
+        1 => addBuffer(.@"const", buffers, &n, pattern),
+        else => if (pattern.len == 1) {
+            const len = @min(splat, splat_buffer.len);
+            @memset(splat_buffer[0..len], pattern[0]);
+            var remaining = splat;
+            while (remaining > 0 and n < buffers.len) {
+                const chunk = @min(remaining, len);
+                addBuffer(.@"const", buffers, &n, splat_buffer[0..chunk]);
+                remaining -= chunk;
+            }
+        } else for (0..@min(splat, buffers.len)) |_| addBuffer(.@"const", buffers, &n, pattern),
+    }
+    return n;
+}
+
+fn firstBuffer(data: []const []u8) []u8 {
+    for (data) |d| if (d.len > 0) return d[0..@min(d.len, std.math.maxInt(u32))];
+    return &.{};
+}
+
+/// The first bytes a streaming write would send: a write may be short.
+fn firstChunk(header: []const u8, data: []const []const u8, splat: usize) []const u8 {
+    if (header.len > 0) return header[0..@min(header.len, std.math.maxInt(u32))];
+    for (data[0 .. data.len - 1]) |d| if (d.len > 0) return d[0..@min(d.len, std.math.maxInt(u32))];
+    const last = data[data.len - 1];
+    if (splat > 0 and last.len > 0) return last[0..@min(last.len, std.math.maxInt(u32))];
+    return &.{};
+}

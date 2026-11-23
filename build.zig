@@ -141,6 +141,54 @@ pub fn build(b: *std.Build) void {
     });
     editor_shell_mod.addImport("engine", engine_mod);
 
+    // External dependencies (validated for Zig 0.17.1)
+    const z_toml_dep = b.dependency("z_toml", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const lookout_dep = b.dependency("lookout", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const yyjson_dep = b.dependency("yyjson", .{});
+
+    const translate_yyjson = b.addTranslateC(.{
+        .root_source_file = yyjson_dep.path("src/yyjson.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const yyjson_c_mod = translate_yyjson.createModule();
+    yyjson_c_mod.addIncludePath(yyjson_dep.path("src"));
+    yyjson_c_mod.addCSourceFile(.{
+        .file = yyjson_dep.path("src/yyjson.c"),
+        .flags = &.{"-std=c11"},
+    });
+
+    const toml_format_mod = b.addModule("toml_format", .{
+        .root_source_file = b.path("packages/formats/toml/src/toml_format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    toml_format_mod.addImport("engine", engine_mod);
+    toml_format_mod.addImport("toml", z_toml_dep.module("toml"));
+
+    const json_format_mod = b.addModule("json_format", .{
+        .root_source_file = b.path("packages/formats/json/src/json_format.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    json_format_mod.addImport("engine", engine_mod);
+    json_format_mod.addImport("yyjson_c", yyjson_c_mod);
+
+    const file_watcher_mod = b.addModule("file_watcher", .{
+        .root_source_file = b.path("packages/tooling/file-watcher/src/file_watcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    file_watcher_mod.addImport("engine", engine_mod);
+    file_watcher_mod.addImport("lookout", lookout_dep.module("lookout"));
+
     const render_3d_mod = b.addModule("render_3d", .{
         .root_source_file = b.path("packages/render-3d/src/render_3d.zig"),
         .target = target,
@@ -208,11 +256,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("benchmarks/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     bench_mod.addImport("engine", engine_mod);
     bench_mod.addImport("graphics", graphics_mod);
     bench_mod.addImport("ui_core", ui_core_mod);
     bench_mod.addImport("scene", scene_mod);
+    bench_mod.addImport("json_format", json_format_mod);
 
     const bench_exe = b.addExecutable(.{
         .name = "zigeng-bench",
@@ -321,5 +371,20 @@ pub fn build(b: *std.Build) void {
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "render_3d", .mod = render_3d_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/formats/toml/tests/toml_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "toml_format", .mod = toml_format_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/formats/json/tests/json_tests.zig", target, optimize, true, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "json_format", .mod = json_format_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/tooling/file-watcher/tests/file_watcher_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "file_watcher", .mod = file_watcher_mod },
     }, null);
 }

@@ -1,0 +1,187 @@
+//! Exact decimal integer conversion, with no floating intermediate.
+const std = @import("std");
+const aegis = @import("aegis");
+const core = @import("../core.zig");
+/// A number as a `T`: any number whose value is whole and in range, or under
+/// `Integers.digits` only one written as an integer (digits, a minus only for
+/// a signed type), anything else `UnexpectedType`.
+pub inline fn integer(comptime T: type, text: []const u8, c: *core.Context) core.DecodeError!T {
+    try c.chargeWork(text.len);
+    if (plain(T, text)) |value| {
+        // Only `-0` is a plain unsigned with a sign.
+        if (@typeInfo(T).int.signedness == .unsigned and text[0] == '-' and c.acceptance.integers == .digits) return error.UnexpectedType;
+        return value;
+    }
+    return lexeme(T, text, c);
+}
+
+/// An integer in any other spelling, as the reading takes it.
+fn lexeme(comptime T: type, text: []const u8, c: *core.Context) core.DecodeError!T {
+    if (c.acceptance.integers == .digits) {
+        if (std.mem.findAny(u8, text, ".eE") != null) return error.UnexpectedType;
+        if (@typeInfo(T).int.signedness == .unsigned and text[0] == '-') return error.UnexpectedType;
+    }
+    return spelled(T, text);
+}
+
+/// An integer spelled with digits alone and short enough that it cannot
+/// overflow the accumulator: the common case, read without looking for a
+/// fraction or an exponent. `null` hands every other spelling to `spelled`.
+inline fn plain(comptime T: type, text: []const u8) ?T {
+    const bits = @typeInfo(T).int.bits;
+    if (bits == 0 or bits > 64) return null;
+    const negative = text[0] == '-';
+    const digits = text[@intFromBool(negative)..];
+    // Nineteen digits always fit a u64; a twentieth may not.
+    if (digits.len == 0 or digits.len > 20) return null;
+    var magnitude: u64 = 0;
+    for (digits[0..@min(digits.len, 19)]) |byte| {
+        if (byte < '0' or byte > '9') return null;
+        magnitude = magnitude * 10 + (byte - '0');
+    }
+    if (digits.len == 20) {
+        const last = digits[19];
+        if (last < '0' or last > '9') return null;
+        const scaled = @mulWithOverflow(magnitude, 10);
+        if (scaled[1] != 0) return null;
+        const sum = @addWithOverflow(scaled[0], last - '0');
+        if (sum[1] != 0) return null;
+        magnitude = sum[0];
+    }
+    if (@typeInfo(T).int.signedness == .unsigned) {
+        if (negative and magnitude != 0) return null;
+        return std.math.cast(T, magnitude);
+    }
+    if (negative) {
+        if (magnitude > @as(u64, 1) << (bits - 1)) return null;
+        return @intCast(-@as(i65, magnitude)); // safe: the magnitude is at most that of the signed minimum.
+    }
+    return std.math.cast(T, magnitude);
+}
+
+fn spelled(comptime T: type, text: []const u8) core.DecodeError!T {
+    const negative = text[0] == '-';
+    const start = @intFromBool(negative);
+    const exponent_at = std.mem.findAny(u8, text, "eE") orelse text.len;
+    const dot = std.mem.findScalar(u8, text[0..exponent_at], '.');
+    const fraction = if (dot) |at| exponent_at - at - 1 else 0;
+    var exponent: i64 = 0;
+    if (exponent_at != text.len) {
+        exponent = std.fmt.parseInt(i64, text[exponent_at + 1 ..], 10) catch return error.NumberOutOfRange;
+    }
+    const shift = (aegis.int.Checked(i64).init(exponent).sub(std.math.cast(i64, fraction) orelse return error.NumberOutOfRange) catch return error.NumberOutOfRange).raw();
+    const digits = exponent_at - start - @intFromBool(dot != null);
+    var trailing: usize = 0;
+    var at = exponent_at;
+    while (at > start) {
+        at -= 1;
+        if (text[at] == '.') continue;
+        if (text[at] != '0') break;
+        trailing += 1;
+    }
+    if (trailing == digits) return 0;
+    const trim: usize = if (shift < 0) aegis.int.cast(usize, std.math.negate(shift) catch return error.NumberOutOfRange) catch return error.NumberOutOfRange else 0;
+    if (trim > trailing) return error.NumberOutOfRange;
+    const magnitude_type = @Int(.unsigned, @max(@typeInfo(T).int.bits, 4)); // wide enough for the ten each digit is scaled by; the range of `T` is checked at the end
+    var magnitude: magnitude_type = 0;
+    var seen: usize = 0;
+    for (text[start..exponent_at]) |byte| {
+        if (byte == '.') continue;
+        seen += 1;
+        if (seen > digits - trim) break;
+        magnitude = (aegis.int.Checked(magnitude_type).init(magnitude).mul(10) catch return error.NumberOutOfRange).raw();
+        magnitude = (aegis.int.Checked(magnitude_type).init(magnitude).add(std.math.cast(magnitude_type, byte - '0') orelse return error.NumberOutOfRange) catch return error.NumberOutOfRange).raw();
+    }
+    if (shift > 0) {
+        if (shift > @typeInfo(T).int.bits) return error.NumberOutOfRange;
+        var n: i64 = 0;
+        while (n < shift) : (n += 1) magnitude = (aegis.int.Checked(magnitude_type).init(magnitude).mul(10) catch return error.NumberOutOfRange).raw();
+    }
+    if (@typeInfo(T).int.signedness == .unsigned) {
+        if (negative or magnitude > std.math.maxInt(T)) return error.NumberOutOfRange;
+        return @intCast(magnitude); // safe: magnitude checked against T.
+    }
+    if (negative) {
+        const min_magnitude: magnitude_type = @as(magnitude_type, 1) << (@typeInfo(T).int.bits - 1);
+        if (magnitude > min_magnitude) return error.NumberOutOfRange;
+        if (magnitude == min_magnitude) return std.math.minInt(T);
+        return -@as(T, @intCast(magnitude)); // safe: below signed minimum magnitude.
+    }
+    return std.math.cast(T, magnitude) orelse error.NumberOutOfRange;
+}
+pub fn floating(comptime T: type, text: []const u8, exact: bool, c: *core.Context) core.DecodeError!T {
+    try c.chargeWork(text.len);
+    const value = std.fmt.parseFloat(T, text) catch return error.NumberOutOfRange;
+    if (!std.math.isFinite(value)) return error.NumberOutOfRange;
+    if (exact and !try isExact(T, value, text, c)) return error.InexactNumber;
+    return value;
+}
+
+fn isExact(comptime T: type, value: T, text: []const u8, c: *core.Context) core.DecodeError!bool {
+    const Big = std.math.big.int.Managed;
+    const sign = @intFromBool(text[0] == '-');
+    const end = std.mem.findAny(u8, text, "eE") orelse text.len;
+    const dot = std.mem.findScalar(u8, text[0..end], '.');
+    const fraction = if (dot) |at| end - at - 1 else 0;
+    const digits = try c.alloc(u8, end - sign - @intFromBool(dot != null));
+    var n: usize = 0;
+    for (text[sign..end]) |byte| if (byte != '.') {
+        digits[n] = byte;
+        n += 1;
+    };
+    if (std.mem.allEqual(u8, digits, '0')) return value == 0;
+    if (value == 0) return false;
+    const exponent: i64 = if (end == text.len) 0 else std.fmt.parseInt(i64, text[end + 1 ..], 10) catch return false;
+    const scale = (aegis.int.Checked(i64).init(exponent).sub(std.math.cast(i64, fraction) orelse return false) catch return false).raw();
+    const scale_abs = aegis.int.cast(usize, @abs(scale)) catch return false;
+    // A finite IEEE value cannot need more decimal powers than its binary
+    // exponent range plus the supplied coefficient. Refuse before big work.
+    if (scale_abs > std.math.floatExponentMax(T) + text.len + std.math.floatMantissaBits(T)) return false;
+    try c.chargeWork((aegis.int.Checked(usize).init(scale_abs + digits.len).mul(scale_abs + digits.len) catch return error.WorkLimit).raw());
+    const allocator = c.allocator();
+    var decimal = try Big.init(allocator);
+    defer decimal.deinit();
+    decimal.setString(10, digits) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.SyntaxError;
+    const parts = std.math.frexp(@abs(value));
+    const precision = std.math.floatFractionalBits(T) + 1;
+    const mantissa: u128 = @intFromFloat(std.math.ldexp(@as(f128, parts.significand), precision)); // safe: significand is finite and scaled to at most 113 bits.
+    var binary = try Big.initSet(allocator, mantissa);
+    defer binary.deinit();
+    var ten = try Big.initSet(allocator, 10);
+    defer ten.deinit();
+    var power = try Big.init(allocator);
+    defer power.deinit();
+    const power_count = aegis.int.cast(u32, scale_abs) catch return false;
+    try power.pow(&ten, power_count);
+    if (scale >= 0) try decimal.mul(&decimal, &power) else try binary.mul(&binary, &power);
+    const binary_scale = parts.exponent - precision;
+    if (binary_scale >= 0) try binary.shiftLeft(&binary, @intCast(binary_scale)) // safe: nonnegative checked exponent.
+    else try decimal.shiftLeft(&decimal, @intCast(-binary_scale)); // safe: negative exponent magnitude is within IEEE range.
+    return decimal.eqlAbs(binary);
+}
+
+/// A complete numeric lexeme, with no surrounding whitespace or other value.
+pub fn valid(bytes: []const u8) bool {
+    var at: usize = 0;
+    if (bytes.len == 0) return false;
+    if (bytes[at] == '-') at += 1;
+    if (at == bytes.len) return false;
+    if (bytes[at] == '0') at += 1 else {
+        if (bytes[at] < '1' or bytes[at] > '9') return false;
+        while (at < bytes.len and std.ascii.isDigit(bytes[at])) at += 1;
+    }
+    if (at < bytes.len and bytes[at] == '.') {
+        at += 1;
+        const start = at;
+        while (at < bytes.len and std.ascii.isDigit(bytes[at])) at += 1;
+        if (at == start) return false;
+    }
+    if (at < bytes.len and (bytes[at] == 'e' or bytes[at] == 'E')) {
+        at += 1;
+        if (at < bytes.len and (bytes[at] == '+' or bytes[at] == '-')) at += 1;
+        const start = at;
+        while (at < bytes.len and std.ascii.isDigit(bytes[at])) at += 1;
+        if (at == start) return false;
+    }
+    return at == bytes.len;
+}

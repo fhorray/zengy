@@ -1,0 +1,44 @@
+//! Internal work counts, which tests read to hold the hot paths to the work
+//! they claim. The observer belongs to the test that installs it, and each
+//! thread has its own. Outside test builds the calls compile to nothing; a
+//! consumer's own test build pays one thread-local load per call.
+const builtin = @import("builtin");
+
+pub const Counts = struct {
+    scan_bytes: usize = 0,
+    parses: usize = 0,
+    lane_searches: usize = 0,
+    scalar_string_bytes: usize = 0,
+};
+
+threadlocal var observer: ?*Counts = null;
+
+pub fn observe(counts: ?*Counts) void {
+    if (builtin.is_test) observer = counts;
+}
+
+pub inline fn scan(bytes: usize) void {
+    if (builtin.is_test) if (observer) |counts| {
+        counts.scan_bytes += bytes;
+    };
+}
+
+pub inline fn parse() void {
+    if (builtin.is_test) if (observer) |counts| {
+        counts.parses += 1;
+    };
+}
+
+// Finding a lane is separate from asking whether a vector has any hits.
+pub inline fn laneSearch() void {
+    if (builtin.is_test) if (observer) |counts| {
+        counts.lane_searches += 1;
+    };
+}
+
+// String bytes checked individually rather than in a vector.
+pub inline fn scalarString(bytes: usize) void {
+    if (builtin.is_test) if (observer) |counts| {
+        counts.scalar_string_bytes += bytes;
+    };
+}

@@ -1,0 +1,784 @@
+//! The extensions over any `Io`: on std's `Io.Threaded` (the fallbacks),
+//! on the seeded driver (the runtime's native waits, replayed from a
+//! seed), and on real worker threads.
+const builtin = @import("builtin");
+const std = @import("std");
+const current_thread = @import("testing/thread.zig");
+const shakedown = @import("shakedown");
+const testing = std.testing;
+const Io = std.Io;
+const posix = std.posix;
+
+const reactor = @import("reactor.zig");
+const supported = @import("Scheduler.zig").supported;
+const Loop = @import("Loop.zig");
+const Driver = @import("testing/Driver.zig");
+const Threads = @import("testing/Threads.zig");
+const Fake = @import("testing/Fake.zig");
+const op = @import("backend/op.zig");
+
+const is_windows = builtin.os.tag == .windows;
+
+fn skipWithoutFibers() !void {
+    if (!supported) return error.SkipZigTest;
+}
+
+const small: reactor.Runtime.Options = .{ .max_tasks = 256, .stack_size = .fromRaw(256 << 10), .offload = .none };
+
+fn ms(n: i64) Io.Timeout {
+    return .{ .duration = .{ .raw = .fromMilliseconds(n), .clock = .awake } };
+}
+
+/// A pipe's two ends, for a descriptor to wait on.
+fn pipe() ![2]posix.fd_t {
+    return Io.Threaded.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+}
+
+fn closeAll(fds: []const posix.fd_t) void {
+    for (fds) |fd| _ = posix.system.close(fd);
+}
+
+// Waits on std's `Io.Threaded`: the calling thread, through its batch.
+
+test "a wait on Threaded reports the readable member and times out on none" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    const a = try pipe();
+    defer closeAll(&a);
+    const b = try pipe();
+    defer closeAll(&b);
+    try testing.expectError(error.Timeout, reactor.waitAny(io, &.{ .{ .readable = a[0] }, .{ .readable = b[0] } }, ms(20)));
+    _ = posix.system.write(b[1], "x", 1);
+    try testing.expectEqual(@as(usize, 1), try reactor.waitAny(io, &.{ .{ .readable = a[0] }, .{ .readable = b[0] } }, ms(1000)));
+    // A pipe with room is writable at once.
+    try reactor.wait(io, .{ .writable = a[1] }, .none);
+}
+
+fn signalLater(w: *reactor.Wake) void {
+    var threaded: Io.Threaded = .init_single_threaded;
+    threaded.io().sleep(.fromMilliseconds(10), .awake) catch return;
+    w.signal();
+}
+
+test "a Wake set from another thread ends a wait, which clears it" {
+    const io = testing.io;
+    var wake = try reactor.Wake.init(io);
+    defer wake.deinit(io);
+    const thread = try std.Thread.spawn(.{}, signalLater, .{&wake});
+    defer thread.join();
+    try reactor.wait(io, .{ .wake = &wake }, ms(5000));
+    // Cleared by the wait that reported it; a signal while nobody waits is
+    // kept for the next.
+    try testing.expectError(error.Timeout, reactor.wait(io, .{ .wake = &wake }, ms(10)));
+    wake.signal();
+    try reactor.wait(io, .{ .wake = &wake }, .none);
+}
+
+fn waitForever(io: Io, w: *reactor.Wake) reactor.WaitError!void {
+    return reactor.wait(io, .{ .wake = w }, .none);
+}
+
+test "a cancel ends a wait on Threaded" {
+    const io = testing.io;
+    var wake = try reactor.Wake.init(io);
+    defer wake.deinit(io);
+    var waiting = io.concurrent(waitForever, .{ io, &wake }) catch return error.SkipZigTest;
+    try io.sleep(.fromMilliseconds(10), .awake);
+    try testing.expectError(error.Canceled, waiting.cancel(io));
+}
+
+/// A task that computes until its cancel is in, then waits: what a task
+/// looping on a wait whose set is always ready does, once canceled.
+const Late = struct {
+    var go: std.atomic.Value(bool) = .init(false);
+    fn waitReady(io: Io, w: *reactor.Wake) reactor.WaitError!usize {
+        while (!go.load(.acquire)) std.atomic.spinLoopHint();
+        return reactor.waitAny(io, &.{.{ .wake = w }}, .none);
+    }
+    fn nextReady(io: Io, s: *reactor.Signals) reactor.Signals.NextError!reactor.Signals.Signal {
+        while (!go.load(.acquire)) std.atomic.spinLoopHint();
+        return s.next(io, .none);
+    }
+    fn release() void {
+        var threaded: Io.Threaded = .init_single_threaded;
+        threaded.io().sleep(.fromMilliseconds(10), .awake) catch |err| switch (err) {
+            // The cancel stays asked for, at the thread's next cancelation point; the task is let go either way.
+            error.Canceled => threaded.io().recancel(),
+        };
+        go.store(true, .release);
+    }
+};
+
+test "a canceled task's wait is Canceled even when its set is ready, as std's operations are" {
+    const io = testing.io;
+    var wake = try reactor.Wake.init(io);
+    defer wake.deinit(io);
+    wake.signal();
+    Late.go.store(false, .release);
+    var waiting = io.concurrent(Late.waitReady, .{ io, &wake }) catch return error.SkipZigTest;
+    const releaser = try std.Thread.spawn(.{}, Late.release, .{});
+    defer releaser.join();
+    try testing.expectError(error.Canceled, waiting.cancel(io));
+}
+
+test "a canceled task's next signal is Canceled even when one is waiting" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var s = try reactor.Signals.start(io, &.{.user1});
+    defer s.stop(io);
+    try posix.raise(.USR1);
+    // Delivered: the listener holds it before the task asks.
+    try testing.expectEqual(@as(usize, 0), try reactor.waitAny(io, &.{.{ .wake = s.wake() }}, ms(5000)));
+    Late.go.store(false, .release);
+    var asking = io.concurrent(Late.nextReady, .{ io, &s }) catch return error.SkipZigTest;
+    const releaser = try std.Thread.spawn(.{}, Late.release, .{});
+    defer releaser.join();
+    try testing.expectError(error.Canceled, asking.cancel(io));
+}
+
+fn contextSwitches() i64 {
+    const usage = posix.getrusage(posix.rusage.SELF);
+    return @intCast(usage.nvcsw + usage.nivcsw);
+}
+
+test "a blocked wait on Threaded sleeps in one poll, not in slices, and a write ends it" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    const a = try pipe();
+    defer closeAll(&a);
+    const before = contextSwitches();
+    try testing.expectError(error.Timeout, reactor.wait(io, .{ .readable = a[0] }, ms(300)));
+    // Slices of 5 ms would switch about 60 times.
+    try testing.expect(contextSwitches() - before < 20);
+    _ = posix.system.write(a[1], "x", 1);
+    try reactor.wait(io, .{ .readable = a[0] }, .none);
+}
+
+// Processes.
+
+fn spawnSleeper(io: Io, seconds: []const u8) !std.process.Child {
+    return std.process.spawn(io, .{ .argv = &.{ "sleep", seconds }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+}
+
+test "a process is reported once it ends, and is still there to reap" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var child = try spawnSleeper(io, "0.05");
+    var p = try reactor.Process.open(io, child.id.?);
+    defer p.close(io);
+    try reactor.wait(io, .{ .process = &p }, ms(10_000));
+    // Not reaped: the child's own wait collects the status.
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a process still running times out; one that ended before it was opened is ready at once" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var running = try spawnSleeper(io, "5");
+    defer running.kill(io);
+    var p = try reactor.Process.open(io, running.id.?);
+    defer p.close(io);
+    try testing.expectError(error.Timeout, reactor.wait(io, .{ .process = &p }, ms(20)));
+
+    var done = try spawnSleeper(io, "0");
+    // Ended but unreaped: a zombie, which Darwin refuses to watch.
+    while (true) {
+        var q = try reactor.Process.open(io, done.id.?);
+        defer q.close(io);
+        reactor.wait(io, .{ .process = &q }, ms(10)) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => |e| return e,
+        };
+        break;
+    }
+    var q = try reactor.Process.open(io, done.id.?);
+    defer q.close(io);
+    try reactor.wait(io, .{ .process = &q }, .none);
+    _ = try done.wait(io);
+}
+
+const process_sys = @import("sys/process.zig");
+
+const is_bsd = switch (builtin.os.tag) {
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .dragonfly, .freebsd, .netbsd, .openbsd => true,
+    else => false,
+};
+
+/// Ends `child` without reaping it.
+fn endWithoutReaping(child: *const std.process.Child) !void {
+    try posix.kill(child.id.?, .KILL);
+}
+
+test "the ended query looks without waiting: running, then ended, as the wait says" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var child = try spawnSleeper(io, "5");
+    var p = try reactor.Process.open(io, child.id.?);
+    defer p.close(io);
+    try testing.expect(!p.ended());
+    try endWithoutReaping(&child);
+    try reactor.wait(io, .{ .process = &p }, ms(10_000));
+    try testing.expect(p.ended());
+    // Not reaped: asking again says the same, and the child's wait collects it.
+    try testing.expect(p.ended());
+    switch (try child.wait(io)) {
+        .signal => |sig| try testing.expectEqual(posix.SIG.KILL, sig),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "the ended query on a watch that asks, and on one already ended" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var child = try spawnSleeper(io, "5");
+    var asking: reactor.Process = .{ .watch = .asking, .id = child.id.? };
+    try testing.expect(!asking.ended());
+    var gone: reactor.Process = .{ .watch = .ended, .id = child.id.? };
+    try testing.expect(gone.ended());
+    try endWithoutReaping(&child);
+    // The kernel marks the child waitable a moment after the kill.
+    while (!asking.ended()) try io.sleep(.fromMilliseconds(1), .awake);
+    _ = try child.wait(io);
+}
+
+test "a process killed as it starts is watched, never only asked about" {
+    if (!is_bsd) return error.SkipZigTest;
+    const io = testing.io;
+    var refused: usize = 0;
+    // The window is a few milliseconds wide and opens when the kill comes
+    // soon after the exec: about one open in forty meets it.
+    for (0..240) |i| {
+        var child = try spawnSleeper(io, "5");
+        try io.sleep(.fromMilliseconds(1 + @as(i64, @intCast(i % 6))), .awake);
+        try endWithoutReaping(&child);
+        var p = try reactor.Process.open(io, child.id.?);
+        defer p.close(io);
+        if (p.watch == .exiting) refused += 1;
+        try testing.expect(p.watch != .asking);
+        try reactor.wait(io, .{ .process = &p }, ms(10_000));
+        _ = try child.wait(io);
+    }
+    std.debug.print("{d} of 240 opens met a process that was going\n", .{refused});
+}
+
+test "a watch on a process that is going wakes at its end, and not at another child's" {
+    if (!is_bsd) return error.SkipZigTest;
+    const io = testing.io;
+    var watched = try spawnSleeper(io, "5");
+    var p: reactor.Process = .{ .watch = try process_sys.exiting(watched.id.?), .id = watched.id.? };
+    defer p.close(io);
+    try testing.expect(p.watch == .exiting);
+    // Another child ends: its SIGCHLD reaches the watch, which looks on.
+    var other = try spawnSleeper(io, "0");
+    try testing.expectError(error.Timeout, reactor.wait(io, .{ .process = &p }, ms(100)));
+    _ = try other.wait(io);
+    try testing.expect(!p.ended());
+    // Its own end ends the wait; a waiter on a long timeout is not left to a slice.
+    var waiting = try io.concurrent(struct {
+        fn run(i: Io, q: *reactor.Process) reactor.WaitError!void {
+            return reactor.wait(i, .{ .process = q }, ms(10_000));
+        }
+    }.run, .{ io, &p });
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try endWithoutReaping(&watched);
+    try waiting.await(io);
+    try testing.expect(p.ended());
+    _ = try watched.wait(io);
+}
+
+// Signals.
+
+test "a signal reaches every listener that asked for it, and only those" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var first = try reactor.Signals.start(io, &.{ .user1, .user2 });
+    defer first.stop(io);
+    var second = try reactor.Signals.start(io, &.{.user1});
+    defer second.stop(io);
+    try testing.expectError(error.Unsupported, reactor.Signals.start(io, &.{.logoff}));
+    try posix.raise(.USR1);
+    try testing.expectEqual(reactor.Signals.Signal.user1, try first.next(io, ms(5000)));
+    try testing.expectEqual(reactor.Signals.Signal.user1, try second.next(io, ms(5000)));
+    try testing.expectError(error.Timeout, second.next(io, ms(10)));
+    try posix.raise(.USR2);
+    try testing.expectEqual(reactor.Signals.Signal.user2, try first.next(io, ms(5000)));
+    try testing.expectError(error.Timeout, second.next(io, ms(10)));
+}
+
+test "a listener's wake is a member of a wait beside other waitables, and next takes what it reported" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var s = try reactor.Signals.start(io, &.{.user1});
+    defer s.stop(io);
+    var other = try reactor.Wake.init(io);
+    defer other.deinit(io);
+    try testing.expectError(error.Timeout, reactor.waitAny(io, &.{ .{ .wake = &other }, .{ .wake = s.wake() } }, ms(10)));
+    try posix.raise(.USR1);
+    try testing.expectEqual(@as(usize, 1), try reactor.waitAny(io, &.{ .{ .wake = &other }, .{ .wake = s.wake() } }, ms(5000)));
+    try testing.expectEqual(reactor.Signals.Signal.user1, try s.next(io, ms(0)));
+    try testing.expectError(error.Timeout, s.next(io, ms(10)));
+}
+
+test "a wake's handle is readable while it is signaled, until it is cleared" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var w = try reactor.Wake.init(io);
+    defer w.deinit(io);
+    var fds = [_]posix.pollfd{.{ .fd = w.handle(), .events = posix.POLL.IN, .revents = 0 }};
+    try testing.expectEqual(@as(usize, 0), try posix.poll(&fds, 0));
+    w.signal();
+    try testing.expectEqual(@as(usize, 1), try posix.poll(&fds, 0));
+    w.clear();
+    fds[0].revents = 0;
+    try testing.expectEqual(@as(usize, 0), try posix.poll(&fds, 0));
+}
+
+test "the last listener to stop puts the previous handler back" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var before: posix.Sigaction = undefined;
+    posix.sigaction(.USR2, null, &before);
+    var s = try reactor.Signals.start(io, &.{.user2});
+    var during: posix.Sigaction = undefined;
+    posix.sigaction(.USR2, null, &during);
+    try testing.expect(during.handler.handler != before.handler.handler);
+    s.stop(io);
+    var after: posix.Sigaction = undefined;
+    posix.sigaction(.USR2, null, &after);
+    try testing.expectEqual(before.handler.handler, after.handler.handler);
+}
+
+// Blocking calls.
+
+fn triple(x: u32) u32 {
+    return 3 * x;
+}
+
+test "blocking runs the call on the caller under Threaded, and on a lane under a runtime" {
+    try testing.expectEqual(@as(u32, 21), try reactor.blocking(testing.io, .general, triple, .{7}));
+    try skipWithoutFibers();
+    var t: Threads = undefined;
+    try t.init(testing.allocator, .{ .workers = 1, .max_tasks = 64, .stack_size = .fromRaw(256 << 10) });
+    defer t.deinit();
+    const io = t.io();
+    try testing.expectEqual(@as(u32, 42), try reactor.blocking(io, .sync, triple, .{14}));
+    try testing.expectEqual(@as(u64, 0), t.runtime.stats().lanes[@backingInt(reactor.Runtime.Lane.sync)].@"inline");
+}
+
+// The runtime's native waits, on the seeded driver.
+
+/// A script under which readiness never comes: a wait ends only by its
+/// deadline or a cancel.
+fn neverReady(context: ?*anyopaque, o: *op.Op, random: *shakedown.Source) ?op.Result {
+    return switch (o.kind) {
+        .wait => null,
+        else => Fake.defaultScript(context, o, random),
+    };
+}
+
+test "on the driver a wait's members are the loop's own operations: one ready ends it, all come back" {
+    try skipWithoutFibers();
+    if (is_windows) return error.SkipZigTest;
+    for (0..8) |seed| {
+        var d: Driver = undefined;
+        try d.init(testing.allocator, seed, small);
+        defer d.deinit();
+        const io = d.io();
+        var wake = try reactor.Wake.init(io);
+        defer wake.deinit(io);
+        const index = try reactor.waitAny(io, &.{ .{ .readable = 0 }, .{ .writable = 1 }, .{ .wake = &wake } }, .none);
+        try testing.expect(index < 3);
+        // Every operation is back: the loop holds nothing.
+        try testing.expectEqual(@as(u32, 0), d.runtime.core.processors[0].loop.in_flight);
+    }
+}
+
+test "on the driver a wait with nothing ready ends at its deadline, in virtual time" {
+    try skipWithoutFibers();
+    if (is_windows) return error.SkipZigTest;
+    for (0..8) |seed| {
+        var d: Driver = undefined;
+        try d.init(testing.allocator, seed, small);
+        defer d.deinit();
+        d.fake.script = neverReady;
+        const io = d.io();
+        const before = d.elapsed();
+        try testing.expectError(error.Timeout, reactor.waitAny(io, &.{ .{ .readable = 0 }, .{ .readable = 1 } }, ms(250)));
+        const waited = d.elapsed() - before;
+        try testing.expect(waited >= 250 * std.time.ns_per_ms and waited < 251 * std.time.ns_per_ms);
+        try testing.expectEqual(@as(u32, 0), d.runtime.core.processors[0].loop.in_flight);
+    }
+}
+
+fn waitOn(io: Io, fd: posix.fd_t) reactor.WaitError!void {
+    return reactor.wait(io, .{ .readable = fd }, .none);
+}
+
+test "on the driver a cancel ends a native wait, and no operation is left behind" {
+    try skipWithoutFibers();
+    if (is_windows) return error.SkipZigTest;
+    for (0..8) |seed| {
+        var d: Driver = undefined;
+        try d.init(testing.allocator, seed, small);
+        defer d.deinit();
+        d.fake.script = neverReady;
+        const io = d.io();
+        var waiting = try io.concurrent(waitOn, .{ io, 3 });
+        try io.sleep(.fromMilliseconds(1), .awake);
+        try testing.expectError(error.Canceled, waiting.cancel(io));
+        try testing.expectEqual(@as(u32, 0), d.runtime.core.processors[0].loop.in_flight);
+    }
+}
+
+test "on real worker threads a native wait ends at its deadline or its cancel" {
+    try skipWithoutFibers();
+    if (is_windows) return error.SkipZigTest;
+    var t: Threads = undefined;
+    try t.init(testing.allocator, .{ .workers = 2, .max_tasks = 64, .stack_size = .fromRaw(256 << 10) });
+    defer t.deinit();
+    const io = t.io();
+    // The idle fake never makes a descriptor ready.
+    try testing.expectError(error.Timeout, reactor.wait(io, .{ .readable = 0 }, ms(5)));
+    var waiting = try io.concurrent(waitOn, .{ io, 0 });
+    try io.sleep(.fromMilliseconds(2), .awake);
+    try testing.expectError(error.Canceled, waiting.cancel(io));
+}
+
+test "an extension called with another Io counts a fallback; one with a runtime does not" {
+    try skipWithoutFibers();
+    var d: Driver = undefined;
+    try d.init(testing.allocator, 1, small);
+    defer d.deinit();
+    const before = reactor.fallbacks();
+    _ = try reactor.blocking(d.io(), .general, triple, .{1});
+    try testing.expectEqual(before, reactor.fallbacks());
+    _ = try reactor.blocking(testing.io, .general, triple, .{1});
+    try testing.expect(reactor.fallbacks() > before);
+}
+
+// Windows: objects, a job's port, console control events.
+
+extern "kernel32" fn CreateJobObjectW(attributes: ?*anyopaque, name: ?[*:0]const u16) callconv(.winapi) ?std.os.windows.HANDLE;
+
+test "Windows: a Wake and an event wait as objects, and a job with no process has no message" {
+    if (!is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var wake = try reactor.Wake.init(io);
+    defer wake.deinit(io);
+    const win32 = @import("sys/win32.zig");
+    const blocker = win32.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.SystemResources;
+    defer std.os.windows.CloseHandle(blocker);
+    wake.signal();
+    try testing.expectEqual(@as(usize, 1), try reactor.waitAny(io, &.{ .{ .object = blocker }, .{ .wake = &wake } }, ms(1000)));
+    const handle = CreateJobObjectW(null, null) orelse return error.SkipZigTest;
+    defer std.os.windows.CloseHandle(handle);
+    var job = try reactor.Job.attach(io, handle);
+    defer job.detach(io);
+    try testing.expectError(error.AlreadyAttached, reactor.Job.attach(io, handle));
+    try testing.expectError(error.Timeout, job.next(io, ms(20)));
+}
+
+test "Windows: console control events have listeners; the POSIX-only signals are refused" {
+    if (!is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var s = try reactor.Signals.start(io, &.{ .interrupt, .close });
+    defer s.stop(io);
+    try testing.expectError(error.Unsupported, reactor.Signals.start(io, &.{.window_change}));
+    try testing.expectError(error.Timeout, s.next(io, ms(10)));
+}
+
+test "a zero timeout consumes a ready Wake and otherwise times out" {
+    const io = testing.io;
+    var wake = try reactor.Wake.init(io);
+    defer wake.deinit(io);
+    wake.signal();
+    try reactor.wait(io, .{ .wake = &wake }, ms(0));
+    try testing.expectError(error.Timeout, reactor.wait(io, .{ .wake = &wake }, ms(0)));
+}
+
+test "syncLane runs a library's raw call on the sync lane, and on the caller under another Io" {
+    try skipWithoutFibers();
+    const Call = struct {
+        id: std.Thread.Id,
+        pub fn execute(c: *@This()) void {
+            c.id = current_thread.now();
+        }
+        fn fromTask(io: std.Io) !void {
+            var call: @This() = .{ .id = current_thread.now() };
+            try reactor.syncLane(io, &call);
+            try testing.expect(call.id != current_thread.now());
+        }
+    };
+    var t: Threads = undefined;
+    try t.init(testing.allocator, .{ .workers = 0, .max_tasks = 16, .stack_size = .fromRaw(256 << 10) });
+    defer t.deinit();
+    var call: Call = .{ .id = undefined };
+    try reactor.syncLane(t.io(), &call);
+    try testing.expect(call.id != current_thread.now());
+    var task = try t.io().concurrent(Call.fromTask, .{t.io()});
+    try task.await(t.io());
+    try reactor.syncLane(testing.io, &call);
+    try testing.expectEqual(current_thread.now(), call.id);
+}
+
+test "syncLane: a task canceled before its call starts gets Canceled, and the call never runs" {
+    try skipWithoutFibers();
+    const Call = struct {
+        var go: std.atomic.Value(bool) = .init(false);
+        const Mark = struct {
+            ran: *bool,
+            pub fn execute(m: *Mark) void {
+                m.ran.* = true;
+            }
+        };
+        /// Computes until the cancel is in, then calls.
+        fn task(io: std.Io, ran: *bool) std.Io.Cancelable!void {
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            var mark: Mark = .{ .ran = ran };
+            return reactor.syncLane(io, &mark);
+        }
+        fn release() void {
+            std.Io.Threaded.global_single_threaded.io().sleep(.fromMilliseconds(10), .awake) catch unreachable; // unreachable: nothing cancels this plain thread
+            go.store(true, .release);
+        }
+    };
+    var t: Threads = undefined;
+    try t.init(testing.allocator, .{ .workers = 0, .max_tasks = 16, .stack_size = .fromRaw(256 << 10) });
+    defer t.deinit();
+    var ran = false;
+    var future = try t.io().concurrent(Call.task, .{ t.io(), &ran });
+    const releaser = try std.Thread.spawn(.{}, Call.release, .{});
+    defer releaser.join();
+    try testing.expectError(error.Canceled, future.cancel(t.io()));
+    try testing.expect(!ran);
+}
+
+test "job notification storage bounds messages and ignores retired attachments" {
+    if (@bitSizeOf(usize) != 64) return error.SkipZigTest;
+    const Notifications = @import("backend/iocp/Notifications.zig");
+    var table = try Notifications.init(testing.allocator, 1);
+    defer table.deinit(testing.allocator);
+    const record = table.acquire(testing.io).?;
+    const first_key = record.key();
+    try testing.expect(table.acquire(testing.io) == null);
+    for (0..33) |i| try testing.expect(table.dispatch(first_key, i, 6));
+    for (0..32) |i| {
+        const message = try record.next(testing.io, ms(0));
+        try testing.expectEqual(@as(u32, @intCast(i)), message.process);
+    }
+    try testing.expectError(error.SystemResources, record.next(testing.io, ms(0)));
+    try testing.expectError(error.Timeout, record.next(testing.io, ms(0)));
+    record.release();
+    const next_record = table.acquire(testing.io).?;
+    defer next_record.release();
+    try testing.expect(first_key != next_record.key());
+    try testing.expect(table.dispatch(first_key, 99, 6));
+    try testing.expectError(error.Timeout, next_record.next(testing.io, ms(0)));
+    try testing.expect(table.dispatch(next_record.key(), 42, 7));
+    try testing.expectEqual(@as(u32, 42), (try next_record.next(testing.io, ms(0))).process);
+}
+
+test "a zero timeout chooses a ready Wake before an ended process" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var wake = try reactor.Wake.init(io);
+    defer wake.deinit(io);
+    wake.signal();
+    const ended: reactor.Process = .{ .watch = .ended, .id = 0 };
+    try testing.expectEqual(@as(usize, 0), try reactor.waitAny(io, &.{ .{ .wake = &wake }, .{ .process = &ended } }, ms(0)));
+}
+
+test "a reaped operation can alternate kernel and timer requests without reinitialization" {
+    const clocks = @import("clock.zig");
+    const loop_internal = @import("loop/internal.zig");
+    var virtual: clocks.Virtual = .{};
+    var fake = Fake.init(testing.allocator, .{ .seeded = .{ .seed = 71, .virtual = &virtual } });
+    defer fake.deinit();
+    var loop: Loop = undefined;
+    loop_internal.initWith(&loop, .{ .custom = fake.custom() }, .{ .virtual = &virtual }, 8);
+    defer loop.deinit(testing.allocator);
+    var operation: Loop.Op = .{ .backend = .{ .kind = .{ .sync = undefined } } };
+    var reaped: [1]*Loop.Op = undefined;
+    for (0..32) |round| {
+        operation.backend.kind = .{ .sync = undefined };
+        try loop.submit(&operation);
+        // Stand in for bytes a kernel backend leaves in its scratch.
+        @memset(std.mem.asBytes(&operation.backend.state.storage.scratch), 0xa5);
+        var polls: usize = 0;
+        while (loop.in_flight > 0 and polls < 1000) : (polls += 1) _ = try loop.run(.nowait);
+        try testing.expectEqual(@as(usize, 1), loop.reap(&reaped).len);
+        try testing.expectEqual(&operation, reaped[0]);
+        try operation.backend.result.sync;
+        operation.backend.kind = .{ .timer = .{ .clock = .awake, .raw = virtual.now(.awake).addDuration(.fromMilliseconds(1)) } };
+        try loop.submit(&operation);
+        if (round % 2 == 0) {
+            loop.cancel(&operation);
+        } else {
+            virtual.advance(.fromMilliseconds(1));
+            _ = try loop.run(.nowait);
+        }
+        try testing.expectEqual(@as(usize, 1), loop.reap(&reaped).len);
+        if (round % 2 == 0) try testing.expectError(error.Canceled, operation.backend.result.timer) else try operation.backend.result.timer;
+    }
+}
+
+const RefusingOffload = shakedown.Layer(u8, .{ .groupConcurrent = struct {
+    fn refuse(_: ?*anyopaque, _: *Io.Group, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque) void) Io.ConcurrentError!void {
+        return error.ConcurrencyUnavailable;
+    }
+}.refuse });
+
+fn refusedVoid(ran: *bool) void {
+    ran.* = true;
+}
+fn refusedValue(ran: *bool) u32 {
+    ran.* = true;
+    return 7;
+}
+fn refusedNarrow(ran: *bool) error{RawFailure}!u32 {
+    ran.* = true;
+    return error.RawFailure;
+}
+fn voidOffload(io: Io, ran: *bool) anyerror!void {
+    return reactor.blocking(io, .general, refusedVoid, .{ran});
+}
+fn valueOffload(io: Io, ran: *bool) anyerror!u32 {
+    return reactor.blocking(io, .general, refusedValue, .{ran});
+}
+fn narrowOffload(io: Io, ran: *bool) anyerror!u32 {
+    return reactor.blocking(io, .general, refusedNarrow, .{ran});
+}
+fn checkOffloadRefusal(io: Io) !void {
+    var ran = false;
+    try testing.expectError(error.ConcurrencyUnavailable, voidOffload(io, &ran));
+    try testing.expectError(error.ConcurrencyUnavailable, valueOffload(io, &ran));
+    try testing.expectError(error.ConcurrencyUnavailable, narrowOffload(io, &ran));
+    try testing.expect(!ran);
+}
+
+test "r6: refused void value and narrow offloads return an error without running" {
+    try skipWithoutFibers();
+    var refusing: RefusingOffload = .init(testing.io, 0);
+    var t: Threads = undefined;
+    try t.init(testing.allocator, .{ .workers = 0, .max_tasks = 16, .stack_size = .fromRaw(256 << 10), .offload = .{ .injected = .{ .io = refusing.io(), .capacity = 128 } } });
+    defer t.deinit();
+    const io = t.io();
+    try checkOffloadRefusal(io);
+    var task = try io.concurrent(checkOffloadRefusal, .{io});
+    try task.await(io);
+    try testing.expectEqual(@as(u64, 0), t.runtime.stats().lanes[@backingInt(reactor.Runtime.Lane.general)].@"inline");
+}
+
+fn originalOffloadError() error{RawFailure}!void {
+    return error.RawFailure;
+}
+test "r6: fallible offloads preserve user errors and successful void results" {
+    try testing.expectError(error.RawFailure, reactor.blocking(testing.io, .general, originalOffloadError, .{}));
+    var ran = false;
+    try reactor.blocking(testing.io, .general, refusedVoid, .{&ran});
+    try testing.expect(ran);
+    try skipWithoutFibers();
+    var t: Threads = undefined;
+    try t.init(testing.allocator, .{ .workers = 0, .max_tasks = 16, .stack_size = .fromRaw(256 << 10) });
+    defer t.deinit();
+    try testing.expectError(error.RawFailure, reactor.blocking(t.io(), .general, originalOffloadError, .{}));
+    ran = false;
+    try reactor.blocking(t.io(), .general, refusedVoid, .{&ran});
+    try testing.expect(ran);
+}
+
+const OffloadGate = struct {
+    io: Io,
+    begun: Io.Event = .unset,
+    release: Io.Event = .unset,
+    fn wait(gate: *OffloadGate) void {
+        gate.begun.set(gate.io);
+        gate.release.waitUncancelable(gate.io);
+    }
+};
+fn waitOffload(io: Io, gate: *OffloadGate) !void {
+    return reactor.blocking(io, .general, OffloadGate.wait, .{gate});
+}
+test "r6: canceling a queued void offload drains without invoking it" {
+    try skipWithoutFibers();
+    var t: Threads = undefined;
+    try t.init(testing.allocator, .{ .workers = 0, .max_tasks = 16, .stack_size = .fromRaw(256 << 10), .offload = .{ .owned = .{ .general = 1 } } });
+    defer t.deinit();
+    const io = t.io();
+    var gate: OffloadGate = .{ .io = testing.io };
+    var first = try io.concurrent(waitOffload, .{ io, &gate });
+    defer _ = first.cancel(io) catch {};
+    // Drive the first task onto the lane before blocking on test infrastructure.
+    t.runtime.run(.nowait);
+    defer gate.release.set(testing.io);
+    try gate.begun.wait(testing.io);
+    var ran = false;
+    var queued = try io.concurrent(voidOffload, .{ io, &ran });
+    defer _ = queued.cancel(io) catch {};
+    t.runtime.run(.nowait);
+    try testing.expectEqual(@as(u32, 1), t.runtime.stats().lanes[@backingInt(reactor.Runtime.Lane.general)].queued);
+    try testing.expectError(error.Canceled, queued.cancel(io));
+    try testing.expect(!ran);
+    gate.release.set(testing.io);
+    try first.await(io);
+    try testing.expectEqual(@as(u32, 0), t.runtime.stats().lanes[@backingInt(reactor.Runtime.Lane.general)].running);
+}
+
+/// Children that end at once, each waited on and then reaped without
+/// waiting: the wait reports a child only once `waitpid` can take it.
+fn reapableAfterWait(io: Io) !void {
+    for (0..40) |_| {
+        const child = try std.process.spawn(io, .{ .argv = &.{ "sh", "-c", "exit 3" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+        var p = try reactor.Process.open(io, child.id.?);
+        defer p.close(io);
+        try reactor.wait(io, .{ .process = &p }, ms(10_000));
+        try testing.expect(p.ended());
+        try testing.expect(reapNow(child.id.?));
+    }
+}
+
+/// `waitpid` with `WNOHANG`: whether it took `pid`.
+fn reapNow(pid: posix.pid_t) bool {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var status: i32 = 0;
+        const rc = linux.waitpid(pid, &status, linux.W.NOHANG);
+        return linux.errno(rc) == .SUCCESS and rc == pid;
+    }
+    var status: c_int = 0;
+    return std.c.waitpid(pid, &status, std.c.W.NOHANG) == pid;
+}
+
+test "a process wait reports a child once waitpid can reap it, on Threaded and on a runtime" {
+    if (is_windows) return error.SkipZigTest;
+    try reapableAfterWait(testing.io);
+    try skipWithoutFibers();
+    var r: reactor.Runtime = undefined;
+    try r.init(testing.allocator, small);
+    defer r.deinit();
+    try r.start();
+    var task = try r.io().concurrent(reapableAfterWait, .{r.io()});
+    try task.await(r.io());
+}
+
+fn wakeWaits(io: Io) !void {
+    var wake = try reactor.Wake.init(io);
+    defer wake.deinit(io);
+    try testing.expectError(error.Timeout, wake.wait(io, ms(5)));
+    wake.signal();
+    try wake.wait(io, ms(10_000));
+    // The wait cleared it.
+    try testing.expectError(error.Timeout, wake.wait(io, ms(0)));
+}
+
+test "Wake.wait ends at a signal, which it clears, or at its timeout, on Threaded and on a runtime" {
+    try wakeWaits(testing.io);
+    try skipWithoutFibers();
+    var r: reactor.Runtime = undefined;
+    try r.init(testing.allocator, small);
+    defer r.deinit();
+    try r.start();
+    var task = try r.io().concurrent(wakeWaits, .{r.io()});
+    try task.await(r.io());
+}

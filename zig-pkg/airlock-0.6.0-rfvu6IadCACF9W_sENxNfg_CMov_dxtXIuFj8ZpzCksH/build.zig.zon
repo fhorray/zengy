@@ -1,0 +1,34 @@
+.{
+    .name = .airlock,
+    .version = "0.6.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xba8f3100e8eefbad,
+    // What a consumer fetches: the module and its documents. The tests,
+    // benchmarks, examples and CI stay in the repository, behind build.zig's
+    // own-tree guard.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "CHANGELOG.md",
+        "LICENSE",
+        "README.md",
+    },
+    .dependencies = .{
+        .aegis = .{
+            .url = "git+https://github.com/pedronaugusto/aegis#f52eabef3ec6534c3a74bea3a3b7d95a91ce2581",
+            .hash = "aegis-0.2.4-rsxouoquDQApwYDuGdd2YyEeTeNp6CnJoOZKdVCfc3jt",
+        },
+    },
+    .dev_dependencies = .{
+        .shakedown = .{
+            .url = "git+https://github.com/pedronaugusto/shakedown#327bc61dc5cdf6ac93865684847f4451ac3eced9",
+            .hash = "shakedown-0.6.0-BR8U4ztYGwBShgx6F8H8RO6Qq21kxUXUUuzu2J5WG2Ci",
+        },
+
+        .preflight = .{
+            .url = "git+https://github.com/pedronaugusto/preflight?ref=ci-standard#f991816b108a21e4508924e3c220fcc36615aa77",
+            .hash = "preflight-0.18.6-LX1Zwnv-GwCkV_vbReMV3ld3WZ9xyw7vAG1gSja5eupx",
+        },
+    },
+}
