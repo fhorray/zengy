@@ -433,18 +433,18 @@ pub fn build(b: *std.Build) void {
     scripting_lua_mod.addImport("scripting_host", scripting_host_mod);
     scripting_lua_mod.addImport("lua_c", lua_c_mod);
 
-    // PocketPy v2.2.0 (MIT) vendored in third_party/pocketpy: compiled as one C11 unit.
+    // PocketPy v2.2.0 (MIT) vendored inside packages/scripting-python/third_party/pocketpy.
     const pocketpy_c_mod = blk: {
         const translate_pocketpy = b.addTranslateC(.{
             .root_source_file = b.path("packages/scripting-python/src/pocketpy_bundle.h"),
             .target = target,
             .optimize = optimize,
         });
-        translate_pocketpy.addIncludePath(b.path("third_party/pocketpy"));
+        translate_pocketpy.addIncludePath(b.path("packages/scripting-python/third_party/pocketpy"));
         const mod = translate_pocketpy.createModule();
-        mod.addIncludePath(b.path("third_party/pocketpy"));
+        mod.addIncludePath(b.path("packages/scripting-python/third_party/pocketpy"));
         mod.addCSourceFile(.{
-            .file = b.path("third_party/pocketpy/pocketpy.c"),
+            .file = b.path("packages/scripting-python/third_party/pocketpy/pocketpy.c"),
             .flags = &.{ "-std=c11", "-DPK_ENABLE_OS=0" },
         });
         // PocketPy's `socket` module uses Winsock on Windows.

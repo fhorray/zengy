@@ -50,7 +50,7 @@ const OFFICIAL_PACKAGES = [_]OfficialPackageInfo{
     .{ .name = "ui-immediate", .entry = "src/ui_immediate.zig", .summary = "Immediate-mode UI backend" },
     .{ .name = "scripting-host", .entry = "src/scripting_host.zig", .summary = "Language-agnostic scripting host & bridge" },
     .{ .name = "scripting-lua", .entry = "src/scripting_lua.zig", .summary = "Embedded Lua 5.4 runtime" },
-    .{ .name = "scripting-python", .entry = "src/scripting_python.zig", .summary = "Embedded PocketPy (Python) runtime", .third_party = "pocketpy" },
+    .{ .name = "scripting-python", .entry = "src/scripting_python.zig", .summary = "Embedded PocketPy (Python) runtime" },
     .{ .name = "assets", .entry = "src/assets.zig", .summary = "URI-cached asset registry" },
     .{ .name = "editor-shell", .entry = "src/editor_shell.zig", .summary = "Dockable editor shell & undo/redo" },
     .{ .name = "testing", .entry = "src/testing_sdk.zig", .summary = "Deterministic TestDriver & CaptureService" },

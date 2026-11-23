@@ -4,7 +4,7 @@
 //! as an optional `engine.Module` registered with `official.script.host` (`engine.script.host/1`).
 //!
 //! Design:
-//! - PocketPy sources are vendored in `third_party/pocketpy/` and compiled as a single C11 unit.
+//! - PocketPy sources are vendored in `packages/scripting-python/third_party/pocketpy/` and compiled as a single C11 unit.
 //!   No system Python is required on the build or target machine.
 //! - Each `ScriptingHost` runtime owns one PocketPy VM (`py_switchvm`, indices 1..15).
 //!   Scripts of one runtime never see the globals of another.

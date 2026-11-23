@@ -4,7 +4,7 @@ Embedded **PocketPy v2.2.0** (Python subset, MIT) scripting runtime registered w
 
 ## Features
 
-- **Zero external Python install**: PocketPy is vendored in `third_party/pocketpy/` and compiled as a single C11 unit (`-DPK_ENABLE_OS=0` sandboxed).
+- **Zero external Python install**: PocketPy is vendored in `packages/scripting-python/third_party/pocketpy/` and compiled as a single C11 unit (`-DPK_ENABLE_OS=0` sandboxed).
 - **Isolated per-runtime VMs**: Each `ScriptingHost` Python runtime owns an independent PocketPy VM (`py_switchvm`, slots `1..15`).
 - **Bound `engine` module**:
   - `engine.log(msg: str)` → writes to `app.diagnostics`
