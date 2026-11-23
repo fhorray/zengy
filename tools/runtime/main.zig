@@ -22,7 +22,6 @@ const graphics = @import("graphics");
 const graphics_sdlgpu = @import("graphics_sdlgpu");
 const scene = @import("scene");
 const physics = @import("physics");
-const physics_jolt = @import("physics_jolt");
 const ui_core = @import("ui_core");
 const ui_markup = @import("ui_markup");
 const scripting_host = @import("scripting_host");
@@ -148,15 +147,12 @@ fn isSharedLibName(name: []const u8) bool {
         std.mem.endsWith(u8, name, ".dylib");
 }
 
-fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App, manifest_plugins: []const []const u8, has_physics_jolt: bool) !usize {
+fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App, manifest_plugins: []const []const u8) !usize {
     var loaded_count: usize = 0;
 
     // 1. Load explicit shared library paths listed in game.toml
     for (manifest_plugins) |spec| {
         if (isSharedLibName(spec)) {
-            if (has_physics_jolt and std.mem.indexOf(u8, spec, "zigeng_physics_jolt") != null) {
-                continue;
-            }
             const ph = try app.ensurePluginHost();
             const h = try ph.loadSharedLibrary(spec);
             const rc = ph.startPlugin(h);
@@ -176,9 +172,6 @@ fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!isSharedLibName(entry.name)) continue;
-        if (has_physics_jolt and std.mem.indexOf(u8, entry.name, "zigeng_physics_jolt") != null) {
-            continue;
-        }
 
         const full_path = try std.fmt.allocPrint(allocator, ".zigeng/plugins/{s}", .{entry.name});
         defer allocator.free(full_path);
@@ -247,7 +240,6 @@ pub fn main(init: std.process.Init) !void {
 
     var has_scene = false;
     var has_physics = false;
-    var has_physics_jolt = false;
     for (manifest.plugins) |plugin_name| {
         if (std.mem.eql(u8, plugin_name, "scene")) {
             if (!has_scene) {
@@ -259,30 +251,20 @@ pub fn main(init: std.process.Init) !void {
                 try app.registerModule(physics.module());
                 has_physics = true;
             }
-        } else if (std.mem.eql(u8, plugin_name, "physics-jolt")) {
-            if (!has_physics) {
-                try app.registerModule(physics.module());
-                has_physics = true;
-            }
-            if (!has_physics_jolt) {
-                try app.registerModule(physics_jolt.module());
-                has_physics_jolt = true;
-            }
-        } else if (isSharedLibName(plugin_name) or std.mem.indexOfScalar(u8, plugin_name, '/') != null or std.mem.startsWith(u8, plugin_name, "./")) {
-            // External dynamic plugins need the physics contract available if they attach to it.
-            if (!has_physics) {
-                try app.registerModule(physics.module());
-                has_physics = true;
-            }
         } else {
-            std.debug.print("[zigeng-runtime] unknown plugin in game.toml: '{s}'\n", .{plugin_name});
+            // Dynamic plugins (e.g. physics backends, owner/repo, URLs, ./local-path, or shared libs)
+            // are loaded via PluginHost; ensure the physics contract is available if they attach to it.
+            if (!has_physics) {
+                try app.registerModule(physics.module());
+                has_physics = true;
+            }
         }
     }
 
     if (headless) {
         try app.scheduler.addSystem(.{ .name = "runtime.headless_update", .stage = .update, .run = headlessUpdateSystem });
         try app.initialize();
-        const dynamic_loaded = try loadDynamicPlugins(allocator, io, &app, manifest.plugins, has_physics_jolt);
+        const dynamic_loaded = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
 
         const host = app.resources.get(scripting_host.ScriptingHost).?;
         var loaded_script: ?scripting_host.ScriptModuleHandle = null;
@@ -325,7 +307,7 @@ pub fn main(init: std.process.Init) !void {
     try app.scheduler.addSystem(.{ .name = "runtime.render", .stage = .render_extract, .run = runtimeRenderSystem });
 
     try app.initialize();
-    _ = try loadDynamicPlugins(allocator, io, &app, manifest.plugins, has_physics_jolt);
+    _ = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
 
     const i_entry = try app.services.getService("engine.input", 1);
     const input: *window.InputService = @ptrCast(@alignCast(@constCast(i_entry.api_ptr)));

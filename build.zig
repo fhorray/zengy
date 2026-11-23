@@ -812,7 +812,6 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("toml_format", toml_format_mod);
     runtime_mod.addImport("scene", scene_mod);
     runtime_mod.addImport("physics", physics_mod);
-    runtime_mod.addImport("physics_jolt", physics_jolt_mod);
 
     const runtime_exe = b.addExecutable(.{
         .name = "zigeng-runtime",

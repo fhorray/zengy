@@ -98,7 +98,7 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
 
     std.debug.print("Installed official package into ./packages/{s}/\n", .{pkg.name});
     if (pkg.third_party) |tp| {
-        std.debug.print("Installed required dependency into ./third_party/{s}/\n", .{tp});
+        std.debug.print("Installed required dependency into ./packages/{s}/\n", .{tp});
     }
     std.debug.print("\nAdd to your build.zig:\n  const pkg_mod = b.addModule(\"{s}\", .{{\n      .root_source_file = b.path(\"packages/{s}/{s}\"),\n      .target = target,\n      .optimize = optimize,\n  }});\n", .{
         pkg.name,
