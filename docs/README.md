@@ -4,7 +4,11 @@ Welcome to the `zigeng` documentation. This engine is built around a **minimal h
 
 ## Documentation Index
 
-- **API Reference & User Guides**
+- **Guides & Workflows**
+  - [Getting Started](getting-started.md) — setup, first app, and running headless/visual examples
+  - [Releasing, CI/CD & Distribution](releasing.md) — merging to `main`, tagging releases, and `engine-cli` scope
+  - [Package Catalog](../packages/README.md) — all optional packages, including [PocketPy Python](../packages/scripting-python/README.md), [SDL_GPU](../packages/graphics-sdlgpu/README.md), [2D](../packages/render-2d/README.md), and [3D](../packages/render-3d/README.md)
+- **API Reference**
   - [Core App, ECS, Scheduler, Commands, Events & Diagnostics](api/core-app-and-ecs.md)
   - [Modules, Services & Runtime Reflection](api/modules-services-and-reflection.md)
   - [C ABI Extensions & Native Plugins](api/c-abi-extensions.md)
@@ -24,19 +28,25 @@ Welcome to the `zigeng` documentation. This engine is built around a **minimal h
 Requires **Zig `0.17.1`**:
 
 ```bash
-# Run all 12 per-module test suites (Debug)
+# Run all 50 test steps (Debug / ReleaseSafe)
 zig build test --summary all
-
-# Run all tests in ReleaseSafe mode
 zig build test -Doptimize=ReleaseSafe --summary all
 
-# Run the integrated playground (composes all optional packages + C plugin)
+# Headless & integrated playground
+zig build run-headless
 zig build run-playground
 
-# Run the standalone 1,000-entity headless ECS example
-zig build run-headless
-
-# Run the diagnostic CLI
+# Diagnostic CLI
 zig build run-cli
 zig build run-cli -Dcli-cmd=packages
+zig build run-cli -Dcli-cmd=test-scenario
+
+# Visual demos (Windows x64)
+zig build run-visual-hello
+zig build run-visual-gpu
+zig build run-visual-2d
+zig build run-visual-ui
+zig build run-visual-playground
+zig build run-visual-python
+zig build run-visual-3d
 ```

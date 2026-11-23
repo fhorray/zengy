@@ -19,6 +19,22 @@ jobs:
         with:
           version: 0.17.1
       - name: Run unit, integration, and ABI tests
-        run: zig build test -Doptimize=${{ matrix.optimize }}
+        run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
       - name: Run headless ECS example
         run: zig build run-headless -Doptimize=${{ matrix.optimize }}
+      - name: Run engine-cli diagnostics
+        run: |
+          zig build run-cli -Doptimize=${{ matrix.optimize }}
+          zig build run-cli -Dcli-cmd=packages -Doptimize=${{ matrix.optimize }}
+          zig build run-cli -Dcli-cmd=test-scenario -Doptimize=${{ matrix.optimize }}
+
+  windows-cross:
+    name: Cross-Compile Windows x64 Visual & Headless Targets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Build all Windows x64 targets
+        run: zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
