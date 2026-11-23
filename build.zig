@@ -189,6 +189,17 @@ pub fn build(b: *std.Build) void {
     file_watcher_mod.addImport("engine", engine_mod);
     file_watcher_mod.addImport("lookout", lookout_dep.module("lookout"));
 
+    const testing_sdk_mod = b.addModule("testing_sdk", .{
+        .root_source_file = b.path("packages/testing/src/testing_sdk.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    testing_sdk_mod.addImport("engine", engine_mod);
+    testing_sdk_mod.addImport("window", window_mod);
+    testing_sdk_mod.addImport("graphics", graphics_mod);
+    testing_sdk_mod.addImport("ui_core", ui_core_mod);
+    testing_sdk_mod.addImport("toml_format", toml_format_mod);
+
     const render_3d_mod = b.addModule("render_3d", .{
         .root_source_file = b.path("packages/render-3d/src/render_3d.zig"),
         .target = target,
@@ -386,5 +397,13 @@ pub fn build(b: *std.Build) void {
     addModuleTest(b, test_step, "packages/tooling/file-watcher/tests/file_watcher_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "file_watcher", .mod = file_watcher_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/testing/tests/testing_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "testing_sdk", .mod = testing_sdk_mod },
     }, null);
 }
