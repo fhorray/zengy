@@ -52,7 +52,7 @@ jobs:
           TAG="${{ needs.meta.outputs.tag }}"
           STAGE="dist/zigeng-${TAG}-x86_64-windows"
           mkdir -p "$STAGE/include"
-          cp zig-out/bin/*.exe "$STAGE/"
+          cp zig-out/bin/zigeng.exe zig-out/bin/zigeng-runtime.exe "$STAGE/"
           curl -sL "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20-win32-x64.zip" -o /tmp/sdl3.zip
           unzip -j -o /tmp/sdl3.zip "SDL3.dll" -d "$STAGE/"
           cp include/engine_extension.h "$STAGE/include/"
@@ -72,7 +72,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
-      - name: Run tests & build Linux x64 headless/CLI/C-plugin (ReleaseSafe)
+      - name: Run tests & build Linux x64 CLI (ReleaseSafe)
         run: |
           zig build test -Doptimize=ReleaseSafe
           zig build install -Doptimize=ReleaseSafe || true
@@ -80,9 +80,8 @@ jobs:
         run: |
           TAG="${{ needs.meta.outputs.tag }}"
           STAGE="dist/zigeng-${TAG}-x86_64-linux"
-          mkdir -p "$STAGE/include" "$STAGE/lib"
-          cp zig-out/bin/headless-ecs zig-out/bin/zigeng zig-out/bin/playground zig-out/bin/zigeng-bench "$STAGE/" 2>/dev/null || true
-          cp zig-out/lib/* "$STAGE/lib/" 2>/dev/null || true
+          mkdir -p "$STAGE/include"
+          cp zig-out/bin/zigeng "$STAGE/"
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
           tar -czf "dist/zigeng-${TAG}-x86_64-linux.tar.gz" -C dist "zigeng-${TAG}-x86_64-linux"
