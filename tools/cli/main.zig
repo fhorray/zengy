@@ -20,7 +20,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cmd = if (init.args.vector.len > 1) std.mem.span(init.args.vector[1]) else "doctor";
+    var args_it = try init.args.iterateAllocator(allocator);
+    defer args_it.deinit();
+    _ = args_it.next(); // skip executable name
+    const cmd = args_it.next() orelse "doctor";
 
     // Compose a representative application graph to inspect resolution & ABI health.
     var app = engine.App.init(allocator, .{});

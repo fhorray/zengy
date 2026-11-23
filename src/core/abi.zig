@@ -10,9 +10,37 @@
 //! - Rejects stale handles deterministically with `AEStatus.invalid_handle`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const diagnostics_mod = @import("diagnostics.zig");
 const service_mod = @import("service_registry.zig");
 const events_mod = @import("events.zig");
+
+/// Cross-platform dynamic library loader supporting Windows (kernel32) and POSIX (std.DynLib).
+pub const NativeLib = if (builtin.os.tag == .windows) struct {
+    handle: std.os.windows.HMODULE,
+
+    extern "kernel32" fn LoadLibraryA(lpLibFileName: [*:0]const u8) callconv(.winapi) ?std.os.windows.HMODULE;
+    extern "kernel32" fn GetProcAddress(hModule: std.os.windows.HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn FreeLibrary(hLibModule: std.os.windows.HMODULE) callconv(.winapi) std.os.windows.BOOL;
+
+    pub fn open(path: []const u8) !NativeLib {
+        var buf: [4096]u8 = undefined;
+        if (path.len >= buf.len) return error.NameTooLong;
+        @memcpy(buf[0..path.len], path);
+        buf[path.len] = 0;
+        const h = LoadLibraryA(@ptrCast(buf[0..path.len :0])) orelse return error.FileNotFound;
+        return .{ .handle = h };
+    }
+
+    pub fn lookup(self: *NativeLib, comptime T: type, name: [:0]const u8) ?T {
+        const sym = GetProcAddress(self.handle, name.ptr) orelse return null;
+        return @ptrCast(@alignCast(sym));
+    }
+
+    pub fn close(self: *NativeLib) void {
+        _ = FreeLibrary(self.handle);
+    }
+} else std.DynLib;
 
 pub const ABI_MAJOR: u32 = 1;
 pub const ABI_MINOR: u32 = 0;
@@ -82,7 +110,7 @@ pub const LoadedPlugin = struct {
     plugin_id: []const u8,
     owner_id: u64,
     generation: u32,
-    lib: ?std.DynLib,
+    lib: ?NativeLib,
     api: *const AEPluginApi,
     state: ?*anyopaque,
     started: bool,
@@ -191,7 +219,7 @@ pub const PluginHost = struct {
     /// Note: On POSIX/Linux, host binaries loading `libc`-linked C plugins must be
     /// built with `.link_libc = true` so `dlopen` performs full dynamic relocations.
     pub fn loadSharedLibrary(self: *PluginHost, path: []const u8) !PluginHandle {
-        var lib = try std.DynLib.open(path);
+        var lib = try NativeLib.open(path);
         errdefer lib.close();
 
         const entry_fn = lib.lookup(AEPluginEntryFn, "ae_plugin_entry") orelse return error.MissingEntrySymbol;
@@ -199,7 +227,7 @@ pub const PluginHost = struct {
         return self.loadFromApi(api, lib);
     }
 
-    pub fn loadFromApi(self: *PluginHost, api: *const AEPluginApi, lib: ?std.DynLib) !PluginHandle {
+    pub fn loadFromApi(self: *PluginHost, api: *const AEPluginApi, lib: ?NativeLib) !PluginHandle {
         const status = validatePluginApi(api);
         if (status != .ok) return error.UnsupportedAbi;
 

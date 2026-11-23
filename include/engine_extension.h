@@ -92,9 +92,15 @@ typedef struct AEPluginApi {
     void (*unload)(void *state);
 } AEPluginApi;
 
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define AE_EXPORT __declspec(dllexport)
+#else
+#define AE_EXPORT __attribute__((visibility("default")))
+#endif
+
 /** Function signature for the required shared library symbol `ae_plugin_entry`. */
 typedef const AEPluginApi *(*AEPluginEntryFn)(void);
-const AEPluginApi *ae_plugin_entry(void);
+AE_EXPORT const AEPluginApi *ae_plugin_entry(void);
 
 #ifdef __cplusplus
 }

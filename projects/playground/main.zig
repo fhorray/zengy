@@ -61,8 +61,13 @@ pub fn main() !void {
     try app.initialize();
 
     // 2. Load the compiled C11 shared library plugin via the versioned C ABI.
+    const plugin_path = switch (@import("builtin").os.tag) {
+        .windows => "zig-out/bin/c_plugin.dll",
+        .macos => "zig-out/lib/libc_plugin.dylib",
+        else => "zig-out/lib/libc_plugin.so",
+    };
     const plugin_host = try app.ensurePluginHost();
-    const c_plugin_handle = try plugin_host.loadSharedLibrary("zig-out/lib/libc_plugin.so");
+    const c_plugin_handle = try plugin_host.loadSharedLibrary(plugin_path);
     _ = plugin_host.startPlugin(c_plugin_handle);
 
     // 3. Create a window and graphics render target.
