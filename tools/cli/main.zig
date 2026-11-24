@@ -41,6 +41,7 @@ const OFFICIAL_PACKAGES = [_]OfficialPackageInfo{
     .{ .name = "graphics", .entry = "src/graphics.zig", .summary = "Headless graphics device & DrawCommand" },
     .{ .name = "graphics-sdlgpu", .entry = "src/graphics_sdlgpu.zig", .summary = "SDL_GPU (Vulkan/SPIR-V) 2D/3D backend", .third_party = "sdl3" },
     .{ .name = "scene", .entry = "src/scene.zig", .summary = "2D transform hierarchy & SceneSnapshot" },
+    .{ .name = "prefab", .entry = "src/prefab.zig", .summary = "Portable prefab IR, overrides & atomic batch instantiation" },
     .{ .name = "physics", .entry = "src/physics.zig", .summary = "Agnostic ECS physics contract & PhysicsBackendVTable" },
     .{ .name = "physics-jolt", .entry = "src/physics_jolt.zig", .summary = "JoltPhysics v5.7.0 3D solver backend" },
     .{ .name = "physics-rapier", .entry = "src/physics_rapier.zig", .summary = "Rapier3D (Rust) solver backend (requires cargo/rustc)" },

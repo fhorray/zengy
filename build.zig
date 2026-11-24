@@ -139,6 +139,13 @@ pub fn build(b: *std.Build) void {
     });
     scene_mod.addImport("engine", engine_mod);
 
+    const prefab_mod = b.addModule("prefab", .{
+        .root_source_file = b.path("packages/prefab/src/prefab.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prefab_mod.addImport("engine", engine_mod);
+
     const physics_mod = b.addModule("physics", .{
         .root_source_file = b.path("packages/physics/core/src/physics.zig"),
         .target = target,
@@ -818,6 +825,11 @@ pub fn build(b: *std.Build) void {
     addModuleTest(b, test_step, "packages/assets/tests/assets_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "assets", .mod = assets_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/prefab/tests/prefab_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "prefab", .mod = prefab_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/scene/tests/scene_tests.zig", target, optimize, false, &.{

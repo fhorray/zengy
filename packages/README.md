@@ -17,7 +17,7 @@ Related packages are grouped by category; the public package name used by `zengy
 | `scripting/` | `host`, `lua`, `python` |
 | `render/` | `2d`, `3d`, `text` |
 | `formats/`, `tooling/` | format adapters and file watcher |
-| flat | `assets`, `scene`, `editor-shell`, `testing`, `default-plugins`, `sdl3` (third-party SDK) |
+| flat | `assets`, `scene`, `prefab`, `editor-shell`, `testing`, `default-plugins`, `sdl3` (third-party SDK) |
 
 ## Package Catalog
 
@@ -36,6 +36,7 @@ Related packages are grouped by category; the public package name used by `zengy
 | [`scripting/python/`](scripting/python/src/scripting_python.zig) | `official.script.python` | `engine.script.runtime.python/1` | **PocketPy v2.2.0** (Python subset, vendored in `packages/scripting/python/third_party/pocketpy`) runtime, one VM per `ScriptingHost` runtime, registered with `ScriptingHost`. |
 | [`assets/`](assets/src/assets.zig) | `official.assets` | `engine.assets/1` | URI-cached asset registry, priority-ordered importers, and owner-scoped unload. |
 | [`scene/`](scene/src/scene.zig) | `official.scene` | `engine.scene.2d/1` | 2D transform hierarchy (`Transform2D`, `Parent`), O(N) `.post_update` propagation, scene graph v1 (`scene.graph`: child lists, `reparent`, despawn policies), and `SceneSnapshot`. |
+| [`prefab/`](prefab/src/prefab.zig) | `official.prefab` | `engine.prefab/1` | Portable `Prefab` entity trees (stable type ids, versioned encoded components), field overrides, atomic batch `instantiate`, and a `PrefabLibrary` resource. |
 | [`editor-shell/`](editor-shell/src/editor_shell.zig) | `official.tools.editor_shell` | `engine.tools.editor_shell/1` | Optional dockable panel registry, schema-driven inspector, and transactional undo/redo. |
 | [`render/3d/`](render/3d/src/render_3d.zig) | `official.render.3d` | `engine.render.3d/1` | 3D transform/camera/mesh components and `.render_extract` draw extraction. |
 | [`formats/toml/`](formats/toml/src/toml_format.zig) | `official.format.toml` | `engine.format.toml/1` | TOML v1.1.0 adapter over `z-toml` for manifests and test scenarios. |
