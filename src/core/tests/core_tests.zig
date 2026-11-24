@@ -1111,3 +1111,36 @@ test "Schema v2: stable ids, portable encoding, and migration chain" {
     std.mem.writeInt(u128, bad[0..16], 12345, .little);
     try testing.expectError(error.UnknownSchema, reg.decodeComponent(testing.allocator, bad));
 }
+
+test "Scheduler.parallelBatches groups only conflict-free, unordered systems" {
+    var sched = engine.scheduler.Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    const noop = struct {
+        fn run(_: *engine.SystemContext) !void {}
+    }.run;
+    try sched.addSystem(.{ .name = "physics", .run = noop, .writes = &.{"Transform"} });
+    try sched.addSystem(.{ .name = "ai", .run = noop, .writes = &.{"Brain"}, .reads = &.{"Config"} });
+    try sched.addSystem(.{ .name = "audio", .run = noop, .reads = &.{"Config"} });
+    try sched.addSystem(.{ .name = "render_prep", .run = noop, .reads = &.{"Transform"} }); // reads what physics writes
+    try sched.addSystem(.{ .name = "cleanup", .run = noop, .exclusive = true });
+    try sched.addSystem(.{ .name = "ui", .run = noop, .after = &.{"cleanup"}, .reads = &.{"Ui"} });
+
+    var plan = try sched.parallelBatches(.update);
+    defer plan.deinit();
+    // [physics, ai, audio] are independent; render_prep conflicts with physics; cleanup is exclusive;
+    // ui is ordered after cleanup.
+    try testing.expectEqual(@as(usize, 4), plan.batchCount());
+    try testing.expectEqual(@as(usize, 3), plan.batch(0).len);
+    try testing.expectEqual(@as(usize, 1), plan.batch(1).len);
+    try testing.expectEqual(@as(usize, 1), plan.batch(2).len);
+    try testing.expectEqual(@as(usize, 1), plan.batch(3).len);
+    // Flattening the batches reproduces the serial order exactly.
+    var flat: usize = 0;
+    for (0..plan.batchCount()) |b| {
+        for (plan.batch(b)) |idx| {
+            try testing.expectEqual(plan.order[flat], idx);
+            flat += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 6), flat);
+}

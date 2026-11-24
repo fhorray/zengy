@@ -324,6 +324,86 @@ pub const Scheduler = struct {
         return false;
     }
 
+    /// Execution order of a stage grouped into batches whose members have no read/write conflicts
+    /// and no ordering edges between them, so each batch could run concurrently and still produce
+    /// the serial result. Batches are contiguous slices of the serial order, which keeps serial
+    /// execution a valid fallback. See `parallelBatches`.
+    pub const BatchPlan = struct {
+        allocator: std.mem.Allocator,
+        /// System indices in serial execution order.
+        order: []usize,
+        /// Exclusive end offset of each batch within `order`.
+        batch_ends: []usize,
+
+        pub fn deinit(self: *BatchPlan) void {
+            self.allocator.free(self.order);
+            self.allocator.free(self.batch_ends);
+        }
+
+        pub fn batchCount(self: *const BatchPlan) usize {
+            return self.batch_ends.len;
+        }
+
+        /// System indices (into the stage's system list) of batch `i`.
+        pub fn batch(self: *const BatchPlan, i: usize) []const usize {
+            const start = if (i == 0) 0 else self.batch_ends[i - 1];
+            return self.order[start..self.batch_ends[i]];
+        }
+    };
+
+    fn asDescriptor(sys: StoredSystem) SystemDescriptor {
+        return .{
+            .name = sys.name,
+            .stage = sys.stage,
+            .run = sys.run,
+            .reads = sys.reads,
+            .writes = sys.writes,
+            .before = sys.before,
+            .after = sys.after,
+            .exclusive = sys.exclusive,
+            .thread_affinity = sys.thread_affinity,
+        };
+    }
+
+    fn hasOrderEdge(a: StoredSystem, b: StoredSystem) bool {
+        for (a.before) |n| if (std.mem.eql(u8, n, b.name)) return true;
+        for (b.after) |n| if (std.mem.eql(u8, n, a.name)) return true;
+        for (b.before) |n| if (std.mem.eql(u8, n, a.name)) return true;
+        for (a.after) |n| if (std.mem.eql(u8, n, b.name)) return true;
+        return false;
+    }
+
+    /// Plans safe concurrency for `stage` (building the schedule first if needed). This is analysis
+    /// only: `runStage` still executes serially until a worker pool consumes the plan.
+    pub fn parallelBatches(self: *Scheduler, stage: Stage) !BatchPlan {
+        const s_idx = @intFromEnum(stage);
+        if (self.dirty[s_idx]) try self.buildStageSchedule(stage);
+        const systems = self.stages[s_idx].items;
+        const order = try self.allocator.dupe(usize, self.execution_order[s_idx].items);
+        errdefer self.allocator.free(order);
+        var ends: std.ArrayList(usize) = .empty;
+        errdefer ends.deinit(self.allocator);
+
+        var batch_start: usize = 0;
+        for (order, 0..) |sys_idx, pos| {
+            var fits = true;
+            for (order[batch_start..pos]) |member| {
+                if (hasWriteConflict(asDescriptor(systems[member]), asDescriptor(systems[sys_idx])) or
+                    hasOrderEdge(systems[member], systems[sys_idx]))
+                {
+                    fits = false;
+                    break;
+                }
+            }
+            if (!fits) {
+                try ends.append(self.allocator, pos);
+                batch_start = pos;
+            }
+        }
+        if (order.len > 0) try ends.append(self.allocator, order.len);
+        return .{ .allocator = self.allocator, .order = order, .batch_ends = try ends.toOwnedSlice(self.allocator) };
+    }
+
     /// Snapshot of per-stage system counts, used to roll back systems added by a failed module.
     pub const Checkpoint = [Stage.count]usize;
 
