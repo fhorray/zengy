@@ -184,16 +184,16 @@ pub fn main(init: std.process.Init) !void {
         defer cw.deinit();
         var ev = engine.EventBus.init(allocator, 8, .drop_newest);
         defer ev.deinit();
-        var cmds = engine.CommandBuffer.init(allocator);
-        defer cmds.deinit();
+        var cb = engine.CommandBuffer.init(allocator);
+        defer cb.deinit();
         const n = 10_000;
         for (0..n) |_| {
-            const e = try cmds.spawn();
-            try cmds.set(e, Position, .{});
-            try cmds.set(e, Velocity, .{});
+            const e = try cb.spawn();
+            try cb.set(e, Position, .{});
+            try cb.set(e, Velocity, .{});
         }
         const t0 = std.Io.Clock.now(.awake, io);
-        try cmds.apply(&cw, &ev);
+        try cb.apply(&cw, &ev);
         const apply_ns = elapsedNs(io, t0);
         std.debug.print("9. CommandBuffer.apply ({d} spawn+2set): {d:.1} ns/entity\n", .{ n, @as(f64, @floatFromInt(apply_ns)) / @as(f64, n) });
 
