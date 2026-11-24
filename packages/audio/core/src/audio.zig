@@ -56,6 +56,11 @@ pub const AudioPlayer = struct {
     position: [3]f32 = .{ 0, 0, 0 },
     auto_play: bool = true,
     active_playback: ?AudioPlaybackHandle = null,
+    applied_source: AudioSourceHandle = .invalid,
+    applied_volume: f32 = -1.0,
+    applied_paused: bool = false,
+    applied_speed: f32 = -1.0,
+    applied_pan: f32 = -2.0,
 };
 
 /// ECS component marking the active listener position and right vector for spatial audio.
@@ -332,13 +337,28 @@ fn audioUpdateSystem(ctx: *engine.SystemContext) !void {
             .{ .gain = 1.0, .pan = 0.0 };
         const spatial_scale = spatial.gain * listener_gain;
 
+        if (p.active_playback) |pb| {
+            if (p.source != p.applied_source) {
+                svc.stop(pb);
+                p.active_playback = null;
+            }
+        }
+
+        const eff_vol = p.settings.volume * spatial_scale;
         if (p.active_playback == null and p.auto_play) {
             var eff = p.settings;
-            eff.volume *= spatial_scale;
+            eff.volume = eff_vol;
             if (svc.play(p.source, eff)) |pb| {
                 p.active_playback = pb;
+                p.applied_source = p.source;
+                p.applied_volume = eff_vol;
+                p.applied_paused = p.settings.paused;
+                p.applied_speed = p.settings.speed;
+                p.applied_pan = if (p.settings.spatial) spatial.pan else 0.0;
                 if (p.settings.spatial) svc.setPan(pb, spatial.pan);
-            } else |_| {}
+            } else |err| {
+                std.log.warn("audio: failed to start playback: {s}", .{@errorName(err)});
+            }
             continue;
         }
 
@@ -346,6 +366,7 @@ fn audioUpdateSystem(ctx: *engine.SystemContext) !void {
             if (svc.isFinished(pb)) {
                 svc.stop(pb);
                 p.active_playback = null;
+                p.applied_source = .invalid;
                 switch (p.settings.mode) {
                     .once => p.auto_play = false,
                     .loop => {},
@@ -353,10 +374,22 @@ fn audioUpdateSystem(ctx: *engine.SystemContext) !void {
                     .remove_component => try ctx.commands.remove(row.entity, AudioPlayer),
                 }
             } else {
-                svc.setVolume(pb, p.settings.volume * spatial_scale);
-                svc.setPaused(pb, p.settings.paused);
-                svc.setSpeed(pb, p.settings.speed);
-                if (p.settings.spatial) svc.setPan(pb, spatial.pan);
+                if (@abs(eff_vol - p.applied_volume) > 1e-4) {
+                    svc.setVolume(pb, eff_vol);
+                    p.applied_volume = eff_vol;
+                }
+                if (p.settings.paused != p.applied_paused) {
+                    svc.setPaused(pb, p.settings.paused);
+                    p.applied_paused = p.settings.paused;
+                }
+                if (@abs(p.settings.speed - p.applied_speed) > 1e-4) {
+                    svc.setSpeed(pb, p.settings.speed);
+                    p.applied_speed = p.settings.speed;
+                }
+                if (p.settings.spatial and @abs(spatial.pan - p.applied_pan) > 1e-3) {
+                    svc.setPan(pb, spatial.pan);
+                    p.applied_pan = spatial.pan;
+                }
             }
         }
     }

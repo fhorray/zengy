@@ -38,6 +38,7 @@ const BRDF_LUT_SIZE: u32 = 128;
 
 const PbrVertUniforms = extern struct {
     model: [16]f32,
+    normal_matrix: [16]f32,
     mvp: [16]f32,
     light_vp: [4][16]f32,
 };
@@ -182,6 +183,8 @@ pub const PbrGpuState = struct {
     diag: *engine.Diagnostics,
 
     pbr_pipeline: *c.SDL_GPUGraphicsPipeline,
+    pbr_double_sided_pipeline: *c.SDL_GPUGraphicsPipeline,
+    pbr_blend_pipeline: *c.SDL_GPUGraphicsPipeline,
     sky_pipeline: *c.SDL_GPUGraphicsPipeline,
     shadow_pipeline: *c.SDL_GPUGraphicsPipeline,
     ssao_pipeline: *c.SDL_GPUGraphicsPipeline,
@@ -214,8 +217,15 @@ pub const PbrGpuState = struct {
     sky_sh: ibl.SkyDiffuseSH = .{},
     ibl_initialized: bool = false,
     last_sun_dir: [3]f32 = .{ 0, 0, 0 },
+    last_sun_col: [3]f32 = .{ 0, 0, 0 },
+    last_sun_int: f32 = -1.0,
     last_sky_kind: pbr.SkyboxKind = .procedural,
-    last_sky_energy: f32 = -1.0,
+    last_sky_tint: [3]f32 = .{ 0, 0, 0 },
+    last_horizon_tint: [3]f32 = .{ 0, 0, 0 },
+    last_ground_albedo: [3]f32 = .{ 0, 0, 0 },
+    last_solid_color: [3]f32 = .{ 0, 0, 0 },
+    last_atmo_thick: f32 = -1.0,
+    last_hdri_ev: f32 = 0.0,
 
     hdr_texture: ?*c.SDL_GPUTexture = null,
     ssao_texture: ?*c.SDL_GPUTexture = null,
@@ -247,10 +257,14 @@ pub const PbrGpuState = struct {
 
         const pbr_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, PBR_VERT_SPV, 0, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_vs);
-        const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 8, 4, 1);
+        const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 10, 4, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_fs);
-        const pbr_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format);
+        const pbr_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_pipe);
+        const pbr_ds_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, false);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_ds_pipe);
+        const pbr_blend_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_blend_pipe);
 
         const sky_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, SKY_VERT_SPV, 0, 0);
         defer c.SDL_ReleaseGPUShader(device, sky_vs);
@@ -271,7 +285,7 @@ pub const PbrGpuState = struct {
         const ssao_pipe = try createFullscreenPipeline(device, sky_vs, ssao_fs, ao_format, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, ssao_pipe);
 
-        const ssao_blur_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, SSAO_BLUR_SPV, 1, 0);
+        const ssao_blur_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, SSAO_BLUR_SPV, 2, 0);
         defer c.SDL_ReleaseGPUShader(device, ssao_blur_fs);
         const ssao_blur_pipe = try createFullscreenPipeline(device, sky_vs, ssao_blur_fs, ao_format, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, ssao_blur_pipe);
@@ -419,6 +433,8 @@ pub const PbrGpuState = struct {
             .device = device,
             .diag = diag,
             .pbr_pipeline = pbr_pipe,
+            .pbr_double_sided_pipeline = pbr_ds_pipe,
+            .pbr_blend_pipeline = pbr_blend_pipe,
             .sky_pipeline = sky_pipe,
             .shadow_pipeline = sh_pipe,
             .ssao_pipeline = ssao_pipe,
@@ -487,6 +503,8 @@ pub const PbrGpuState = struct {
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.ssao_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.shadow_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.sky_pipeline);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pbr_blend_pipeline);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pbr_double_sided_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pbr_pipeline);
     }
 
@@ -553,8 +571,7 @@ pub const PbrGpuState = struct {
 
     fn ensureHdrTargets(self: *PbrGpuState, w: u32, h: u32) !void {
         if (self.hdr_texture == null or self.hdr_w != w or self.hdr_h != h) {
-            if (self.hdr_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
-            self.hdr_texture = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+            const new_hdr = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
                 .type = c.SDL_GPU_TEXTURETYPE_2D,
                 .format = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
                 .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
@@ -563,13 +580,11 @@ pub const PbrGpuState = struct {
                 .layer_count_or_depth = 1,
                 .num_levels = 1,
             })) orelse return error.SdlGpuFailure;
-            self.hdr_w = w;
-            self.hdr_h = h;
+            errdefer c.SDL_ReleaseGPUTexture(self.device, new_hdr);
 
             const ao_w = @max(w / 2, 1);
             const ao_h = @max(h / 2, 1);
-            if (self.ssao_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
-            self.ssao_texture = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+            const new_ssao = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
                 .type = c.SDL_GPU_TEXTURETYPE_2D,
                 .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
                 .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
@@ -578,9 +593,9 @@ pub const PbrGpuState = struct {
                 .layer_count_or_depth = 1,
                 .num_levels = 1,
             })) orelse return error.SdlGpuFailure;
+            errdefer c.SDL_ReleaseGPUTexture(self.device, new_ssao);
 
-            if (self.ssao_blur_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
-            self.ssao_blur_texture = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+            const new_ssao_blur = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
                 .type = c.SDL_GPU_TEXTURETYPE_2D,
                 .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
                 .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
@@ -589,12 +604,15 @@ pub const PbrGpuState = struct {
                 .layer_count_or_depth = 1,
                 .num_levels = 1,
             })) orelse return error.SdlGpuFailure;
+            errdefer c.SDL_ReleaseGPUTexture(self.device, new_ssao_blur);
 
+            var new_blooms: [BLOOM_MIPS]?*c.SDL_GPUTexture = @splat(null);
+            var new_sizes: [BLOOM_MIPS][2]u32 = undefined;
+            errdefer for (new_blooms) |bt| if (bt) |t| c.SDL_ReleaseGPUTexture(self.device, t);
             var mw = @max(w / 2, 1);
             var mh = @max(h / 2, 1);
             for (0..BLOOM_MIPS) |i| {
-                if (self.bloom_textures[i]) |t| c.SDL_ReleaseGPUTexture(self.device, t);
-                self.bloom_textures[i] = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+                new_blooms[i] = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
                     .type = c.SDL_GPU_TEXTURETYPE_2D,
                     .format = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
                     .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
@@ -603,10 +621,23 @@ pub const PbrGpuState = struct {
                     .layer_count_or_depth = 1,
                     .num_levels = 1,
                 })) orelse return error.SdlGpuFailure;
-                self.bloom_sizes[i] = .{ mw, mh };
+                new_sizes[i] = .{ mw, mh };
                 mw = @max(mw / 2, 1);
                 mh = @max(mh / 2, 1);
             }
+
+            if (self.hdr_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+            if (self.ssao_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+            if (self.ssao_blur_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+            for (self.bloom_textures) |bt| if (bt) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+
+            self.hdr_texture = new_hdr;
+            self.hdr_w = w;
+            self.hdr_h = h;
+            self.ssao_texture = new_ssao;
+            self.ssao_blur_texture = new_ssao_blur;
+            self.bloom_textures = new_blooms;
+            self.bloom_sizes = new_sizes;
         }
     }
 
@@ -646,14 +677,33 @@ pub const PbrGpuState = struct {
             1.0;
 
         // 0. Rebuild equirectangular IBL + SH9 when sun, sky, or HDRI changes
-        const hdri_ptr: usize = if (self.frame_data.sky.hdri_pixels) |px| @intFromPtr(px.ptr) else 0;
-        const sky_energy = self.frame_data.sky.sky_tint[1] + self.frame_data.sky.horizon_tint[1] + sun_int;
+        const sky_cfg = self.frame_data.sky;
+        const hdri_ptr: usize = if (sky_cfg.hdri_pixels) |px| @intFromPtr(px.ptr) else 0;
         const dsun = @abs(sun_dir[0] - self.last_sun_dir[0]) + @abs(sun_dir[1] - self.last_sun_dir[1]) + @abs(sun_dir[2] - self.last_sun_dir[2]);
-        if (!self.ibl_initialized or dsun > 0.02 or self.last_sky_kind != self.frame_data.sky.kind or @abs(sky_energy - self.last_sky_energy) > 0.02 or hdri_ptr != self.last_hdri_ptr) {
+        const sky_changed = !self.ibl_initialized or
+            dsun > 0.02 or
+            self.last_sky_kind != sky_cfg.kind or
+            !std.mem.eql(f32, &self.last_sky_tint, &sky_cfg.sky_tint) or
+            !std.mem.eql(f32, &self.last_horizon_tint, &sky_cfg.horizon_tint) or
+            !std.mem.eql(f32, &self.last_ground_albedo, &sky_cfg.ground_albedo) or
+            !std.mem.eql(f32, &self.last_solid_color, &sky_cfg.solid_color) or
+            self.last_atmo_thick != sky_cfg.atmosphere_thickness or
+            self.last_hdri_ev != sky_cfg.hdri_exposure_ev or
+            !std.mem.eql(f32, &self.last_sun_col, &sun_col) or
+            @abs(sun_int - self.last_sun_int) > 0.02 or
+            hdri_ptr != self.last_hdri_ptr;
+        if (sky_changed) {
             try self.updateEnvIbl(sun_dir, sun_col, sun_int);
             self.last_sun_dir = sun_dir;
-            self.last_sky_kind = self.frame_data.sky.kind;
-            self.last_sky_energy = sky_energy;
+            self.last_sun_col = sun_col;
+            self.last_sun_int = sun_int;
+            self.last_sky_kind = sky_cfg.kind;
+            self.last_sky_tint = sky_cfg.sky_tint;
+            self.last_horizon_tint = sky_cfg.horizon_tint;
+            self.last_ground_albedo = sky_cfg.ground_albedo;
+            self.last_solid_color = sky_cfg.solid_color;
+            self.last_atmo_thick = sky_cfg.atmosphere_thickness;
+            self.last_hdri_ev = sky_cfg.hdri_exposure_ev;
             self.last_hdri_ptr = hdri_ptr;
             self.ibl_initialized = true;
         }
@@ -689,7 +739,8 @@ pub const PbrGpuState = struct {
             const half_w: f32 = @floatFromInt(SHADOW_W / 2);
             const half_h: f32 = @floatFromInt(SHADOW_H / 2);
             var prev_b: f32 = dl.minimum_distance;
-            for (0..4) |ci| {
+            const active_cascades: usize = @min(dl.cascade_count, 4);
+            for (0..active_cascades) |ci| {
                 const far_b = cascade_splits[ci];
                 const center_d = (prev_b + far_b) * 0.5;
                 const center = math3d.Vec3{
@@ -868,6 +919,11 @@ pub const PbrGpuState = struct {
             self.frame_data.rect_lights[0..rc_count],
         );
         defer built_clusters.deinit(self.allocator);
+        if (built_clusters.dropped_refs > 0) {
+            var msg_buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "cluster index budget exceeded: dropped {d} light refs", .{built_clusters.dropped_refs}) catch "cluster index budget exceeded";
+            self.diag.log(.warn, "graphics-sdlgpu", msg) catch {};
+        }
 
         // Batch all 4 SSBO uploads into a single persistent transfer buffer and copy pass.
         {
@@ -961,8 +1017,11 @@ pub const PbrGpuState = struct {
             const blur_pass = c.SDL_BeginGPURenderPass(cmd_buf, &blur_col, 1, null) orelse return error.SdlGpuFailure;
             c.SDL_SetGPUViewport(blur_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(ao_w), .h = @floatFromInt(ao_h), .min_depth = 0, .max_depth = 1 });
             c.SDL_BindGPUGraphicsPipeline(blur_pass, self.ssao_blur_pipeline);
-            const blur_samplers = [_]c.SDL_GPUTextureSamplerBinding{.{ .texture = self.ssao_texture.?, .sampler = linear_sampler }};
-            c.SDL_BindGPUFragmentSamplers(blur_pass, 0, &blur_samplers, 1);
+            const blur_samplers = [_]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = self.ssao_texture.?, .sampler = linear_sampler },
+                .{ .texture = depth_tex, .sampler = nearest_sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(blur_pass, 0, &blur_samplers, blur_samplers.len);
             c.SDL_DrawGPUPrimitives(blur_pass, 3, 1, 0, 0);
             c.SDL_EndGPURenderPass(blur_pass);
         }
@@ -1070,18 +1129,32 @@ pub const PbrGpuState = struct {
             };
             c.SDL_BindGPUFragmentStorageBuffers(pbr_pass, 0, &pbr_ssbos, pbr_ssbos.len);
 
+            var active_pipe: ?*c.SDL_GPUGraphicsPipeline = null;
             for (self.queued_draws.items) |qm| {
                 const gm = meshes.get(@bitCast(qm.mesh_asset)) orelse continue;
                 const mat = qm.material;
+                const want_pipe: *c.SDL_GPUGraphicsPipeline = if (mat.alpha_mode == .blend)
+                    self.pbr_blend_pipeline
+                else if (mat.double_sided)
+                    self.pbr_double_sided_pipeline
+                else
+                    self.pbr_pipeline;
+                if (active_pipe != want_pipe) {
+                    c.SDL_BindGPUGraphicsPipeline(pbr_pass, want_pipe);
+                    active_pipe = want_pipe;
+                }
                 const base_t = if (mat.base_color_tex != 0) (textures.get(@bitCast(mat.base_color_tex)) orelse white_tex) else white_tex;
                 const norm_t = if (mat.normal_tex != 0) (textures.get(@bitCast(mat.normal_tex)) orelse self.flat_normal_texture) else self.flat_normal_texture;
                 const mr_t = if (mat.metallic_roughness_tex != 0) (textures.get(@bitCast(mat.metallic_roughness_tex)) orelse white_tex) else white_tex;
+                const ao_t = if (mat.ao_tex != 0) (textures.get(@bitCast(mat.ao_tex)) orelse white_tex) else white_tex;
+                const em_t = if (mat.emissive_tex != 0) (textures.get(@bitCast(mat.emissive_tex)) orelse white_tex) else white_tex;
 
                 c.SDL_BindGPUVertexBuffers(pbr_pass, 0, &.{ .buffer = gm.vertex_buffer, .offset = 0 }, 1);
                 c.SDL_BindGPUIndexBuffer(pbr_pass, &.{ .buffer = gm.index_buffer, .offset = 0 }, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
                 const vu = PbrVertUniforms{
                     .model = qm.model_matrix,
+                    .normal_matrix = normalMatrixFromModel(qm.model_matrix),
                     .mvp = qm.mvp_matrix,
                     .light_vp = .{ light_vps[0].m, light_vps[1].m, light_vps[2].m, light_vps[3].m },
                 };
@@ -1108,7 +1181,7 @@ pub const PbrGpuState = struct {
                     .camera_fwd_overlap = .{ self.frame_data.camera_forward[0], self.frame_data.camera_forward[1], self.frame_data.camera_forward[2], cascade_overlap },
                     .cascade_splits = cascade_splits,
                     .cascade_depth_ranges = cascade_depth_ranges,
-                    .cluster_factors = .{ built_clusters.factors.z_scale, built_clusters.factors.z_bias, 1.0, 0.0 },
+                    .cluster_factors = .{ built_clusters.factors.z_scale, built_clusters.factors.z_bias, 1.0, if (mat.alpha_mode == .mask) mat.alpha_cutoff else -1.0 },
                     .probe_volumetric = .{ @floatFromInt(pr_count), pcss_on, vol_on, self.frame_data.fog.volumetric.scattering },
                 };
                 c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &fu, @sizeOf(PbrFragUniforms));
@@ -1121,6 +1194,8 @@ pub const PbrGpuState = struct {
                     .{ .texture = self.brdf_lut_texture, .sampler = linear_sampler },
                     .{ .texture = ssao_tex, .sampler = linear_sampler },
                     .{ .texture = self.local_shadow_texture, .sampler = self.shadow_sampler },
+                    .{ .texture = ao_t, .sampler = linear_sampler },
+                    .{ .texture = em_t, .sampler = linear_sampler },
                 };
                 c.SDL_BindGPUFragmentSamplers(pbr_pass, 0, &pbr_samplers, pbr_samplers.len);
                 c.SDL_DrawGPUIndexedPrimitives(pbr_pass, gm.index_count, 1, 0, 0, 0);
@@ -1215,8 +1290,7 @@ pub const PbrGpuState = struct {
             c.SDL_PushGPUComputeUniformData(cmd_buf, 0, &hp, @sizeOf(HistParams));
             c.SDL_DispatchGPUCompute(c_pass, (tex_w + 15) / 16, (tex_h + 15) / 16, 1);
             c.SDL_EndGPUComputePass(c_pass);
-        }
-        {
+
             const exp_rw_tex = [_]c.SDL_GPUStorageTextureReadWriteBinding{.{ .texture = self.exposure_texture, .mip_level = 0, .layer = 0, .cycle = false }};
             const adapt_rw_bufs = [_]c.SDL_GPUStorageBufferReadWriteBinding{.{ .buffer = self.histogram_buffer, .cycle = false }};
             const a_pass = c.SDL_BeginGPUComputePass(
@@ -1230,7 +1304,7 @@ pub const PbrGpuState = struct {
             const ap = AdaptParams{
                 .ev_bounds = .{ pp.auto_exposure.min_ev100, pp.auto_exposure.max_ev100, pp.auto_exposure.low_percent, pp.auto_exposure.high_percent },
                 .speed_dt = .{ pp.auto_exposure.speed_brighten, pp.auto_exposure.speed_darken, @max(self.frame_data.dt, 1.0 / 120.0), pp.auto_exposure.compensation_ev },
-                .hist_range = .{ min_log2, log2_range, if (pp.auto_exposure.enabled) 1.0 else 0.0, 0.0 },
+                .hist_range = .{ min_log2, log2_range, 1.0, 0.0 },
             };
             c.SDL_PushGPUComputeUniformData(cmd_buf, 0, &ap, @sizeOf(AdaptParams));
             c.SDL_DispatchGPUCompute(a_pass, 1, 1, 1);
@@ -1360,7 +1434,16 @@ pub const PbrGpuState = struct {
             c.SDL_EndGPUCopyPass(cp_h);
             _ = c.SDL_SubmitGPUCommandBuffer(cmd_h);
 
-            break :blk try ibl.downsampleEquirectRgba32f(self.allocator, hp, hw, hh, ENV_W, ENV_H);
+            const ds = try ibl.downsampleEquirectRgba32f(self.allocator, hp, hw, hh, ENV_W, ENV_H);
+            const ev_scale = std.math.pow(f32, 2.0, self.frame_data.sky.hdri_exposure_ev);
+            if (@abs(ev_scale - 1.0) > 1e-4) {
+                for (ds) |*px_val| {
+                    px_val[0] *= ev_scale;
+                    px_val[1] *= ev_scale;
+                    px_val[2] *= ev_scale;
+                }
+            }
+            break :blk ds;
         } else try ibl.generateProceduralEquirectSky(
             self.allocator,
             self.frame_data.sky,
@@ -1523,6 +1606,37 @@ fn orthoMat(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) m
     } };
 }
 
+fn normalMatrixFromModel(m: [16]f32) [16]f32 {
+    const a00 = m[0];
+    const a01 = m[4];
+    const a02 = m[8];
+    const a10 = m[1];
+    const a11 = m[5];
+    const a12 = m[9];
+    const a20 = m[2];
+    const a21 = m[6];
+    const a22 = m[10];
+    const c00 = a11 * a22 - a12 * a21;
+    const c01 = -(a10 * a22 - a12 * a20);
+    const c02 = a10 * a21 - a11 * a20;
+    const c10 = -(a01 * a22 - a02 * a21);
+    const c11 = a00 * a22 - a02 * a20;
+    const c12 = -(a00 * a21 - a01 * a20);
+    const c20 = a01 * a12 - a02 * a11;
+    const c21 = -(a00 * a12 - a02 * a10);
+    const c22 = a00 * a11 - a01 * a10;
+    const det = a00 * c00 + a01 * c01 + a02 * c02;
+    if (@abs(det) < 1e-8) return math3d.Mat4.identity().m;
+    const inv_det = 1.0 / det;
+    // Column-major inverse-transpose (cofactor matrix stored row-wise into columns).
+    return .{
+        c00 * inv_det, c10 * inv_det, c20 * inv_det, 0,
+        c01 * inv_det, c11 * inv_det, c21 * inv_det, 0,
+        c02 * inv_det, c12 * inv_det, c22 * inv_det, 0,
+        0,             0,             0,             1,
+    };
+}
+
 fn invertMat4(m: [16]f32) [16]f32 {
     var inv: [16]f32 = undefined;
     inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
@@ -1584,7 +1698,15 @@ fn createComputePipeline(device: *c.SDL_GPUDevice, code: []const u8, samplers: u
     })) orelse error.SdlGpuFailure;
 }
 
-fn createMeshPbrPipeline(device: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.SDL_GPUShader, color_fmt: c.SDL_GPUTextureFormat, depth_fmt: c.SDL_GPUTextureFormat) !*c.SDL_GPUGraphicsPipeline {
+fn createMeshPbrPipeline(
+    device: *c.SDL_GPUDevice,
+    vs: *c.SDL_GPUShader,
+    fs: *c.SDL_GPUShader,
+    color_fmt: c.SDL_GPUTextureFormat,
+    depth_fmt: c.SDL_GPUTextureFormat,
+    double_sided: bool,
+    alpha_blend: bool,
+) !*c.SDL_GPUGraphicsPipeline {
     const vb_desc = [_]c.SDL_GPUVertexBufferDescription{.{
         .slot = 0,
         .pitch = 32,
@@ -1596,7 +1718,18 @@ fn createMeshPbrPipeline(device: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.
         .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = 12 },
         .{ .location = 2, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 24 },
     };
-    const targets = [_]c.SDL_GPUColorTargetDescription{.{ .format = color_fmt }};
+    const targets = [_]c.SDL_GPUColorTargetDescription{.{
+        .format = color_fmt,
+        .blend_state = if (alpha_blend) std.mem.zeroInit(c.SDL_GPUColorTargetBlendState, .{
+            .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+            .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
+            .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+            .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
+            .enable_blend = true,
+        }) else std.mem.zeroes(c.SDL_GPUColorTargetBlendState),
+    }};
     return c.SDL_CreateGPUGraphicsPipeline(device, &std.mem.zeroInit(c.SDL_GPUGraphicsPipelineCreateInfo, .{
         .vertex_shader = vs,
         .fragment_shader = fs,
@@ -1609,13 +1742,13 @@ fn createMeshPbrPipeline(device: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.
         .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
         .rasterizer_state = std.mem.zeroInit(c.SDL_GPURasterizerState, .{
             .fill_mode = c.SDL_GPU_FILLMODE_FILL,
-            .cull_mode = c.SDL_GPU_CULLMODE_BACK,
+            .cull_mode = @as(c_uint, if (double_sided) c.SDL_GPU_CULLMODE_NONE else c.SDL_GPU_CULLMODE_BACK),
             .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE,
         }),
         .depth_stencil_state = std.mem.zeroInit(c.SDL_GPUDepthStencilState, .{
             .compare_op = c.SDL_GPU_COMPAREOP_LESS,
             .enable_depth_test = true,
-            .enable_depth_write = true,
+            .enable_depth_write = !alpha_blend,
         }),
         .target_info = std.mem.zeroInit(c.SDL_GPUGraphicsPipelineTargetInfo, .{
             .color_target_descriptions = &targets,

@@ -439,18 +439,23 @@ fn uploadTextureRgba8Internal(
     width: u32,
     height: u32,
     pixels: []const u8,
+    srgb: bool,
 ) !*c.SDL_GPUTexture {
     const expected_bytes: usize = @as(usize, width) * @as(usize, height) * 4;
     if (pixels.len < expected_bytes) return error.InvalidTextureData;
 
+    const max_dim = @max(width, height);
+    const num_levels: u32 = if (max_dim > 1) @as(u32, std.math.log2_int(u32, max_dim)) + 1 else 1;
+    const fmt: c.SDL_GPUTextureFormat = if (srgb) c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB else c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+
     const tex = c.SDL_CreateGPUTexture(device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
         .type = c.SDL_GPU_TEXTURETYPE_2D,
-        .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-        .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .format = fmt,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER | (if (num_levels > 1) c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET else 0),
         .width = width,
         .height = height,
         .layer_count_or_depth = 1,
-        .num_levels = 1,
+        .num_levels = num_levels,
         .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
     })) orelse return sdlFail(diag, "SDL_CreateGPUTexture failed");
     errdefer c.SDL_ReleaseGPUTexture(device, tex);
@@ -480,6 +485,9 @@ fn uploadTextureRgba8Internal(
         false,
     );
     c.SDL_EndGPUCopyPass(copy_pass);
+    if (num_levels > 1) {
+        c.SDL_GenerateMipmapsForGPUTexture(cmd, tex);
+    }
     if (!c.SDL_SubmitGPUCommandBuffer(cmd)) {
         return sdlFail(diag, "SDL_SubmitGPUCommandBuffer (texture) failed");
     }
@@ -1053,10 +1061,18 @@ pub fn queueTexturedQuad(app: *engine.App, quad: TexturedQuad) !void {
     try state.queued_quads.append(state.allocator, quad);
 }
 
-/// Uploads an RGBA8 texture to the GPU and returns a generational handle.
+/// Uploads a linear RGBA8 texture (normals, roughness, metallic, AO, UI) to the GPU with mipmaps.
 pub fn createTextureRgba8(app: *engine.App, width: u32, height: u32, pixels: []const u8) !GpuTextureHandle {
     const state = app.resources.get(SdlGpuState) orelse return error.MissingGpuState;
-    const tex = try uploadTextureRgba8Internal(state.device, state.diagnostics, width, height, pixels);
+    const tex = try uploadTextureRgba8Internal(state.device, state.diagnostics, width, height, pixels, false);
+    errdefer c.SDL_ReleaseGPUTexture(state.device, tex);
+    return try state.textures.insert(tex);
+}
+
+/// Uploads an sRGB RGBA8 color texture (albedo, emissive) to the GPU with mipmaps.
+pub fn createTextureSrgbRgba8(app: *engine.App, width: u32, height: u32, pixels: []const u8) !GpuTextureHandle {
+    const state = app.resources.get(SdlGpuState) orelse return error.MissingGpuState;
+    const tex = try uploadTextureRgba8Internal(state.device, state.diagnostics, width, height, pixels, true);
     errdefer c.SDL_ReleaseGPUTexture(state.device, tex);
     return try state.textures.insert(tex);
 }
@@ -1209,6 +1225,8 @@ fn buildModule(raw_app: *anyopaque) !void {
         .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
         .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
         .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .max_anisotropy = 8.0,
+        .enable_anisotropy = true,
         .max_lod = 16.0,
     })) orelse return sdlFail(&app.diagnostics, "SDL_CreateGPUSampler (linear) failed");
     errdefer c.SDL_ReleaseGPUSampler(device, linear_sampler);
@@ -1243,22 +1261,22 @@ fn buildModule(raw_app: *anyopaque) !void {
     errdefer tex_pool.deinit();
 
     const white_pixels = [_]u8{ 255, 255, 255, 255 };
-    const white_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, 1, 1, &white_pixels);
+    const white_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, 1, 1, &white_pixels, false);
     const white_handle = try tex_pool.insert(white_raw);
 
     const font_pixels = try text_pkg.generateFontAtlasRgba8(app.allocator);
     defer app.allocator.free(font_pixels);
-    const font_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, text_pkg.ATLAS_WIDTH, text_pkg.ATLAS_HEIGHT, font_pixels);
+    const font_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, text_pkg.ATLAS_WIDTH, text_pkg.ATLAS_HEIGHT, font_pixels, false);
     const font_handle = try tex_pool.insert(font_raw);
 
     var ttf_atlas = try text_pkg.TtfAtlas.bake(app.allocator, text_pkg.FIRA_SANS_REGULAR, 28.0);
     errdefer ttf_atlas.deinit();
-    const ttf_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, ttf_atlas.width, ttf_atlas.height, ttf_atlas.rgba_pixels);
+    const ttf_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, ttf_atlas.width, ttf_atlas.height, ttf_atlas.rgba_pixels, false);
     const ttf_font_handle = try tex_pool.insert(ttf_raw);
 
     var lucide_atlas = try text_pkg.IconAtlas.bake(app.allocator, 32.0);
     errdefer lucide_atlas.deinit();
-    const lucide_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, lucide_atlas.width, lucide_atlas.height, lucide_atlas.rgba_pixels);
+    const lucide_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, lucide_atlas.width, lucide_atlas.height, lucide_atlas.rgba_pixels, false);
     const lucide_handle = try tex_pool.insert(lucide_raw);
 
     logDiag(&app.diagnostics, .info, "Uploaded built-in 1x1 white and {d}x{d} font atlas textures", .{

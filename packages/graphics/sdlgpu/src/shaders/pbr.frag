@@ -13,6 +13,8 @@ layout(set = 2, binding = 4) uniform sampler2D u_prefilter_env;
 layout(set = 2, binding = 5) uniform sampler2D u_brdf_lut;
 layout(set = 2, binding = 6) uniform sampler2D u_ssao_tex;
 layout(set = 2, binding = 7) uniform sampler2DShadow u_local_shadow_tex;
+layout(set = 2, binding = 8) uniform sampler2D u_ao_tex;
+layout(set = 2, binding = 9) uniform sampler2D u_emissive_tex;
 
 struct GpuPointLight {
     vec4 pos_range;  // xyz=pos, w=range
@@ -41,22 +43,22 @@ struct GpuReflectionProbe {
     vec4 ground_pad; // rgb=ground_tint
 };
 
-layout(std430, set = 2, binding = 8) readonly buffer ClusterLightsBuffer {
+layout(std430, set = 2, binding = 10) readonly buffer ClusterLightsBuffer {
     GpuPointLight c_points[256];
     GpuSpotLight c_spots[256];
     GpuRectLight c_rects[64];
     GpuReflectionProbe c_probes[32];
 };
 
-layout(std430, set = 2, binding = 9) readonly buffer ClusterGridBuffer {
+layout(std430, set = 2, binding = 11) readonly buffer ClusterGridBuffer {
     uvec4 clusters[];
 };
 
-layout(std430, set = 2, binding = 10) readonly buffer ClusterIndicesBuffer {
+layout(std430, set = 2, binding = 12) readonly buffer ClusterIndicesBuffer {
     uint cluster_indices[];
 };
 
-layout(std430, set = 2, binding = 11) readonly buffer LocalShadowBuffer {
+layout(std430, set = 2, binding = 13) readonly buffer LocalShadowBuffer {
     mat4 local_shadow_vp[16];
     vec4 local_atlas_rect[16]; // x, y, w, h in [0,1]
 };
@@ -302,9 +304,13 @@ vec3 evalRectLight(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float 
 void main() {
     vec4 tex_albedo = texture(u_base_color_tex, v_uv);
     vec4 albedo_a = vec4(tex_albedo.rgb * base_color.rgb, tex_albedo.a * base_color.a);
+    if (cluster_factors.w >= 0.0 && albedo_a.a < cluster_factors.w) {
+        discard;
+    }
 
+    vec3 emissive_rgb = emissive_weight.rgb * texture(u_emissive_tex, v_uv).rgb;
     if (mat_flags.x > 0.5) {
-        frag_color = vec4(albedo_a.rgb + emissive_weight.rgb, albedo_a.a);
+        frag_color = vec4(albedo_a.rgb + emissive_rgb, albedo_a.a);
         return;
     }
 
@@ -426,8 +432,11 @@ void main() {
     vec3 Fms = FssEss * Favg / max(vec3(1.0) - Ems * Favg, vec3(1e-4));
     vec3 specular_ibl = prefiltered * (FssEss + Fms * Ems);
 
-    vec3 ambient = (kD_env * diffuse_ibl + specular_ibl) * mat_params.w * ssao;
-    vec3 color = ambient + Lo + emissive_weight.rgb;
+    float ao_tex_val = texture(u_ao_tex, v_uv).r;
+    float diff_ao = mix(1.0, ao_tex_val, mat_params.w) * ssao;
+    float spec_ao = clamp(pow(NdotV + diff_ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + diff_ao, 0.0, 1.0);
+    vec3 ambient = kD_env * diffuse_ibl * diff_ao + specular_ibl * spec_ao;
+    vec3 color = ambient + Lo + emissive_rgb;
 
     if (camera_pos_fog.w > 0.5) {
         float d = max(length(camera_pos_fog.xyz - v_world_pos) - fog_color_start.w, 0.0);

@@ -10,6 +10,8 @@ pub const CLUSTER_X: u32 = 16;
 pub const CLUSTER_Y: u32 = 9;
 pub const CLUSTER_Z: u32 = 24;
 pub const CLUSTER_COUNT: usize = @as(usize, CLUSTER_X) * @as(usize, CLUSTER_Y) * @as(usize, CLUSTER_Z);
+/// Maximum number of light index entries uploaded to the GPU cluster index SSBO.
+pub const MAX_CLUSTER_INDICES: u32 = 65536;
 
 /// Packed per-cluster index offsets and counts (`16 bytes`, matches GLSL `uvec4`).
 /// Layout: `x = (point_offset << 12) | point_count`, `y = (spot_offset << 12) | spot_count`,
@@ -51,6 +53,7 @@ pub const BuiltClusters = struct {
     factors: ClusterGridFactors,
     entries: []ClusterEntry,
     indices: []u32,
+    dropped_refs: u32 = 0,
 
     pub fn deinit(self: *BuiltClusters, allocator: std.mem.Allocator) void {
         allocator.free(self.entries);
@@ -186,21 +189,37 @@ pub fn buildClusters(
         }
     }
 
-    // Prefix sum offsets.
+    // Prefix sum offsets bounded by MAX_CLUSTER_INDICES so GPU reads never go out of bounds.
     var p_offs: [CLUSTER_COUNT]u32 = undefined;
     var s_offs: [CLUSTER_COUNT]u32 = undefined;
     var r_offs: [CLUSTER_COUNT]u32 = undefined;
+    var p_caps: [CLUSTER_COUNT]u8 = @splat(0);
+    var s_caps: [CLUSTER_COUNT]u8 = @splat(0);
+    var r_caps: [CLUSTER_COUNT]u8 = @splat(0);
+    var dropped_refs: u32 = 0;
     var cursor: u32 = 0;
     for (0..CLUSTER_COUNT) |cid| {
-        const pc: u32 = p_counts[cid];
-        const sc: u32 = s_counts[cid];
-        const rc: u32 = r_counts[cid];
+        const avail_p = MAX_CLUSTER_INDICES - @min(cursor, MAX_CLUSTER_INDICES);
+        const pc: u32 = @min(@as(u32, p_counts[cid]), avail_p);
+        dropped_refs += @as(u32, p_counts[cid]) - pc;
         p_offs[cid] = cursor;
         cursor += pc;
+        p_caps[cid] = @intCast(pc);
+
+        const avail_s = MAX_CLUSTER_INDICES - @min(cursor, MAX_CLUSTER_INDICES);
+        const sc: u32 = @min(@as(u32, s_counts[cid]), avail_s);
+        dropped_refs += @as(u32, s_counts[cid]) - sc;
         s_offs[cid] = cursor;
         cursor += sc;
+        s_caps[cid] = @intCast(sc);
+
+        const avail_r = MAX_CLUSTER_INDICES - @min(cursor, MAX_CLUSTER_INDICES);
+        const rc: u32 = @min(@as(u32, r_counts[cid]), avail_r);
+        dropped_refs += @as(u32, r_counts[cid]) - rc;
         r_offs[cid] = cursor;
         cursor += rc;
+        r_caps[cid] = @intCast(rc);
+
         entries[cid] = .{
             .point_packed = (p_offs[cid] << 8) | pc,
             .spot_packed = (s_offs[cid] << 8) | sc,
@@ -224,7 +243,7 @@ pub fn buildClusters(
                 for (b.z0..b.z1 + 1) |z| {
                     const cid = (y * CLUSTER_X + x) * CLUSTER_Z + z;
                     const c_idx = p_counts[cid];
-                    if (c_idx < 64) {
+                    if (c_idx < p_caps[cid]) {
                         indices[p_offs[cid] + c_idx] = @intCast(li);
                         p_counts[cid] = c_idx + 1;
                     }
@@ -240,7 +259,7 @@ pub fn buildClusters(
                 for (b.z0..b.z1 + 1) |z| {
                     const cid = (y * CLUSTER_X + x) * CLUSTER_Z + z;
                     const c_idx = s_counts[cid];
-                    if (c_idx < 64) {
+                    if (c_idx < s_caps[cid]) {
                         indices[s_offs[cid] + c_idx] = @intCast(li);
                         s_counts[cid] = c_idx + 1;
                     }
@@ -256,7 +275,7 @@ pub fn buildClusters(
                 for (b.z0..b.z1 + 1) |z| {
                     const cid = (y * CLUSTER_X + x) * CLUSTER_Z + z;
                     const c_idx = r_counts[cid];
-                    if (c_idx < 64) {
+                    if (c_idx < r_caps[cid]) {
                         indices[r_offs[cid] + c_idx] = @intCast(li);
                         r_counts[cid] = c_idx + 1;
                     }
@@ -269,5 +288,6 @@ pub fn buildClusters(
         .factors = factors,
         .entries = entries,
         .indices = indices,
+        .dropped_refs = dropped_refs,
     };
 }

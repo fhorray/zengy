@@ -117,6 +117,25 @@ pub const Render3DService = struct {
     }
 };
 
+fn rotateDir(
+    local_dir: [3]f32,
+    gt_opt: ?*const scene.incremental.GlobalTransform3D,
+    t_opt: ?*const Transform3D,
+) [3]f32 {
+    const m = if (gt_opt) |gt|
+        gt.m
+    else if (t_opt) |t|
+        t.toModelMatrix().m
+    else
+        return local_dir;
+    const rx = m[0] * local_dir[0] + m[4] * local_dir[1] + m[8] * local_dir[2];
+    const ry = m[1] * local_dir[0] + m[5] * local_dir[1] + m[9] * local_dir[2];
+    const rz = m[2] * local_dir[0] + m[6] * local_dir[1] + m[10] * local_dir[2];
+    const len = @sqrt(rx * rx + ry * ry + rz * rz);
+    if (len < 1e-6) return local_dir;
+    return .{ rx / len, ry / len, rz / len };
+}
+
 fn extract3DSystem(ctx: *engine.SystemContext) !void {
     const svc = ctx.resources.get(Render3DService) orelse return;
     svc.extracted_draws.clearRetainingCapacity();
@@ -198,14 +217,22 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
 
     // Extract Directional, Point, and Spot lights.
     {
-        var dl_q = try ctx.query(.{ .read = .{pbr.DirectionalLight} });
+        var dl_q = try ctx.query(.{
+            .read = .{pbr.DirectionalLight},
+            .optional = .{ scene.incremental.GlobalTransform3D, Transform3D },
+        });
         defer dl_q.deinit();
         while (dl_q.next()) |row| {
             const dl = row.read(pbr.DirectionalLight);
             var cfg = dl.cascades;
             cfg.cascade_count = std.math.clamp(dl.cascade_count, 1, 4);
+            const ldir = rotateDir(
+                dl.direction,
+                row.optional(scene.incremental.GlobalTransform3D),
+                row.optional(Transform3D),
+            );
             try svc.directional_lights.append(svc.allocator, .{
-                .direction = dl.direction,
+                .direction = ldir,
                 .color = dl.color,
                 .illuminance_lux = dl.illuminance_lux,
                 .shadows_enabled = dl.shadows_enabled,
@@ -258,9 +285,14 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 t.position
             else
                 .{ 0, 0, 0 };
+            const ldir = rotateDir(
+                sl.direction,
+                row.optional(scene.incremental.GlobalTransform3D),
+                row.optional(Transform3D),
+            );
             try svc.spot_lights.append(svc.allocator, .{
                 .position = lpos,
-                .direction = sl.direction,
+                .direction = ldir,
                 .color = sl.color,
                 .intensity_lumens = sl.intensity_lumens,
                 .range = sl.range,

@@ -170,9 +170,8 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
     }
 
     if (st.rotate_sun) {
-        st.sun_angle += ctx.dt * 0.65;
-        const elev = 0.35 + 0.55 * (0.5 + 0.5 * @sin(st.sun_angle * 0.7));
-        sun.direction = .{ -@cos(st.sun_angle) * 0.65, -elev, -@sin(st.sun_angle) * 0.55 - 0.15 };
+        st.sun_angle += ctx.dt * 0.35;
+        sun.direction = .{ -@cos(st.sun_angle) * 0.6, -@max(@sin(st.sun_angle), 0.05), -0.45 };
     }
 
     const sky_label: []const u8 = switch (st.sky_preset) {
@@ -389,7 +388,7 @@ pub fn main(init: std.process.Init) !void {
             floor_pixels[idx + 3] = 255;
         }
     }
-    const floor_tex = try graphics_sdlgpu.createTextureRgba8(&app, 256, 256, &floor_pixels);
+    const floor_tex = try graphics_sdlgpu.createTextureSrgbRgba8(&app, 256, 256, &floor_pixels);
 
     // Ground plane.
     const floor_mat = try mats.add(.{

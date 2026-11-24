@@ -149,7 +149,11 @@ const SdlAudioState = struct {
         const stream = c.SDL_CreateAudioStream(&src.spec, null) orelse return error.SdlAudioStreamFailed;
         errdefer c.SDL_DestroyAudioStream(stream);
 
-        if (!c.SDL_BindAudioStream(self.device_id, stream)) return error.SdlAudioBindFailed;
+        if (settings.paused) {
+            c.SDL_UnbindAudioStream(stream);
+        } else if (!c.SDL_BindAudioStream(self.device_id, stream)) {
+            return error.SdlAudioBindFailed;
+        }
         _ = c.SDL_SetAudioStreamGain(stream, @max(0.0, settings.volume));
         _ = c.SDL_SetAudioStreamFrequencyRatio(stream, @max(0.05, settings.speed));
         if (!c.SDL_PutAudioStreamData(stream, src.data, @intCast(src.len))) {
@@ -157,9 +161,6 @@ const SdlAudioState = struct {
         }
         if (settings.mode != .loop) {
             _ = c.SDL_FlushAudioStream(stream);
-        }
-        if (settings.paused) {
-            _ = c.SDL_PauseAudioStreamDevice(stream);
         }
 
         const id = self.next_playback_id;
@@ -196,10 +197,11 @@ const SdlAudioState = struct {
         const pb = self.findPlaybackMut(backend_playback_id) orelse return;
         if (pb.paused == paused) return;
         pb.paused = paused;
+        // Unbind/rebind per stream so pausing one voice never pauses the entire SDL audio device.
         if (paused) {
-            _ = c.SDL_PauseAudioStreamDevice(pb.stream);
-        } else {
-            _ = c.SDL_ResumeAudioStreamDevice(pb.stream);
+            c.SDL_UnbindAudioStream(pb.stream);
+        } else if (self.device_id != 0) {
+            _ = c.SDL_BindAudioStream(self.device_id, pb.stream);
         }
     }
 
@@ -212,17 +214,18 @@ const SdlAudioState = struct {
     fn isFinished(raw: *anyopaque, backend_playback_id: u64) bool {
         const self: *SdlAudioState = @ptrCast(@alignCast(raw));
         const pb = self.findPlaybackMut(backend_playback_id) orelse return true;
+        if (pb.paused) return false;
         const queued = c.SDL_GetAudioStreamQueued(pb.stream);
-        if (queued <= 0) {
-            if (pb.loop) {
-                if (self.findSource(pb.source_id)) |src| {
+        if (pb.loop) {
+            if (self.findSource(pb.source_id)) |src| {
+                const threshold: i32 = @intCast(@min(src.len / 2, 65536));
+                if (queued <= threshold) {
                     _ = c.SDL_PutAudioStreamData(pb.stream, src.data, @intCast(src.len));
-                    return false;
                 }
+                return false;
             }
-            return true;
         }
-        return false;
+        return queued <= 0;
     }
 
     fn vtable(self: *SdlAudioState) audio.AudioBackendVTable {
@@ -250,7 +253,7 @@ fn buildSdl3Audio(raw_app: *anyopaque) !void {
 fn startSdl3Audio(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     const st = app.resources.get(SdlAudioState) orelse return error.MissingAudioState;
-    if (!c.SDL_WasInit(c.SDL_INIT_AUDIO) != 0) {
+    if (c.SDL_WasInit(c.SDL_INIT_AUDIO) == 0) {
         if (!c.SDL_InitSubSystem(c.SDL_INIT_AUDIO)) return error.SdlAudioInitFailed;
         st.initialized_subsys = true;
     }

@@ -6,6 +6,7 @@ layout(location = 2) in vec2 in_uv;
 
 layout(std140, set = 1, binding = 0) uniform PbrVertUniforms {
     mat4 model;
+    mat4 normal_matrix;
     mat4 mvp;
     mat4 light_vp[4];
 };
@@ -18,7 +19,7 @@ layout(location = 3) out vec4 v_light_pos[4];
 void main() {
     vec4 wp = model * vec4(in_pos, 1.0);
     v_world_pos = wp.xyz;
-    v_world_normal = normalize(mat3(model) * in_normal);
+    v_world_normal = normalize(mat3(normal_matrix) * in_normal);
     v_uv = in_uv;
     for (int i = 0; i < 4; ++i) {
         v_light_pos[i] = light_vp[i] * wp;
