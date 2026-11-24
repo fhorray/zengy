@@ -5,7 +5,7 @@ This guide walks you through setting up `zigeng`, running the built-in examples,
 ## 1. Prerequisites
 
 - **Zig `0.17.1`** (pinned in [`build.zig.zon`](../build.zig.zon)).
-- **Visual demos on Windows x64**: SDL 3.4.20 headers and `SDL3.lib` are vendored in `third_party/sdl3/`. Place `SDL3.dll` in `third_party/sdl3/bin/x64/SDL3.dll` (or next to the `.exe` in `zig-out/bin/`). A Vulkan-capable GPU driver is required for the SPIR-V `SDL_GPU` backend.
+- **Visual demos on Windows x64**: SDL 3.4.20 headers and `SDL3.lib` are vendored in `packages/sdl3/`. Place `SDL3.dll` in `packages/sdl3/bin/x64/SDL3.dll` (or next to the `.exe` in `zig-out/bin/`). A Vulkan-capable GPU driver is required for the SPIR-V `SDL_GPU` backend.
 - **Linux / macOS**: Headless builds and `zig build test` work out of the box. Native visual builds on Linux/macOS require installing SDL3 system libraries.
 
 ## 2. Verify Your Environment
@@ -81,7 +81,7 @@ try window_sdl3.runVisualLoop(&app);
 ## 4. Next Reading
 
 - [Package Catalog](../packages/README.md)
-- [PocketPy Python Scripting]( ../packages/scripting-python/README.md)
-- [SDL_GPU Backend](../packages/graphics-sdlgpu/README.md)
-- [2D Renderer](../packages/render-2d/README.md) & [3D Renderer](../packages/render-3d/README.md)
+- [PocketPy Python Scripting]( ../packages/scripting/python/README.md)
+- [SDL_GPU Backend](../packages/graphics/sdlgpu/README.md)
+- [2D Renderer](../packages/render/2d/README.md) & [3D Renderer](../packages/render/3d/README.md)
 - [Releasing & Distribution Guide](releasing.md)

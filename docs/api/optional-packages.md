@@ -4,21 +4,21 @@ All packages under `packages/` are optional `engine.Module` implementations that
 
 ---
 
-## 1. Window & Input (`official.window` — `packages/window/src/window.zig`)
+## 1. Window & Input (`official.window` — `packages/window/core/src/window.zig`)
 
 - **Provides:** `engine.window/1` (`WindowService`), `engine.input/1` (`InputService`)
 - **Key APIs:**
   - `WindowService`: `createWindow(desc)`, `getSize(handle)`, `resize(handle, w, h)`, `requestClose(handle)`, `shouldClose(handle)`, `destroyWindow(handle)`.
   - `InputService`: `beginFrame()`, `injectMouseMove(x, y)`, `injectMouseButton(btn, down)`, `injectKey(code, down)`, `isMouseDown(btn)`, `wasMouseClicked(btn)`, `isKeyDown(code)`, `wasKeyPressed(code)`.
 
-## 2. Graphics Device (`official.graphics` — `packages/graphics/src/graphics.zig`)
+## 2. Graphics Device (`official.graphics` — `packages/graphics/core/src/graphics.zig`)
 
 - **Requires:** `engine.window/1`
 - **Provides:** `engine.graphics.device/1` (`GraphicsDeviceService`)
 - **Behavior:** Automatically sets `app.scheduler.render_extract_enabled = true` while active.
 - **Key APIs:** `createSurface(window_handle, w, h)`, `resizeSurface(target, w, h)`, `beginFrame(target)`, `submitDrawCommands(target, cmds)`, `present(target)`, `setDeviceAvailable(bool)` (returns `error.DeviceUnavailable` when lost).
 
-## 3. Retained UI Core (`official.ui.core` — `packages/ui-core/src/ui_core.zig`)
+## 3. Retained UI Core (`official.ui.core` — `packages/ui/core/src/ui_core.zig`)
 
 - **Requires:** `engine.graphics.device/1`
 - **Provides:** `engine.ui.tree/1` (`UiTree`)
@@ -30,14 +30,14 @@ All packages under `packages/` are optional `engine.Module` implementations that
 
 ## 4. UI Frontends & Alternative Backends
 
-- **HTML-like Markup (`official.ui.markup` — `packages/ui-markup/src/ui_markup.zig`):**
+- **HTML-like Markup (`official.ui.markup` — `packages/ui/markup/src/ui_markup.zig`):**
   `ui_markup.parseIntoTree(allocator, html_src, &ui_tree)`
-- **Community NovaUI DSL (`community.ui.novaui` — `packages/ui-novaui/src/novaui.zig`):**
+- **Community NovaUI DSL (`community.ui.novaui` — `packages/ui/novaui/src/novaui.zig`):**
   `ui_novaui.parseIntoTree(allocator, nova_src, &ui_tree)` — produces the exact same `UiTree` IR.
-- **Immediate-Mode UI Backend (`community.ui.immediate` — `packages/ui-immediate/src/ui_immediate.zig`):**
+- **Immediate-Mode UI Backend (`community.ui.immediate` — `packages/ui/immediate/src/ui_immediate.zig`):**
   Provides `engine.ui.backend.immediate/1` (`ImmediateUiService`). Consumes `window`, `input`, and `graphics` directly **without** `official.ui.core`.
 
-## 5. Scripting Host Protocol (`official.script.host` — `packages/scripting-host/src/scripting_host.zig`)
+## 5. Scripting Host Protocol (`official.script.host` — `packages/scripting/host/src/scripting_host.zig`)
 
 - **Provides:** `engine.script.host/1` (`ScriptingHost`)
 - **Key APIs:**
@@ -69,7 +69,7 @@ All packages under `packages/` are optional `engine.Module` implementations that
 - **Provides:** `engine.tools.editor_shell/1` (`EditorShellService`)
 - **Key APIs:** `registerPanel(desc)`, `setInspectedField(&world, &types, entity, schema_id, field, val)`, `undo(&world, &types)`, `redo(&world, &types)`.
 
-## 9. 3D Renderer Foundation (`official.render.3d` — `packages/render-3d/src/render_3d.zig`)
+## 9. 3D Renderer Foundation (`official.render.3d` — `packages/render/3d/src/render_3d.zig`)
 
 - **Requires:** `engine.graphics.device/1`
 - **Provides:** `engine.render.3d/1` (`Render3DService`)

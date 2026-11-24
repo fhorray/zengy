@@ -69,21 +69,21 @@ pub fn build(b: *std.Build) void {
 
     // Optional packages (Phases 5-13)
     const window_mod = b.addModule("window", .{
-        .root_source_file = b.path("packages/window/src/window.zig"),
+        .root_source_file = b.path("packages/window/core/src/window.zig"),
         .target = target,
         .optimize = optimize,
     });
     window_mod.addImport("engine", engine_mod);
 
     const graphics_mod = b.addModule("graphics", .{
-        .root_source_file = b.path("packages/graphics/src/graphics.zig"),
+        .root_source_file = b.path("packages/graphics/core/src/graphics.zig"),
         .target = target,
         .optimize = optimize,
     });
     graphics_mod.addImport("engine", engine_mod);
 
     const ui_core_mod = b.addModule("ui_core", .{
-        .root_source_file = b.path("packages/ui-core/src/ui_core.zig"),
+        .root_source_file = b.path("packages/ui/core/src/ui_core.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -91,21 +91,21 @@ pub fn build(b: *std.Build) void {
     ui_core_mod.addImport("graphics", graphics_mod);
 
     const ui_markup_mod = b.addModule("ui_markup", .{
-        .root_source_file = b.path("packages/ui-markup/src/ui_markup.zig"),
+        .root_source_file = b.path("packages/ui/markup/src/ui_markup.zig"),
         .target = target,
         .optimize = optimize,
     });
     ui_markup_mod.addImport("ui_core", ui_core_mod);
 
     const ui_novaui_mod = b.addModule("ui_novaui", .{
-        .root_source_file = b.path("packages/ui-novaui/src/novaui.zig"),
+        .root_source_file = b.path("packages/ui/novaui/src/novaui.zig"),
         .target = target,
         .optimize = optimize,
     });
     ui_novaui_mod.addImport("ui_core", ui_core_mod);
 
     const ui_immediate_mod = b.addModule("ui_immediate", .{
-        .root_source_file = b.path("packages/ui-immediate/src/ui_immediate.zig"),
+        .root_source_file = b.path("packages/ui/immediate/src/ui_immediate.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -114,7 +114,7 @@ pub fn build(b: *std.Build) void {
     ui_immediate_mod.addImport("graphics", graphics_mod);
 
     const scripting_host_mod = b.addModule("scripting_host", .{
-        .root_source_file = b.path("packages/scripting-host/src/scripting_host.zig"),
+        .root_source_file = b.path("packages/scripting/host/src/scripting_host.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -133,6 +133,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     scene_mod.addImport("engine", engine_mod);
+
+    const physics_mod = b.addModule("physics", .{
+        .root_source_file = b.path("packages/physics/core/src/physics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    physics_mod.addImport("engine", engine_mod);
 
     const editor_shell_mod = b.addModule("editor_shell", .{
         .root_source_file = b.path("packages/editor-shell/src/editor_shell.zig"),
@@ -202,7 +209,7 @@ pub fn build(b: *std.Build) void {
 
     const lua_c_dep = b.dependency("lua_c", .{});
     const translate_lua = b.addTranslateC(.{
-        .root_source_file = b.path("packages/scripting-lua/src/lua_bundle.h"),
+        .root_source_file = b.path("packages/scripting/lua/src/lua_bundle.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -224,7 +231,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const scripting_lua_mod = b.addModule("scripting_lua", .{
-        .root_source_file = b.path("packages/scripting-lua/src/scripting_lua.zig"),
+        .root_source_file = b.path("packages/scripting/lua/src/scripting_lua.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -233,18 +240,18 @@ pub fn build(b: *std.Build) void {
     scripting_lua_mod.addImport("scripting_host", scripting_host_mod);
     scripting_lua_mod.addImport("lua_c", lua_c_mod);
 
-    // PocketPy v2.2.0 (MIT) vendored in third_party/pocketpy: compiled as one C11 unit.
+    // PocketPy v2.2.0 (MIT) vendored inside packages/scripting/python/third_party/pocketpy.
     const pocketpy_c_mod = blk: {
         const translate_pocketpy = b.addTranslateC(.{
-            .root_source_file = b.path("packages/scripting-python/src/pocketpy_bundle.h"),
+            .root_source_file = b.path("packages/scripting/python/src/pocketpy_bundle.h"),
             .target = target,
             .optimize = optimize,
         });
-        translate_pocketpy.addIncludePath(b.path("third_party/pocketpy"));
+        translate_pocketpy.addIncludePath(b.path("packages/scripting/python/third_party/pocketpy"));
         const mod = translate_pocketpy.createModule();
-        mod.addIncludePath(b.path("third_party/pocketpy"));
+        mod.addIncludePath(b.path("packages/scripting/python/third_party/pocketpy"));
         mod.addCSourceFile(.{
-            .file = b.path("third_party/pocketpy/pocketpy.c"),
+            .file = b.path("packages/scripting/python/third_party/pocketpy/pocketpy.c"),
             .flags = &.{ "-std=c11", "-DPK_ENABLE_OS=0" },
         });
         // PocketPy's `socket` module uses Winsock on Windows.
@@ -253,7 +260,7 @@ pub fn build(b: *std.Build) void {
     };
 
     const scripting_python_mod = b.addModule("scripting_python", .{
-        .root_source_file = b.path("packages/scripting-python/src/scripting_python.zig"),
+        .root_source_file = b.path("packages/scripting/python/src/scripting_python.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -278,7 +285,7 @@ pub fn build(b: *std.Build) void {
     default_plugins_mod.addImport("json_format", json_format_mod);
 
     const render_3d_mod = b.addModule("render_3d", .{
-        .root_source_file = b.path("packages/render-3d/src/render_3d.zig"),
+        .root_source_file = b.path("packages/render/3d/src/render_3d.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -297,6 +304,7 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("scripting_host", scripting_host_mod);
     cli_mod.addImport("assets", assets_mod);
     cli_mod.addImport("testing_sdk", testing_sdk_mod);
+    cli_mod.addImport("toml_format", toml_format_mod);
 
     const cli_exe = b.addExecutable(.{
         .name = "zigeng",
@@ -343,23 +351,23 @@ pub fn build(b: *std.Build) void {
     const run_playground_step = b.step("run-playground", "Run the integrated engine playground");
     run_playground_step.dependOn(&run_playground.step);
 
-    // SDL 3.4.20 (zlib) vendored in third_party/sdl3 (Windows x64 binaries for D1).
+    // SDL 3.4.20 (zlib) vendored in packages/sdl3 (Windows x64 binaries).
     const sdl3_c_mod = blk: {
         const translate_sdl3 = b.addTranslateC(.{
-            .root_source_file = b.path("packages/window-sdl3/src/sdl3_bundle.h"),
+            .root_source_file = b.path("packages/window/sdl3/src/sdl3_bundle.h"),
             .target = target,
             .optimize = optimize,
         });
-        translate_sdl3.addIncludePath(b.path("third_party/sdl3/include"));
+        translate_sdl3.addIncludePath(b.path("packages/sdl3/include"));
         const mod = translate_sdl3.createModule();
-        mod.addIncludePath(b.path("third_party/sdl3/include"));
-        mod.addLibraryPath(b.path("third_party/sdl3/lib/x64"));
+        mod.addIncludePath(b.path("packages/sdl3/include"));
+        mod.addLibraryPath(b.path("packages/sdl3/lib/x64"));
         mod.linkSystemLibrary("SDL3", .{});
         break :blk mod;
     };
 
     const window_sdl3_mod = b.addModule("window_sdl3", .{
-        .root_source_file = b.path("packages/window-sdl3/src/window_sdl3.zig"),
+        .root_source_file = b.path("packages/window/sdl3/src/window_sdl3.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -385,10 +393,14 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(visual_hello_exe);
 
     // The SDL3 runtime DLL must sit next to the executable in zig-out/bin when present.
-    if (std.Io.Dir.cwd().access(b.graph.io, "third_party/sdl3/bin/x64/SDL3.dll", .{})) |_| {
-        const install_sdl3_dll = b.addInstallBinFile(b.path("third_party/sdl3/bin/x64/SDL3.dll"), "SDL3.dll");
-        b.getInstallStep().dependOn(&install_sdl3_dll.step);
-    } else |_| {}
+    // Windows x64: the SDL3 runtime DLL comes from the pinned official release (`sdl3_win64` in build.zig.zon),
+    // fetched on demand and installed next to the executables. Other targets link the system SDL3.
+    if (target.result.os.tag == .windows and target.result.cpu.arch == .x86_64) {
+        if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
+            const install_sdl3_dll = b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll");
+            b.getInstallStep().dependOn(&install_sdl3_dll.step);
+        }
+    }
     // Run the installed copy: the cache copy has no SDL3.dll beside it (Windows exit 0xC0000135).
     const run_visual_hello = b.addSystemCommand(&.{"zig-out/bin/visual-hello.exe"});
     run_visual_hello.setCwd(b.path("."));
@@ -397,14 +409,14 @@ pub fn build(b: *std.Build) void {
     run_visual_hello_step.dependOn(&run_visual_hello.step);
 
     const text_mod = b.addModule("text", .{
-        .root_source_file = b.path("packages/text/src/text.zig"),
+        .root_source_file = b.path("packages/render/text/src/text.zig"),
         .target = target,
         .optimize = optimize,
     });
     text_mod.addImport("graphics", graphics_mod);
 
     const render_2d_mod = b.addModule("render_2d", .{
-        .root_source_file = b.path("packages/render-2d/src/render_2d.zig"),
+        .root_source_file = b.path("packages/render/2d/src/render_2d.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -413,14 +425,14 @@ pub fn build(b: *std.Build) void {
     render_2d_mod.addImport("scene", scene_mod);
 
     const gpu_resources_mod = b.addModule("gpu_resources", .{
-        .root_source_file = b.path("packages/graphics-sdlgpu/src/gpu_resources.zig"),
+        .root_source_file = b.path("packages/graphics/sdlgpu/src/gpu_resources.zig"),
         .target = target,
         .optimize = optimize,
     });
     gpu_resources_mod.addImport("graphics", graphics_mod);
 
     const graphics_sdlgpu_mod = b.addModule("graphics_sdlgpu", .{
-        .root_source_file = b.path("packages/graphics-sdlgpu/src/graphics_sdlgpu.zig"),
+        .root_source_file = b.path("packages/graphics/sdlgpu/src/graphics_sdlgpu.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -609,6 +621,8 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("scripting_python", scripting_python_mod);
     runtime_mod.addImport("scripting_lua", scripting_lua_mod);
     runtime_mod.addImport("toml_format", toml_format_mod);
+    runtime_mod.addImport("scene", scene_mod);
+    runtime_mod.addImport("physics", physics_mod);
 
     const runtime_exe = b.addExecutable(.{
         .name = "zigeng-runtime",
@@ -668,6 +682,15 @@ pub fn build(b: *std.Build) void {
         }
     }.add;
 
+    const pkg_manifest_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/cli/pkg_manifest.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(pkg_manifest_tests).step);
+
     addModuleTest(b, test_step, "src/core/tests/core_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
     }, null);
@@ -677,38 +700,38 @@ pub fn build(b: *std.Build) void {
         .{ .name = "c_abi", .mod = c_abi_mod },
     }, &install_c_plugin.step);
 
-    addModuleTest(b, test_step, "packages/window/tests/window_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/window/core/tests/window_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/graphics/tests/graphics_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/graphics/core/tests/graphics_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/ui-core/tests/ui_core_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/ui/core/tests/ui_core_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "ui_core", .mod = ui_core_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/ui-markup/tests/ui_frontends_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/ui/markup/tests/ui_frontends_tests.zig", target, optimize, false, &.{
         .{ .name = "ui_core", .mod = ui_core_mod },
         .{ .name = "ui_markup", .mod = ui_markup_mod },
         .{ .name = "ui_novaui", .mod = ui_novaui_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/ui-immediate/tests/ui_immediate_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/ui/immediate/tests/ui_immediate_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "ui_immediate", .mod = ui_immediate_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/scripting-host/tests/scripting_host_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/scripting/host/tests/scripting_host_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "scripting_host", .mod = scripting_host_mod },
     }, null);
@@ -731,7 +754,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "editor_shell", .mod = editor_shell_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/render-3d/tests/render_3d_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/render/3d/tests/render_3d_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
@@ -761,34 +784,40 @@ pub fn build(b: *std.Build) void {
         .{ .name = "testing_sdk", .mod = testing_sdk_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/scripting-lua/tests/scripting_lua_tests.zig", target, optimize, true, &.{
+    addModuleTest(b, test_step, "packages/scripting/lua/tests/scripting_lua_tests.zig", target, optimize, true, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "scripting_host", .mod = scripting_host_mod },
         .{ .name = "scripting_lua", .mod = scripting_lua_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/scripting-python/tests/scripting_python_tests.zig", target, optimize, true, &.{
+    addModuleTest(b, test_step, "packages/scripting/python/tests/scripting_python_tests.zig", target, optimize, true, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "scripting_host", .mod = scripting_host_mod },
         .{ .name = "scripting_lua", .mod = scripting_lua_mod },
         .{ .name = "scripting_python", .mod = scripting_python_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/graphics-sdlgpu/tests/graphics_sdlgpu_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/graphics/sdlgpu/tests/graphics_sdlgpu_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "gpu_resources", .mod = gpu_resources_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/text/tests/text_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/render/text/tests/text_tests.zig", target, optimize, false, &.{
         .{ .name = "text", .mod = text_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/render-2d/tests/render_2d_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "packages/render/2d/tests/render_2d_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "scene", .mod = scene_mod },
         .{ .name = "render_2d", .mod = render_2d_mod },
     }, null);
+
+    addModuleTest(b, test_step, "packages/physics/core/tests/physics_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "physics", .mod = physics_mod },
+    }, null);
+
 }

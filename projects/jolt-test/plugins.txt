@@ -1,0 +1,2 @@
+# plugins installed by `zigeng add` before running
+../../packages/physics/jolt

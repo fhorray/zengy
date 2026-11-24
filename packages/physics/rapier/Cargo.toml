@@ -1,0 +1,10 @@
+[package]
+name = "zigeng_rapier_ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+rapier3d = "0.22"

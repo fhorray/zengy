@@ -1,0 +1,2 @@
+# Rapier is a staticlib today (no plugin_entry yet), so this is expected to fail
+../../packages/physics/rapier

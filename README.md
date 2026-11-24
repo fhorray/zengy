@@ -104,19 +104,20 @@ When you are ready to add graphics, simply register the optional modules you wan
 | **C / Native Plugins** | `include/engine_extension.h` | Load `.dll` / `.so` / `.dylib` plugins dynamically at runtime |
 | **Automated Testing** | `testing` + `zigeng` CLI | Deterministic TOML scenarios & offscreen framebuffer capture |
 
-### Zero-Boilerplate Games with `zigeng` CLI
+### Zero-Boilerplate Projects with `zigeng` CLI
 
-If you want to build a game with **only your game content** (`game.toml`, `scripts/main.py`, `ui/hud.html`, `assets/`) without writing Zig boilerplate, download a Release bundle and use the `zigeng` CLI:
+If you want to configure a project with an agnostic `game.toml` (without writing Zig boilerplate or forcing a specific scripting language or UI template), download a Release bundle and use the `zigeng` CLI:
 
 ```bash
-# Create a new content-only game project
+# Create a minimal agnostic project (game.toml)
 zigeng new my-game
 cd my-game
+zigeng install
 zigeng run
 
 # Or install individual official packages into ./packages/ for custom Zig builds
 zigeng list-official
-zigeng add scripting-python
+zigeng add physics
 ```
 
 ---
@@ -125,6 +126,6 @@ zigeng add scripting-python
 
 - **[Getting Started Guide](docs/getting-started.md)** — Setup, running demos, and composing headless vs visual apps
 - **[Package Catalog](packages/README.md)** — Overview of every optional module
-- **[Scripting with Python (PocketPy)](packages/scripting-python/README.md)** — Optional Python scripting guide
+- **[Scripting with Python (PocketPy)](packages/scripting/python/README.md)** — Optional Python scripting guide
 - **[Releasing & Distribution](docs/releasing.md)** — How CI builds and publishes releases
 - **[Full Documentation Index](docs/README.md)** — API reference, architecture plan, and ADRs

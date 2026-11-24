@@ -11,6 +11,7 @@
 //! mode = "2d"
 //! entry_script = "scripts/main.py"
 //! ui = "ui/hud.html"
+//! plugins = ["scene", "physics", "physics-jolt"]
 //! ```
 
 const std = @import("std");
@@ -19,6 +20,8 @@ const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
 const graphics_sdlgpu = @import("graphics_sdlgpu");
+const scene = @import("scene");
+const physics = @import("physics");
 const ui_core = @import("ui_core");
 const ui_markup = @import("ui_markup");
 const scripting_host = @import("scripting_host");
@@ -47,6 +50,32 @@ fn onUiAction(user_ctx: ?*anyopaque, ev: engine.EventEnvelope) void {
     const st: *RuntimeState = @ptrCast(@alignCast(user_ctx orelse return));
     if (st.script) |sc| {
         _ = st.host.invokeScript(sc, "on_ui_action", ev.payload);
+    }
+}
+
+fn invokeOptionalHook(
+    host: *scripting_host.ScriptingHost,
+    sc: scripting_host.ScriptModuleHandle,
+    fn_name: []const u8,
+    arg: []const u8,
+) void {
+    const res = host.invokeScript(sc, fn_name, arg);
+    if (!res.ok) {
+        if (std.mem.eql(u8, res.error_message, "python function not found") or
+            std.mem.eql(u8, res.error_message, "lua function not found"))
+        {
+            return;
+        }
+        std.debug.print("[zigeng-runtime] script error in '{s}': {s}\n", .{ fn_name, res.error_message });
+    }
+}
+
+fn runtimeFixedUpdateSystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(RuntimeState) orelse return;
+    if (st.script) |sc| {
+        var dt_buf: [32]u8 = undefined;
+        const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.fixedDeltaSeconds()}) catch "0.01667";
+        invokeOptionalHook(st.host, sc, "fixed_update", dt_str);
     }
 }
 
@@ -85,10 +114,44 @@ fn runtimeUpdateSystem(ctx: *engine.SystemContext) !void {
     if (st.script) |sc| {
         var dt_buf: [32]u8 = undefined;
         const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
-        const res = st.host.invokeScript(sc, "on_frame", dt_str);
-        if (!res.ok) {
-            std.debug.print("[zigeng-runtime] script error: {s}\n", .{res.error_message});
-        }
+        invokeOptionalHook(st.host, sc, "update", dt_str);
+    }
+}
+
+fn runtimeDestroySystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(RuntimeState) orelse return;
+    if (st.script) |sc| {
+        invokeOptionalHook(st.host, sc, "destroy", "");
+    }
+}
+
+const HeadlessScriptState = struct {
+    host: *scripting_host.ScriptingHost,
+    script: ?scripting_host.ScriptModuleHandle,
+};
+
+fn headlessFixedUpdateSystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(HeadlessScriptState) orelse return;
+    if (st.script) |sc| {
+        var dt_buf: [32]u8 = undefined;
+        const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.fixedDeltaSeconds()}) catch "0.01667";
+        invokeOptionalHook(st.host, sc, "fixed_update", dt_str);
+    }
+}
+
+fn headlessUpdateSystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(HeadlessScriptState) orelse return;
+    if (st.script) |sc| {
+        var dt_buf: [32]u8 = undefined;
+        const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
+        invokeOptionalHook(st.host, sc, "update", dt_str);
+    }
+}
+
+fn headlessDestroySystem(ctx: *engine.SystemContext) !void {
+    const st = ctx.resources.get(HeadlessScriptState) orelse return;
+    if (st.script) |sc| {
+        invokeOptionalHook(st.host, sc, "destroy", "");
     }
 }
 
@@ -121,9 +184,71 @@ fn runtimeRenderSystem(ctx: *engine.SystemContext) !void {
     try st.gfx.present(st.rt);
 }
 
+fn isSharedLibName(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".so") or
+        std.mem.endsWith(u8, name, ".dll") or
+        std.mem.endsWith(u8, name, ".dylib");
+}
+
+fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App, manifest_plugins: []const []const u8) !usize {
+    var loaded_count: usize = 0;
+
+    // 1. Load explicit shared library paths listed in game.toml
+    for (manifest_plugins) |spec| {
+        if (isSharedLibName(spec)) {
+            const ph = try app.ensurePluginHost();
+            const h = try ph.loadSharedLibrary(spec);
+            const rc = ph.startPlugin(h);
+            if (rc != .ok) return error.PluginStartFailed;
+            loaded_count += 1;
+        }
+    }
+
+    // 2. Auto-load compiled plugins in .zigeng/plugins/
+    var dir = std.Io.Dir.cwd().openDir(io, ".zigeng/plugins", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return loaded_count,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSharedLibName(entry.name)) continue;
+
+        const full_path = try std.fmt.allocPrint(allocator, ".zigeng/plugins/{s}", .{entry.name});
+        defer allocator.free(full_path);
+
+        const ph = try app.ensurePluginHost();
+        const h = try ph.loadSharedLibrary(full_path);
+        const rc = ph.startPlugin(h);
+        if (rc != .ok) return error.PluginStartFailed;
+        loaded_count += 1;
+    }
+
+    return loaded_count;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
+
+    var headless = std.mem.eql(u8, "headless", "never");
+    var headless_ticks: u64 = 60;
+    {
+        var args_it = try init.minimal.args.iterateAllocator(allocator);
+        defer args_it.deinit();
+        _ = args_it.next();
+        while (args_it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--headless")) {
+                headless = true;
+            } else if (std.mem.eql(u8, arg, "--ticks")) {
+                if (args_it.next()) |val| {
+                    headless_ticks = std.fmt.parseInt(u64, val, 10) catch 60;
+                }
+            }
+        }
+    }
 
     const manifest_bytes = readFileCwd(allocator, io, "game.toml") catch |err| {
         std.debug.print("[zigeng-runtime] could not read 'game.toml' in current directory: {}\n", .{err});
@@ -134,21 +259,90 @@ pub fn main(init: std.process.Init) !void {
     var manifest = try toml_format.TomlService.parseGameManifest(allocator, manifest_bytes);
     defer manifest.deinit(allocator);
 
+    if (std.mem.eql(u8, manifest.mode, "headless")) {
+        headless = true;
+    }
+
     const title = manifest.title;
     const width: u32 = manifest.width;
     const height: u32 = manifest.height;
     const entry_script: ?[]const u8 = if (manifest.entry_script.len > 0) manifest.entry_script else null;
     const ui_path: ?[]const u8 = if (manifest.ui.len > 0) manifest.ui else null;
 
-    var app = engine.App.init(allocator, .{});
+    var app = engine.App.init(allocator, .{ .fixed_dt = 1.0 / 60.0 });
     defer app.deinit();
 
-    try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
-    try app.registerModule(ui_core.module());
+    if (!headless) {
+        try app.registerModule(window_sdl3.module());
+        try app.registerModule(graphics_sdlgpu.module());
+        try app.registerModule(ui_core.module());
+    }
     try app.registerModule(scripting_host.module());
     try app.registerModule(scripting_lua.module());
     try app.registerModule(scripting_python.module());
+
+    var has_scene = false;
+    var has_physics = false;
+    for (manifest.plugins) |plugin_name| {
+        if (std.mem.eql(u8, plugin_name, "scene")) {
+            if (!has_scene) {
+                try app.registerModule(scene.module());
+                has_scene = true;
+            }
+        } else if (std.mem.eql(u8, plugin_name, "physics")) {
+            if (!has_physics) {
+                try app.registerModule(physics.module());
+                has_physics = true;
+            }
+        } else {
+            // Dynamic plugins (e.g. physics backends, owner/repo, URLs, ./local-path, or shared libs)
+            // are loaded via PluginHost; ensure the physics contract is available if they attach to it.
+            if (!has_physics) {
+                try app.registerModule(physics.module());
+                has_physics = true;
+            }
+        }
+    }
+
+    if (headless) {
+        try app.scheduler.addSystem(.{ .name = "runtime.headless_fixed_update", .stage = .fixed_update, .run = headlessFixedUpdateSystem });
+        try app.scheduler.addSystem(.{ .name = "runtime.headless_update", .stage = .update, .run = headlessUpdateSystem });
+        try app.scheduler.addSystem(.{ .name = "runtime.headless_destroy", .stage = .shutdown, .run = headlessDestroySystem });
+        try app.initialize();
+        const dynamic_loaded = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
+
+        const host = app.resources.get(scripting_host.ScriptingHost).?;
+        var loaded_script: ?scripting_host.ScriptModuleHandle = null;
+        if (entry_script) |sp| {
+            if (sp.len > 0) {
+                const src = try readFileCwd(allocator, io, sp);
+                defer allocator.free(src);
+                const rt_idx: u16 = if (std.mem.endsWith(u8, sp, ".lua")) 0 else 1;
+                loaded_script = try host.loadScript(rt_idx, sp, src);
+            }
+        }
+        try app.resources.insert(HeadlessScriptState, .{
+            .host = host,
+            .script = loaded_script,
+        });
+        if (loaded_script) |sc| {
+            invokeOptionalHook(host, sc, "start", "");
+        }
+
+        var t: u64 = 0;
+        while (t < headless_ticks) : (t += 1) {
+            try app.tick(1.0 / 60.0);
+        }
+
+        const phys_steps: u64 = if (app.resources.get(physics.PhysicsService)) |ps| ps.step_count else 0;
+        const phys_backend = if (app.resources.get(physics.PhysicsService)) |ps| ps.hasBackend() else false;
+        app.shutdown();
+        std.debug.print(
+            "{{\"mode\":\"headless\",\"ticks\":{d},\"dynamic_plugins\":{d},\"physics_steps\":{d},\"physics_backend\":{},\"status\":\"ok\"}}\n",
+            .{ headless_ticks, dynamic_loaded, phys_steps, phys_backend },
+        );
+        return;
+    }
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
         .title = title,
@@ -157,10 +351,13 @@ pub fn main(init: std.process.Init) !void {
         .resizable = true,
     });
 
+    try app.scheduler.addSystem(.{ .name = "runtime.fixed_update", .stage = .fixed_update, .run = runtimeFixedUpdateSystem });
     try app.scheduler.addSystem(.{ .name = "runtime.update", .stage = .update, .run = runtimeUpdateSystem });
     try app.scheduler.addSystem(.{ .name = "runtime.render", .stage = .render_extract, .run = runtimeRenderSystem });
+    try app.scheduler.addSystem(.{ .name = "runtime.destroy", .stage = .shutdown, .run = runtimeDestroySystem });
 
     try app.initialize();
+    _ = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
 
     const i_entry = try app.services.getService("engine.input", 1);
     const input: *window.InputService = @ptrCast(@alignCast(@constCast(i_entry.api_ptr)));
@@ -189,6 +386,9 @@ pub fn main(init: std.process.Init) !void {
             const rt_idx: u16 = if (std.mem.endsWith(u8, sp, ".lua")) 0 else 1;
             loaded_script = try host.loadScript(rt_idx, sp, src);
         }
+    }
+    if (loaded_script) |sc| {
+        invokeOptionalHook(host, sc, "start", "");
     }
 
     const px = window_sdl3.pixelSize(&app);

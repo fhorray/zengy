@@ -7,7 +7,7 @@ Welcome to the `zigeng` documentation. This engine is built around a **minimal h
 - **Guides & Workflows**
   - [Getting Started](getting-started.md) — setup, first app, and running headless/visual examples
   - [Releasing, CI/CD & Distribution](releasing.md) — merging to `main`, tagging releases, and `engine-cli` scope
-  - [Package Catalog](../packages/README.md) — all optional packages, including [PocketPy Python](../packages/scripting-python/README.md), [SDL_GPU](../packages/graphics-sdlgpu/README.md), [2D](../packages/render-2d/README.md), and [3D](../packages/render-3d/README.md)
+  - [Package Catalog](../packages/README.md) — all optional packages, including [PocketPy Python](../packages/scripting/python/README.md), [SDL_GPU](../packages/graphics/sdlgpu/README.md), [2D](../packages/render/2d/README.md), and [3D](../packages/render/3d/README.md)
 - **API Reference**
   - [Core App, ECS, Scheduler, Commands, Events & Diagnostics](api/core-app-and-ecs.md)
   - [Modules, Services & Runtime Reflection](api/modules-services-and-reflection.md)
@@ -15,6 +15,8 @@ Welcome to the `zigeng` documentation. This engine is built around a **minimal h
   - [Optional Packages, Playground & CLI](api/optional-packages.md)
 - **Architecture & Decisions**
   - [Architecture Plan & Roadmap](architecture/zig_modular_engine_architecture_plan.md)
+  - [Agnostic Physics Roadmap](roadmap/physics.md)
+  - [External Plugins & Local Build Workflow](roadmap/external-plugins.md)
   - [ADR-001: Minimal Core Scope](adr/ADR-001-minimal-core.md)
   - [ADR-002: Module Contract, Lifecycle, and Scopes](adr/ADR-002-module-lifecycle.md)
   - [ADR-003: Capability and Provider Resolution](adr/ADR-003-service-resolution.md)
