@@ -81,3 +81,27 @@ Any repository can act as a `zigeng` plugin if it:
 1. Provides a `build.zig` that installs a shared library (`.dll` / `.so` / `.dylib`) into `zig-out/lib` or `zig-out/bin`.
 2. Exports `ae_plugin_entry` matching `include/engine_extension.h`.
 3. Resolves capabilities via `AEHostApi.get_service` during `load()` and cleans up state in `unload()`.
+
+---
+
+## 4. Package Install Flow (`zigeng.toml`)
+
+Any package (official or community) can ship a `zigeng.toml` at its root. `zigeng add <pkg>` runs it **inside the user's project**, so no binaries need to live in the package repository:
+
+```toml
+name = "sdl3"
+
+[[dependency]]                 # `zig fetch --save=<name> <url>` (hash verified by Zig)
+name = "sdl3_win64"
+url  = "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20-win32-x64.zip"
+platforms = ["windows-x86_64"] # optional; `<os>-<arch>`; omitted = all
+
+[[install]]                    # file copied to zig-out/bin through a hook block in build.zig
+dependency = "sdl3_win64"
+path = "SDL3.dll"
+platforms = ["windows-x86_64"]
+```
+
+- Projects with `build.zig.zon`: dependencies for the host platform are fetched and the hook block is written between `// zigeng:begin <pkg>` / `// zigeng:end <pkg>` right after the `// zigeng:install-hooks` anchor (place it inside `build()` after `const target = ...`). Re-running replaces the block (idempotent). Without the anchor the CLI prints the block to paste.
+- `game.toml` projects have no `build.zig.zon`, so nothing is edited: `zigeng-runtime` already ships its runtime libraries.
+- Manifests are untrusted input and become Zig code: only `https://` URLs, identifier-safe names, relative paths without `..`, and no quotes or backslashes are accepted (`tools/cli/pkg_manifest.zig`).

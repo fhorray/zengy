@@ -24,6 +24,7 @@ const scripting_host = @import("scripting_host");
 const assets = @import("assets");
 const testing_sdk = @import("testing_sdk");
 const toml_format = @import("toml_format");
+const pkg_manifest = @import("pkg_manifest.zig");
 
 const OfficialPackageInfo = struct {
     name: []const u8,
@@ -99,11 +100,9 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
     std.debug.print("Installed official package into ./packages/{s}/\n", .{pkg.name});
     if (pkg.third_party) |tp| {
         std.debug.print("Installed required dependency into ./packages/{s}/\n", .{tp});
-        if (builtin.os.tag == .windows and std.mem.eql(u8, tp, "sdl3")) {
-            std.debug.print("[zigeng] Downloading SDL3.dll (3.4.20) into ./packages/sdl3/bin/x64/...\n", .{});
-            const sdl_dl_cmd = "mkdir packages\\sdl3\\bin\\x64 2>nul & curl -sL \"https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20-win32-x64.zip\" -o \"%TEMP%\\zigeng-sdl3.zip\" && tar -xf \"%TEMP%\\zigeng-sdl3.zip\" -C packages\\sdl3\\bin\\x64 SDL3.dll && del /q \"%TEMP%\\zigeng-sdl3.zip\" 2>nul";
-            try runShell(allocator, io, sdl_dl_cmd);
-        }
+        const tp_dir = try std.fmt.allocPrint(allocator, "packages/{s}", .{tp});
+        defer allocator.free(tp_dir);
+        try provisionPackageDir(allocator, io, tp_dir);
     }
 
     const pkg_dir = try std.fmt.allocPrint(allocator, "packages/{s}", .{pkg.name});
@@ -111,6 +110,7 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
     if (fileExists(allocator, io, pkg_dir, "build.zig") or fileExists(allocator, io, pkg_dir, "Cargo.toml")) {
         try compileAndInstallPluginDir(allocator, io, pkg_dir, pkg.name);
     }
+    try provisionPackageDir(allocator, io, pkg_dir);
 
     std.debug.print("\nAdd to your build.zig:\n  const pkg_mod = b.addModule(\"{s}\", .{{\n      .root_source_file = b.path(\"packages/{s}/{s}\"),\n      .target = target,\n      .optimize = optimize,\n  }});\n", .{
         pkg.name,
@@ -184,6 +184,78 @@ fn fileExists(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8, re
     return true;
 }
 
+fn runArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    const res = try std.process.run(allocator, io, .{ .argv = argv });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+    if (res.stdout.len > 0) std.debug.print("{s}", .{res.stdout});
+    if (res.stderr.len > 0) std.debug.print("{s}", .{res.stderr});
+    switch (res.term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
+
+fn cwdFileExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// Runs the install flow declared by `<dir>/zigeng.toml` (if any) inside the user's project:
+/// `zig fetch --save` for each dependency of this platform, then a marker-delimited hook block
+/// in `build.zig` (inserted after `// zigeng:install-hooks`). Packages without a manifest are skipped.
+/// Projects without `build.zig.zon` (plain `game.toml` projects) skip this: `zigeng-runtime` ships
+/// its runtime libraries.
+fn provisionPackageDir(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest_path = try std.fmt.allocPrint(arena, "{s}/zigeng.toml", .{dir});
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, arena, .limited(256 * 1024)) catch return;
+
+    const manifest = pkg_manifest.parse(arena, bytes) catch |err| {
+        std.debug.print("[zigeng] Invalid {s}: {s}. Skipping package provisioning.\n", .{ manifest_path, @errorName(err) });
+        return error.InvalidPackageManifest;
+    };
+    if (manifest.dependencies.len == 0 and manifest.installs.len == 0) return;
+    const pkg_name = if (manifest.name.len != 0) manifest.name else std.fs.path.basename(dir);
+
+    if (!cwdFileExists(io, "build.zig.zon")) {
+        std.debug.print("[zigeng] '{s}': no build.zig.zon here (game.toml project); runtime libraries come with zigeng-runtime.\n", .{pkg_name});
+        return;
+    }
+
+    for (manifest.dependencies) |d| {
+        if (!pkg_manifest.platformMatches(d.platforms, pkg_manifest.host_platform)) continue;
+        std.debug.print("[zigeng] Fetching '{s}' for '{s}' (hash verified by zig)...\n", .{ d.name, pkg_name });
+        const save_flag = try std.fmt.allocPrint(arena, "--save={s}", .{d.name});
+        try runArgv(allocator, io, &.{ "zig", "fetch", save_flag, d.url });
+    }
+
+    if (manifest.installs.len == 0) return;
+    if (!cwdFileExists(io, "build.zig")) {
+        std.debug.print("[zigeng] '{s}': no build.zig found; cannot install runtime files.\n", .{pkg_name});
+        return;
+    }
+    const block = try pkg_manifest.renderBlock(arena, pkg_name, manifest);
+    const build_src = try std.Io.Dir.cwd().readFileAlloc(io, "build.zig", arena, .limited(4 * 1024 * 1024));
+    const updated = pkg_manifest.applyBlock(arena, build_src, pkg_name, block) catch |err| switch (err) {
+        error.NoAnchor => {
+            std.debug.print(
+                "[zigeng] build.zig has no '{s}' anchor. Add that line inside build() after `const target = ...`, then re-run, or paste this block manually:\n\n{s}\n",
+                .{ pkg_manifest.ANCHOR, block },
+            );
+            return;
+        },
+        else => return err,
+    };
+    if (!std.mem.eql(u8, build_src, updated)) {
+        try writeFileRelative(io, "build.zig", updated);
+        std.debug.print("[zigeng] Updated build.zig hooks for '{s}' (zig-out/bin install of runtime files).\n", .{pkg_name});
+    }
+}
+
 fn compileAndInstallPluginDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, label: []const u8) !void {
     const has_cargo = fileExists(allocator, io, dir_path, "Cargo.toml");
     const has_zig = fileExists(allocator, io, dir_path, "build.zig");
@@ -243,6 +315,15 @@ fn compileAndInstallPluginDir(allocator: std.mem.Allocator, io: std.Io, dir_path
     std.debug.print("[zigeng] Installed compiled plugin '{s}' into .zigeng/plugins/\n", .{label});
 }
 
+/// Community/local package flow: compile it when it has build files, then run its `zigeng.toml` install flow.
+/// A package that only declares a `zigeng.toml` (nothing to compile) is valid.
+fn installPluginDirAndProvision(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, label: []const u8) !void {
+    const has_build = fileExists(allocator, io, dir_path, "build.zig") or fileExists(allocator, io, dir_path, "Cargo.toml");
+    const has_manifest = fileExists(allocator, io, dir_path, "zigeng.toml");
+    if (has_build or !has_manifest) try compileAndInstallPluginDir(allocator, io, dir_path, label);
+    try provisionPackageDir(allocator, io, dir_path);
+}
+
 fn installPluginSpec(allocator: std.mem.Allocator, io: std.Io, spec: []const u8) !void {
     if (std.mem.eql(u8, spec, "scene") or std.mem.eql(u8, spec, "physics")) {
         std.debug.print("[zigeng] '{s}' is a built-in engine contract.\n", .{spec});
@@ -251,7 +332,7 @@ fn installPluginSpec(allocator: std.mem.Allocator, io: std.Io, spec: []const u8)
 
     // 1. Local directory path (e.g. ./my-plugin or ../my-plugin)
     if (std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../") or std.mem.startsWith(u8, spec, "/")) {
-        try compileAndInstallPluginDir(allocator, io, spec, spec);
+        try installPluginDirAndProvision(allocator, io, spec, spec);
         return;
     }
 
@@ -298,7 +379,7 @@ fn installPluginSpec(allocator: std.mem.Allocator, io: std.Io, spec: []const u8)
             );
         defer allocator.free(clone_cmd);
         try runShell(allocator, io, clone_cmd);
-        try compileAndInstallPluginDir(allocator, io, cache_dir, repo_name);
+        try installPluginDirAndProvision(allocator, io, cache_dir, repo_name);
         return;
     }
 

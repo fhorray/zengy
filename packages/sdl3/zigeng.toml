@@ -1,0 +1,12 @@
+# Install flow executed by `zigeng add` inside the user's project (nothing binary lives in this repo).
+name = "sdl3"
+
+[[dependency]]
+name = "sdl3_win64"
+url = "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20-win32-x64.zip"
+platforms = ["windows-x86_64"]
+
+[[install]]
+dependency = "sdl3_win64"
+path = "SDL3.dll"
+platforms = ["windows-x86_64"]
