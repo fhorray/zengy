@@ -80,7 +80,7 @@ jobs:
           TAG="${{ needs.meta.outputs.tag }}"
           STAGE="dist/zigeng-${TAG}-x86_64-linux"
           mkdir -p "$STAGE/include"
-          cp zig-out/bin/zigeng "$STAGE/"
+          cp zig-out/bin/zigeng zig-out/bin/zigeng-runtime "$STAGE/"
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
           tar -czf "dist/zigeng-${TAG}-x86_64-linux.tar.gz" -C dist "zigeng-${TAG}-x86_64-linux"

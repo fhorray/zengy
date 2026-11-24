@@ -99,7 +99,19 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
     std.debug.print("Installed official package into ./packages/{s}/\n", .{pkg.name});
     if (pkg.third_party) |tp| {
         std.debug.print("Installed required dependency into ./packages/{s}/\n", .{tp});
+        if (builtin.os.tag == .windows and std.mem.eql(u8, tp, "sdl3")) {
+            std.debug.print("[zigeng] Downloading SDL3.dll (3.4.20) into ./packages/sdl3/bin/x64/...\n", .{});
+            const sdl_dl_cmd = "mkdir packages\\sdl3\\bin\\x64 2>nul & curl -sL \"https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20-win32-x64.zip\" -o \"%TEMP%\\zigeng-sdl3.zip\" && tar -xf \"%TEMP%\\zigeng-sdl3.zip\" -C packages\\sdl3\\bin\\x64 SDL3.dll && del /q \"%TEMP%\\zigeng-sdl3.zip\" 2>nul";
+            try runShell(allocator, io, sdl_dl_cmd);
+        }
     }
+
+    const pkg_dir = try std.fmt.allocPrint(allocator, "packages/{s}", .{pkg.name});
+    defer allocator.free(pkg_dir);
+    if (fileExists(allocator, io, pkg_dir, "build.zig") or fileExists(allocator, io, pkg_dir, "Cargo.toml")) {
+        try compileAndInstallPluginDir(allocator, io, pkg_dir, pkg.name);
+    }
+
     std.debug.print("\nAdd to your build.zig:\n  const pkg_mod = b.addModule(\"{s}\", .{{\n      .root_source_file = b.path(\"packages/{s}/{s}\"),\n      .target = target,\n      .optimize = optimize,\n  }});\n", .{
         pkg.name,
         pkg.name,
