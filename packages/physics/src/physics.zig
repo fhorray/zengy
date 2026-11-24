@@ -11,6 +11,8 @@
 const std = @import("std");
 const engine = @import("engine");
 
+pub const cabi = @import("cabi.zig");
+
 pub const MODULE_OWNER_ID: u64 = 2012;
 
 pub const RigidBodyType = enum {
@@ -134,6 +136,8 @@ pub const PhysicsService = struct {
     gravity: [3]f32 = .{ 0.0, -9.81, 0.0 },
     backend: ?*const PhysicsBackendVTable = null,
     backend_ctx: ?*anyopaque = null,
+    /// C-ABI attachment point for dynamically loaded plugins (see `cabi.zig`). Takes precedence over `backend`.
+    slot: cabi.Slot = .{},
     step_count: u64 = 0,
     last_dt: f32 = 0,
 
@@ -161,11 +165,18 @@ pub const PhysicsService = struct {
     }
 
     pub fn hasBackend(self: *const PhysicsService) bool {
-        return self.backend != null and self.backend_ctx != null;
+        return (self.backend != null and self.backend_ctx != null) or self.hasPluginBackend();
+    }
+
+    /// True when a dynamic plugin attached a C-ABI backend through `slot`.
+    pub fn hasPluginBackend(self: *const PhysicsService) bool {
+        return self.slot.vtable != null and self.slot.ctx != null;
     }
 
     pub fn step(self: *PhysicsService, dt: f32) !void {
-        if (self.backend) |b| {
+        if (self.hasPluginBackend()) {
+            try cabi.hostStep(&self.slot, dt, self.gravity);
+        } else if (self.backend) |b| {
             if (b.step) |fn_step| {
                 try fn_step(self.backend_ctx.?, dt, self.gravity);
             }
@@ -175,6 +186,7 @@ pub const PhysicsService = struct {
     }
 
     pub fn raycast(self: *const PhysicsService, desc: RaycastDesc) ?RaycastHit {
+        if (self.hasPluginBackend()) return cabi.hostRaycast(&self.slot, desc);
         if (self.backend) |b| {
             if (b.raycast) |fn_raycast| {
                 return fn_raycast(self.backend_ctx.?, desc);
@@ -184,6 +196,7 @@ pub const PhysicsService = struct {
     }
 
     pub fn applyImpulse(self: *PhysicsService, body_id: u64, impulse: [3]f32) void {
+        if (self.hasPluginBackend()) return cabi.hostApplyImpulse(&self.slot, body_id, impulse);
         if (self.backend) |b| {
             if (b.apply_impulse) |fn_impulse| {
                 fn_impulse(self.backend_ctx.?, body_id, impulse);
@@ -222,6 +235,16 @@ fn buildModule(raw_app: *anyopaque) !void {
         .api_size = @sizeOf(PhysicsService),
     });
 
+    try app.services.register(.{
+        .capability = cabi.CAPABILITY,
+        .major_version = 1,
+        .provider_id = "official.physics.noop",
+        .owner_id = MODULE_OWNER_ID,
+        .exclusive = true,
+        .api_ptr = &svc.slot,
+        .api_size = @sizeOf(cabi.Slot),
+    });
+
     try app.addSystem(.{
         .name = "physics.fixed_step",
         .stage = .fixed_update,
@@ -240,7 +263,7 @@ pub fn module() engine.Module {
         .descriptor = .{
             .id = "official.physics",
             .version = "0.1.0",
-            .provides_capabilities = &.{"engine.physics/1"},
+            .provides_capabilities = &.{ "engine.physics/1", "engine.physics.backend/1" },
         },
         .build = buildModule,
         .stop = stopModule,

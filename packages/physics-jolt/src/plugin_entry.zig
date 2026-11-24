@@ -2,7 +2,7 @@
 //!
 //! Allows `zigeng-runtime` (or any host implementing `include/engine_extension.h`)
 //! to load `zigeng_physics_jolt.{dll,so,dylib}` dynamically and attach `JoltBackend`
-//! to the registered `engine.physics/1` service.
+//! to the host's `engine.physics.backend/1` C-ABI slot.
 
 const std = @import("std");
 const engine = @import("engine");
@@ -52,7 +52,7 @@ const AEPluginApi = extern struct {
 
 const PluginState = struct {
     backend: physics_jolt.JoltBackend,
-    svc: *physics.PhysicsService,
+    slot: *physics.cabi.Slot,
 };
 
 fn pluginLoad(host: *const AEHostApi, out_state: *?*anyopaque) callconv(.c) i32 {
@@ -63,23 +63,27 @@ fn pluginLoad(host: *const AEHostApi, out_state: *?*anyopaque) callconv(.c) i32 
     var svc_size: u32 = 0;
     const rc = get_svc(
         host.host_context,
-        AEStringView.fromSlice("engine.physics"),
+        AEStringView.fromSlice(physics.cabi.CAPABILITY),
         1,
         &svc_ptr,
         &svc_size,
     );
-    if (rc != AE_OK or svc_ptr == null or svc_size != @sizeOf(physics.PhysicsService)) {
+    if (rc != AE_OK or svc_ptr == null or svc_size != @sizeOf(physics.cabi.Slot)) {
         return AE_MISSING_SERVICE;
     }
 
-    const svc: *physics.PhysicsService = @ptrCast(@alignCast(@constCast(svc_ptr.?)));
+    // Only plain `extern` types cross the plugin boundary (see physics `cabi.zig`); verify the host speaks our ABI.
+    const slot: *physics.cabi.Slot = @ptrCast(@alignCast(@constCast(svc_ptr.?)));
+    if (!physics.cabi.slotIsCompatible(slot)) return AE_UNSUPPORTED_ABI;
+
     const st = std.heap.c_allocator.create(PluginState) catch return AE_ERROR;
     st.backend = physics_jolt.JoltBackend.init() catch {
         std.heap.c_allocator.destroy(st);
         return AE_ERROR;
     };
-    st.svc = svc;
-    st.backend.attachTo(svc);
+    st.slot = slot;
+    slot.ctx = &st.backend;
+    slot.vtable = physics.cabi.vtableFor(physics_jolt.JoltBackend);
 
     if (host.log) |log_fn| {
         log_fn(host.host_context, 1, AEStringView.fromSlice("official.physics.jolt attached to engine.physics/1"));
@@ -97,7 +101,8 @@ fn pluginStop(_: ?*anyopaque) callconv(.c) void {}
 
 fn pluginUnload(raw_state: ?*anyopaque) callconv(.c) void {
     const st: *PluginState = @ptrCast(@alignCast(raw_state orelse return));
-    st.svc.setBackend(null, null);
+    st.slot.vtable = null;
+    st.slot.ctx = null;
     st.backend.deinit();
     std.heap.c_allocator.destroy(st);
 }

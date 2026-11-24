@@ -69,7 +69,7 @@ pub const InputService = struct {
     }
 
     pub fn injectMouseButton(self: *InputService, button: MouseButton, down: bool) void {
-        const idx = @intFromEnum(button);
+        const idx = @backingInt(button);
         if (down and !self.mouse_down[idx]) {
             self.mouse_clicked[idx] = true;
         }
@@ -84,17 +84,19 @@ pub const InputService = struct {
     }
 
     pub fn injectText(self: *InputService, text: []const u8) void {
-        const copy_len = @min(text.len, self.last_text.len);
-        @memcpy(self.last_text[0..copy_len], text[0..copy_len]);
-        self.last_text_len = copy_len;
+        // Append: several text events can arrive in one frame (fast typing, IME commits).
+        const room = self.last_text.len - self.last_text_len;
+        const copy_len = @min(text.len, room);
+        @memcpy(self.last_text[self.last_text_len..][0..copy_len], text[0..copy_len]);
+        self.last_text_len += copy_len;
     }
 
     pub fn isMouseDown(self: *const InputService, button: MouseButton) bool {
-        return self.mouse_down[@intFromEnum(button)];
+        return self.mouse_down[@backingInt(button)];
     }
 
     pub fn wasMouseClicked(self: *const InputService, button: MouseButton) bool {
-        return self.mouse_clicked[@intFromEnum(button)];
+        return self.mouse_clicked[@backingInt(button)];
     }
 
     pub fn isKeyDown(self: *const InputService, key_code: u8) bool {

@@ -7,3 +7,6 @@ zig-out/
 *.a
 .DS_Store
 zig-pkg/
+
+# Rust build output (plugins built with cargo)
+target/

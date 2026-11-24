@@ -256,6 +256,47 @@ fn provisionPackageDir(allocator: std.mem.Allocator, io: std.Io, dir: []const u8
     }
 }
 
+/// Runs `argv` inside `cwd` without a shell (no quoting or path-separator pitfalls) and echoes its output.
+fn runArgvIn(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: []const u8) !void {
+    const res = try std.process.run(allocator, io, .{ .argv = argv, .cwd = .{ .path = cwd } });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+    if (res.stdout.len > 0) std.debug.print("{s}", .{res.stdout});
+    if (res.stderr.len > 0) std.debug.print("{s}", .{res.stderr});
+    switch (res.term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
+
+fn isPluginLib(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".dll") or std.mem.endsWith(u8, name, ".so") or std.mem.endsWith(u8, name, ".dylib");
+}
+
+/// Copies shared libraries found under `src_dir` into `./.zigeng/plugins/` (created on demand).
+fn copyPluginLibs(allocator: std.mem.Allocator, io: std.Io, src_dir: []const u8, recursive: bool) !void {
+    try std.Io.Dir.cwd().createDirPath(io, ".zigeng/plugins");
+    var plugins = try std.Io.Dir.cwd().openDir(io, ".zigeng/plugins", .{});
+    defer plugins.close(io);
+    var src = std.Io.Dir.cwd().openDir(io, src_dir, .{ .iterate = true }) catch return error.PluginBuildOutputMissing;
+    defer src.close(io);
+
+    var walker = try src.walk(allocator);
+    defer walker.deinit();
+    var copied: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !isPluginLib(entry.basename)) continue;
+        if (!recursive and std.mem.indexOfAny(u8, entry.path, "/\\") != null) continue;
+        try entry.dir.copyFile(entry.basename, plugins, entry.basename, io, .{});
+        std.debug.print("[zigeng] Copied {s} -> .zigeng/plugins/\n", .{entry.basename});
+        copied += 1;
+    }
+    if (copied == 0) {
+        std.debug.print("[zigeng] No shared library (.dll/.so/.dylib) found under '{s}'.\n", .{src_dir});
+        return error.PluginBuildOutputMissing;
+    }
+}
+
 fn compileAndInstallPluginDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, label: []const u8) !void {
     const has_cargo = fileExists(allocator, io, dir_path, "Cargo.toml");
     const has_zig = fileExists(allocator, io, dir_path, "build.zig");
@@ -268,45 +309,19 @@ fn compileAndInstallPluginDir(allocator: std.mem.Allocator, io: std.Io, dir_path
             return error.MissingRustToolchain;
         }
         std.debug.print("[zigeng] Building Rust dependency for '{s}' (cargo build --release)...\n", .{label});
-        const cargo_cmd = if (builtin.os.tag == .windows)
-            try std.fmt.allocPrint(allocator, "pushd \"{s}\" && cargo build --release && popd", .{dir_path})
-        else
-            try std.fmt.allocPrint(allocator, "cd \"{s}\" && cargo build --release", .{dir_path});
-        defer allocator.free(cargo_cmd);
-        try runShell(allocator, io, cargo_cmd);
+        try runArgvIn(allocator, io, &.{ "cargo", "build", "--release" }, dir_path);
     }
 
     if (has_zig) {
         std.debug.print("[zigeng] Building plugin '{s}' locally with zig...\n", .{label});
-        const cmd = if (builtin.os.tag == .windows)
-            try std.fmt.allocPrint(
-                allocator,
-                "mkdir .zigeng\\plugins 2>nul & pushd \"{s}\" && zig build -Doptimize=ReleaseSafe && popd && (for /r \"{s}\\zig-out\" %f in (*.dll) do copy /y \"%f\" .zigeng\\plugins\\ >nul)",
-                .{ dir_path, dir_path },
-            )
-        else
-            try std.fmt.allocPrint(
-                allocator,
-                "mkdir -p .zigeng/plugins && (cd \"{s}\" && zig build -Doptimize=ReleaseSafe) && find \"{s}/zig-out\" -type f \\( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \\) -exec cp -f {{}} .zigeng/plugins/ \\;",
-                .{ dir_path, dir_path },
-            );
-        defer allocator.free(cmd);
-        try runShell(allocator, io, cmd);
+        try runArgvIn(allocator, io, &.{ "zig", "build", "-Doptimize=ReleaseSafe" }, dir_path);
+        const out_dir = try std.fmt.allocPrint(allocator, "{s}/zig-out", .{dir_path});
+        defer allocator.free(out_dir);
+        try copyPluginLibs(allocator, io, out_dir, true);
     } else if (has_cargo) {
-        const copy_cmd = if (builtin.os.tag == .windows)
-            try std.fmt.allocPrint(
-                allocator,
-                "mkdir .zigeng\\plugins 2>nul & (for /r \"{s}\\target\\release\" %f in (*.dll) do copy /y \"%f\" .zigeng\\plugins\\ >nul)",
-                .{dir_path},
-            )
-        else
-            try std.fmt.allocPrint(
-                allocator,
-                "mkdir -p .zigeng/plugins && find \"{s}/target/release\" -maxdepth 1 -type f \\( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \\) -exec cp -f {{}} .zigeng/plugins/ \\;",
-                .{dir_path},
-            );
-        defer allocator.free(copy_cmd);
-        try runShell(allocator, io, copy_cmd);
+        const out_dir = try std.fmt.allocPrint(allocator, "{s}/target/release", .{dir_path});
+        defer allocator.free(out_dir);
+        try copyPluginLibs(allocator, io, out_dir, false);
     } else {
         std.debug.print("[zigeng] Error: plugin '{s}' has neither build.zig nor Cargo.toml.\n", .{label});
         return error.InvalidPluginDirectory;

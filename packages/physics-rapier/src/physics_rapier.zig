@@ -50,8 +50,13 @@ pub const RapierBackend = struct {
         svc.setBackend(&backend_vtable, self);
     }
 
-    fn cbCreateBody(ctx: *anyopaque, entity: engine.EntityHandle, pos: [3]f32, body: physics.RigidBody, collider: ?physics.Collider) anyerror!u64 {
-        const self: *RapierBackend = @ptrCast(@alignCast(ctx));
+    pub fn createBody(
+        self: *RapierBackend,
+        entity: engine.EntityHandle,
+        pos: [3]f32,
+        body: physics.RigidBody,
+        collider: ?physics.Collider,
+    ) !u64 {
         const body_type: u8 = switch (body.body_type) {
             .dynamic => 0,
             .static => 1,
@@ -108,27 +113,48 @@ pub const RapierBackend = struct {
         return h;
     }
 
-    fn cbDestroyBody(ctx: *anyopaque, body_id: u64) void {
-        const self: *RapierBackend = @ptrCast(@alignCast(ctx));
+    pub fn destroyBody(self: *RapierBackend, body_id: u64) void {
         c.rapier_world_destroy_body(self.world, body_id);
     }
 
-    fn cbGetTransform(ctx: *anyopaque, body_id: u64) ?physics.BodyTransform {
-        const self: *RapierBackend = @ptrCast(@alignCast(ctx));
+    pub fn getTransform(self: *RapierBackend, body_id: u64) ?physics.BodyTransform {
         var pos: [3]f32 = .{ 0, 0, 0 };
         var rot: [3]f32 = .{ 0, 0, 0 };
         if (!c.rapier_world_get_transform(self.world, body_id, &pos, &rot)) return null;
         return .{ .pos = pos, .rot_euler = rot };
     }
 
+    pub fn applyImpulse(self: *RapierBackend, body_id: u64, impulse: [3]f32) void {
+        c.rapier_world_apply_impulse(self.world, body_id, &impulse);
+    }
+
+    pub fn step(self: *RapierBackend, dt: f32, gravity: [3]f32) void {
+        c.rapier_world_step(self.world, dt, &gravity);
+    }
+
+    fn cbCreateBody(ctx: *anyopaque, entity: engine.EntityHandle, pos: [3]f32, body: physics.RigidBody, collider: ?physics.Collider) anyerror!u64 {
+        const self: *RapierBackend = @ptrCast(@alignCast(ctx));
+        return self.createBody(entity, pos, body, collider);
+    }
+
+    fn cbDestroyBody(ctx: *anyopaque, body_id: u64) void {
+        const self: *RapierBackend = @ptrCast(@alignCast(ctx));
+        self.destroyBody(body_id);
+    }
+
+    fn cbGetTransform(ctx: *anyopaque, body_id: u64) ?physics.BodyTransform {
+        const self: *RapierBackend = @ptrCast(@alignCast(ctx));
+        return self.getTransform(body_id);
+    }
+
     fn cbApplyImpulse(ctx: *anyopaque, body_id: u64, impulse: [3]f32) void {
         const self: *RapierBackend = @ptrCast(@alignCast(ctx));
-        c.rapier_world_apply_impulse(self.world, body_id, &impulse);
+        self.applyImpulse(body_id, impulse);
     }
 
     fn cbStep(ctx: *anyopaque, dt: f32, gravity: [3]f32) anyerror!void {
         const self: *RapierBackend = @ptrCast(@alignCast(ctx));
-        c.rapier_world_step(self.world, dt, &gravity);
+        self.step(dt, gravity);
     }
 
     const backend_vtable = physics.PhysicsBackendVTable{
