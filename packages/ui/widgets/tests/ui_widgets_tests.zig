@@ -264,3 +264,44 @@ test "clicking empty space or plain chrome blurs the focused text input" {
     try click(input, mgr, tree, 299, 299);
     try testing.expect(tree.focused_node == null);
 }
+
+test "WidgetManager prunes dead bindings and restores focus on popover Escape" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(window.module());
+    try app.registerModule(graphics.module());
+    try app.registerModule(ui_core.module());
+    try app.registerModule(ui_widgets.module());
+    try app.initialize();
+
+    const tree = app.resources.get(ui_core.UiTree).?;
+    const mgr = app.resources.get(ui_widgets.WidgetManager).?;
+    const input = @as(*window.InputService, @ptrCast(@alignCast(@constCast((try app.services.getService("engine.input", 1)).api_ptr))));
+
+    const anchor = try tree.createNode(null, .{ .id = "anchor", .kind = .button, .focusable = true, .style = .{ .width = 80, .height = 24 } });
+    const pop = try tree.createNode(null, .{ .id = "pop", .kind = .panel, .style = .{ .width = 100, .height = 60, .visible = false } });
+    const inner = try tree.createNode(pop, .{ .id = "inner", .kind = .button, .focusable = true, .style = .{ .width = 80, .height = 24 } });
+    const doomed = try tree.createNode(null, .{ .id = "doomed", .kind = .button, .focusable = true, .style = .{ .width = 80, .height = 24 } });
+
+    const anchor_id = tree.idOf(anchor).?;
+    const pop_id = tree.idOf(pop).?;
+    const doomed_id = tree.idOf(doomed).?;
+    _ = try mgr.attach(anchor_id, "a", .{ .button = .{} });
+    _ = try mgr.attach(pop_id, "p", .{ .popover = .{ .anchor = anchor_id, .open = true } });
+    _ = try mgr.attach(doomed_id, "d", .{ .button = .{} });
+
+    // Focus anchor, run frame so popover opens & records restore_focus, then move focus inside popover.
+    tree.setFocus(anchor, true);
+    try mgr.processFrame(tree, input, null, 300, 300);
+    tree.setFocus(inner, true);
+
+    // Remove doomed node and press Escape to close popover.
+    tree.removeSubtree(doomed);
+    input.beginFrame();
+    input.injectKey(window.KeyCode.escape, true);
+    try mgr.processFrame(tree, input, null, 300, 300);
+
+    try testing.expect(mgr.findByNode(doomed_id) == null);
+    try testing.expectEqual(@as(?usize, anchor), tree.focused_node);
+}

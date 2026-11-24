@@ -52,6 +52,10 @@ pub const AppConfig = struct {
     /// Minimum wall-clock duration of a `runRealtime` frame in nanoseconds. The loop sleeps for the
     /// remainder so it does not spin a CPU core; `0` disables pacing (e.g. when vsync paces frames).
     min_frame_ns: u64 = 0,
+    /// Opt-in parallel scheduler execution for `.worker`/`.any` systems.
+    enable_parallel: bool = false,
+    /// Optional worker limit when `enable_parallel` is true (`null` uses default CPU-scaled limit).
+    parallel_threads: ?usize = null,
 };
 
 /// Root application container composing all core subsystems.
@@ -69,6 +73,7 @@ pub const App = struct {
     types: reflection_mod.TypeRegistry,
     diagnostics: diagnostics_mod.Diagnostics,
     plugin_host: ?*abi_mod.PluginHost,
+    parallel_io: ?*std.Io.Threaded = null,
     should_quit: bool,
 
     /// Initializes a new headless `App` without allocating any optional UI, GPU, or VM resources.
@@ -112,6 +117,11 @@ pub const App = struct {
         self.events.deinit();
         self.commands.deinit();
         self.scheduler.deinit();
+        if (self.parallel_io) |pio| {
+            pio.deinit();
+            self.allocator.destroy(pio);
+            self.parallel_io = null;
+        }
         self.world.deinit();
         self.diagnostics.deinit();
     }
@@ -125,6 +135,7 @@ pub const App = struct {
             &self.diagnostics,
             &self.services,
             &self.events,
+            &self.types,
         );
         self.plugin_host = host;
         return host;
@@ -176,6 +187,17 @@ pub const App = struct {
         errdefer self.state = .stopped;
         try self.modules.startAll(self);
         errdefer self.modules.stopAll(self);
+
+        if (self.config.enable_parallel and self.parallel_io == null) {
+            const pio = try self.allocator.create(std.Io.Threaded);
+            errdefer self.allocator.destroy(pio);
+            pio.* = if (self.config.parallel_threads) |n|
+                std.Io.Threaded.init(self.allocator, .{ .async_limit = .limited(n) })
+            else
+                std.Io.Threaded.init(self.allocator, .{});
+            self.parallel_io = pio;
+            self.scheduler.setParallel(pio.io());
+        }
 
         try self.scheduler.buildAll();
 

@@ -91,6 +91,36 @@ static AEStatus plugin_start(void *raw_state) {
                 ev->post(ev->events_context, ev_name, ev_payload, state->spawned_entity);
             }
         }
+
+        /* Resolve engine.reflection/1 and register a plugin-owned component schema */
+        AEStringView refl_id = { "engine.reflection", 17 };
+        if (state->host->get_service(state->host->host_context, refl_id, 1, &svc_api, &svc_size) == AE_OK &&
+            svc_size >= sizeof(AEReflectionApiV1)) {
+            const AEReflectionApiV1 *refl = (const AEReflectionApiV1 *)svc_api;
+            if (refl->abi_major == AE_ABI_MAJOR && refl->register_component_schema) {
+                AEFieldDescriptor fields[2] = {
+                    { { "hp", 2 }, AE_FIELD_F32 },
+                    { { "max_hp", 6 }, AE_FIELD_F32 }
+                };
+                uint64_t schema_id = 0;
+                AEStringView owner = { "community.example.c_plugin", 26 };
+                AEStringView ns = { "c_plugin", 8 };
+                AEStringView name = { "Health", 6 };
+                if (refl->register_component_schema(
+                    refl->reflection_context,
+                    owner,
+                    ns,
+                    name,
+                    1,
+                    AE_STORAGE_BLITTABLE,
+                    fields,
+                    2,
+                    &schema_id
+                ) == AE_OK) {
+                    log_msg(state->host, 1, "c-plugin: registered Health schema");
+                }
+            }
+        }
     }
 
     log_msg(state->host, 1, "c-plugin: started");

@@ -21,6 +21,8 @@ test "Phase 3: C ABI struct layout parity with include/engine_extension.h" {
     try testing.expectEqual(@as(usize, @offsetOf(c_abi.AEPluginApi, "unload")), @offsetOf(engine.abi.AEPluginApi, "unload"));
     try testing.expectEqual(@as(usize, @sizeOf(c_abi.AEWorldApiV1)), @sizeOf(engine.abi.AEWorldApiV1));
     try testing.expectEqual(@as(usize, @sizeOf(c_abi.AEEventsApiV1)), @sizeOf(engine.abi.AEEventsApiV1));
+    try testing.expectEqual(@as(usize, @sizeOf(c_abi.AEFieldDescriptor)), @sizeOf(engine.abi.AEFieldDescriptor));
+    try testing.expectEqual(@as(usize, @sizeOf(c_abi.AEReflectionApiV1)), @sizeOf(engine.abi.AEReflectionApiV1));
 }
 
 test "Phase 3 & B: Load real C plugin, verify entity spawn + event post via C ABI, and validate ABI rejection" {
@@ -58,9 +60,14 @@ test "Phase 3 & B: Load real C plugin, verify entity spawn + event post via C AB
     // Verify C plugin logged through AEHostApi.log into Diagnostics
     try testing.expect(app.diagnostics.count() >= 3);
 
-    // Unload plugin -> stop() despawns its entity and stale handle is rejected
+    // Verify C plugin registered its component schema via engine.reflection/1
+    const health_schema = app.types.getLatest("c_plugin", "Health") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), health_schema.fields.len);
+
+    // Unload plugin -> stop() despawns its entity, stale handle is rejected, and plugin-owned schemas are removed
     try testing.expectEqual(engine.abi.AEStatus.ok, host.unloadPlugin(handle));
     try testing.expectEqual(@as(usize, 0), app.world.entity_count);
+    try testing.expect(app.types.getLatest("c_plugin", "Health") == null);
     try testing.expectEqual(engine.abi.AEStatus.invalid_handle, host.startPlugin(handle));
 
     // Reject incompatible ABI major version

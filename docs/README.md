@@ -6,6 +6,8 @@ Welcome to the `zengy` documentation. This engine is built around a **minimal he
 
 - **Guides & Workflows**
   - [Getting Started](getting-started.md) — setup, first app, and running headless/visual examples
+  - [Headless GPU Testing](headless-gpu-testing.md) — offscreen/lavapipe verification and GPU smoke checks
+  - [Benchmarks Baseline](benchmarks-baseline.md) — ECS, Scene Graph, and parallel scheduler baselines
   - [Releasing, CI/CD & Distribution](releasing.md) — merging to `main`, tagging releases, and `engine-cli` scope
   - [Package Catalog](../packages/README.md) — all optional packages, including [PocketPy Python](../packages/scripting/python/README.md), [SDL_GPU](../packages/graphics/sdlgpu/README.md), [2D](../packages/render/2d/README.md), and [3D](../packages/render/3d/README.md)
 - **API Reference**
@@ -30,25 +32,29 @@ Welcome to the `zengy` documentation. This engine is built around a **minimal he
 Requires **Zig `0.17.1`**:
 
 ```bash
-# Run all 50 test steps (Debug / ReleaseSafe)
+# Run all 68 test steps (Debug / ReleaseSafe)
 zig build test --summary all
 zig build test -Doptimize=ReleaseSafe --summary all
 
-# Headless & integrated playground
+# Headless, benchmark & integrated playground
 zig build run-headless
 zig build run-playground
+zig build run-bench -Doptimize=ReleaseFast
 
 # Diagnostic CLI
 zig build run-cli
 zig build run-cli -Dcli-cmd=packages
 zig build run-cli -Dcli-cmd=test-scenario
 
-# Visual demos (Windows x64)
+# Visual demos
 zig build run-visual-hello
 zig build run-visual-gpu
 zig build run-visual-2d
+zig build run-visual-plume
 zig build run-visual-ui
 zig build run-visual-playground
 zig build run-visual-python
 zig build run-visual-3d
+zig build run-visual-camera
+zig build run-visual-gamepad
 ```

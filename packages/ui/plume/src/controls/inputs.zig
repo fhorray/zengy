@@ -697,7 +697,7 @@ pub fn syncCombobox(tree: *ui_core.UiTree, mgr: *const ui_widgets.WidgetManager,
             if (tree.resolveId(oid)) |oi| {
                 const txt = tree.nodes.items[oi].text;
                 tree.nodes.items[oi].style.visible = containsInsensitive(txt, query);
-                const hov = tree.nodes.items[oi].hovered;
+                const hov = tree.nodes.items[oi].hovered or tree.nodes.items[oi].focused;
                 tree.nodes.items[oi].style.bg_color = if (hov) th.color(.item_hover, .floating) else .{ .r = 0, .g = 0, .b = 0, .a = 0 };
             }
         }

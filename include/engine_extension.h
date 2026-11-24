@@ -79,6 +79,58 @@ typedef struct AEEventsApiV1 {
     AEStatus (*post)(void *events_context, AEStringView name, AEStringView payload, AEHandle entity);
 } AEEventsApiV1;
 
+/** Reflection field type tags matching `engine.reflection.FieldType`. */
+enum {
+    AE_FIELD_BOOL = 0,
+    AE_FIELD_I32 = 1,
+    AE_FIELD_I64 = 2,
+    AE_FIELD_U32 = 3,
+    AE_FIELD_U64 = 4,
+    AE_FIELD_F32 = 5,
+    AE_FIELD_F64 = 6,
+    AE_FIELD_VEC2 = 7,
+    AE_FIELD_VEC3 = 8,
+    AE_FIELD_VEC4 = 9,
+    AE_FIELD_ENUM_U32 = 10,
+    AE_FIELD_ENTITY_REF = 11,
+    AE_FIELD_ASSET_REF = 12,
+    AE_FIELD_FIXED_STR64 = 13
+};
+
+/** Reflection storage policy tags matching `engine.reflection.StoragePolicy`. */
+enum {
+    AE_STORAGE_BLITTABLE = 0,
+    AE_STORAGE_MANAGED_HANDLE = 1,
+    AE_STORAGE_BLOB = 2
+};
+
+/** Field descriptor passed to `AEReflectionApiV1.register_component_schema`. */
+typedef struct AEFieldDescriptor {
+    AEStringView name;
+    uint32_t field_type;
+} AEFieldDescriptor;
+
+/**
+ * Stable C ABI v1 function table for component schema registration (`engine.reflection/1`).
+ * Schemas registered with `owner_plugin_id` are automatically removed when that plugin unloads.
+ */
+typedef struct AEReflectionApiV1 {
+    uint32_t struct_size;
+    uint32_t abi_major;
+    void *reflection_context;
+    AEStatus (*register_component_schema)(
+        void *reflection_context,
+        AEStringView owner_plugin_id,
+        AEStringView namespace_name,
+        AEStringView type_name,
+        uint32_t version,
+        uint32_t storage_policy,
+        const AEFieldDescriptor *fields,
+        size_t field_count,
+        uint64_t *out_schema_id
+    );
+} AEReflectionApiV1;
+
 /**
  * Host capability table passed to `AEPluginApi.load()`.
  * Allows plugins to log diagnostics and resolve registered engine services.

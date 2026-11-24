@@ -9,12 +9,17 @@
 
 > Note: `engine-cli` does **not** upload or publish builds to users. Distribution is handled via **GitHub Actions + GitHub Releases** (`.github/workflows/release.yml`).
 
-## 2. CI Workflow (`.github/workflows/ci.yml`)
+## 2. CI Workflows (`.github/workflows/ci.yml` & `fuzz.yml`)
 
-Every push to `main`, `feat/**`, `fix/**` and every Pull Request to `main` automatically verifies:
+Every push to `main`, `feat/**`, `fix/**` and every Pull Request to `main` automatically runs:
 1. `zig build test` in `Debug` and `ReleaseSafe`
 2. `zig build run-headless` and `zig build run-cli`
 3. `zig build -Dtarget=x86_64-windows` cross-compilation of all visual & headless binaries
+4. `sanitize` — ThreadSanitizer (TSan) verification on parallel scheduler tests
+5. `bench` — `tools/ci/check_bench.sh` regression guard against `docs/benchmarks-baseline.md`
+6. `gpu-smoke` — headless Vulkan (`lavapipe` + `SDL_VIDEODRIVER=offscreen`) smoke run of visual demos
+
+Additionally, `.github/workflows/fuzz.yml` runs nightly scaled fuzzing (ECS reference model, cooked prefab mutations, and randomized parallel schedules).
 
 ## 3. Merging to `main` & Publishing a Release
 

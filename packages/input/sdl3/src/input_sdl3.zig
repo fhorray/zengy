@@ -147,6 +147,22 @@ fn pollSdlGamepads(raw_ctx: ?*anyopaque, gamepads: *input.Gamepads) void {
 
         g.buttons.setDown(.left_trigger, lz > 0.5);
         g.buttons.setDown(.right_trigger, rz > 0.5);
+
+        g.touchpad_fingers = @splat(.{});
+        g.touchpad_finger_count = 0;
+        if (c.SDL_GetNumGamepadTouchpads(pad) > 0) {
+            const max_f = @min(@as(usize, @intCast(@max(0, c.SDL_GetNumGamepadTouchpadFingers(pad, 0)))), 2);
+            for (0..max_f) |fi| {
+                var f_down: bool = false;
+                var fx: f32 = 0.0;
+                var fy: f32 = 0.0;
+                var fp: f32 = 0.0;
+                if (c.SDL_GetGamepadTouchpadFinger(pad, 0, @intCast(fi), &f_down, &fx, &fy, &fp)) {
+                    g.touchpad_fingers[fi] = .{ .down = f_down, .x = fx, .y = fy, .pressure = fp };
+                    if (f_down) g.touchpad_finger_count += 1;
+                }
+            }
+        }
     }
 }
 

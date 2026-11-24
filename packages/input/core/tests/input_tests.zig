@@ -37,6 +37,12 @@ test "GamepadState D-Pad and deadzone axis filtering" {
     const ls = gp.leftStick();
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), ls[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, -0.80), ls[1], 1e-4);
+
+    gp.touchpad_fingers[0] = .{ .down = true, .x = 0.42, .y = 0.75, .pressure = 1.0 };
+    gp.touchpad_finger_count = 1;
+    const f0 = gp.touchpadFinger(0).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.42), f0.x, 1e-4);
+    try std.testing.expect(gp.touchpadFinger(1) == null);
 }
 
 test "syncInputSystem bridges window.InputService into KeyInput, MouseInput, motion, and scroll" {

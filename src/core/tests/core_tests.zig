@@ -1558,3 +1558,30 @@ test "TypeRegistry serializeWorld and deserializeWorld remap EntityRef and prese
     }
     try testing.expect(found_owner);
 }
+
+test "AppConfig.enable_parallel configures and tears down parallel scheduler automatically" {
+    var app = engine.App.init(testing.allocator, .{
+        .enable_parallel = true,
+        .parallel_threads = 2,
+    });
+    defer app.deinit();
+
+    const Counter = struct { n: u32 = 0 };
+    _ = try app.world.registerComponent(Counter);
+    const e = try app.world.spawn();
+    try app.world.set(e, Counter, .{ .n = 1 });
+
+    const sys = struct {
+        fn run(ctx: *engine.SystemContext) !void {
+            var q = try ctx.query(.{ .write = .{Counter} });
+            defer q.deinit();
+            while (q.next()) |row| row.write(Counter).n += 1;
+        }
+    }.run;
+    try app.addSystem(.{ .name = "inc", .thread_affinity = .any, .writes = &.{"Counter"}, .run = sys });
+
+    try app.initialize();
+    try testing.expect(app.parallel_io != null);
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 2), app.world.getConst(e, Counter).?.n);
+}

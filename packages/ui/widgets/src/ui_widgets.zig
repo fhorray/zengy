@@ -87,6 +87,8 @@ pub const BehaviorKind = union(enum) {
         context_target: ?ui_core.UiNodeId = null,
         placement: events.PopoverPlacement = .{},
         open: bool = false,
+        was_open: bool = false,
+        restore_focus: ?ui_core.UiNodeId = null,
         dismiss_on_outside: bool = true,
         match_anchor_width: bool = false,
         window_margin: f32 = 6.0,
@@ -248,6 +250,27 @@ pub const WidgetManager = struct {
         return self.processFrameWithDt(tree, input, win_svc, viewport_w, viewport_h, 16.6667);
     }
 
+    /// Removes bindings whose target `UiNodeId` is no longer alive in `tree`.
+    pub fn pruneDeadBindings(self: *WidgetManager, tree: *const ui_core.UiTree) void {
+        var i: usize = 0;
+        var removed = false;
+        while (i < self.bindings.items.len) {
+            if (tree.resolveId(self.bindings.items[i].node) == null) {
+                const removed_binding = self.bindings.swapRemove(i);
+                if (removed_binding.tag.len > 0) self.allocator.free(removed_binding.tag);
+                removed = true;
+            } else {
+                i += 1;
+            }
+        }
+        if (removed) {
+            self.node_index.clearRetainingCapacity();
+            for (self.bindings.items, 0..) |b, idx| {
+                self.node_index.put(self.allocator, b.node, @intCast(idx)) catch {};
+            }
+        }
+    }
+
     /// Runs one headless interaction & layout-sync pass over `tree` with explicit frame delta `dt_ms`.
     pub fn processFrameWithDt(
         self: *WidgetManager,
@@ -259,6 +282,7 @@ pub const WidgetManager = struct {
         dt_ms: f32,
     ) !void {
         self.event_queue.clear();
+        self.pruneDeadBindings(tree);
         // Never keep keyboard focus on destroyed, hidden, or modal-blocked nodes.
         if (tree.focused_node) |pf| {
             const before = pf;
@@ -418,7 +442,16 @@ pub const WidgetManager = struct {
                     }
                     if (should_close) {
                         pop.open = false;
+                        pop.was_open = false;
                         tree.nodes.items[p_idx].style.visible = false;
+                        if (pop.restore_focus) |rf| {
+                            if (tree.resolveId(rf)) |rf_idx| {
+                                if (tree.nodes.items[rf_idx].alive and tree.nodes.items[rf_idx].style.visible and !tree.nodes.items[rf_idx].disabled) {
+                                    tree.setFocus(rf_idx, esc_pressed);
+                                }
+                            }
+                            pop.restore_focus = null;
+                        }
                         try self.event_queue.push(.{
                             .node = b.node,
                             .tag = b.tag,
@@ -1047,12 +1080,22 @@ pub const WidgetManager = struct {
     }
 
     fn syncPopovers(self: *WidgetManager, tree: *ui_core.UiTree, vw: f32, vh: f32) void {
-        for (self.bindings.items) |b| {
+        for (self.bindings.items) |*b| {
             if (b.behavior != .popover) continue;
-            const pop = b.behavior.popover;
+            const pop = &b.behavior.popover;
             const p_idx = tree.resolveId(b.node) orelse continue;
             tree.nodes.items[p_idx].style.visible = pop.open;
-            if (!pop.open) continue;
+            if (!pop.open) {
+                pop.was_open = false;
+                continue;
+            }
+            if (!pop.was_open) {
+                pop.was_open = true;
+                pop.restore_focus = if (tree.focused_node) |fi|
+                    (if (!isDescendantOrSelf(tree, fi, p_idx)) tree.idOf(fi) else pop.anchor)
+                else
+                    pop.anchor;
+            }
 
             const a_idx = tree.resolveId(pop.anchor) orelse continue;
             const anchor_r = tree.nodes.items[a_idx].layout;

@@ -23,9 +23,12 @@ pub const AppConfig = struct {
     fixed_dt: f64 = 1.0 / 60.0,
     max_fixed_steps: u32 = 8,
     max_frames: ?u64 = null,
+    min_frame_ns: u64 = 0,
     event_queue_capacity: usize = 1024,
     event_overflow_policy: OverflowPolicy = .drop_newest,
     log_capacity: usize = 256,
+    enable_parallel: bool = false,
+    parallel_threads: ?usize = null,
 };
 ```
 
@@ -47,26 +50,28 @@ pub const AppConfig = struct {
 
 ### Handles & Identity
 
-- `EntityHandle` — Packed 64-bit `(index: u32, generation: u32)`. Despawning increments `generation`, so stale handles return `false` from `isAlive()` and `null` from `get()`/`getConst()`.
-- `EntityGuid` — Persistent `u128` identifier for scene serialization and asset references.
+- `EntityHandle` — Packed 64-bit `(index: u32, generation: u32)` where the top 8 bits of `generation` carry `WorldId.index & 0xFF`. Despawning increments `generation`, so stale handles and handles from another `World` return `false` from `isAlive()` and `null` from `get()`/`getConst()`.
+- `EntityGuid` — Persistent `u128` identifier for scene serialization and asset references. Use `world.setGuidNamespace(...)` to scope GUIDs per world/project.
 - `WorldId` — Packed 64-bit `(index: u32, generation: u32)` identifying a `World`.
 
 ### World Methods
 
-- `world.spawn() !EntityHandle` — Allocates or recycles an entity slot. Fails with `error.MutationDuringActiveQuery` if a `Query` is open.
-- `world.despawn(entity) !bool` — Removes all components, bumps generation, and recycles the index.
-- `world.isAlive(entity) bool` — Checks generation and alive flag.
+- `world.spawn() !EntityHandle` — Allocates or recycles an entity slot. Fails with `error.MutationDuringActiveQuery` if a `Query` is open or `error.MutationDuringParallelPhase` during parallel execution.
+- `world.despawn(entity) !bool` — Visits only pools present via the per-entity membership bitset, removes all components, bumps generation, and recycles the index.
+- `world.isAlive(entity) bool` — Checks generation, world tag, and alive flag.
 - `world.getGuid(entity) ?EntityGuid` — Returns the persistent GUID if alive.
-- `world.set(entity, T, value) !void` — Attaches or updates component `T`. Auto-registers `T` if needed.
+- `world.set(entity, T, value) !void` — Attaches or updates component `T`. Auto-registers `T` if needed (alignment must be a power of two <= 64 bytes).
 - `world.get(entity, T) ?*T` / `world.getConst(entity, T) ?*const T` — Returns a pointer to component `T`.
 - `world.has(entity, T) bool` — Checks component presence.
-- `world.remove(entity, T) !bool` — Removes component `T`.
+- `world.remove(entity, T) !bool` — Removes component `T` and records a removal event for `removedSince(T)`.
+- `world.enableChangeTracking(T) !void` — Opt-in change tracking (`added`/`changed` filters) for component `T`.
+- `world.removedSince(T, since_tick) []const EntityHandle` — Queries entities that had `T` removed since `since_tick` (pruned by the scheduler).
 - `world.registerDynamicComponent(name, size) !ComponentTypeId` — Registers a runtime-sized component pool.
 - `world.setRaw(entity, type_id, bytes) !void` / `world.getRaw(entity, type_id) ?[]u8` — Raw byte access for schemas and scripting bridges.
 
 ### Queries
 
-`World.query` caches component pool pointers during `init()` for zero-hash-lookup iteration:
+`World.query` caches component pool pointers during `init()` for zero-hash-lookup iteration and supports `.read`, `.write`, `.without`, `.optional`, `.added`, and `.changed` clauses:
 
 ```zig
 fn movementSystem(ctx: *engine.SystemContext) !void {
@@ -114,8 +119,9 @@ try app.addSystem(.{
 ```
 
 - Systems within each stage are topologically sorted using `before`/`after` constraints.
-- Cycles return `error.DependencyCycle`.
-- `CommandBuffer.apply()` runs automatically at the end of every stage.
+- Cycles return `error.DependencyCycle`; invalid `fixed_dt` (zero/negative/NaN/inf) returns `error.InvalidFixedTimestep`.
+- `scheduler.setParallel(io)` (or `AppConfig.enable_parallel = true`) enables concurrent execution of conflict-free `.worker`/`.any` systems grouped by `Scheduler.parallelBatches`, with per-task ticks and per-task `CommandBuffer`s merged deterministically in schedule order.
+- `CommandBuffer.apply()` is transactional (pre-allocates before mutating so OOM leaves no partial state) and runs automatically at the end of every stage.
 
 ---
 
@@ -155,9 +161,9 @@ pub const EventEnvelope = struct {
 
 ## 6. ResourceRegistry (`src/core/resources.zig`)
 
-Type-erased singleton storage keyed by `@typeName(T)` hash:
+Type-erased singleton storage keyed by `@typeName(T)` hash with hash-collision detection and deterministic **reverse-insertion order** destruction on `deinit()`:
 
-- `resources.insert(T, value) !void`
+- `resources.insert(T, value) !void` (caller retains ownership of any external heap allocations unless a destructor is registered)
 - `resources.get(T) ?*T` / `resources.getConst(T) ?*const T`
 - `resources.contains(T) bool`
 - `resources.remove(T) bool`

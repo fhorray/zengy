@@ -15,6 +15,7 @@ const diagnostics_mod = @import("diagnostics.zig");
 const service_mod = @import("service_registry.zig");
 const events_mod = @import("events.zig");
 const world_mod = @import("world.zig");
+const reflection_mod = @import("reflection.zig");
 
 /// Cross-platform dynamic library loader supporting Windows (kernel32) and POSIX (std.DynLib).
 pub const NativeLib = if (builtin.os.tag == .windows) struct {
@@ -117,6 +118,28 @@ pub const AEEventsApiV1 = extern struct {
     post: ?*const fn (events_context: ?*anyopaque, name: AEStringView, payload: AEStringView, entity: AEHandle) callconv(.c) i32,
 };
 
+pub const AEFieldDescriptor = extern struct {
+    name: AEStringView,
+    field_type: u32,
+};
+
+pub const AEReflectionApiV1 = extern struct {
+    struct_size: u32,
+    abi_major: u32,
+    reflection_context: ?*anyopaque,
+    register_component_schema: ?*const fn (
+        reflection_context: ?*anyopaque,
+        owner_plugin_id: AEStringView,
+        namespace_name: AEStringView,
+        type_name: AEStringView,
+        version: u32,
+        storage_policy: u32,
+        fields: ?[*]const AEFieldDescriptor,
+        field_count: usize,
+        out_schema_id: ?*u64,
+    ) callconv(.c) i32,
+};
+
 pub const AEPluginEntryFn = *const fn () callconv(.c) ?*const AEPluginApi;
 
 pub const PluginHandle = packed struct(u64) {
@@ -140,6 +163,7 @@ pub const HostContext = struct {
     diagnostics: *diagnostics_mod.Diagnostics,
     services: *service_mod.ServiceRegistry,
     events: *events_mod.EventBus,
+    reflection: *reflection_mod.TypeRegistry,
 };
 
 pub const PluginHost = struct {
@@ -148,6 +172,7 @@ pub const PluginHost = struct {
     host_api: AEHostApi,
     world_api: AEWorldApiV1,
     events_api: AEEventsApiV1,
+    reflection_api: AEReflectionApiV1,
     plugins: std.ArrayList(LoadedPlugin),
     next_owner_id: u64,
 
@@ -157,6 +182,7 @@ pub const PluginHost = struct {
         diagnostics: *diagnostics_mod.Diagnostics,
         services: *service_mod.ServiceRegistry,
         events: *events_mod.EventBus,
+        reflection: *reflection_mod.TypeRegistry,
     ) !*PluginHost {
         const self = try allocator.create(PluginHost);
         errdefer allocator.destroy(self);
@@ -168,10 +194,12 @@ pub const PluginHost = struct {
                 .diagnostics = diagnostics,
                 .services = services,
                 .events = events,
+                .reflection = reflection,
             },
             .host_api = undefined,
             .world_api = undefined,
             .events_api = undefined,
+            .reflection_api = undefined,
             .plugins = .empty,
             .next_owner_id = 1000,
         };
@@ -198,6 +226,12 @@ pub const PluginHost = struct {
             .events_context = events,
             .post = cEventsPost,
         };
+        self.reflection_api = .{
+            .struct_size = @sizeOf(AEReflectionApiV1),
+            .abi_major = ABI_MAJOR,
+            .reflection_context = self,
+            .register_component_schema = cRegisterComponentSchema,
+        };
 
         try services.register(.{
             .capability = "engine.world",
@@ -218,6 +252,16 @@ pub const PluginHost = struct {
             .exclusive = true,
             .api_ptr = &self.events_api,
             .api_size = @sizeOf(AEEventsApiV1),
+        });
+
+        try services.register(.{
+            .capability = "engine.reflection",
+            .major_version = 1,
+            .provider_id = "core.reflection.c_abi_v1",
+            .owner_id = 1,
+            .exclusive = true,
+            .api_ptr = &self.reflection_api,
+            .api_size = @sizeOf(AEReflectionApiV1),
         });
 
         return self;
@@ -253,6 +297,92 @@ pub const PluginHost = struct {
             .payload = payload.toSlice(),
             .entity_handle = entity,
         }) catch return @intFromEnum(AEStatus.err);
+        return @intFromEnum(AEStatus.ok);
+    }
+
+    fn fieldTypeFromC(raw: u32) ?reflection_mod.FieldType {
+        return switch (raw) {
+            0 => .bool_t,
+            1 => .i32_t,
+            2 => .i64_t,
+            3 => .u32_t,
+            4 => .u64_t,
+            5 => .f32_t,
+            6 => .f64_t,
+            7 => .vec2_t,
+            8 => .vec3_t,
+            9 => .vec4_t,
+            10 => .enum_u32_t,
+            11 => .entity_ref_t,
+            12 => .asset_ref_t,
+            13 => .fixed_str64_t,
+            else => null,
+        };
+    }
+
+    fn storagePolicyFromC(raw: u32) ?reflection_mod.StoragePolicy {
+        return switch (raw) {
+            0 => .blittable,
+            1 => .managed_handle,
+            2 => .blob,
+            else => null,
+        };
+    }
+
+    fn cRegisterComponentSchema(
+        raw_ctx: ?*anyopaque,
+        owner_plugin_id: AEStringView,
+        namespace_name: AEStringView,
+        type_name: AEStringView,
+        version: u32,
+        storage_policy: u32,
+        fields: ?[*]const AEFieldDescriptor,
+        field_count: usize,
+        out_schema_id: ?*u64,
+    ) callconv(.c) i32 {
+        const self: *PluginHost = @ptrCast(@alignCast(raw_ctx orelse return @intFromEnum(AEStatus.err)));
+        const pid_slice = owner_plugin_id.toSlice();
+        var owner_id: ?u64 = null;
+        for (self.plugins.items) |p| {
+            if (p.active and std.mem.eql(u8, p.plugin_id, pid_slice)) {
+                owner_id = p.owner_id;
+                break;
+            }
+        }
+        const resolved_owner = owner_id orelse return @intFromEnum(AEStatus.invalid_handle);
+        const storage = storagePolicyFromC(storage_policy) orelse return @intFromEnum(AEStatus.err);
+        if (field_count > 0 and fields == null) return @intFromEnum(AEStatus.err);
+
+        const ns_slice = namespace_name.toSlice();
+        const name_slice = type_name.toSlice();
+        if (ns_slice.len == 0 or name_slice.len == 0) return @intFromEnum(AEStatus.err);
+
+        const zig_fields = self.allocator.alloc(reflection_mod.FieldDescriptor, field_count) catch {
+            return @intFromEnum(AEStatus.err);
+        };
+        defer self.allocator.free(zig_fields);
+
+        if (field_count > 0) {
+            const c_fields = fields.?[0..field_count];
+            for (c_fields, 0..) |cf, i| {
+                const ft = fieldTypeFromC(cf.field_type) orelse return @intFromEnum(AEStatus.err);
+                zig_fields[i] = .{
+                    .name = cf.name.toSlice(),
+                    .field_type = ft,
+                };
+            }
+        }
+
+        const schema = self.host_ctx.reflection.registerSchemaWithOwner(
+            resolved_owner,
+            ns_slice,
+            name_slice,
+            version,
+            storage,
+            zig_fields,
+        ) catch return @intFromEnum(AEStatus.err);
+
+        if (out_schema_id) |out_ptr| out_ptr.* = schema.schema_id;
         return @intFromEnum(AEStatus.ok);
     }
 
@@ -383,9 +513,10 @@ pub const PluginHost = struct {
     pub fn unloadPlugin(self: *PluginHost, handle: PluginHandle) AEStatus {
         const plugin = self.getPluginMut(handle) orelse return .invalid_handle;
 
-        // Quiesce: revoke event subscriptions and services owned by this plugin first.
+        // Quiesce: revoke event subscriptions, services, and reflection schemas owned by this plugin first.
         _ = self.host_ctx.events.unsubscribeByOwner(plugin.owner_id);
         _ = self.host_ctx.services.unregisterByOwner(plugin.owner_id);
+        _ = self.host_ctx.reflection.unregisterByOwner(plugin.owner_id);
 
         if (plugin.started) {
             plugin.api.stop.?(plugin.state);

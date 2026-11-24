@@ -75,9 +75,13 @@ _ = host.unloadPlugin(handle);
 
 > **Important (Linux/POSIX):** Host executables that load `libc`-linked C shared libraries via `PluginHost.loadSharedLibrary()` must set `.link_libc = true` in `build.zig` so `dlopen` performs full dynamic relocations.
 
-## 4. Ownership & Safety Rules
+## 4. Reflection Schema Registration (`engine.reflection/1`)
+
+Plugins can resolve `engine.reflection` (major `1`, `AEReflectionApiV1`) via `host->get_service` and call `register_component_schema` with `AEFieldDescriptor` entries (`AE_FIELD_*` and `AE_STORAGE_*`). Schemas registered with `owner_plugin_id` are automatically unregistered when `unloadPlugin()` runs.
+
+## 5. Ownership & Safety Rules
 
 1. `struct_size` and `abi_major` are validated before dereferencing any fields beyond the prefix.
 2. Host allocations are freed only by the host; plugin `state` is allocated in `load()` and freed in `unload()`.
-3. On `unloadPlugin()`, the host revokes all `EventBus` subscriptions and `ServiceRegistry` entries owned by that plugin before calling `stop() -> unload()` and closing the dynamic library.
+3. On `unloadPlugin()`, the host revokes all `EventBus` subscriptions, `ServiceRegistry` entries, and `TypeRegistry` schemas owned by that plugin before calling `stop() -> unload()` and closing the dynamic library.
 4. `PluginHandle` includes a generation counter, preventing use-after-unload.

@@ -254,6 +254,7 @@ pub fn main(init: std.process.Init) !void {
 
     var headless = std.mem.eql(u8, "headless", "never");
     var headless_ticks: u64 = 60;
+    var parallel = false;
     {
         var args_it = try init.minimal.args.iterateAllocator(allocator);
         defer args_it.deinit();
@@ -261,6 +262,8 @@ pub fn main(init: std.process.Init) !void {
         while (args_it.next()) |arg| {
             if (std.mem.eql(u8, arg, "--headless")) {
                 headless = true;
+            } else if (std.mem.eql(u8, arg, "--parallel")) {
+                parallel = true;
             } else if (std.mem.eql(u8, arg, "--ticks")) {
                 if (args_it.next()) |val| {
                     headless_ticks = std.fmt.parseInt(u64, val, 10) catch 60;
@@ -288,7 +291,7 @@ pub fn main(init: std.process.Init) !void {
     const entry_script: ?[]const u8 = if (manifest.entry_script.len > 0) manifest.entry_script else null;
     const ui_path: ?[]const u8 = if (manifest.ui.len > 0) manifest.ui else null;
 
-    var app = engine.App.init(allocator, .{ .fixed_dt = 1.0 / 60.0 });
+    var app = engine.App.init(allocator, .{ .fixed_dt = 1.0 / 60.0, .enable_parallel = parallel });
     defer app.deinit();
 
     if (!headless) {

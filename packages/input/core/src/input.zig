@@ -223,6 +223,14 @@ pub const MouseInput = ButtonInput(MouseButton);
 /// Resource alias for gamepad `ButtonInput(GamepadButton)`.
 pub const GamepadButtonInput = ButtonInput(GamepadButton);
 
+/// Normalized finger contact on a controller touchpad (e.g., PS5 DualSense central touchpad).
+pub const TouchpadFinger = struct {
+    down: bool = false,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    pressure: f32 = 0.0,
+};
+
 /// State of a single connected or virtual gamepad slot.
 pub const GamepadState = struct {
     connected: bool = false,
@@ -232,6 +240,8 @@ pub const GamepadState = struct {
     buttons: GamepadButtonInput = .{},
     axes: [6]f32 = @splat(0.0),
     deadzone: f32 = 0.12,
+    touchpad_fingers: [2]TouchpadFinger = @splat(.{}),
+    touchpad_finger_count: u8 = 0,
 
     /// Returns the controller display name (e.g., `"DualSense Wireless Controller"`).
     pub fn name(self: *const GamepadState) []const u8 {
@@ -285,6 +295,13 @@ pub const GamepadState = struct {
         if (self.pressed(.dpad_up)) y += 1.0;
         if (self.pressed(.dpad_down)) y -= 1.0;
         return .{ x, y };
+    }
+
+    /// Returns the active touchpad finger at `idx` (`0..1`), or `null` if not touching.
+    pub fn touchpadFinger(self: *const GamepadState, idx: usize) ?TouchpadFinger {
+        if (idx >= self.touchpad_fingers.len) return null;
+        const f = self.touchpad_fingers[idx];
+        return if (f.down) f else null;
     }
 };
 

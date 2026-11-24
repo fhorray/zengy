@@ -91,6 +91,7 @@ pub const ComponentSchema = struct {
     schema_id: SchemaId,
     stable_id: StableTypeId,
     component_type_id: world_mod.ComponentTypeId,
+    owner_id: u64 = 0,
     namespace: []const u8,
     name: []const u8,
     version: u32,
@@ -174,6 +175,19 @@ pub const TypeRegistry = struct {
         storage: StoragePolicy,
         input_fields: []const FieldDescriptor,
     ) !ComponentSchema {
+        return self.registerSchemaWithOwner(0, namespace, name, version, storage, input_fields);
+    }
+
+    /// Registers a component schema associated with `owner_id` (0 for built-in/core types).
+    pub fn registerSchemaWithOwner(
+        self: *TypeRegistry,
+        owner_id: u64,
+        namespace: []const u8,
+        name: []const u8,
+        version: u32,
+        storage: StoragePolicy,
+        input_fields: []const FieldDescriptor,
+    ) !ComponentSchema {
         const schema_id = computeSchemaId(namespace, name, version);
         if (self.schemas.get(schema_id)) |existing| {
             return existing;
@@ -219,6 +233,7 @@ pub const TypeRegistry = struct {
             .schema_id = schema_id,
             .stable_id = computeStableId(namespace, name),
             .component_type_id = world_mod.World.dynamicTypeId(full_name),
+            .owner_id = owner_id,
             .namespace = ns_copy,
             .name = name_copy,
             .version = version,
@@ -243,6 +258,56 @@ pub const TypeRegistry = struct {
             self.name_to_schema.putAssumeCapacity(full_name, schema_id);
         }
         return schema;
+    }
+
+    /// Unregisters all schemas registered under `owner_id` and frees their metadata.
+    /// Returns the number of schemas removed. Passing `owner_id == 0` is a no-op.
+    pub fn unregisterByOwner(self: *TypeRegistry, owner_id: u64) usize {
+        if (owner_id == 0) return 0;
+
+        var removed_ids: std.ArrayList(SchemaId) = .empty;
+        defer removed_ids.deinit(self.allocator);
+
+        var it = self.schemas.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.owner_id == owner_id) {
+                removed_ids.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        if (removed_ids.items.len == 0) return 0;
+
+        for (removed_ids.items) |sid| {
+            if (self.schemas.fetchRemove(sid)) |kv| {
+                self.allocator.free(kv.value.namespace);
+                self.allocator.free(kv.value.name);
+                for (kv.value.fields) |f| self.allocator.free(f.name);
+                self.allocator.free(kv.value.fields);
+            }
+        }
+
+        var dead_names: std.ArrayList([]const u8) = .empty;
+        defer dead_names.deinit(self.allocator);
+        var name_it = self.name_to_schema.iterator();
+        while (name_it.next()) |entry| {
+            if (!self.schemas.contains(entry.value_ptr.*)) {
+                dead_names.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (dead_names.items) |key| {
+            _ = self.name_to_schema.remove(key);
+            self.allocator.free(key);
+        }
+
+        self.latest_version.clearRetainingCapacity();
+        self.stable_names.clearRetainingCapacity();
+        var rem_it = self.schemas.valueIterator();
+        while (rem_it.next()) |schema| {
+            const lv = self.latest_version.getOrPutAssumeCapacity(schema.stable_id);
+            if (!lv.found_existing or lv.value_ptr.* < schema.version) lv.value_ptr.* = schema.version;
+            self.stable_names.putAssumeCapacity(schema.stable_id, schema.schema_id);
+        }
+
+        return removed_ids.items.len;
     }
 
     /// Registers the upgrade from `from_version` to `from_version + 1` of `namespace.name`.

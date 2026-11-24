@@ -39,8 +39,11 @@ const GamepadDemoState = struct {
     cam_entity: engine.EntityHandle,
     cube_entity: engine.EntityHandle,
     color_idx: usize = 0,
-    rumble_status: []const u8 = "Idle (X=Rumble, Options/Touchpad=10s Show, O=Stop)",
+    rumble_status: []const u8 = "Idle (X=Rumble, Square=CoD Trigger, Start/Touch=10s Show, O=Stop)",
     haptic_show_t: f32 = -1.0,
+    cod_mode: bool = false,
+    fire_cooldown: f32 = 0.0,
+    shots_fired: u32 = 0,
     hud_line1: [160]u8 = @splat(0),
     hud_line1_len: usize = 0,
     hud_line2: [160]u8 = @splat(0),
@@ -91,6 +94,12 @@ fn updateGamepadDemo(ctx: *engine.SystemContext) !void {
             if (hap) |h| _ = h.playRumble(0, 0.25, 0.45, 120);
             st.rumble_status = "R3 Pressed: Reset Rotation";
         }
+        if (gp.justPressed(.select)) {
+            st.color_idx = (st.color_idx + 1) % PALETTE.len;
+            m.color = PALETTE[st.color_idx];
+            if (hap) |h| _ = h.playRumble(0, 0.2, 0.4, 90);
+            st.rumble_status = "Select/Create Pressed: Cycle Color";
+        }
 
         if (gp.justPressed(.north)) {
             t.position = .{ 0, 0, 0 };
@@ -100,25 +109,48 @@ fn updateGamepadDemo(ctx: *engine.SystemContext) !void {
 
         if (hap) |h| {
             if (gp.justPressed(.start) or gp.justPressed(.touchpad)) {
+                st.cod_mode = false;
                 st.haptic_show_t = 0.0;
             } else if (gp.justPressed(.south)) {
+                st.cod_mode = false;
                 st.haptic_show_t = -1.0;
                 const ok = h.playRumble(0, 0.75, 0.55, 350);
                 st.rumble_status = if (ok) "Dual-Motor Rumble (350ms)" else "Rumble unsupported/failed";
             } else if (gp.justPressed(.west)) {
                 st.haptic_show_t = -1.0;
-                const trig_ok = h.setAdaptiveTrigger(0, .right, .{ .weapon = .{ .start_position = 0.25, .end_position = 0.65, .strength = 1.0 } });
-                _ = h.setAdaptiveTrigger(0, .left, .{ .feedback = .{ .start_position = 0.2, .strength = 0.8 } });
+                st.cod_mode = true;
+                st.fire_cooldown = 0.0;
+                const trig_ok = h.setAdaptiveTrigger(0, .right, .{ .vibration = .{ .start_position = 0.22, .amplitude = 1.0, .frequency_hz = 18 } });
+                _ = h.setAdaptiveTrigger(0, .left, .{ .feedback = .{ .start_position = 0.15, .strength = 0.75 } });
                 if (trig_ok) {
-                    st.rumble_status = "PS5 Adaptive Triggers Active (R2=Weapon, L2=Feedback)";
+                    st.rumble_status = "CoD Machine Gun: Hold R2 to shoot, L2 to ADS!";
                 } else {
                     _ = h.playRumble(0, 0.35, 0.90, 250);
                     st.rumble_status = "Adaptive Triggers N/A -> High-Freq Pulse";
                 }
             } else if (gp.justPressed(.east)) {
+                st.cod_mode = false;
                 st.haptic_show_t = -1.0;
                 h.stop(0);
                 st.rumble_status = "Stopped (Rumble + Triggers Off)";
+            }
+
+            if (st.cod_mode) {
+                st.fire_cooldown = @max(0.0, st.fire_cooldown - ctx.dt);
+                if (r2 < 0.35) {
+                    st.fire_cooldown = 0.0;
+                } else if (r2 >= 0.45 and st.fire_cooldown <= 0.0) {
+                    st.fire_cooldown = 0.075;
+                    st.shots_fired += 1;
+                    // Rapid machine-gun recoil pulse + visual kick.
+                    _ = h.playRumble(0, 0.85, 0.95, 55);
+                    t.rotation_euler[0] -= 0.12;
+                    t.rotation_euler[2] = if (st.shots_fired % 2 == 0) 0.08 else -0.08;
+                    st.rumble_status = if (l2 > 0.35)
+                        "CoD Machine Gun [ADS]: BRRRRRT!"
+                    else
+                        "CoD Machine Gun: BRRRRRT!";
+                }
             }
 
             // 10-second choreographed haptic + adaptive trigger showcase sequence.
@@ -179,7 +211,7 @@ fn updateGamepadDemo(ctx: *engine.SystemContext) !void {
         st.hud_line2_len = l2_str.len;
         const l3_str = std.fmt.bufPrint(
             &st.hud_line3,
-            "DPad:[{s}{s}{s}{s}] Face:[{s}{s}{s}{s}] L1:{any} R1:{any} L3:{any} R3:{any} Touch:{any}",
+            "DPad:[{s}{s}{s}{s}] Face:[{s}{s}{s}{s}] L1:{any} R1:{any} L3:{any} R3:{any} Sel:{any} Sta:{any} Touch:{any}",
             .{
                 if (gp.pressed(.dpad_up)) "U" else ".",
                 if (gp.pressed(.dpad_down)) "D" else ".",
@@ -193,6 +225,8 @@ fn updateGamepadDemo(ctx: *engine.SystemContext) !void {
                 gp.pressed(.right_bumper),
                 gp.pressed(.left_thumb),
                 gp.pressed(.right_thumb),
+                gp.pressed(.select),
+                gp.pressed(.start),
                 gp.pressed(.touchpad),
             },
         ) catch "";
@@ -247,17 +281,32 @@ fn renderGamepadDemo(ctx: *engine.SystemContext) !void {
         } },
     });
 
-    // Visual analog trigger bars (L2 & R2) at bottom-left.
+    // Visual analog trigger bars (L2 & R2) at bottom-left + DualSense Touchpad preview at bottom-right.
     if (ctx.resources.get(input.Gamepads)) |gps| {
         if (gps.firstConnected()) |gp| {
             const l2 = gp.axis(.left_z);
             const r2 = gp.axis(.right_z);
+            const pad_x = @as(f32, @floatFromInt(px_w)) - 200.0;
+            const pad_y = @as(f32, @floatFromInt(px_h)) - 110.0;
+            const pad_w: f32 = 180.0;
+            const pad_h: f32 = 90.0;
             try st.gfx.submitDrawCommands(st.rt, &.{
                 .{ .rect = .{ .x = 20, .y = @as(f32, @floatFromInt(px_h)) - 44, .width = 160, .height = 12, .color = .{ .r = 0.16, .g = 0.18, .b = 0.24, .a = 1.0 } } },
                 .{ .rect = .{ .x = 20, .y = @as(f32, @floatFromInt(px_h)) - 44, .width = 160 * l2, .height = 12, .color = .{ .r = 0.30, .g = 0.65, .b = 0.98, .a = 1.0 } } },
                 .{ .rect = .{ .x = 200, .y = @as(f32, @floatFromInt(px_h)) - 44, .width = 160, .height = 12, .color = .{ .r = 0.16, .g = 0.18, .b = 0.24, .a = 1.0 } } },
                 .{ .rect = .{ .x = 200, .y = @as(f32, @floatFromInt(px_h)) - 44, .width = 160 * r2, .height = 12, .color = .{ .r = 0.96, .g = 0.56, .b = 0.22, .a = 1.0 } } },
+                .{ .rect = .{ .x = pad_x, .y = pad_y, .width = pad_w, .height = pad_h, .color = .{ .r = 0.14, .g = 0.16, .b = 0.21, .a = 1.0 } } },
             });
+            if (gp.touchpadFinger(0)) |f0| {
+                try st.gfx.submitDrawCommands(st.rt, &.{
+                    .{ .rect = .{ .x = pad_x + f0.x * pad_w - 5, .y = pad_y + f0.y * pad_h - 5, .width = 10, .height = 10, .color = .{ .r = 0.30, .g = 0.85, .b = 0.98, .a = 1.0 } } },
+                });
+            }
+            if (gp.touchpadFinger(1)) |f1| {
+                try st.gfx.submitDrawCommands(st.rt, &.{
+                    .{ .rect = .{ .x = pad_x + f1.x * pad_w - 5, .y = pad_y + f1.y * pad_h - 5, .width = 10, .height = 10, .color = .{ .r = 0.98, .g = 0.45, .b = 0.72, .a = 1.0 } } },
+                });
+            }
         }
     }
 

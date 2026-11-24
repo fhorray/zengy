@@ -267,6 +267,8 @@ pub const UiTree = struct {
     hovered_node: ?usize = null,
     pressed_node: ?usize = null,
     pointer_capture_node: ?usize = null,
+    last_modal_root: ?usize = null,
+    modal_restore_focus: ?UiNodeId = null,
     focus_visible: bool = false,
     caret_phase: f32 = 0.0,
     /// Duration of the current frame in seconds; advances caret blinking (set by the widget runtime).
@@ -970,8 +972,28 @@ pub const UiTree = struct {
     /// closed popover), or sits outside the active modal, so keyboard input never reaches
     /// invisible or blocked widgets.
     pub fn sanitizeFocus(self: *UiTree) void {
-        const f = self.focused_node orelse return;
         const modal = self.activeModalRoot();
+        if (modal) |m| {
+            if (self.focused_node) |pf| {
+                if (pf < self.nodes.items.len and self.nodes.items[pf].alive and !self.isInSubtree(pf, m)) {
+                    self.modal_restore_focus = self.idOf(pf);
+                }
+            }
+            self.last_modal_root = m;
+        } else if (self.last_modal_root != null) {
+            self.last_modal_root = null;
+            if (self.modal_restore_focus) |rid| {
+                self.modal_restore_focus = null;
+                if (self.resolveId(rid)) |ridx| {
+                    if (self.isEffectivelyVisible(ridx) and !self.nodes.items[ridx].disabled) {
+                        self.setFocus(ridx, self.focus_visible);
+                        return;
+                    }
+                }
+            }
+        }
+
+        const f = self.focused_node orelse return;
         const valid = f < self.nodes.items.len and self.nodes.items[f].alive and
             self.isEffectivelyVisible(f) and (modal == null or self.isInSubtree(f, modal.?));
         if (!valid) self.setFocus(null, false);

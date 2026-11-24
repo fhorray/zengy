@@ -94,7 +94,7 @@ Enables dynamic component schemas for editors, inspectors, scripting runtimes, a
 
 ### Supported Field Types (`FieldType`)
 
-`bool_t`, `i32_t`, `i64_t`, `u32_t`, `u64_t`, `f32_t`, `f64_t`, `vec2_t` (`[2]f32`), `vec3_t` (`[3]f32`), `vec4_t` (`[4]f32`).
+`bool_t`, `i32_t`, `i64_t`, `u32_t`, `u64_t`, `f32_t`, `f64_t`, `vec2_t` (`[2]f32`), `vec3_t` (`[3]f32`), `vec4_t` (`[4]f32`), `enum_u32_t`, `entity_ref_t`, `asset_ref_t`, `fixed_str64_t`.
 
 ### Registering and Using a Schema
 
@@ -119,5 +119,8 @@ const stored = app.world.getRaw(entity, tid).?;
 const current = try engine.TypeRegistry.getField(schema, stored, "current");
 ```
 
-- `SchemaId` is deterministically hashed from `namespace + name + version`.
+- `StableTypeId` (`u128`) is deterministically derived from `namespace + name` across schema versions; `SchemaId` (`u64`) identifies a specific `(namespace, name, version)`.
+- `registerSchemaWithOwner(owner_id, ...)` / `unregisterByOwner(owner_id)` bind plugin-registered schemas to an `owner_id` so unloading a plugin cleans up its types.
+- `getLatest(namespace, name)` and `getVersion(stable_id, version)` resolve schema versions; `registerMigration(namespace, name, from_version, fn)` chains `v -> v + 1` upgrades.
+- `encodeComponent` / `decodeComponent` provide portable little-endian binary encoding without struct padding; `serializeWorld` / `deserializeWorld` persist and restore entities and registered component pools across worlds.
 - Field offsets and total `byte_size` are automatically aligned according to each `FieldType`.

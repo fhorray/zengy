@@ -49,30 +49,47 @@ All packages under `packages/` are optional `engine.Module` implementations that
 - **Key APIs:**
   - `svc.registerImporter(ImporterDescriptor)` (resolved by extension and highest `priority`)
   - `svc.loadFromBytes(uri, raw_source) !AssetHandle` (URI-cached)
-  - `svc.reload(handle, new_source) !void` (bumps version in place)
-  - `svc.unload(handle) bool` (bumps generation, invalidating stale handles)
+  - `svc.reload(handle, new_source) !void` / `svc.reloadAndInvalidate(handle, new_source)` (bumps version in place and invalidates dependents)
+  - `svc.unload(handle) bool` / `svc.unloadIfUnreferenced(handle)` (bumps generation, invalidating stale handles)
+  - `svc.addDependency(parent, dep)` / `svc.dependentsOf(handle)` (dependency graph with cycle detection)
 
-## 7. 2D Scene & Transform Graph (`official.scene` — `packages/scene/src/scene.zig`)
+## 7. Scene & Transform Graph (`official.scene` — `packages/scene/src/scene.zig`)
 
 - **Provides:** `engine.scene.2d/1`
-- **Components:** `Transform2D`, `Parent`
-- **System:** `propagateTransformsSystem` in `.post_update` (supports arbitrary-depth parent chains).
+- **Components:** `Transform2D`, `Parent`, `HierarchyLinks`, `LocalTransform2D`, `GlobalTransform2D`, `LocalTransform3D`, `GlobalTransform3D`
+- **Systems:** `propagateTransformsSystem` (O(N) `Transform2D` propagation) and incremental change-tracked `scene.propagate_local_2d` / `scene.propagate_local_3d` (`.thread_affinity = .any`).
+- **Graph APIs (`graph.zig`):** `reparent` (cycle rejection + `preserve_world`), `despawnNode` (`cascade`, `orphan`, `reparent_to_parent`), `rebuildLinks`.
 - **Serialization:** `SceneSnapshot.capture(allocator, &world)` and `snap.restore(&target_world)`.
 
-## 8. Modular Editor Shell (`official.tools.editor_shell` — `packages/editor-shell/src/editor_shell.zig`)
+## 8. Prefabs & Cell Streaming (`official.prefab` — `packages/prefab/src/prefab.zig`)
+
+- **Provides:** `engine.prefab/1` (`PrefabLibrary`)
+- **Key APIs:**
+  - Portable `Prefab` definitions (local IDs, hierarchy, versioned component blobs, field overrides, nested prefabs)
+  - Two-phase atomic instantiation (`prepare` + `commit`) and `reinstantiate` hot reload
+  - Strict JSON loader, TOML bridge (`toml_format.tableToJsonValue`), and CRC-32 binary cooked format
+  - `CellStreamer` with per-frame entity budget, cancellation, and cell unloading
+
+## 9. Camera & Input (`official.camera`, `official.input`, `official.input.haptics`, `official.input.sdl3`)
+
+- **`official.camera` (`packages/camera/src/camera.zig`):** `Camera`, `Projection`, `CameraPose`, `CameraService` driving `render-2d` and `render-3d` view/projection matrices.
+- **`official.input` (`packages/input/core/src/input.zig`):** `KeyInput`, `MouseInput`, `Gamepads` (sticks, triggers, buttons, DualSense `TouchpadFinger` tracking), and `InputMap` action bindings.
+- **`official.input.haptics` / `official.input.sdl3`:** `HapticService` for dual-motor rumble and DualSense adaptive triggers (`feedback`, `weapon`, `vibration`).
+
+## 10. Modular Editor Shell (`official.tools.editor_shell` — `packages/editor-shell/src/editor_shell.zig`)
 
 - **Requires:** `engine.ui.tree/1`
 - **Provides:** `engine.tools.editor_shell/1` (`EditorShellService`)
 - **Key APIs:** `registerPanel(desc)`, `setInspectedField(&world, &types, entity, schema_id, field, val)`, `undo(&world, &types)`, `redo(&world, &types)`.
 
-## 9. 3D Renderer Foundation (`official.render.3d` — `packages/render/3d/src/render_3d.zig`)
+## 11. 3D Renderer Foundation (`official.render.3d` — `packages/render/3d/src/render_3d.zig`)
 
 - **Requires:** `engine.graphics.device/1`
 - **Provides:** `engine.render.3d/1` (`Render3DService`)
 - **Components:** `Transform3D`, `Camera3D`, `MeshRef`
 - **System:** `extract3DSystem` in `.render_extract` populates `extracted_draws` when an active `Camera3D` exists.
 
-## 10. Playground & CLI
+## 12. Playground & CLI
 
 - **Playground (`examples/playground/main.zig`):** `zig build run-playground` — end-to-end sandbox composing all optional packages and `libc_plugin.so`.
 - **Diagnostic CLI (`tools/cli/main.zig`):**

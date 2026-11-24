@@ -235,6 +235,15 @@ test "UiTree focus: skips hidden subtrees, traps Tab inside a modal, sanitizes s
     tree.nodes.items[modal].style.visible = false;
     try testing.expectEqual(@as(?usize, b1), tree.focusNext(false)); // modal closed: back to page
 
+    // Closing a modal via sanitizeFocus restores the focus that was active before it opened.
+    tree.setFocus(b2, true);
+    tree.nodes.items[modal].style.visible = true;
+    tree.sanitizeFocus();
+    try testing.expect(tree.focused_node == null);
+    tree.nodes.items[modal].style.visible = false;
+    tree.sanitizeFocus();
+    try testing.expectEqual(@as(?usize, b2), tree.focused_node);
+
     // More than 256 focusable nodes: every one is reachable.
     var tree2 = ui_core.UiTree.init(testing.allocator);
     defer tree2.deinit();

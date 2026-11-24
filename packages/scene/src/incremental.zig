@@ -219,6 +219,20 @@ pub fn install(app: *engine.App) !void {
     try app.world.enableChangeTracking(LocalTransform3D);
     try app.world.enableChangeTracking(scene.Parent);
     try app.resources.insert(PropagationState, .{});
-    try app.addSystem(.{ .name = "scene.propagate_local_2d", .stage = .post_update, .run = propagateLocal2DSystem });
-    try app.addSystem(.{ .name = "scene.propagate_local_3d", .stage = .post_update, .run = propagateLocal3DSystem });
+    try app.addSystem(.{
+        .name = "scene.propagate_local_2d",
+        .stage = .post_update,
+        .thread_affinity = .any,
+        .reads = &.{ "LocalTransform2D", "Parent", "HierarchyLinks" },
+        .writes = &.{"GlobalTransform2D"},
+        .run = propagateLocal2DSystem,
+    });
+    try app.addSystem(.{
+        .name = "scene.propagate_local_3d",
+        .stage = .post_update,
+        .thread_affinity = .any,
+        .reads = &.{ "LocalTransform3D", "Parent", "HierarchyLinks" },
+        .writes = &.{"GlobalTransform3D"},
+        .run = propagateLocal3DSystem,
+    });
 }
