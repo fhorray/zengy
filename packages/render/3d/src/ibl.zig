@@ -125,6 +125,26 @@ pub fn generateProceduralEquirectSky(
     return pixels;
 }
 
+/// Rotates an equirectangular map around the vertical axis, in place: `out(u) = in(u + turns)`.
+/// `turns` is a fraction of a full revolution; positive values move the image toward +u. The sky shader
+/// applies the same convention to the HDRI texture, so the IBL and the visible sky stay aligned.
+pub fn rotateEquirectColumns(allocator: std.mem.Allocator, pixels: [][4]f32, width: u32, height: u32, turns: f32) !void {
+    const w: usize = width;
+    const h: usize = height;
+    if (w == 0 or h == 0 or pixels.len < w * h) return;
+    const shift: usize = @as(usize, @intFromFloat(@round(@mod(turns, 1.0) * @as(f32, @floatFromInt(w))))) % w;
+    if (shift == 0) return;
+
+    const tmp = try allocator.alloc([4]f32, w * h);
+    defer allocator.free(tmp);
+    for (0..h) |row| {
+        for (0..w) |col| {
+            tmp[row * w + col] = pixels[row * w + (col + shift) % w];
+        }
+    }
+    @memcpy(pixels[0 .. w * h], tmp);
+}
+
 /// Projects an equirectangular HDR sky image into cosine-convolved SH9 irradiance coefficients.
 pub fn projectSkyDiffuse(pixels: []const [4]f32, width: u32, height: u32) SkyDiffuseSH {
     // Cosine lobe zonal harmonics weights (Ramamoorthi & Hanrahan 2001), divided by pi.

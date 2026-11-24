@@ -233,6 +233,9 @@ pub const VolumetricFogConfig = struct {
     anisotropy: f32 = 0.6,
     scattering: f32 = 0.04,
     max_distance: f32 = 80.0,
+    /// Ray-march at half resolution and upsample depth-aware (about 4x fewer marched pixels).
+    /// Off by default: full resolution keeps thin shafts sharp; opt in on GPUs where the cost matters.
+    half_resolution: bool = false,
 };
 
 /// Exponential/height distance fog resource.
@@ -338,6 +341,12 @@ pub const ExtractedReflectionProbe = struct {
 };
 
 /// Camera component configuring the HDR & post-processing stack.
+/// Screen-space anti-aliasing applied in the post-process pass. Future modes (SMAA, TAA) extend this enum.
+pub const AntiAliasingMode = enum(u32) {
+    none = 0,
+    fxaa = 1,
+};
+
 pub const PostProcessSettings = struct {
     auto_exposure: AutoExposureSettings = .{},
     bloom: BloomSettings = .{},
@@ -347,6 +356,7 @@ pub const PostProcessSettings = struct {
     vignette: VignetteSettings = .{},
     ssao: SsaoSettings = .{},
     contact_shadows: ContactShadowSettings = .{},
+    anti_aliasing: AntiAliasingMode = .fxaa,
 };
 
 /// Extracted directional light snapshot for backend submission.

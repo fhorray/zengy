@@ -369,3 +369,102 @@ test "Phase 2/3 Lighting: Clustered Forward+ assignment, RectLight, and Reflecti
     try testing.expect(assigned_points > 0);
     try testing.expect(assigned_rects > 0);
 }
+
+test "Forward+ perspectiveNearFar recovers the planes of a camera-layout projection" {
+    // Same layout as camera.zig PerspectiveProjection: column-major, depth in [0, 1], -1 in row 3 col 2.
+    const n: f32 = 0.5;
+    const f: f32 = 50.0;
+    const inv = 1.0 / (n - f);
+    var m: [16]f32 = @splat(0);
+    m[0] = 1.0;
+    m[5] = 1.0;
+    m[10] = f * inv;
+    m[11] = -1.0;
+    m[14] = n * f * inv;
+    const nf = render_3d.cluster.perspectiveNearFar(m) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqRel(n, nf.near, 1e-4);
+    try testing.expectApproxEqRel(f, nf.far, 1e-4);
+
+    // Orthographic projections have no perspective row and must not be interpreted as one.
+    m[11] = 0.0;
+    try testing.expect(render_3d.cluster.perspectiveNearFar(m) == null);
+}
+
+test "Forward+ budget is shared fairly when every cluster is over the limit" {
+    const view = render_3d.math3d.Mat4.identity();
+    // A camera-layout perspective matrix (near 0.1, far 200) so the planes match the default range.
+    const proj = render_3d.math3d.Mat4.perspective(std.math.pi / 3.0, 16.0 / 9.0, 0.1, 200.0);
+
+    // Range 1000 around the camera: every light covers the whole frustum, so each cluster gets all 300 lights.
+    var pts: [300]render_3d.pbr.ExtractedPointLight = undefined;
+    for (&pts) |*p| p.* = .{ .position = .{ 0, 0, 0 }, .color = .{ 1, 1, 1 }, .intensity_lumens = 100, .range = 1000, .radius = 0.1, .shadows_enabled = false };
+
+    var built = try render_3d.cluster.buildClusters(testing.allocator, view.m, proj.m, 0.1, 200.0, &pts, &.{}, &.{});
+    defer built.deinit(testing.allocator);
+
+    const cluster_count = render_3d.cluster.CLUSTER_COUNT;
+    var min_count: u32 = std.math.maxInt(u32);
+    var max_count: u32 = 0;
+    for (built.entries) |e| {
+        const count = e.point_packed & 0xFF;
+        min_count = @min(min_count, count);
+        max_count = @max(max_count, count);
+    }
+    // 65536 / 3456 = 18.96: every cluster keeps 18 or 19 refs, so no cluster is starved.
+    try testing.expect(min_count >= 18);
+    try testing.expect(max_count <= 19);
+    try testing.expectEqual(@as(usize, render_3d.cluster.MAX_CLUSTER_INDICES), built.indices.len);
+    // Every reference beyond the budget is reported, not silently discarded.
+    const raw_refs: u32 = @intCast(cluster_count * 300);
+    try testing.expectEqual(raw_refs - render_3d.cluster.MAX_CLUSTER_INDICES, built.dropped_refs);
+}
+
+test "Forward+ rejects lights whose footprint lies entirely off screen" {
+    const view = render_3d.math3d.Mat4.lookAt(.{ .x = 0, .y = 2, .z = 10 }, .{ .x = 0, .y = 2, .z = 0 }, .{ .x = 0, .y = 1, .z = 0 });
+    const proj = render_3d.math3d.Mat4.perspective(std.math.pi / 3.0, 16.0 / 9.0, 0.1, 200.0);
+
+    // Far to the side of the frustum: the sphere is in front of the camera but well outside the screen.
+    const pts = [_]render_3d.pbr.ExtractedPointLight{
+        .{ .position = .{ 1000, 2, 0 }, .color = .{ 1, 1, 1 }, .intensity_lumens = 100, .range = 1, .radius = 0.1, .shadows_enabled = false },
+    };
+    var built = try render_3d.cluster.buildClusters(testing.allocator, view.m, proj.m, 0.1, 200.0, &pts, &.{}, &.{});
+    defer built.deinit(testing.allocator);
+
+    var refs: u32 = 0;
+    for (built.entries) |e| refs += e.point_packed & 0xFF;
+    try testing.expectEqual(@as(u32, 0), refs);
+    try testing.expectEqual(@as(u32, 0), built.dropped_refs);
+}
+
+test "Forward+ scratch buffers are reused across frames with identical results" {
+    const allocator = testing.allocator;
+    const view = render_3d.math3d.Mat4.lookAt(.{ .x = 0, .y = 2, .z = 10 }, .{ .x = 0, .y = 2, .z = 0 }, .{ .x = 0, .y = 1, .z = 0 });
+    const proj = render_3d.math3d.Mat4.perspective(std.math.pi / 3.0, 16.0 / 9.0, 0.1, 200.0);
+    const pts = [_]render_3d.pbr.ExtractedPointLight{
+        .{ .position = .{ 0, 2, 0 }, .color = .{ 1, 1, 1 }, .intensity_lumens = 100, .range = 8, .radius = 0.1, .shadows_enabled = false },
+    };
+
+    var scratch: render_3d.cluster.ClusterScratch = .{};
+    defer scratch.deinit(allocator);
+    const first = try render_3d.cluster.buildClustersInto(&scratch, allocator, view.m, proj.m, 0.1, 200.0, &pts, &.{}, &.{});
+    const first_refs = first.indices.len;
+    const second = try render_3d.cluster.buildClustersInto(&scratch, allocator, view.m, proj.m, 0.1, 200.0, &pts, &.{}, &.{});
+    try testing.expectEqual(first_refs, second.indices.len);
+    try testing.expectEqual(first.entries[100].point_packed, second.entries[100].point_packed);
+}
+
+test "IBL HDRI rotation shifts equirect columns along +u and wraps around" {
+    var px = [_][4]f32{
+        .{ 0, 0, 0, 1 }, .{ 1, 0, 0, 1 }, .{ 2, 0, 0, 1 }, .{ 3, 0, 0, 1 },
+    };
+    try render_3d.ibl.rotateEquirectColumns(testing.allocator, &px, 4, 1, 0.25);
+    // out(u) = in(u + 0.25): one column to the left, wrapping the first column to the end.
+    try testing.expectApproxEqAbs(@as(f32, 1), px[0][0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2), px[1][0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 3), px[2][0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0), px[3][0], 1e-6);
+
+    // A full turn (or zero) leaves the image unchanged.
+    try render_3d.ibl.rotateEquirectColumns(testing.allocator, &px, 4, 1, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 1), px[0][0], 1e-6);
+}
