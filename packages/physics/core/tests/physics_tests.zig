@@ -149,3 +149,83 @@ test "PhysicsService rejects half-null setBackend and syncs ECS bodies with back
     const pt = app.world.getConst(e, physics.PhysicsTransform).?;
     try std.testing.expect(pt.pos[1] < 10.0);
 }
+
+test "Physics bodies are destroyed with their entities, rotated at creation, and not retried after failure" {
+    const LifeMock = struct {
+        next_id: u64 = 1,
+        live: u32 = 0,
+        fail_create: bool = false,
+        create_calls: u32 = 0,
+        last_rot: [3]f32 = .{ 0, 0, 0 },
+
+        fn createBody(ctx: *anyopaque, _: engine.EntityHandle, _: [3]f32, _: physics.RigidBody, _: ?physics.Collider) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.create_calls += 1;
+            if (self.fail_create) return error.BackendRefused;
+            self.live += 1;
+            defer self.next_id += 1;
+            return self.next_id;
+        }
+        fn destroyBody(ctx: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.live -= 1;
+        }
+        fn setTransform(ctx: *anyopaque, _: u64, _: [3]f32, rot: [3]f32) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.last_rot = rot;
+        }
+        const vt = physics.PhysicsBackendVTable{
+            .create_body = createBody,
+            .destroy_body = destroyBody,
+            .set_transform = setTransform,
+        };
+    };
+
+    var app = engine.App.init(std.testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(physics.module());
+    try app.initialize();
+    const svc = app.resources.get(physics.PhysicsService).?;
+    var mock = LifeMock{};
+    svc.setBackend(&LifeMock.vt, &mock);
+
+    const a = try app.world.spawn();
+    try app.world.set(a, physics.RigidBody, .{ .body_type = .dynamic });
+    try app.world.set(a, physics.PhysicsTransform, .{ .rot_euler = .{ 0, 1.5, 0 } });
+    const b = try app.world.spawn();
+    try app.world.set(b, physics.RigidBody, .{ .body_type = .dynamic });
+    try app.world.set(b, physics.PhysicsTransform, .{ .rot_euler = .{ 0, 1.5, 0 } });
+
+    try app.tickFixed();
+    try std.testing.expectEqual(@as(u32, 2), mock.live);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), mock.last_rot[1], 0.0001);
+
+    // Despawn and component removal must both release backend bodies on the next sync.
+    _ = try app.world.despawn(a);
+    _ = try app.world.remove(b, physics.RigidBody);
+    try app.tickFixed();
+    try std.testing.expectEqual(@as(u32, 0), mock.live);
+    try std.testing.expectEqual(@as(usize, 0), svc.live_bodies.count());
+
+    // A failing backend is tried once, not every step.
+    mock.fail_create = true;
+    mock.create_calls = 0;
+    const c = try app.world.spawn();
+    try app.world.set(c, physics.RigidBody, .{ .body_type = .dynamic });
+    try app.world.set(c, physics.PhysicsTransform, .{});
+    try app.tickFixed();
+    try app.tickFixed();
+    try app.tickFixed();
+    try std.testing.expectEqual(@as(u32, 1), mock.create_calls);
+
+    // Replacing the backend destroys its bodies and invalidates ECS handles (epoch bump).
+    mock.fail_create = false;
+    _ = try app.world.remove(c, physics.PhysicsBodyHandle);
+    try app.tickFixed();
+    try std.testing.expectEqual(@as(u32, 1), mock.live);
+    var mock2 = LifeMock{};
+    svc.setBackend(&LifeMock.vt, &mock2);
+    try std.testing.expectEqual(@as(u32, 0), mock.live);
+    try app.tickFixed();
+    try std.testing.expectEqual(@as(u32, 1), mock2.live);
+}

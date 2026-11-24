@@ -83,6 +83,12 @@ pub const GravityScale = struct {
 /// Opaque backend body handle stored on entities managed by a physics backend.
 pub const PhysicsBodyHandle = struct {
     id: u64 = 0,
+    /// Backend generation the id belongs to; ids from a replaced backend are discarded and recreated.
+    epoch: u32 = 0,
+
+    /// Marker id stored after a failed `createBody` so the sync system does not retry every step.
+    /// Remove the component to request another attempt.
+    pub const failed_id: u64 = std.math.maxInt(u64);
 };
 
 /// Contact lifecycle phase emitted by collision callbacks.
@@ -167,11 +173,40 @@ pub const PhysicsService = struct {
     step_count: u64 = 0,
     active_step_count: u64 = 0,
     last_dt: f32 = 0,
+    /// Body id -> owning entity for every body this service created on the current backend.
+    live_bodies: std.AutoHashMapUnmanaged(u64, engine.EntityHandle) = .empty,
+    /// Bumped whenever the backend is replaced; invalidates `PhysicsBodyHandle`s from the old one.
+    backend_epoch: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) PhysicsService {
         return .{
             .allocator = allocator,
         };
+    }
+
+    /// Releases bookkeeping and destroys any bodies still alive on the backend.
+    pub fn deinit(self: *PhysicsService) void {
+        self.deinitBodies();
+        self.live_bodies.deinit(self.allocator);
+    }
+
+    fn deinitBodies(self: *PhysicsService) void {
+        var it = self.live_bodies.keyIterator();
+        while (it.next()) |id| self.destroyBackendBody(id.*);
+        self.live_bodies.clearRetainingCapacity();
+        self.backend_epoch +%= 1;
+    }
+
+    fn destroyBackendBody(self: *PhysicsService, body_id: u64) void {
+        if (self.hasPluginBackend()) return cabi.hostDestroyBody(&self.slot, body_id);
+        if (self.backend) |b| {
+            if (b.vtable.destroy_body) |f| f(b.context, body_id);
+        }
+    }
+
+    /// Destroys a body created through `createBody` and forgets it. Unknown ids are ignored.
+    pub fn destroyBody(self: *PhysicsService, body_id: u64) void {
+        if (self.live_bodies.remove(body_id)) self.destroyBackendBody(body_id);
     }
 
     pub fn initWithBackend(
@@ -188,6 +223,8 @@ pub const PhysicsService = struct {
     /// Sets or clears the Zig backend; passing null for either parameter clears the backend
     /// atomically so invalid half-initialized states are unrepresentable.
     pub fn setBackend(self: *PhysicsService, backend: ?*const PhysicsBackendVTable, backend_ctx: ?*anyopaque) void {
+        // Bodies belong to the outgoing backend: destroy them there and invalidate ECS handles.
+        self.deinitBodies();
         if (backend != null and backend_ctx != null) {
             self.backend = .{ .vtable = backend.?, .context = backend_ctx.? };
         } else {
@@ -205,6 +242,15 @@ pub const PhysicsService = struct {
     }
 
     pub fn createBody(self: *PhysicsService, entity: engine.EntityHandle, pos: [3]f32, body: RigidBody, collider: ?Collider) !u64 {
+        const id = try self.createBackendBody(entity, pos, body, collider);
+        self.live_bodies.put(self.allocator, id, entity) catch |err| {
+            self.destroyBackendBody(id); // never hand out a body we cannot track and later destroy
+            return err;
+        };
+        return id;
+    }
+
+    fn createBackendBody(self: *PhysicsService, entity: engine.EntityHandle, pos: [3]f32, body: RigidBody, collider: ?Collider) !u64 {
         if (self.hasPluginBackend()) return cabi.hostCreateBody(&self.slot, entity, pos, body, collider);
         if (self.backend) |b| {
             if (b.vtable.create_body) |fn_create| {
@@ -278,21 +324,44 @@ pub const PhysicsService = struct {
     }
 };
 
+/// Destroys backend bodies whose entity died or lost its `RigidBody`/`PhysicsBodyHandle`.
+fn reapOrphanBodies(ctx: *engine.SystemContext, svc: *PhysicsService) !void {
+    var doomed: std.ArrayList(u64) = .empty;
+    defer doomed.deinit(svc.allocator);
+    var it = svc.live_bodies.iterator();
+    while (it.next()) |entry| {
+        const e = entry.value_ptr.*;
+        const owned = ctx.world.isAlive(e) and ctx.world.has(e, RigidBody) and
+            (if (ctx.world.getConst(e, PhysicsBodyHandle)) |h| h.id == entry.key_ptr.* else true);
+        if (!owned) try doomed.append(svc.allocator, entry.key_ptr.*);
+    }
+    for (doomed.items) |id| svc.destroyBody(id);
+}
+
 /// Creates missing backend bodies and pushes kinematic transforms + forces before `step()`.
 pub fn physicsSyncInSystem(ctx: *engine.SystemContext) !void {
     const svc = ctx.resources.get(PhysicsService) orelse return;
     if (!svc.hasBackend()) return;
+    try reapOrphanBodies(ctx, svc);
 
     var q = try ctx.query(.{ .read = .{ RigidBody, PhysicsTransform } });
     defer q.deinit();
     while (q.next()) |row| {
         const rb = row.read(RigidBody);
         const xf = row.read(PhysicsTransform);
-        var body_id: u64 = if (ctx.world.getConst(row.entity, PhysicsBodyHandle)) |h| h.id else 0;
+        const existing = ctx.world.getConst(row.entity, PhysicsBodyHandle);
+        var body_id: u64 = if (existing) |h| (if (h.epoch == svc.backend_epoch) h.id else 0) else 0;
+        if (body_id == PhysicsBodyHandle.failed_id) continue;
         if (body_id == 0) {
             const col: ?Collider = if (ctx.world.getConst(row.entity, Collider)) |c| c.* else null;
-            body_id = svc.createBody(row.entity, xf.pos, rb.*, col) catch continue;
-            try ctx.commands.set(row.entity, PhysicsBodyHandle, .{ .id = body_id });
+            body_id = svc.createBody(row.entity, xf.pos, rb.*, col) catch {
+                ctx.diagnostics.log(.warn, "physics", "createBody failed; entity skipped until PhysicsBodyHandle is removed") catch {};
+                try ctx.commands.set(row.entity, PhysicsBodyHandle, .{ .id = PhysicsBodyHandle.failed_id, .epoch = svc.backend_epoch });
+                continue;
+            };
+            // Backends take only a position at creation; push the full pose so rotation is honored.
+            svc.setBodyTransform(body_id, xf.pos, xf.rot_euler);
+            try ctx.commands.set(row.entity, PhysicsBodyHandle, .{ .id = body_id, .epoch = svc.backend_epoch });
         } else if (rb.body_type == .kinematic) {
             svc.setBodyTransform(body_id, xf.pos, xf.rot_euler);
         }
@@ -324,7 +393,7 @@ pub fn physicsSyncOutSystem(ctx: *engine.SystemContext) !void {
         const rb = row.read(RigidBody);
         if (rb.body_type != .dynamic) continue;
         const bh = row.read(PhysicsBodyHandle);
-        if (bh.id == 0) continue;
+        if (bh.id == 0 or bh.id == PhysicsBodyHandle.failed_id or bh.epoch != svc.backend_epoch) continue;
         if (svc.getBodyTransform(bh.id)) |xf| {
             const pt = row.write(PhysicsTransform);
             pt.pos = xf.pos;

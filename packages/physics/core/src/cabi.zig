@@ -319,6 +319,12 @@ pub fn hostCreateBody(
     return out_id;
 }
 
+pub fn hostDestroyBody(slot: *const Slot, body_id: u64) void {
+    const vt = slot.vtable orelse return;
+    const f = vt.destroy_body orelse return;
+    f(slot.ctx.?, body_id);
+}
+
 pub fn hostSetTransform(slot: *const Slot, body_id: u64, pos: [3]f32, rot_euler: [3]f32) void {
     const vt = slot.vtable orelse return;
     const f = vt.set_transform orelse return;
