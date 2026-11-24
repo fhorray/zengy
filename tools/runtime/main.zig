@@ -15,6 +15,7 @@
 //! ```
 
 const std = @import("std");
+const plugin_paths = @import("plugin_paths.zig");
 const engine = @import("engine");
 const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
@@ -192,56 +193,40 @@ fn runtimeRenderSystem(ctx: *engine.SystemContext) !void {
     try st.gfx.present(st.rt);
 }
 
-fn isSharedLibName(name: []const u8) bool {
-    return std.mem.endsWith(u8, name, ".so") or
-        std.mem.endsWith(u8, name, ".dll") or
-        std.mem.endsWith(u8, name, ".dylib");
-}
-
 fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App, manifest_plugins: []const []const u8) !usize {
-    var loaded_count: usize = 0;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // 1. Load explicit shared library paths listed in game.toml
-    for (manifest_plugins) |spec| {
-        if (isSharedLibName(spec)) {
-            const ph = try app.ensurePluginHost();
-            const h = try ph.loadSharedLibrary(spec);
-            const rc = ph.startPlugin(h);
-            if (rc != .ok) return error.PluginStartFailed;
-            loaded_count += 1;
+    // Auto-discovered libraries in .zengy/plugins/ (directory order is filesystem-dependent, so
+    // planLoadOrder sorts them and removes duplicates of explicitly listed libraries).
+    var discovered: std.ArrayList([]const u8) = .empty;
+    if (std.Io.Dir.cwd().openDir(io, ".zengy/plugins", .{ .iterate = true })) |opened| {
+        var dir = opened;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file or !plugin_paths.isSharedLibName(entry.name)) continue;
+            try discovered.append(arena, try arena.dupe(u8, entry.name));
         }
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
     }
 
-    // 2. Auto-load compiled plugins in .zengy/plugins/
-    var dir = std.Io.Dir.cwd().openDir(io, ".zengy/plugins", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return loaded_count,
-        else => return err,
-    };
-    defer dir.close(io);
-
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!isSharedLibName(entry.name)) continue;
-
-        const full_path = try std.fmt.allocPrint(allocator, ".zengy/plugins/{s}", .{entry.name});
-        defer allocator.free(full_path);
-
+    const plan = try plugin_paths.planLoadOrder(arena, manifest_plugins, ".zengy/plugins", discovered.items);
+    for (plan) |path| {
         const ph = try app.ensurePluginHost();
-        const h = try ph.loadSharedLibrary(full_path);
+        const h = try ph.loadSharedLibrary(path);
         const rc = ph.startPlugin(h);
         if (rc != .ok) return error.PluginStartFailed;
-        loaded_count += 1;
     }
-
-    return loaded_count;
+    return plan.len;
 }
 
 fn needsPhysicsModule(plugins: []const []const u8) bool {
     for (plugins) |p| {
-        if (std.mem.eql(u8, p, "physics") or std.mem.indexOf(u8, p, "physics") != null) {
-            return true;
-        }
+        if (plugin_paths.requestsPhysics(p)) return true;
     }
     return false;
 }

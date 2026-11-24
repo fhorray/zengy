@@ -751,6 +751,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(pkg_manifest_tests).step);
 
+    const plugin_path_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/runtime/plugin_paths.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(plugin_path_tests).step);
+
     addModuleTest(b, test_step, "src/core/tests/core_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
     }, null);
