@@ -210,6 +210,42 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("9. Tracked write iterate ({d} entities): {d:.1} ns/entity\n", .{ count, @as(f64, @floatFromInt(it_ns)) / @as(f64, @floatFromInt(count)) });
     }
 
+    // 10. Incremental Local/Global propagation: ~10k nodes, full vs idle vs one dirty subtree
+    {
+        var inc_app = engine.App.init(allocator, .{});
+        defer inc_app.deinit();
+        try inc_app.registerModule(scene.module());
+        const w = &inc_app.world;
+        const inc_root = try w.spawn();
+        try w.set(inc_root, scene.incremental.LocalTransform2D, .{});
+        var first_mid: engine.EntityHandle = inc_root;
+        for (0..100) |mi| {
+            const mid = try w.spawn();
+            try w.set(mid, scene.incremental.LocalTransform2D, .{ .x = 1 });
+            try scene.graph.reparent(w, mid, inc_root, .{});
+            if (mi == 0) first_mid = mid;
+            for (0..100) |_| {
+                const leaf = try w.spawn();
+                try w.set(leaf, scene.incremental.LocalTransform2D, .{ .y = 1 });
+                try scene.graph.reparent(w, leaf, mid, .{});
+            }
+        }
+        const t_full = std.Io.Clock.now(.awake, io);
+        try inc_app.tick(1.0 / 60.0);
+        const full_ns = elapsedNs(io, t_full);
+        const t_idle = std.Io.Clock.now(.awake, io);
+        try inc_app.tick(1.0 / 60.0);
+        const idle_ns = elapsedNs(io, t_idle);
+        w.get(first_mid, scene.incremental.LocalTransform2D).?.x = 5;
+        const t_dirty = std.Io.Clock.now(.awake, io);
+        try inc_app.tick(1.0 / 60.0);
+        const dirty_ns = elapsedNs(io, t_dirty);
+        std.debug.print(
+            "10. Incremental propagate (10101 nodes): first {d:.3} ms, idle {d:.3} ms, 1 dirty subtree (101 nodes) {d:.3} ms\n",
+            .{ @as(f64, @floatFromInt(full_ns)) / 1e6, @as(f64, @floatFromInt(idle_ns)) / 1e6, @as(f64, @floatFromInt(dirty_ns)) / 1e6 },
+        );
+    }
+
     // 6. JSON benchmark: std.json vs yyjson (small ~5KB, medium ~500KB, large ~5MB)
     const sizes = [_]usize{ 100, 10_000, 100_000 };
     const labels = [_][]const u8{ "~5 KB", "~500 KB", "~5 MB" };

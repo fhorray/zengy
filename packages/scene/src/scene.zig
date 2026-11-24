@@ -12,6 +12,9 @@ pub const MODULE_OWNER_ID: u64 = 2007;
 /// Parent/child index and reparenting operations (see `graph.zig`).
 pub const graph = @import("graph.zig");
 
+/// `LocalTransform2D/3D` + `GlobalTransform2D/3D` with incremental propagation (see `incremental.zig`).
+pub const incremental = @import("incremental.zig");
+
 /// Local and computed world-space 2D transform component.
 pub const Transform2D = struct {
     x: f32 = 0,
@@ -308,6 +311,7 @@ fn buildModule(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = try app.registerComponent(Transform2D);
     _ = try app.registerComponent(Parent);
+    try incremental.install(app);
     try app.addSystem(.{
         .name = "scene.propagate_transforms_2d",
         .stage = .post_update,
@@ -319,7 +323,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.scene",
-            .version = "0.2.0",
+            .version = "0.3.0",
             .provides_capabilities = &.{"engine.scene.2d/1"},
         },
         .build = buildModule,

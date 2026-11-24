@@ -18,6 +18,10 @@ sections 7-9) on a shared cloud container. Single runs, noisy: compare only on t
 | `World` spawn + set (10k) | - | 116 ns/entity |
 | Query iteration, 1M updates | - | 2 ns/update |
 
+| Incremental Local/Global propagate, 10,101 nodes: first pass | - | 1.49 ms |
+| same, idle frame (nothing changed) | - | 0.023 ms |
+| same, one dirty subtree of 101 nodes | - | 0.035 ms |
+
 Query plan caching was evaluated and rejected: creating a query costs 14 ns, so a cache would
 add invalidation complexity for no measurable gain.
 

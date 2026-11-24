@@ -226,3 +226,128 @@ test "SceneGraph rebuildLinks repairs links from raw Parent components and break
     // Exactly one edge of the 2-cycle survives.
     try testing.expectEqual(@as(usize, 1), graph.childCount(w, x) + graph.childCount(w, y));
 }
+
+const inc = scene.incremental;
+
+var inc_changed_globals: u32 = 0;
+fn observeGlobals(ctx: *engine.SystemContext) !void {
+    inc_changed_globals = 0;
+    var q = try ctx.query(.{ .read = .{inc.GlobalTransform2D}, .changed = .{inc.GlobalTransform2D} });
+    defer q.deinit();
+    while (q.next()) |_| inc_changed_globals += 1;
+}
+
+fn spawnLocal(w: *engine.World, x: f32, y: f32) !engine.EntityHandle {
+    const e = try w.spawn();
+    try w.set(e, inc.LocalTransform2D, .{ .x = x, .y = y });
+    return e;
+}
+
+test "incremental 2D propagation matches TRS composition" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(scene.module());
+    const w = &app.world;
+
+    const root = try w.spawn();
+    try w.set(root, inc.LocalTransform2D, .{ .x = 100, .y = 0, .rotation_rad = std.math.pi / 2.0, .scale_x = 2, .scale_y = 2 });
+    const child = try spawnLocal(w, 10, 0);
+    try scene.graph.reparent(w, child, root, .{});
+    try app.tick(1.0 / 60.0);
+
+    const g = w.getConst(child, inc.GlobalTransform2D).?;
+    // R(90deg) * S(2) * (10, 0) = (0, 20); plus root translation (100, 0).
+    try testing.expectApproxEqAbs(@as(f32, 100), g.tx, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 20), g.ty, 0.001);
+}
+
+test "incremental propagation touches only dirty subtrees" {
+    inc_changed_globals = 0;
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(scene.module());
+    try app.world.enableChangeTracking(inc.GlobalTransform2D);
+    try app.addSystem(.{ .name = "test.observe_globals", .stage = .post_update, .run = observeGlobals, .after = &.{"scene.propagate_local_2d"} });
+    const w = &app.world;
+
+    // root -> a -> b, and s -> t (independent subtree)
+    const root = try spawnLocal(w, 1, 0);
+    const a = try spawnLocal(w, 1, 0);
+    const b = try spawnLocal(w, 1, 0);
+    const s = try spawnLocal(w, 50, 0);
+    const t = try spawnLocal(w, 1, 0);
+    try scene.graph.reparent(w, a, root, .{});
+    try scene.graph.reparent(w, b, a, .{});
+    try scene.graph.reparent(w, t, s, .{});
+
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 5), inc_changed_globals); // everything computed once
+    try testing.expectApproxEqAbs(@as(f32, 3), w.getConst(b, inc.GlobalTransform2D).?.tx, 0.001);
+
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 0), inc_changed_globals); // idle frame: no transform work at all
+
+    w.get(a, inc.LocalTransform2D).?.x = 10; // moves a and its child b only
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 2), inc_changed_globals);
+    try testing.expectApproxEqAbs(@as(f32, 12), w.getConst(b, inc.GlobalTransform2D).?.tx, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 51), w.getConst(t, inc.GlobalTransform2D).?.tx, 0.001); // untouched
+
+    w.get(root, inc.LocalTransform2D).?.x = 2; // whole chain root, a, b
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 3), inc_changed_globals);
+
+    // Rewriting an identical local value recomputes but publishes no global change.
+    try w.set(root, inc.LocalTransform2D, .{ .x = 2 });
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 0), inc_changed_globals);
+
+    // Reparenting b under s (Parent changed) moves only b.
+    try scene.graph.reparent(w, b, s, .{});
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 1), inc_changed_globals);
+    try testing.expectApproxEqAbs(@as(f32, 51), w.getConst(b, inc.GlobalTransform2D).?.tx, 0.001);
+
+    // Detaching t makes it a root: its global drops the parent's offset.
+    try scene.graph.reparent(w, t, null, .{});
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 1), inc_changed_globals);
+    try testing.expectApproxEqAbs(@as(f32, 1), w.getConst(t, inc.GlobalTransform2D).?.tx, 0.001);
+}
+
+test "reparent preserve_world works with Local/Global transforms" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(scene.module());
+    const w = &app.world;
+    const parent = try spawnLocal(w, 100, 0);
+    const child = try spawnLocal(w, 110, 0);
+    try app.tick(1.0 / 60.0);
+    try scene.graph.reparent(w, child, parent, .{ .preserve_world = true });
+    try testing.expectApproxEqAbs(@as(f32, 10), w.getConst(child, inc.LocalTransform2D).?.x, 0.001);
+    try app.tick(1.0 / 60.0);
+    try testing.expectApproxEqAbs(@as(f32, 110), w.getConst(child, inc.GlobalTransform2D).?.tx, 0.001);
+}
+
+test "3D propagation composes translation, quaternion rotation, and scale" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(scene.module());
+    const w = &app.world;
+    const h = @sqrt(0.5);
+    const parent = try w.spawn();
+    try w.set(parent, inc.LocalTransform3D, .{ .translation = .{ 1, 2, 3 }, .rotation = .{ 0, 0, h, h }, .scale = .{ 2, 2, 2 } });
+    const child = try w.spawn();
+    try w.set(child, inc.LocalTransform3D, .{ .translation = .{ 1, 0, 0 } });
+    try scene.graph.reparent(w, child, parent, .{});
+    try app.tick(1.0 / 60.0);
+
+    const g = w.getConst(child, inc.GlobalTransform3D).?;
+    // Rz(90deg) * S(2) * (1,0,0) = (0,2,0); plus parent translation.
+    try testing.expectApproxEqAbs(@as(f32, 1), g.m[12], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 4), g.m[13], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 3), g.m[14], 0.001);
+    // Child basis X axis is rotated and scaled: (0, 2, 0).
+    try testing.expectApproxEqAbs(@as(f32, 0), g.m[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 2), g.m[1], 0.001);
+}

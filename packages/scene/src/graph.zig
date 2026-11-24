@@ -11,6 +11,7 @@
 const std = @import("std");
 const engine = @import("engine");
 const scene = @import("scene.zig");
+const incremental = @import("incremental.zig");
 
 const EntityHandle = engine.EntityHandle;
 const World = engine.World;
@@ -143,6 +144,23 @@ pub fn reparent(world: *World, child: EntityHandle, new_parent: ?EntityHandle, o
         }
     }
 
+    // The same for the derived-global model: local = inverse(parent_global) * child_global.
+    var new_local_v2: ?incremental.LocalTransform2D = null;
+    if (opts.preserve_world) {
+        if (world.getConst(child, incremental.GlobalTransform2D)) |cg| {
+            if (world.has(child, incremental.LocalTransform2D)) {
+                var parent_inv = scene.Mat2D.identity;
+                if (new_parent) |np| {
+                    if (world.getConst(np, incremental.GlobalTransform2D)) |pg| {
+                        parent_inv = pg.toMat().inverse() orelse return error.SingularTransform;
+                    }
+                }
+                const t = scene.Mat2D.decompose(scene.Mat2D.mul(parent_inv, cg.toMat()));
+                new_local_v2 = .{ .x = t.x, .y = t.y, .rotation_rad = t.rotation_rad, .scale_x = t.scale_x, .scale_y = t.scale_y };
+            }
+        }
+    }
+
     // Fallible phase: component registration and insertion. The old parent is captured first
     // because `set(Parent)` overwrites it.
     const old_parent = parentOf(world, child);
@@ -159,6 +177,7 @@ pub fn reparent(world: *World, child: EntityHandle, new_parent: ?EntityHandle, o
     unlink(world, child, old_parent);
     if (new_parent) |np| linkAsFirstChild(world, np, child);
     if (new_local) |l| world.get(child, scene.Transform2D).?.* = l;
+    if (new_local_v2) |l| world.get(child, incremental.LocalTransform2D).?.* = l;
 }
 
 fn linkAsFirstChild(world: *World, parent: EntityHandle, child: EntityHandle) void {
