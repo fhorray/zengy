@@ -146,3 +146,21 @@ test "WidgetManager node index: attach replaces in place, finds in O(1), and sur
     try testing.expect(mgr.findByNode(mid) == null);
     try testing.expectEqual(@as(usize, 0), try mgr.attach(mid, "", .{ .button = .{} }));
 }
+
+test "TextEditState never truncates undo snapshots and clips paste on UTF-8 boundaries" {
+    var st: ui_widgets.text_edit.TextEditState = .{};
+    st.pushUndo("short");
+    try testing.expectEqual(@as(u8, 1), st.undo_count);
+    // Oversized text clears history rather than recording a truncated copy.
+    const long: [200]u8 = @splat('x');
+    st.pushUndo(&long);
+    try testing.expectEqual(@as(u8, 0), st.undo_count);
+
+    const clip = ui_widgets.text_edit.TextEditState.clipPaste;
+    try testing.expectEqualStrings("ab", clip("abcdef", 2, true));
+    // 'é' is 2 bytes: room for 2 bytes after 'a' must not split it.
+    try testing.expectEqualStrings("a", clip("aé", 2, true));
+    try testing.expectEqualStrings("aé", clip("aé", 3, true));
+    try testing.expectEqualStrings("one", clip("one\ntwo", 100, false));
+    try testing.expectEqualStrings("one\ntwo", clip("one\ntwo", 100, true));
+}

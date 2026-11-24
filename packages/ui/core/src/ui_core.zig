@@ -979,14 +979,41 @@ pub const UiTree = struct {
         }
     }
 
-    /// Appends typed text to the currently focused `.textbox` node.
+    /// Returns the largest UTF-8 code point boundary `<= pos` (clamped to `text.len`).
+    pub fn utf8Floor(text: []const u8, pos: usize) usize {
+        var p = @min(pos, text.len);
+        while (p > 0 and p < text.len and (text[p] & 0xC0) == 0x80) p -= 1;
+        return p;
+    }
+
+    /// Returns the code point boundary before `pos` (0 stays 0).
+    pub fn utf8Prev(text: []const u8, pos: usize) usize {
+        var p = utf8Floor(text, pos);
+        if (p == 0) return 0;
+        p -= 1;
+        while (p > 0 and (text[p] & 0xC0) == 0x80) p -= 1;
+        return p;
+    }
+
+    /// Returns the code point boundary after `pos` (`text.len` stays `text.len`).
+    pub fn utf8Next(text: []const u8, pos: usize) usize {
+        var p = utf8Floor(text, pos);
+        if (p >= text.len) return text.len;
+        p += 1;
+        while (p < text.len and (text[p] & 0xC0) == 0x80) p += 1;
+        return p;
+    }
+
+    /// Inserts `input_text` at `text_cursor` into the focused `.textbox` node.
+    /// Invalid UTF-8 is rejected (returns false) so stored text always stays valid.
     pub fn handleTextInput(self: *UiTree, input_text: []const u8) !bool {
         const idx = self.focused_node orelse return false;
         if (idx >= self.nodes.items.len or !self.nodes.items[idx].alive) return false;
         const node = &self.nodes.items[idx];
         if (node.kind != .textbox or node.disabled or input_text.len == 0) return false;
+        if (!std.unicode.utf8ValidateSlice(input_text)) return false;
 
-        const pos = @min(self.text_cursor, node.text.len);
+        const pos = utf8Floor(node.text, self.text_cursor);
         const next = try std.mem.concat(self.allocator, u8, &.{ node.text[0..pos], input_text, node.text[pos..] });
         self.allocator.free(node.text);
         node.text = next;
@@ -995,45 +1022,51 @@ pub const UiTree = struct {
         return true;
     }
 
-    /// Deletes the byte before `text_cursor` from the currently focused `.textbox` node.
+    /// Deletes the code point before `text_cursor` from the currently focused `.textbox` node.
     pub fn handleBackspace(self: *UiTree) !bool {
         const idx = self.focused_node orelse return false;
         if (idx >= self.nodes.items.len or !self.nodes.items[idx].alive) return false;
         const node = &self.nodes.items[idx];
-        const pos = @min(self.text_cursor, node.text.len);
+        const pos = utf8Floor(node.text, self.text_cursor);
         if (node.kind != .textbox or node.disabled or pos == 0) return false;
 
-        const next = try std.mem.concat(self.allocator, u8, &.{ node.text[0 .. pos - 1], node.text[pos..] });
+        const start = utf8Prev(node.text, pos);
+        const next = try std.mem.concat(self.allocator, u8, &.{ node.text[0..start], node.text[pos..] });
         self.allocator.free(node.text);
         node.text = next;
-        self.text_cursor = pos - 1;
+        self.text_cursor = start;
         self.caret_phase = 0.0;
         return true;
     }
 
-    /// Deletes the byte at `text_cursor` from the currently focused `.textbox` node.
+    /// Deletes the code point at `text_cursor` from the currently focused `.textbox` node.
     pub fn handleDelete(self: *UiTree) !bool {
         const idx = self.focused_node orelse return false;
         if (idx >= self.nodes.items.len or !self.nodes.items[idx].alive) return false;
         const node = &self.nodes.items[idx];
-        const pos = @min(self.text_cursor, node.text.len);
+        const pos = utf8Floor(node.text, self.text_cursor);
         if (node.kind != .textbox or node.disabled or pos >= node.text.len) return false;
 
-        const next = try std.mem.concat(self.allocator, u8, &.{ node.text[0..pos], node.text[pos + 1 ..] });
+        const end = utf8Next(node.text, pos);
+        const next = try std.mem.concat(self.allocator, u8, &.{ node.text[0..pos], node.text[end..] });
         self.allocator.free(node.text);
         node.text = next;
+        self.text_cursor = pos;
         self.caret_phase = 0.0;
         return true;
     }
 
-    /// Moves `text_cursor` horizontally (`delta < 0` left, `delta > 0` right) on the focused `.textbox`.
+    /// Moves `text_cursor` by `delta` code points (`< 0` left, `> 0` right) on the focused `.textbox`.
     pub fn moveTextCursor(self: *UiTree, delta: isize) void {
         const idx = self.focused_node orelse return;
         if (idx >= self.nodes.items.len or !self.nodes.items[idx].alive) return;
-        const len = self.nodes.items[idx].text.len;
-        const cur: isize = @intCast(@min(self.text_cursor, len));
-        const next = std.math.clamp(cur + delta, 0, @as(isize, @intCast(len)));
-        self.text_cursor = @intCast(next);
+        const text = self.nodes.items[idx].text;
+        var cur = utf8Floor(text, self.text_cursor);
+        var steps = if (delta < 0) -delta else delta;
+        while (steps > 0) : (steps -= 1) {
+            cur = if (delta < 0) utf8Prev(text, cur) else utf8Next(text, cur);
+        }
+        self.text_cursor = cur;
         self.caret_phase = 0.0;
     }
 
@@ -1078,6 +1111,7 @@ pub const UiTree = struct {
                 self.text_cursor = txt.len;
             }
         }
+        self.text_cursor = utf8Floor(txt, self.text_cursor); // column math is byte-based
         self.caret_phase = 0.0;
     }
 

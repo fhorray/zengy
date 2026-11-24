@@ -167,3 +167,31 @@ test "UiTree.clear invalidates old handles and destroyed slots are reused" {
     try testing.expect(tree.nodes.items.len <= 3);
     try testing.expectEqual(@as(usize, 1), tree.nodeCount());
 }
+
+test "UiTree text editing moves, inserts, and deletes whole UTF-8 code points" {
+    var tree = ui_core.UiTree.init(testing.allocator);
+    defer tree.deinit();
+    const tb = try tree.createNode(null, .{ .id = "t", .kind = .textbox });
+    tree.focused_node = tb;
+    try tree.setNodeText(tb, "añ€😀b");
+
+    tree.text_cursor = tree.nodes.items[tb].text.len;
+    try testing.expect(try tree.handleBackspace()); // removes 'b'
+    try testing.expect(try tree.handleBackspace()); // removes the 4-byte emoji
+    try testing.expectEqualStrings("añ€", tree.nodes.items[tb].text);
+    try testing.expect(std.unicode.utf8ValidateSlice(tree.nodes.items[tb].text));
+
+    tree.moveTextCursor(-1); // before '€'
+    try testing.expectEqual(@as(usize, 3), tree.text_cursor);
+    try testing.expect(try tree.handleDelete()); // removes '€' (3 bytes)
+    try testing.expectEqualStrings("añ", tree.nodes.items[tb].text);
+
+    // A cursor stranded inside a code point snaps to a boundary before inserting.
+    tree.text_cursor = 2; // middle of 'ñ'
+    try testing.expect(try tree.handleTextInput("é"));
+    try testing.expectEqualStrings("aéñ", tree.nodes.items[tb].text);
+
+    // Invalid UTF-8 never enters the buffer.
+    try testing.expect(!(try tree.handleTextInput("\xff\xfe")));
+    try testing.expectEqualStrings("aéñ", tree.nodes.items[tb].text);
+}

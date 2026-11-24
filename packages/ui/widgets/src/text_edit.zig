@@ -33,8 +33,17 @@ pub const TextEditState = struct {
         if (idx < tree.nodes.items.len) tree.nodes.items[idx].selected = false;
     }
 
+    /// Longest text (bytes) a single undo snapshot can hold.
+    pub const snapshot_capacity: usize = 128;
+
     fn pushSnap(bufs: *[16][128]u8, lens: *[16]u8, count: *u8, txt: []const u8) void {
-        const n = @min(txt.len, 128);
+        if (txt.len > snapshot_capacity) {
+            // A truncated snapshot would make undo silently destroy content, so history that
+            // cannot be restored faithfully is dropped instead.
+            count.* = 0;
+            return;
+        }
+        const n = txt.len;
         if (count.* > 0) {
             const top = count.* - 1;
             if (lens[top] == n and std.mem.eql(u8, bufs[top][0..n], txt[0..n])) return;
@@ -51,10 +60,21 @@ pub const TextEditState = struct {
         count.* += 1;
     }
 
-    /// Pushes current text to the undo stack and invalidates the redo stack.
+    /// Pushes current text to the undo stack and invalidates the redo stack. Text longer than
+    /// `snapshot_capacity` clears the undo history instead of storing a truncated copy.
     pub fn pushUndo(self: *TextEditState, txt: []const u8) void {
         pushSnap(&self.undo_buf, &self.undo_lens, &self.undo_count, txt);
         self.redo_count = 0;
+    }
+
+    /// Clips clipboard text to what fits in `room` bytes without splitting a UTF-8 code point;
+    /// single-line inputs also stop at the first line break.
+    pub fn clipPaste(text: []const u8, room: usize, multiline: bool) []const u8 {
+        var end = @min(text.len, room);
+        if (!multiline) {
+            if (std.mem.indexOfAny(u8, text[0..end], "\r\n")) |nl| end = nl;
+        }
+        return text[0..ui_core.UiTree.utf8Floor(text, end)];
     }
 
     /// Processes all standard editing, clipboard, undo/redo, and cursor-navigation shortcuts.
@@ -130,7 +150,9 @@ pub const TextEditState = struct {
                         try tree.setNodeText(idx, "");
                         self.clearSelection(tree, idx);
                     }
-                    if (try tree.handleTextInput(ct)) out.changed = true;
+                    const room = max_len -| tree.nodes.items[idx].text.len;
+                    const clipped = clipPaste(ct, room, multiline);
+                    if (try tree.handleTextInput(clipped)) out.changed = true;
                 }
             }
             return out;
@@ -143,8 +165,9 @@ pub const TextEditState = struct {
                 try tree.setNodeText(idx, "");
                 self.clearSelection(tree, idx);
             }
-            if (tree.nodes.items[idx].text.len + txt.len <= max_len) {
-                if (try tree.handleTextInput(txt)) out.changed = true;
+            const typed = clipPaste(txt, max_len -| tree.nodes.items[idx].text.len, true);
+            if (typed.len > 0) {
+                if (try tree.handleTextInput(typed)) out.changed = true;
             }
         }
 
