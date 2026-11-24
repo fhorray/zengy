@@ -6,6 +6,10 @@
 
 const std = @import("std");
 const graphics = @import("graphics");
+pub const ttf_atlas = @import("ttf_atlas.zig");
+pub const TtfAtlas = ttf_atlas.TtfAtlas;
+pub const IconAtlas = ttf_atlas.IconAtlas;
+pub const FIRA_SANS_REGULAR = ttf_atlas.FIRA_SANS_REGULAR;
 
 pub const GLYPH_W: u32 = 8;
 pub const GLYPH_H: u32 = 8;
@@ -209,6 +213,26 @@ pub fn measureText(text: []const u8, scale: f32) TextSize {
         .width = max_w,
         .height = lines * line_h,
     };
+}
+
+/// Measures the bounding box of `text` for a target pixel height (`font_size_px`).
+pub fn measureTextScaled(text: []const u8, font_size_px: f32) TextSize {
+    const scale = if (font_size_px > 0.0) font_size_px / @as(f32, @floatFromInt(GLYPH_H)) else 1.0;
+    return measureText(text, scale);
+}
+
+/// Appends textured glyph quads for `text` at `(x, y)` for a target pixel height (`font_size_px`).
+pub fn emitTextQuadsScaled(
+    allocator: std.mem.Allocator,
+    out_quads: *std.ArrayList(TextQuad),
+    x: f32,
+    y: f32,
+    text: []const u8,
+    font_size_px: f32,
+    color: graphics.Color,
+) !void {
+    const scale = if (font_size_px > 0.0) font_size_px / @as(f32, @floatFromInt(GLYPH_H)) else 1.0;
+    return emitTextQuads(allocator, out_quads, x, y, text, scale, color);
 }
 
 /// Appends textured glyph quads for `text` at `(x, y)` with `scale` and `color`.

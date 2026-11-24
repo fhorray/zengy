@@ -41,37 +41,103 @@ const WindowSlot = struct {
     close_requested: bool,
 };
 
+/// Mouse button identifiers tracked by `InputService`.
 pub const MouseButton = enum(u8) {
     left = 0,
     right = 1,
     middle = 2,
 };
 
+/// System cursor shapes requested by UI widgets and applied by the active window backend.
+pub const CursorShape = enum {
+    default,
+    pointer,
+    text,
+    ew_resize,
+    ns_resize,
+    grab,
+    crosshair,
+};
+
+/// Keyboard modifier flags active during the current frame.
+pub const KeyModifiers = packed struct(u8) {
+    shift: bool = false,
+    ctrl: bool = false,
+    alt: bool = false,
+    super: bool = false,
+    _pad: u4 = 0,
+};
+
+/// Standard SDL-aligned physical scancode constants for cross-package UI navigation.
+pub const KeyCode = struct {
+    pub const a: u8 = 4;
+    pub const c: u8 = 6;
+    pub const v: u8 = 25;
+    pub const x: u8 = 27;
+    pub const y: u8 = 28;
+    pub const z: u8 = 29;
+    pub const enter: u8 = 40;
+    pub const escape: u8 = 41;
+    pub const backspace: u8 = 42;
+    pub const tab: u8 = 43;
+    pub const space: u8 = 44;
+    pub const right: u8 = 79;
+    pub const left: u8 = 80;
+    pub const down: u8 = 81;
+    pub const up: u8 = 82;
+    pub const home: u8 = 74;
+    pub const end: u8 = 77;
+    pub const delete: u8 = 76;
+};
+
+/// Per-frame input state service (`engine.input/1`).
 pub const InputService = struct {
     mouse_x: f32 = 0,
     mouse_y: f32 = 0,
+    mouse_delta_x: f32 = 0,
+    mouse_delta_y: f32 = 0,
+    scroll_x: f32 = 0,
+    scroll_y: f32 = 0,
     mouse_down: [3]bool = .{ false, false, false },
     mouse_clicked: [3]bool = .{ false, false, false },
+    mouse_released: [3]bool = .{ false, false, false },
     keys_down: [256]bool = @splat(false),
     keys_pressed: [256]bool = @splat(false),
+    modifiers: KeyModifiers = .{},
     last_text: [64]u8 = @splat(0),
     last_text_len: usize = 0,
+    requested_cursor: CursorShape = .default,
 
     pub fn beginFrame(self: *InputService) void {
         self.mouse_clicked = .{ false, false, false };
+        self.mouse_released = .{ false, false, false };
+        self.mouse_delta_x = 0;
+        self.mouse_delta_y = 0;
+        self.scroll_x = 0;
+        self.scroll_y = 0;
         @memset(&self.keys_pressed, false);
         self.last_text_len = 0;
+        self.requested_cursor = .default;
     }
 
     pub fn injectMouseMove(self: *InputService, x: f32, y: f32) void {
+        self.mouse_delta_x += x - self.mouse_x;
+        self.mouse_delta_y += y - self.mouse_y;
         self.mouse_x = x;
         self.mouse_y = y;
+    }
+
+    pub fn injectMouseWheel(self: *InputService, dx: f32, dy: f32) void {
+        self.scroll_x += dx;
+        self.scroll_y += dy;
     }
 
     pub fn injectMouseButton(self: *InputService, button: MouseButton, down: bool) void {
         const idx = @backingInt(button);
         if (down and !self.mouse_down[idx]) {
             self.mouse_clicked[idx] = true;
+        } else if (!down and self.mouse_down[idx]) {
+            self.mouse_released[idx] = true;
         }
         self.mouse_down[idx] = down;
     }
@@ -81,6 +147,10 @@ pub const InputService = struct {
             self.keys_pressed[key_code] = true;
         }
         self.keys_down[key_code] = down;
+    }
+
+    pub fn injectModifiers(self: *InputService, mods: KeyModifiers) void {
+        self.modifiers = mods;
     }
 
     pub fn injectText(self: *InputService, text: []const u8) void {
@@ -99,6 +169,10 @@ pub const InputService = struct {
         return self.mouse_clicked[@backingInt(button)];
     }
 
+    pub fn wasMouseReleased(self: *const InputService, button: MouseButton) bool {
+        return self.mouse_released[@backingInt(button)];
+    }
+
     pub fn isKeyDown(self: *const InputService, key_code: u8) bool {
         return self.keys_down[key_code];
     }
@@ -106,12 +180,25 @@ pub const InputService = struct {
     pub fn wasKeyPressed(self: *const InputService, key_code: u8) bool {
         return self.keys_pressed[key_code];
     }
+
+    pub fn setRequestedCursor(self: *InputService, shape: CursorShape) void {
+        self.requested_cursor = shape;
+    }
+};
+
+/// Optional clipboard backend vtable installed by native window providers (e.g. SDL3).
+pub const ClipboardVTable = struct {
+    get_text: ?*const fn (ctx: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 = null,
+    set_text: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+    ctx: ?*anyopaque = null,
 };
 
 pub const WindowService = struct {
     allocator: std.mem.Allocator,
     windows: std.ArrayList(WindowSlot),
     events: *engine.EventBus,
+    clipboard_buf: std.ArrayList(u8) = .empty,
+    clipboard_vtable: ClipboardVTable = .{},
 
     pub fn init(allocator: std.mem.Allocator, events: *engine.EventBus) WindowService {
         return .{
@@ -126,6 +213,33 @@ pub const WindowService = struct {
             if (w.title.len > 0) self.allocator.free(w.title);
         }
         self.windows.deinit(self.allocator);
+        self.clipboard_buf.deinit(self.allocator);
+    }
+
+    /// Installs a platform clipboard backend (used by SDL3 window provider).
+    pub fn setClipboardVTable(self: *WindowService, vtable: ClipboardVTable) void {
+        self.clipboard_vtable = vtable;
+    }
+
+    /// Writes `text` to the active clipboard (OS clipboard if available, otherwise headless buffer).
+    pub fn setClipboardText(self: *WindowService, text: []const u8) !void {
+        if (self.clipboard_vtable.set_text) |set_fn| {
+            set_fn(self.clipboard_vtable.ctx, text);
+            return;
+        }
+        self.clipboard_buf.clearRetainingCapacity();
+        try self.clipboard_buf.appendSlice(self.allocator, text);
+    }
+
+    /// Reads the current clipboard contents; caller owns the returned slice.
+    pub fn getClipboardText(self: *const WindowService, allocator: std.mem.Allocator) ![]u8 {
+        if (self.clipboard_vtable.get_text) |get_fn| {
+            if (get_fn(self.clipboard_vtable.ctx, allocator)) |owned| {
+                return owned;
+            }
+            return try allocator.alloc(u8, 0);
+        }
+        return try allocator.dupe(u8, self.clipboard_buf.items);
     }
 
     pub fn createWindow(self: *WindowService, desc: WindowDescriptor) !WindowHandle {
@@ -273,7 +387,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.window",
-            .version = "0.1.0",
+            .version = "0.2.0",
             .provides_capabilities = &.{ "engine.window/1", "engine.input/1" },
         },
         .build = buildModule,

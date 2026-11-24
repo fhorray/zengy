@@ -94,16 +94,26 @@ pub fn parseIntoTree(allocator: std.mem.Allocator, source: []const u8, tree: *ui
             }
         }
 
-        const kind: ?ui_core.NodeKind = if (std.mem.eql(u8, tag_name, "panel"))
+        const kind: ?ui_core.NodeKind = if (std.mem.eql(u8, tag_name, "panel") or
+            std.mem.eql(u8, tag_name, "pane") or
+            std.mem.eql(u8, tag_name, "group"))
             .panel
         else if (std.mem.eql(u8, tag_name, "label"))
             .label
-        else if (std.mem.eql(u8, tag_name, "button"))
+        else if (std.mem.eql(u8, tag_name, "button") or
+            std.mem.eql(u8, tag_name, "checkbox") or
+            std.mem.eql(u8, tag_name, "radio") or
+            std.mem.eql(u8, tag_name, "switch"))
             .button
         else if (std.mem.eql(u8, tag_name, "text-input"))
             .textbox
-        else if (std.mem.eql(u8, tag_name, "virtual-list"))
+        else if (std.mem.eql(u8, tag_name, "virtual-list") or
+            std.mem.eql(u8, tag_name, "list-view"))
             .virtual_list
+        else if (std.mem.eql(u8, tag_name, "slider") or
+            std.mem.eql(u8, tag_name, "number-input") or
+            std.mem.eql(u8, tag_name, "color-input"))
+            .custom
         else
             null;
 

@@ -58,8 +58,72 @@ pub const CaptureService = struct {
         self.pixels[idx + 3] = @intCast(@min(@as(u32, 255), a + (@as(u32, self.pixels[idx + 3]) * inv_a) / 255));
     }
 
+    const ClipBounds = struct {
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+
+        fn intersect(a: @This(), b: @This()) @This() {
+            const ix0 = @max(a.x0, b.x0);
+            const iy0 = @max(a.y0, b.y0);
+            return .{
+                .x0 = ix0,
+                .y0 = iy0,
+                .x1 = @max(ix0, @min(a.x1, b.x1)),
+                .y1 = @max(iy0, @min(a.y1, b.y1)),
+            };
+        }
+    };
+
+    fn blendPixelClipped(self: *CaptureService, x: i32, y: i32, clip: ClipBounds, sr: u8, sg: u8, sb: u8, sa: u8) void {
+        if (x < clip.x0 or y < clip.y0 or x >= clip.x1 or y >= clip.y1) return;
+        self.blendPixel(@intCast(x), @intCast(y), sr, sg, sb, sa);
+    }
+
+    fn hueDegToRgb(hue_deg: f32) graphics.Color {
+        const h = @mod(hue_deg, 360.0) / 60.0;
+        const f = h - @floor(h);
+        const sector: u32 = @intFromFloat(@floor(h));
+        return switch (sector) {
+            0 => .{ .r = 1.0, .g = f, .b = 0.0, .a = 1.0 },
+            1 => .{ .r = 1.0 - f, .g = 1.0, .b = 0.0, .a = 1.0 },
+            2 => .{ .r = 0.0, .g = 1.0, .b = f, .a = 1.0 },
+            3 => .{ .r = 0.0, .g = 1.0 - f, .b = 1.0, .a = 1.0 },
+            4 => .{ .r = f, .g = 0.0, .b = 1.0, .a = 1.0 },
+            else => .{ .r = 1.0, .g = 0.0, .b = 1.0 - f, .a = 1.0 },
+        };
+    }
+
+    fn lerpColor(a: graphics.Color, b: graphics.Color, t: f32) graphics.Color {
+        return .{
+            .r = a.r + (b.r - a.r) * t,
+            .g = a.g + (b.g - a.g) * t,
+            .b = a.b + (b.b - a.b) * t,
+            .a = a.a + (b.a - a.a) * t,
+        };
+    }
+
+    fn toClipBounds(self: *const CaptureService, r: graphics.ClipRect) ClipBounds {
+        const ix0: i32 = @intFromFloat(@max(@as(f32, 0.0), @floor(r.x)));
+        const iy0: i32 = @intFromFloat(@max(@as(f32, 0.0), @floor(r.y)));
+        const ix1: i32 = @intFromFloat(@min(@as(f32, @floatFromInt(self.width)), @ceil(r.x + r.width)));
+        const iy1: i32 = @intFromFloat(@min(@as(f32, @floatFromInt(self.height)), @ceil(r.y + r.height)));
+        return .{ .x0 = ix0, .y0 = iy0, .x1 = @max(ix0, ix1), .y1 = @max(iy0, iy1) };
+    }
+
     /// Rasterizes a slice of `graphics.DrawCommand`s into the offscreen RGBA8 buffer.
     pub fn rasterize(self: *CaptureService, cmds: []const graphics.DrawCommand) void {
+        const full_clip = ClipBounds{
+            .x0 = 0,
+            .y0 = 0,
+            .x1 = @intCast(self.width),
+            .y1 = @intCast(self.height),
+        };
+        var clip_stack: [32]ClipBounds = undefined;
+        var clip_depth: usize = 0;
+        var active_clip = full_clip;
+
         for (cmds) |cmd| {
             switch (cmd) {
                 .clear => |col| {
@@ -88,40 +152,152 @@ pub const CaptureService = struct {
                     const b = floatToU8(rc.color.b);
                     const a = floatToU8(rc.color.a);
 
-                    const fw: f32 = @floatFromInt(self.width);
-                    const fh: f32 = @floatFromInt(self.height);
-                    const cx0 = @max(@as(f32, 0.0), @min(fw, rc.x));
-                    const cy0 = @max(@as(f32, 0.0), @min(fh, rc.y));
-                    const cx1 = @max(@as(f32, 0.0), @min(fw, rc.x + rc.width));
-                    const cy1 = @max(@as(f32, 0.0), @min(fh, rc.y + rc.height));
+                    const x0 = @max(active_clip.x0, @as(i32, @intFromFloat(@floor(rc.x))));
+                    const y0 = @max(active_clip.y0, @as(i32, @intFromFloat(@floor(rc.y))));
+                    const x1 = @min(active_clip.x1, @as(i32, @intFromFloat(@ceil(rc.x + rc.width))));
+                    const y1 = @min(active_clip.y1, @as(i32, @intFromFloat(@ceil(rc.y + rc.height))));
+                    if (x0 >= x1 or y0 >= y1) continue;
 
-                    const x0: u32 = @intFromFloat(cx0);
-                    const y0: u32 = @intFromFloat(cy0);
-                    const x1: u32 = @intFromFloat(cx1);
-                    const y1: u32 = @intFromFloat(cy1);
-
-                    if (a == 255) {
-                        var py = y0;
-                        while (py < y1) : (py += 1) {
-                            const row_base = @as(usize, py) * @as(usize, self.width);
-                            var px = x0;
-                            while (px < x1) : (px += 1) {
-                                const idx = (row_base + @as(usize, px)) * 4;
-                                self.pixels[idx] = r;
-                                self.pixels[idx + 1] = g;
-                                self.pixels[idx + 2] = b;
-                                self.pixels[idx + 3] = 255;
-                            }
+                    var py = y0;
+                    while (py < y1) : (py += 1) {
+                        var px = x0;
+                        while (px < x1) : (px += 1) {
+                            self.blendPixel(@intCast(px), @intCast(py), r, g, b, a);
                         }
-                    } else if (a > 0) {
-                        var py = y0;
-                        while (py < y1) : (py += 1) {
-                            var px = x0;
-                            while (px < x1) : (px += 1) {
-                                self.blendPixel(px, py, r, g, b, a);
+                    }
+                },
+                .rounded_rect => |rr| {
+                    if (rr.width <= 0.0 or rr.height <= 0.0) continue;
+                    const x0 = @max(active_clip.x0, @as(i32, @intFromFloat(@floor(rr.x))));
+                    const y0 = @max(active_clip.y0, @as(i32, @intFromFloat(@floor(rr.y))));
+                    const x1 = @min(active_clip.x1, @as(i32, @intFromFloat(@ceil(rr.x + rr.width))));
+                    const y1 = @min(active_clip.y1, @as(i32, @intFromFloat(@ceil(rr.y + rr.height))));
+                    if (x0 >= x1 or y0 >= y1) continue;
+
+                    const fr = floatToU8(rr.color.r);
+                    const fg = floatToU8(rr.color.g);
+                    const fb = floatToU8(rr.color.b);
+                    const fa = floatToU8(rr.color.a);
+                    const br = floatToU8(rr.border_color.r);
+                    const bg = floatToU8(rr.border_color.g);
+                    const bb = floatToU8(rr.border_color.b);
+                    const ba = floatToU8(rr.border_color.a);
+
+                    const max_r = @min(rr.width, rr.height) * 0.5;
+                    const rads = [4]f32{
+                        @min(max_r, @max(@as(f32, 0.0), rr.corner_radii[0])),
+                        @min(max_r, @max(@as(f32, 0.0), rr.corner_radii[1])),
+                        @min(max_r, @max(@as(f32, 0.0), rr.corner_radii[2])),
+                        @min(max_r, @max(@as(f32, 0.0), rr.corner_radii[3])),
+                    };
+
+                    var py = y0;
+                    while (py < y1) : (py += 1) {
+                        const fy = @as(f32, @floatFromInt(py)) + 0.5 - rr.y;
+                        var px = x0;
+                        while (px < x1) : (px += 1) {
+                            const fx = @as(f32, @floatFromInt(px)) + 0.5 - rr.x;
+                            // Corner rounding test
+                            var inside = true;
+                            if (fx < rads[0] and fy < rads[0]) {
+                                const dx = rads[0] - fx;
+                                const dy = rads[0] - fy;
+                                inside = (dx * dx + dy * dy) <= rads[0] * rads[0];
+                            } else if (fx > rr.width - rads[1] and fy < rads[1]) {
+                                const dx = fx - (rr.width - rads[1]);
+                                const dy = rads[1] - fy;
+                                inside = (dx * dx + dy * dy) <= rads[1] * rads[1];
+                            } else if (fx > rr.width - rads[2] and fy > rr.height - rads[2]) {
+                                const dx = fx - (rr.width - rads[2]);
+                                const dy = fy - (rr.height - rads[2]);
+                                inside = (dx * dx + dy * dy) <= rads[2] * rads[2];
+                            } else if (fx < rads[3] and fy > rr.height - rads[3]) {
+                                const dx = rads[3] - fx;
+                                const dy = fy - (rr.height - rads[3]);
+                                inside = (dx * dx + dy * dy) <= rads[3] * rads[3];
+                            }
+                            if (!inside) continue;
+
+                            const is_border = ba > 0 and (fy < rr.border_widths[0] or
+                                fx > rr.width - rr.border_widths[1] or
+                                fy > rr.height - rr.border_widths[2] or
+                                fx < rr.border_widths[3]);
+                            if (is_border) {
+                                self.blendPixel(@intCast(px), @intCast(py), br, bg, bb, ba);
+                            } else if (fa > 0) {
+                                self.blendPixel(@intCast(px), @intCast(py), fr, fg, fb, fa);
                             }
                         }
                     }
+                },
+                .gradient_rect => |gr| {
+                    if (gr.width <= 0.0 or gr.height <= 0.0) continue;
+                    const x0 = @max(active_clip.x0, @as(i32, @intFromFloat(@floor(gr.x))));
+                    const y0 = @max(active_clip.y0, @as(i32, @intFromFloat(@floor(gr.y))));
+                    const x1 = @min(active_clip.x1, @as(i32, @intFromFloat(@ceil(gr.x + gr.width))));
+                    const y1 = @min(active_clip.y1, @as(i32, @intFromFloat(@ceil(gr.y + gr.height))));
+                    if (x0 >= x1 or y0 >= y1) continue;
+
+                    var py = y0;
+                    while (py < y1) : (py += 1) {
+                        const ty = @max(@as(f32, 0.0), @min(@as(f32, 1.0), (@as(f32, @floatFromInt(py)) + 0.5 - gr.y) / gr.height));
+                        var px = x0;
+                        while (px < x1) : (px += 1) {
+                            const tx = @max(@as(f32, 0.0), @min(@as(f32, 1.0), (@as(f32, @floatFromInt(px)) + 0.5 - gr.x) / gr.width));
+                            const col: graphics.Color = switch (gr.kind) {
+                                .linear_horizontal => lerpColor(gr.stops[0], gr.stops[1], tx),
+                                .linear_vertical => lerpColor(gr.stops[0], gr.stops[1], ty),
+                                .linear_horizontal_3 => if (tx < 0.5)
+                                    lerpColor(gr.stops[0], gr.stops[1], tx * 2.0)
+                                else
+                                    lerpColor(gr.stops[1], gr.stops[2], (tx - 0.5) * 2.0),
+                                .bilinear => lerpColor(
+                                    lerpColor(gr.stops[0], gr.stops[1], tx),
+                                    lerpColor(gr.stops[3], gr.stops[2], tx),
+                                    ty,
+                                ),
+                                .hue_horizontal => hueDegToRgb(tx * 360.0),
+                                .checkerboard => blk: {
+                                    const cx_i: usize = @intFromFloat(@floor((@as(f32, @floatFromInt(px)) - gr.x) / 6.0));
+                                    const cy_i: usize = @intFromFloat(@floor((@as(f32, @floatFromInt(py)) - gr.y) / 6.0));
+                                    break :blk if ((cx_i + cy_i) % 2 == 0) gr.stops[0] else gr.stops[1];
+                                },
+                            };
+                            self.blendPixel(@intCast(px), @intCast(py), floatToU8(col.r), floatToU8(col.g), floatToU8(col.b), floatToU8(col.a));
+                        }
+                    }
+                },
+                .color_wheel => |cw| {
+                    if (cw.size <= 4.0) continue;
+                    const cx = cw.x + cw.size * 0.5;
+                    const cy = cw.y + cw.size * 0.5;
+                    const outer_r = cw.size * 0.5;
+                    const inner_r = @max(@as(f32, 2.0), outer_r - cw.ring_width);
+                    const x0 = @max(active_clip.x0, @as(i32, @intFromFloat(@floor(cw.x))));
+                    const y0 = @max(active_clip.y0, @as(i32, @intFromFloat(@floor(cw.y))));
+                    const x1 = @min(active_clip.x1, @as(i32, @intFromFloat(@ceil(cw.x + cw.size))));
+                    const y1 = @min(active_clip.y1, @as(i32, @intFromFloat(@ceil(cw.y + cw.size))));
+                    var py = y0;
+                    while (py < y1) : (py += 1) {
+                        const dy = (@as(f32, @floatFromInt(py)) + 0.5) - cy;
+                        var px = x0;
+                        while (px < x1) : (px += 1) {
+                            const dx = (@as(f32, @floatFromInt(px)) + 0.5) - cx;
+                            const dist = @sqrt(dx * dx + dy * dy);
+                            if (dist >= inner_r and dist <= outer_r) {
+                                var deg = std.math.atan2(dy, dx) * (180.0 / std.math.pi);
+                                if (deg < 0.0) deg += 360.0;
+                                const col = hueDegToRgb(deg);
+                                self.blendPixel(@intCast(px), @intCast(py), floatToU8(col.r), floatToU8(col.g), floatToU8(col.b), 255);
+                            }
+                        }
+                    }
+                },
+                .icon => |ic| {
+                    if (ic.size <= 1.0 or ic.color.a <= 0.0) continue;
+                    const cx: i32 = @intFromFloat(@round(ic.x + ic.size * 0.5));
+                    const cy: i32 = @intFromFloat(@round(ic.y + ic.size * 0.5));
+                    self.blendPixelClipped(cx, cy, active_clip, floatToU8(ic.color.r), floatToU8(ic.color.g), floatToU8(ic.color.b), floatToU8(ic.color.a));
                 },
                 // Deterministic 3x5 monochrome glyph blocks for visible text presence checks.
                 .text => |tx| {
@@ -148,9 +324,7 @@ pub const CaptureService = struct {
                                     if (bit) {
                                         const px = gx0 + @as(i32, @intCast(dx));
                                         const py = gy0 + @as(i32, @intCast(dy));
-                                        if (px >= 0 and py >= 0) {
-                                            self.blendPixel(@intCast(px), @intCast(py), r, g, b, a);
-                                        }
+                                        self.blendPixelClipped(px, py, active_clip, r, g, b, a);
                                     }
                                 }
                             }
@@ -158,7 +332,30 @@ pub const CaptureService = struct {
                         cursor_x += 4.0;
                     }
                 },
-                .clip_rect => {},
+                .clip_rect => |cr| {
+                    clip_depth = 0;
+                    if (cr) |r| {
+                        const cb = self.toClipBounds(r);
+                        clip_stack[0] = cb;
+                        clip_depth = 1;
+                        active_clip = cb;
+                    } else {
+                        active_clip = full_clip;
+                    }
+                },
+                .clip_push => |r| {
+                    const cb = self.toClipBounds(r);
+                    const next = active_clip.intersect(cb);
+                    if (clip_depth < clip_stack.len) {
+                        clip_stack[clip_depth] = next;
+                        clip_depth += 1;
+                    }
+                    active_clip = next;
+                },
+                .clip_pop => {
+                    if (clip_depth > 0) clip_depth -= 1;
+                    active_clip = if (clip_depth > 0) clip_stack[clip_depth - 1] else full_clip;
+                },
             }
         }
     }

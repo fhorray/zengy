@@ -109,9 +109,14 @@ const SdlGpuState = struct {
     tex_transfer_buffer: *c.SDL_GPUTransferBuffer,
     tex_capacity_bytes: u32,
     sampler: *c.SDL_GPUSampler,
+    linear_sampler: *c.SDL_GPUSampler,
     textures: TexturePool,
     white_texture: GpuTextureHandle,
     font_texture: GpuTextureHandle,
+    ttf_font_texture: GpuTextureHandle,
+    ttf_atlas: text_pkg.TtfAtlas,
+    lucide_texture: GpuTextureHandle,
+    lucide_atlas: text_pkg.IconAtlas,
 
     // Phase E: 3D unlit depth-tested pipeline + mesh pool
     mesh_vert_shader: *c.SDL_GPUShader,
@@ -540,6 +545,54 @@ fn findOffscreenTarget(state: *const SdlGpuState, handle: graphics.RenderTargetH
     return null;
 }
 
+fn intersectScissor(a: ScissorRect, b: ScissorRect) ScissorRect {
+    const ax1 = a.x + @as(i32, @intCast(a.w));
+    const ay1 = a.y + @as(i32, @intCast(a.h));
+    const bx1 = b.x + @as(i32, @intCast(b.w));
+    const by1 = b.y + @as(i32, @intCast(b.h));
+    const ix0 = @max(a.x, b.x);
+    const iy0 = @max(a.y, b.y);
+    const ix1 = @max(ix0, @min(ax1, bx1));
+    const iy1 = @max(iy0, @min(ay1, by1));
+    return .{
+        .x = ix0,
+        .y = iy0,
+        .w = @intCast(ix1 - ix0),
+        .h = @intCast(iy1 - iy0),
+    };
+}
+
+fn toScissorRect(r: graphics.ClipRect, dpi_scale: f32) ScissorRect {
+    const rx: i32 = @intFromFloat(@max(0.0, r.x * dpi_scale));
+    const ry: i32 = @intFromFloat(@max(0.0, r.y * dpi_scale));
+    const rw: u32 = @intFromFloat(@max(0.0, r.width * dpi_scale));
+    const rh: u32 = @intFromFloat(@max(0.0, r.height * dpi_scale));
+    return .{ .x = rx, .y = ry, .w = rw, .h = rh };
+}
+
+fn flushQuadBatch(
+    state: *SdlGpuState,
+    texture: GpuTextureHandle,
+    scissor: ?ScissorRect,
+    first_v: u32,
+    v_count: u32,
+) !void {
+    if (v_count == 0) return;
+    if (state.tex_batches.items.len > 0) {
+        const last = &state.tex_batches.items[state.tex_batches.items.len - 1];
+        if (std.meta.eql(last.texture, texture) and ScissorRect.eql(last.scissor, scissor)) {
+            last.vertex_count += v_count;
+            return;
+        }
+    }
+    try state.tex_batches.append(state.allocator, .{
+        .first_vertex = first_v,
+        .vertex_count = v_count,
+        .texture = texture,
+        .scissor = scissor,
+    });
+}
+
 fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands: []const graphics.DrawCommand) !void {
     const state: *SdlGpuState = @ptrCast(@alignCast(raw_ctx));
     defer {
@@ -556,27 +609,52 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
         1.0;
 
     var clear_color = state.default_clear_color;
+    var clip_stack: [32]ScissorRect = undefined;
+    var clip_depth: usize = 0;
     var active_scissor: ?ScissorRect = null;
     var text_quad_scratch: std.ArrayList(text_pkg.TextQuad) = .empty;
     defer text_quad_scratch.deinit(state.allocator);
 
-    // Convert DrawCommands (logical coordinates) into DPI-scaled TexturedQuads.
+    // Pre-existing queued quads (from render_2d sprite batches) go first.
+    for (state.queued_quads.items) |q| {
+        const first_v: u32 = @intCast(state.tex_vertices.items.len);
+        try gpu_resources.appendTexturedQuadVertices(&state.tex_vertices, state.allocator, q);
+        try flushQuadBatch(state, q.texture, q.scissor, first_v, 6);
+    }
+
+    // Convert DrawCommands (logical coordinates) into DPI-scaled batched vertices.
     for (commands) |cmd| {
         switch (cmd) {
             .clear => |col| clear_color = col,
             .clip_rect => |cr| {
+                clip_depth = 0;
                 if (cr) |r| {
-                    const rx: i32 = @intFromFloat(@max(0.0, r.x * dpi_scale));
-                    const ry: i32 = @intFromFloat(@max(0.0, r.y * dpi_scale));
-                    const rw: u32 = @intFromFloat(@max(0.0, r.width * dpi_scale));
-                    const rh: u32 = @intFromFloat(@max(0.0, r.height * dpi_scale));
-                    active_scissor = .{ .x = rx, .y = ry, .w = rw, .h = rh };
+                    const sc = toScissorRect(r, dpi_scale);
+                    clip_stack[0] = sc;
+                    clip_depth = 1;
+                    active_scissor = sc;
                 } else {
                     active_scissor = null;
                 }
             },
+            .clip_push => |r| {
+                const sc = toScissorRect(r, dpi_scale);
+                const next = if (active_scissor) |prev| intersectScissor(prev, sc) else sc;
+                if (clip_depth < clip_stack.len) {
+                    clip_stack[clip_depth] = next;
+                    clip_depth += 1;
+                }
+                active_scissor = next;
+            },
+            .clip_pop => {
+                if (clip_depth > 0) {
+                    clip_depth -= 1;
+                }
+                active_scissor = if (clip_depth > 0) clip_stack[clip_depth - 1] else null;
+            },
             .rect => |r| {
-                try state.queued_quads.append(state.allocator, .{
+                const first_v: u32 = @intCast(state.tex_vertices.items.len);
+                try gpu_resources.appendTexturedQuadVertices(&state.tex_vertices, state.allocator, .{
                     .x = r.x * dpi_scale,
                     .y = r.y * dpi_scale,
                     .width = r.width * dpi_scale,
@@ -585,20 +663,127 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
                     .texture = state.white_texture,
                     .scissor = active_scissor,
                 });
+                try flushQuadBatch(state, state.white_texture, active_scissor, first_v, 6);
+            },
+            .rounded_rect => |rr| {
+                const first_v: u32 = @intCast(state.tex_vertices.items.len);
+                const scaled_radii = [4]f32{
+                    rr.corner_radii[0] * dpi_scale,
+                    rr.corner_radii[1] * dpi_scale,
+                    rr.corner_radii[2] * dpi_scale,
+                    rr.corner_radii[3] * dpi_scale,
+                };
+                const scaled_borders = [4]f32{
+                    rr.border_widths[0] * dpi_scale,
+                    rr.border_widths[1] * dpi_scale,
+                    rr.border_widths[2] * dpi_scale,
+                    rr.border_widths[3] * dpi_scale,
+                };
+                try gpu_resources.appendRoundedRectVertices(
+                    &state.tex_vertices,
+                    state.allocator,
+                    rr.x * dpi_scale,
+                    rr.y * dpi_scale,
+                    rr.width * dpi_scale,
+                    rr.height * dpi_scale,
+                    rr.color,
+                    rr.border_color,
+                    scaled_borders,
+                    scaled_radii,
+                );
+                const added: u32 = @intCast(state.tex_vertices.items.len - first_v);
+                try flushQuadBatch(state, state.white_texture, active_scissor, first_v, added);
+            },
+            .gradient_rect => |gr| {
+                const first_v: u32 = @intCast(state.tex_vertices.items.len);
+                try gpu_resources.appendGradientRectVertices(
+                    &state.tex_vertices,
+                    state.allocator,
+                    gr.x * dpi_scale,
+                    gr.y * dpi_scale,
+                    gr.width * dpi_scale,
+                    gr.height * dpi_scale,
+                    gr.kind,
+                    gr.stops,
+                    .{
+                        gr.corner_radii[0] * dpi_scale,
+                        gr.corner_radii[1] * dpi_scale,
+                        gr.corner_radii[2] * dpi_scale,
+                        gr.corner_radii[3] * dpi_scale,
+                    },
+                );
+                const added: u32 = @intCast(state.tex_vertices.items.len - first_v);
+                try flushQuadBatch(state, state.white_texture, active_scissor, first_v, added);
+            },
+            .color_wheel => |cw| {
+                const first_v: u32 = @intCast(state.tex_vertices.items.len);
+                try gpu_resources.appendColorWheelVertices(
+                    &state.tex_vertices,
+                    state.allocator,
+                    cw.x * dpi_scale,
+                    cw.y * dpi_scale,
+                    cw.size * dpi_scale,
+                    cw.hue_deg,
+                    cw.ring_width * dpi_scale,
+                );
+                const added: u32 = @intCast(state.tex_vertices.items.len - first_v);
+                try flushQuadBatch(state, state.white_texture, active_scissor, first_v, added);
+            },
+            .icon => |ic| {
+                const first_v: u32 = @intCast(state.tex_vertices.items.len);
+                if (state.lucide_atlas.makeIconQuad(@intFromEnum(ic.kind), ic.x * dpi_scale, ic.y * dpi_scale, ic.size * dpi_scale, ic.color)) |iq| {
+                    try gpu_resources.appendTexturedQuadVertices(&state.tex_vertices, state.allocator, .{
+                        .x = iq.x,
+                        .y = iq.y,
+                        .width = iq.width,
+                        .height = iq.height,
+                        .u0 = iq.u0,
+                        .v0 = iq.v0,
+                        .u1 = iq.u1,
+                        .v1 = iq.v1,
+                        .color = iq.color,
+                    });
+                    const added: u32 = @intCast(state.tex_vertices.items.len - first_v);
+                    try flushQuadBatch(state, state.lucide_texture, active_scissor, first_v, added);
+                } else {
+                    try gpu_resources.appendIconVertices(
+                        &state.tex_vertices,
+                        state.allocator,
+                        ic.x * dpi_scale,
+                        ic.y * dpi_scale,
+                        ic.size * dpi_scale,
+                        ic.kind,
+                        ic.color,
+                    );
+                    const added: u32 = @intCast(state.tex_vertices.items.len - first_v);
+                    try flushQuadBatch(state, state.white_texture, active_scissor, first_v, added);
+                }
             },
             .text => |tx| {
                 text_quad_scratch.clearRetainingCapacity();
-                try text_pkg.emitTextQuads(
+                const target_px = (if (tx.scale > 0.0) tx.scale else 2.0) * 8.0 * dpi_scale;
+                var draw_x = tx.x * dpi_scale;
+                if (tx.box_width > 0.0 and tx.align_mode != .left) {
+                    const measured = state.ttf_atlas.measureText(tx.content, target_px);
+                    const box_px = tx.box_width * dpi_scale;
+                    if (tx.align_mode == .center) {
+                        draw_x += @max(@as(f32, 0.0), (box_px - measured.width) * 0.5);
+                    } else if (tx.align_mode == .right) {
+                        draw_x += @max(@as(f32, 0.0), box_px - measured.width);
+                    }
+                }
+                try state.ttf_atlas.emitTextQuads(
                     state.allocator,
                     &text_quad_scratch,
-                    tx.x * dpi_scale,
+                    draw_x,
                     tx.y * dpi_scale,
                     tx.content,
-                    2.0 * dpi_scale,
+                    target_px,
                     tx.color,
                 );
                 for (text_quad_scratch.items) |tq| {
-                    try state.queued_quads.append(state.allocator, .{
+                    const first_v: u32 = @intCast(state.tex_vertices.items.len);
+                    try gpu_resources.appendTexturedQuadVertices(&state.tex_vertices, state.allocator, .{
                         .x = tq.x,
                         .y = tq.y,
                         .width = tq.width,
@@ -608,31 +793,13 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
                         .u1 = tq.u1,
                         .v1 = tq.v1,
                         .color = tq.color,
-                        .texture = state.font_texture,
+                        .texture = state.ttf_font_texture,
                         .scissor = active_scissor,
                     });
+                    try flushQuadBatch(state, state.ttf_font_texture, active_scissor, first_v, 6);
                 }
             },
         }
-    }
-
-    // Build batched textured vertices grouped by (texture, scissor).
-    for (state.queued_quads.items) |q| {
-        const first_v: u32 = @intCast(state.tex_vertices.items.len);
-        try gpu_resources.appendTexturedQuadVertices(&state.tex_vertices, state.allocator, q);
-        if (state.tex_batches.items.len > 0) {
-            const last = &state.tex_batches.items[state.tex_batches.items.len - 1];
-            if (std.meta.eql(last.texture, q.texture) and ScissorRect.eql(last.scissor, q.scissor)) {
-                last.vertex_count += 6;
-                continue;
-            }
-        }
-        try state.tex_batches.append(state.allocator, .{
-            .first_vertex = first_v,
-            .vertex_count = 6,
-            .texture = q.texture,
-            .scissor = q.scissor,
-        });
     }
 
     const pos_count: u32 = @intCast(state.ndc_vertices.items.len);
@@ -811,18 +978,26 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
         for (state.tex_batches.items) |batch| {
             const gpu_tex = state.textures.get(batch.texture) orelse state.textures.get(state.white_texture).?;
             if (batch.scissor) |sc| {
+                const max_w: i32 = @intCast(tex_w);
+                const max_h: i32 = @intCast(tex_h);
+                const x0 = std.math.clamp(sc.x, 0, max_w);
+                const y0 = std.math.clamp(sc.y, 0, max_h);
+                const x1 = std.math.clamp(sc.x + @as(i32, @intCast(sc.w)), 0, max_w);
+                const y1 = std.math.clamp(sc.y + @as(i32, @intCast(sc.h)), 0, max_h);
+                if (x1 <= x0 or y1 <= y0) continue;
                 c.SDL_SetGPUScissor(render_pass, &.{
-                    .x = sc.x,
-                    .y = sc.y,
-                    .w = @intCast(sc.w),
-                    .h = @intCast(sc.h),
+                    .x = x0,
+                    .y = y0,
+                    .w = x1 - x0,
+                    .h = y1 - y0,
                 });
             } else {
                 c.SDL_SetGPUScissor(render_pass, &full_scissor);
             }
+            const active_sampler = if (std.meta.eql(batch.texture, state.ttf_font_texture) or std.meta.eql(batch.texture, state.lucide_texture)) state.linear_sampler else state.sampler;
             c.SDL_BindGPUFragmentSamplers(render_pass, 0, &.{
                 .texture = gpu_tex,
-                .sampler = state.sampler,
+                .sampler = active_sampler,
             }, 1);
             c.SDL_DrawGPUPrimitives(render_pass, batch.vertex_count, 1, batch.first_vertex, 0);
         }
@@ -996,6 +1171,16 @@ fn buildModule(raw_app: *anyopaque) !void {
     })) orelse return sdlFail(&app.diagnostics, "SDL_CreateGPUSampler failed");
     errdefer c.SDL_ReleaseGPUSampler(device, sampler);
 
+    const linear_sampler = c.SDL_CreateGPUSampler(device, &std.mem.zeroInit(c.SDL_GPUSamplerCreateInfo, .{
+        .min_filter = c.SDL_GPU_FILTER_LINEAR,
+        .mag_filter = c.SDL_GPU_FILTER_LINEAR,
+        .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
+        .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+    })) orelse return sdlFail(&app.diagnostics, "SDL_CreateGPUSampler (linear) failed");
+    errdefer c.SDL_ReleaseGPUSampler(device, linear_sampler);
+
     const pos_bytes: u32 = @intCast(INITIAL_VERTEX_CAPACITY * @sizeOf(Vertex2D));
     const pos_vb = c.SDL_CreateGPUBuffer(device, &std.mem.zeroInit(c.SDL_GPUBufferCreateInfo, .{
         .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX,
@@ -1034,6 +1219,16 @@ fn buildModule(raw_app: *anyopaque) !void {
     const font_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, text_pkg.ATLAS_WIDTH, text_pkg.ATLAS_HEIGHT, font_pixels);
     const font_handle = try tex_pool.insert(font_raw);
 
+    var ttf_atlas = try text_pkg.TtfAtlas.bake(app.allocator, text_pkg.FIRA_SANS_REGULAR, 28.0);
+    errdefer ttf_atlas.deinit();
+    const ttf_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, ttf_atlas.width, ttf_atlas.height, ttf_atlas.rgba_pixels);
+    const ttf_font_handle = try tex_pool.insert(ttf_raw);
+
+    var lucide_atlas = try text_pkg.IconAtlas.bake(app.allocator, 32.0);
+    errdefer lucide_atlas.deinit();
+    const lucide_raw = try uploadTextureRgba8Internal(device, &app.diagnostics, lucide_atlas.width, lucide_atlas.height, lucide_atlas.rgba_pixels);
+    const lucide_handle = try tex_pool.insert(lucide_raw);
+
     logDiag(&app.diagnostics, .info, "Uploaded built-in 1x1 white and {d}x{d} font atlas textures", .{
         text_pkg.ATLAS_WIDTH,
         text_pkg.ATLAS_HEIGHT,
@@ -1060,9 +1255,14 @@ fn buildModule(raw_app: *anyopaque) !void {
         .tex_transfer_buffer = tex_tb,
         .tex_capacity_bytes = tex_bytes,
         .sampler = sampler,
+        .linear_sampler = linear_sampler,
         .textures = tex_pool,
         .white_texture = white_handle,
         .font_texture = font_handle,
+        .ttf_font_texture = ttf_font_handle,
+        .ttf_atlas = ttf_atlas,
+        .lucide_texture = lucide_handle,
+        .lucide_atlas = lucide_atlas,
         .mesh_vert_shader = mesh_vert,
         .mesh_frag_shader = mesh_frag,
         .mesh_pipeline = mesh_pipeline,
@@ -1129,7 +1329,10 @@ fn stopModule(raw_app: *anyopaque) void {
         c.SDL_ReleaseGPUShader(state.device, state.mesh_frag_shader);
         c.SDL_ReleaseGPUShader(state.device, state.mesh_vert_shader);
 
+        c.SDL_ReleaseGPUSampler(state.device, state.linear_sampler);
         c.SDL_ReleaseGPUSampler(state.device, state.sampler);
+        state.ttf_atlas.deinit();
+        state.lucide_atlas.deinit();
         c.SDL_ReleaseGPUTransferBuffer(state.device, state.tex_transfer_buffer);
         c.SDL_ReleaseGPUBuffer(state.device, state.tex_vertex_buffer);
         c.SDL_ReleaseGPUGraphicsPipeline(state.device, state.tex_pipeline);
@@ -1158,6 +1361,14 @@ fn stopModule(raw_app: *anyopaque) void {
         state.graphics_svc.deinit();
         _ = app.resources.remove(SdlGpuState);
     }
+}
+
+/// Measures proportional UI text width in logical pixels using the loaded `TtfAtlas`.
+pub fn measureTextWidth(raw_ctx: ?*anyopaque, content: []const u8, scale: f32) f32 {
+    const ctx_ptr = raw_ctx orelse return @as(f32, @floatFromInt(content.len)) * 4.4 * (if (scale > 0.0) scale else 1.0);
+    const state: *const SdlGpuState = @ptrCast(@alignCast(ctx_ptr));
+    const target_px = (if (scale > 0.0) scale else 2.0) * 8.0;
+    return state.ttf_atlas.measureText(content, target_px).width;
 }
 
 pub fn module() engine.Module {

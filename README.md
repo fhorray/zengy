@@ -100,6 +100,7 @@ When you are ready to add graphics, simply register the optional modules you wan
 | **2D Scenes & Sprites** | `scene` + `render-2d` | `Transform2D`, `Camera2D`, `Sprite`, `Visibility`, layer sorting |
 | **3D Scenes & glTF** | `render-3d` | `Transform3D`, `Camera3D`, `MeshRef`, glTF 2.0 loader, frustum culling |
 | **UI & Text** | `ui-core`, `ui-markup`, `text` | Retained flex layout, HTML-like markup, clickable buttons, textboxes |
+| **Editor & Tooling UI** | `ui-widgets`, `ui-plume` | Headless widget runtime + opinionated widget kit for editors, inspectors, and tooling |
 | **Scripting** | `scripting-host` + `scripting-lua` or `scripting-python` | Bring your own language, or opt into Lua 5.4 / PocketPy (Python) |
 | **C / Native Plugins** | `include/engine_extension.h` | Load `.dll` / `.so` / `.dylib` plugins dynamically at runtime |
 | **Automated Testing** | `testing` + `zengy` CLI | Deterministic TOML scenarios & offscreen framebuffer capture |

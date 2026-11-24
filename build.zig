@@ -1,4 +1,4 @@
-// Build script for the Modular Zig Engine (`zengy`).
+// Build script for the Modular Zengy Engine.
 //
 // Targets:
 // - `engine`: Minimal headless core SDK module (`src/engine.zig`)
@@ -96,6 +96,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ui_markup_mod.addImport("ui_core", ui_core_mod);
+
+    const ui_widgets_mod = b.addModule("ui_widgets", .{
+        .root_source_file = b.path("packages/ui/widgets/src/ui_widgets.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_widgets_mod.addImport("engine", engine_mod);
+    ui_widgets_mod.addImport("window", window_mod);
+    ui_widgets_mod.addImport("graphics", graphics_mod);
+    ui_widgets_mod.addImport("ui_core", ui_core_mod);
+
+    const ui_plume_mod = b.addModule("ui_plume", .{
+        .root_source_file = b.path("packages/ui/plume/src/ui_plume.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_plume_mod.addImport("engine", engine_mod);
+    ui_plume_mod.addImport("window", window_mod);
+    ui_plume_mod.addImport("graphics", graphics_mod);
+    ui_plume_mod.addImport("ui_core", ui_core_mod);
+    ui_plume_mod.addImport("ui_widgets", ui_widgets_mod);
 
     const scripting_host_mod = b.addModule("scripting_host", .{
         .root_source_file = b.path("packages/scripting/host/src/scripting_host.zig"),
@@ -417,6 +438,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("packages/render/text/src/text.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+    });
+    text_mod.addIncludePath(b.path("packages/render/text/src"));
+    text_mod.addCSourceFile(.{
+        .file = b.path("packages/render/text/src/ttf_impl.c"),
+        .flags = &.{"-O2"},
     });
     text_mod.addImport("graphics", graphics_mod);
 
@@ -499,6 +526,34 @@ pub fn build(b: *std.Build) void {
     run_visual_2d.step.dependOn(b.getInstallStep());
     const run_visual_2d_step = b.step("run-visual-2d", "Open the native SDL3 2D sprites & Camera2D demo (D3)");
     run_visual_2d_step.dependOn(&run_visual_2d.step);
+
+    // Visual Plume Widget Gallery: full ui-widgets + ui-plume showcase. Run with `zig build run-visual-plume`.
+    const visual_plume_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-plume/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_plume_mod.addImport("engine", engine_mod);
+    visual_plume_mod.addImport("window", window_mod);
+    visual_plume_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_plume_mod.addImport("graphics", graphics_mod);
+    visual_plume_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_plume_mod.addImport("ui_core", ui_core_mod);
+    visual_plume_mod.addImport("ui_widgets", ui_widgets_mod);
+    visual_plume_mod.addImport("ui_plume", ui_plume_mod);
+
+    const visual_plume_exe = b.addExecutable(.{
+        .name = "visual-plume",
+        .root_module = visual_plume_mod,
+    });
+    b.installArtifact(visual_plume_exe);
+
+    const run_visual_plume = b.addSystemCommand(&.{"zig-out/bin/visual-plume.exe"});
+    run_visual_plume.setCwd(b.path("."));
+    run_visual_plume.step.dependOn(b.getInstallStep());
+    const run_visual_plume_step = b.step("run-visual-plume", "Open the native SDL3 Plume Widget Gallery demo");
+    run_visual_plume_step.dependOn(&run_visual_plume.step);
 
     // Visual UI hello (D4): UiTree, ui_markup, font atlas text, click, textbox & clipping. Run with `zig build run-visual-ui`.
     const visual_ui_mod = b.createModule(.{
@@ -728,6 +783,24 @@ pub fn build(b: *std.Build) void {
         .{ .name = "ui_markup", .mod = ui_markup_mod },
     }, null);
 
+    addModuleTest(b, test_step, "packages/ui/widgets/tests/ui_widgets_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "ui_widgets", .mod = ui_widgets_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/ui/plume/tests/ui_plume_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "ui_widgets", .mod = ui_widgets_mod },
+        .{ .name = "ui_plume", .mod = ui_plume_mod },
+        .{ .name = "testing_sdk", .mod = testing_sdk_mod },
+    }, null);
+
     addModuleTest(b, test_step, "packages/scripting/host/tests/scripting_host_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "scripting_host", .mod = scripting_host_mod },
@@ -816,5 +889,4 @@ pub fn build(b: *std.Build) void {
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "physics", .mod = physics_mod },
     }, null);
-
 }

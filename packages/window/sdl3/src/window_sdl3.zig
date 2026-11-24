@@ -44,6 +44,8 @@ const SdlState = struct {
     pixel_h: u32,
     dpi_scale: f32,
     owns_sdl: bool,
+    applied_cursor: window.CursorShape = .default,
+    cursors: [7]?*c.SDL_Cursor = .{ null, null, null, null, null, null, null },
 };
 
 /// Maps SDL mouse button indices (1 left, 2 middle, 3 right) to `window.MouseButton`.
@@ -113,6 +115,10 @@ fn buildModule(raw_app: *anyopaque) !void {
     });
 
     const state = app.resources.get(SdlState).?;
+    state.window_svc.setClipboardVTable(.{
+        .get_text = sdlGetClipboard,
+        .set_text = sdlSetClipboard,
+    });
     try app.services.register(.{
         .capability = "engine.window",
         .major_version = 1,
@@ -135,10 +141,69 @@ fn buildModule(raw_app: *anyopaque) !void {
     refreshPixelSize(state);
 }
 
+fn sdlGetClipboard(ctx: ?*anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+    _ = ctx;
+    const raw = c.SDL_GetClipboardText() orelse return null;
+    defer c.SDL_free(raw);
+    const span = std.mem.span(raw);
+    return allocator.dupe(u8, span) catch null;
+}
+
+fn sdlSetClipboard(ctx: ?*anyopaque, text: []const u8) void {
+    _ = ctx;
+    var stack_buf: [1024]u8 = undefined;
+    if (text.len < stack_buf.len) {
+        @memcpy(stack_buf[0..text.len], text);
+        stack_buf[text.len] = 0;
+        _ = c.SDL_SetClipboardText(&stack_buf);
+        return;
+    }
+    const z = std.heap.c_allocator.alloc(u8, text.len + 1) catch return;
+    defer std.heap.c_allocator.free(z);
+    @memcpy(z[0..text.len], text);
+    z[text.len] = 0;
+    _ = c.SDL_SetClipboardText(@ptrCast(z.ptr));
+}
+
+fn syncModifiers(state: *SdlState, sdl_mod: c.SDL_Keymod) void {
+    state.input_svc.injectModifiers(.{
+        .shift = (sdl_mod & c.SDL_KMOD_SHIFT) != 0,
+        .ctrl = (sdl_mod & c.SDL_KMOD_CTRL) != 0,
+        .alt = (sdl_mod & c.SDL_KMOD_ALT) != 0,
+        .super = (sdl_mod & c.SDL_KMOD_GUI) != 0,
+    });
+}
+
+fn applyRequestedCursor(state: *SdlState) void {
+    const desired = state.input_svc.requested_cursor;
+    if (desired == state.applied_cursor) return;
+    state.applied_cursor = desired;
+
+    const idx = @intFromEnum(desired);
+    if (state.cursors[idx] == null) {
+        const sys_id: c.SDL_SystemCursor = switch (desired) {
+            .default => c.SDL_SYSTEM_CURSOR_DEFAULT,
+            .pointer => c.SDL_SYSTEM_CURSOR_POINTER,
+            .text => c.SDL_SYSTEM_CURSOR_TEXT,
+            .ew_resize => c.SDL_SYSTEM_CURSOR_EW_RESIZE,
+            .ns_resize => c.SDL_SYSTEM_CURSOR_NS_RESIZE,
+            .grab => c.SDL_SYSTEM_CURSOR_MOVE,
+            .crosshair => c.SDL_SYSTEM_CURSOR_CROSSHAIR,
+        };
+        state.cursors[idx] = c.SDL_CreateSystemCursor(sys_id);
+    }
+    if (state.cursors[idx]) |cur| {
+        _ = c.SDL_SetCursor(cur);
+    }
+}
+
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
     if (app.resources.get(SdlState)) |state| {
+        for (state.cursors) |maybe_cur| {
+            if (maybe_cur) |cur| c.SDL_DestroyCursor(cur);
+        }
         _ = state.window_svc.destroyWindow(state.handle);
         state.window_svc.deinit();
         c.SDL_DestroyWindow(state.sdl_window);
@@ -201,6 +266,7 @@ pub fn pollEvents(app: *engine.App) void {
                 refreshPixelSize(state);
             },
             c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP => {
+                syncModifiers(state, ev.key.mod);
                 if (ev.key.repeat) continue;
                 const key = mapScancode(ev.key.scancode) orelse continue;
                 state.input_svc.injectKey(key, ev.key.down);
@@ -211,6 +277,9 @@ pub fn pollEvents(app: *engine.App) void {
             },
             c.SDL_EVENT_MOUSE_MOTION => {
                 state.input_svc.injectMouseMove(ev.motion.x, ev.motion.y);
+            },
+            c.SDL_EVENT_MOUSE_WHEEL => {
+                state.input_svc.injectMouseWheel(ev.wheel.x, ev.wheel.y);
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP => {
                 state.input_svc.injectMouseMove(ev.button.x, ev.button.y);
@@ -223,6 +292,7 @@ pub fn pollEvents(app: *engine.App) void {
             else => {},
         }
     }
+    syncModifiers(state, c.SDL_GetModState());
 }
 
 /// Requests a close from the application side (e.g. a "Quit" button).
@@ -261,6 +331,9 @@ pub fn runVisualLoop(app: *engine.App) !void {
         const dt = @min(@as(f64, @floatFromInt(dt_ns_raw)) / std.time.ns_per_s, MAX_FRAME_DT);
 
         try app.tick(dt);
+        if (app.resources.get(SdlState)) |st| {
+            applyRequestedCursor(st);
+        }
 
         // Frame pacing: sleep off the remaining budget so an idle window does not spin.
         const frame_ns = (c.SDL_GetPerformanceCounter() - now) * std.time.ns_per_s / freq;
@@ -276,7 +349,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = PROVIDER_ID,
-            .version = "0.1.0",
+            .version = "0.2.0",
             .provides_capabilities = &.{ "engine.window/1", "engine.input/1" },
         },
         .build = buildModule,

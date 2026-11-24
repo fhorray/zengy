@@ -102,9 +102,43 @@ test "UiTree textbox input, backspace, scrollNode, and clip_rect emission" {
     var saw_clip_open = false;
     var saw_clip_close = false;
     for (cmds.items) |cmd| {
-        if (cmd == .clip_rect) {
-            if (cmd.clip_rect != null) saw_clip_open = true else saw_clip_close = true;
-        }
+        if (cmd == .clip_push) saw_clip_open = true;
+        if (cmd == .clip_pop) saw_clip_close = true;
     }
     try testing.expect(saw_clip_open and saw_clip_close);
+}
+
+test "UiTree v2 generational ids, Tab navigation, pointer capture, and overlay layering" {
+    var tree = ui_core.UiTree.init(testing.allocator);
+    defer tree.deinit();
+
+    const root = try tree.createNode(null, .{
+        .id = "root",
+        .kind = .panel,
+        .style = .{ .direction = .row, .width = 400, .height = 100 },
+    });
+    const b1 = try tree.createNode(root, .{ .id = "b1", .kind = .button, .text = "A" });
+    const b2 = try tree.createNode(root, .{ .id = "b2", .kind = .button, .text = "B" });
+    const ov = try tree.createNode(null, .{
+        .id = "overlay",
+        .kind = .panel,
+        .style = .{ .position = .absolute, .left = 10, .top = 10, .width = 80, .height = 40, .layer = .overlay },
+    });
+
+    tree.layoutTree(400, 300);
+
+    // Overlay should win hit testing over base layer at (20, 20).
+    try testing.expectEqual(@as(?usize, ov), tree.hitTest(20, 20));
+
+    // Tab navigation cycles focusable nodes.
+    try testing.expectEqual(@as(?usize, b1), tree.focusNext(false));
+    try testing.expect(tree.nodes.items[b1].focus_visible);
+    try testing.expectEqual(@as(?usize, b2), tree.focusNext(false));
+    try testing.expectEqual(@as(?usize, b1), tree.focusNext(true));
+
+    // Generational ID invalidates after subtree removal.
+    const b2_id = tree.idOf(b2).?;
+    try testing.expectEqual(@as(?usize, b2), tree.resolveId(b2_id));
+    tree.removeSubtree(b2);
+    try testing.expectEqual(@as(?usize, null), tree.resolveId(b2_id));
 }
