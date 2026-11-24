@@ -1,0 +1,80 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(r32f, set = 1, binding = 0) uniform writeonly image2D u_exposure_out;
+
+layout(std430, set = 1, binding = 1) buffer HistogramBuffer {
+    uint bins[64];
+    float adapted_ev100;
+    float target_ev100;
+};
+
+layout(std140, set = 2, binding = 0) uniform AdaptParams {
+    vec4 ev_bounds;  // x=min_ev100, y=max_ev100, z=low_pct, w=high_pct
+    vec4 speed_dt;   // x=speed_brighten, y=speed_darken, z=dt, w=compensation_ev
+    vec4 hist_range; // x=min_log2, y=log2_range, z=enabled, w=manual_ev
+};
+
+shared uint s_bins[64];
+
+void main() {
+    uint idx = gl_LocalInvocationIndex;
+    s_bins[idx] = bins[idx];
+    bins[idx] = 0u;
+    barrier();
+
+    if (idx != 0u) return;
+
+    if (hist_range.z < 0.5) {
+        adapted_ev100 = hist_range.w;
+        target_ev100 = hist_range.w;
+        imageStore(u_exposure_out, ivec2(0, 0), vec4(hist_range.w, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    uint total = 0u;
+    for (uint i = 0u; i < 64u; ++i) total += s_bins[i];
+    if (total == 0u) {
+        imageStore(u_exposure_out, ivec2(0, 0), vec4(adapted_ev100, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    float low_count = float(total) * ev_bounds.z;
+    float high_count = float(total) * ev_bounds.w;
+    float accum = 0.0;
+    float weighted_sum = 0.0;
+    float weight_total = 0.0;
+
+    for (uint i = 1u; i < 64u; ++i) {
+        float c = float(s_bins[i]);
+        float next_acc = accum + c;
+        float lo = max(accum, low_count);
+        float hi = min(next_acc, high_count);
+        if (hi > lo) {
+            float w = hi - lo;
+            float log_lum = hist_range.x + ((float(i) - 0.5) / 62.0) * hist_range.y;
+            weighted_sum += log_lum * w;
+            weight_total += w;
+        }
+        accum = next_acc;
+    }
+
+    float avg_log2 = (weight_total > 0.0) ? (weighted_sum / weight_total) : log2(0.18);
+    float avg_lum = exp2(avg_log2);
+    // Relative EV where 18% middle gray maps to EV = 0.0 (1.0x exposure).
+    float raw_ev = log2(max(avg_lum / 0.18, 1e-4)) - speed_dt.w;
+    float clamped_ev = clamp(raw_ev, ev_bounds.x, ev_bounds.y);
+    target_ev100 = clamped_ev;
+
+    float prev = adapted_ev100;
+    if (isnan(prev) || isinf(prev)) {
+        prev = clamped_ev;
+    }
+    float spd = (clamped_ev > prev) ? speed_dt.x : speed_dt.y;
+    float alpha = 1.0 - exp(-max(speed_dt.z, 0.0001) * max(spd, 0.01));
+    float next_ev = mix(prev, clamped_ev, alpha);
+    adapted_ev100 = next_ev;
+
+    imageStore(u_exposure_out, ivec2(0, 0), vec4(next_ev, 0.0, 0.0, 1.0));
+}

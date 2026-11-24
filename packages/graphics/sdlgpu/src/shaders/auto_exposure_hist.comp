@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_hdr;
+
+layout(std430, set = 1, binding = 0) buffer HistogramBuffer {
+    uint bins[64];
+    float adapted_ev100;
+    float target_ev100;
+};
+
+layout(std140, set = 2, binding = 0) uniform AutoExpParams {
+    vec4 range_params; // x=min_log2, y=inv_log2_range, z=width, w=height
+};
+
+shared uint local_bins[64];
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid < 64u) {
+        local_bins[tid] = 0u;
+    }
+    barrier();
+
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x < uint(range_params.z) && gid.y < uint(range_params.w)) {
+        vec2 uv = (vec2(gid) + 0.5) / range_params.zw;
+        vec3 col = textureLod(u_hdr, uv, 0.0).rgb;
+        float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+        uint bin = 0u;
+        if (lum > 1e-5) {
+            float t = clamp((log2(lum) - range_params.x) * range_params.y, 0.0, 1.0);
+            bin = min(uint(t * 62.0) + 1u, 63u);
+        }
+        atomicAdd(local_bins[bin], 1u);
+    }
+    barrier();
+
+    if (tid < 64u && local_bins[tid] > 0u) {
+        atomicAdd(bins[tid], local_bins[tid]);
+    }
+}

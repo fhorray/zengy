@@ -567,6 +567,7 @@ pub fn build(b: *std.Build) void {
     graphics_sdlgpu_mod.addImport("graphics", graphics_mod);
     graphics_sdlgpu_mod.addImport("window_sdl3", window_sdl3_mod);
     graphics_sdlgpu_mod.addImport("text", text_mod);
+    graphics_sdlgpu_mod.addImport("render_3d", render_3d_mod);
     graphics_sdlgpu_mod.addImport("sdl3_c", sdl3_c_mod);
 
     // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
@@ -866,6 +867,34 @@ pub fn build(b: *std.Build) void {
     run_visual_audio.step.dependOn(b.getInstallStep());
     const run_visual_audio_step = b.step("run-visual-audio", "Open the Visual Audio, State & Time demo");
     run_visual_audio_step.dependOn(&run_visual_audio.step);
+
+    // Visual PBR, Shadows, Sky, AutoExposure & Tonemapping demo. Run with `zig build run-visual-pbr`.
+    const visual_pbr_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-pbr/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_pbr_mod.addImport("engine", engine_mod);
+    visual_pbr_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_pbr_mod.addImport("graphics", graphics_mod);
+    visual_pbr_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_pbr_mod.addImport("input", input_mod);
+    visual_pbr_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_pbr_mod.addImport("camera", camera_mod);
+    visual_pbr_mod.addImport("render_3d", render_3d_mod);
+
+    const visual_pbr_exe = b.addExecutable(.{
+        .name = "visual-pbr",
+        .root_module = visual_pbr_mod,
+    });
+    b.installArtifact(visual_pbr_exe);
+
+    const run_visual_pbr = b.addSystemCommand(&.{"zig-out/bin/visual-pbr.exe"});
+    run_visual_pbr.setCwd(b.path("."));
+    run_visual_pbr.step.dependOn(b.getInstallStep());
+    const run_visual_pbr_step = b.step("run-visual-pbr", "Open the Visual PBR, Shadows, AutoExposure & Tonemapping demo");
+    run_visual_pbr_step.dependOn(&run_visual_pbr.step);
 
     // Manifesto-driven visual runtime (`tools/runtime/main.zig`): reads game.toml in CWD.
     const runtime_mod = b.createModule(.{

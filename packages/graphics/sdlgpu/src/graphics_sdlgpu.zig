@@ -16,8 +16,10 @@ const engine = @import("engine");
 const graphics = @import("graphics");
 const window_sdl3 = @import("window_sdl3");
 const text_pkg = @import("text");
+const render_3d = @import("render_3d");
 const c = @import("sdl3_c");
 pub const gpu_resources = @import("gpu_resources.zig");
+pub const pbr_backend = @import("pbr_backend.zig");
 
 pub const Vertex2D = gpu_resources.Vertex2D;
 pub const FrameUniforms = gpu_resources.FrameUniforms;
@@ -124,6 +126,7 @@ const SdlGpuState = struct {
     mesh_pipeline: *c.SDL_GPUGraphicsPipeline,
     meshes: MeshPool,
     queued_meshes: std.ArrayList(QueuedMeshDraw),
+    pbr: pbr_backend.PbrGpuState,
 
     default_clear_color: graphics.Color,
     ndc_vertices: std.ArrayList(Vertex2D),
@@ -323,7 +326,7 @@ fn ensureDepthTexture(state: *SdlGpuState, w: u32, h: u32) !*c.SDL_GPUTexture {
     const tex = c.SDL_CreateGPUTexture(state.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
         .type = c.SDL_GPU_TEXTURETYPE_2D,
         .format = state.depth_format,
-        .usage = c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
         .width = w,
         .height = h,
         .layer_count_or_depth = 1,
@@ -892,9 +895,25 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
         return;
     }
 
-    // Optional Phase E 3D depth-tested pass.
-    const has_3d = state.queued_meshes.items.len > 0;
-    if (has_3d) {
+    // Optional PBR pass (HDR -> Shadow -> Sky -> Lit -> AutoExposure -> Bloom -> PostFX) or legacy unlit 3D pass.
+    const has_pbr = state.pbr.frame_active;
+    const has_3d = has_pbr or state.queued_meshes.items.len > 0;
+    if (has_pbr) {
+        const depth_tex = try ensureDepthTexture(state, tex_w, tex_h);
+        const white_tex = state.textures.get(state.white_texture).?;
+        try state.pbr.renderFrame(
+            cmd_buf,
+            target_tex.?,
+            depth_tex,
+            tex_w,
+            tex_h,
+            white_tex,
+            state.linear_sampler,
+            state.sampler,
+            &state.meshes,
+            &state.textures,
+        );
+    } else if (state.queued_meshes.items.len > 0) {
         const depth_tex = try ensureDepthTexture(state, tex_w, tex_h);
         const color_3d = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
             .texture = target_tex.?,
@@ -1179,6 +1198,7 @@ fn buildModule(raw_app: *anyopaque) !void {
         .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
         .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
         .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .max_lod = 16.0,
     })) orelse return sdlFail(&app.diagnostics, "SDL_CreateGPUSampler (linear) failed");
     errdefer c.SDL_ReleaseGPUSampler(device, linear_sampler);
 
@@ -1235,6 +1255,9 @@ fn buildModule(raw_app: *anyopaque) !void {
         text_pkg.ATLAS_HEIGHT,
     });
 
+    var pbr_state = try pbr_backend.PbrGpuState.init(app.allocator, device, &app.diagnostics, swapchain_format, depth_format);
+    errdefer pbr_state.deinit();
+
     try app.resources.insert(SdlGpuState, .{
         .allocator = app.allocator,
         .app = app,
@@ -1269,6 +1292,7 @@ fn buildModule(raw_app: *anyopaque) !void {
         .mesh_pipeline = mesh_pipeline,
         .meshes = MeshPool.init(app.allocator),
         .queued_meshes = .empty,
+        .pbr = pbr_state,
         .default_clear_color = cfg.default_clear_color,
         .ndc_vertices = .empty,
         .queued_quads = .empty,
@@ -1304,13 +1328,26 @@ fn buildModule(raw_app: *anyopaque) !void {
     });
 }
 
+fn startModule(raw_app: *anyopaque) !void {
+    const app: *engine.App = @ptrCast(@alignCast(raw_app));
+    if (app.resources.get(render_3d.Render3DService)) |r3d| {
+        if (app.resources.get(SdlGpuState)) |state| {
+            r3d.setPbrBackend(state.pbr.vtable());
+        }
+    }
+}
+
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
+    if (app.resources.get(render_3d.Render3DService)) |r3d| {
+        r3d.setPbrBackend(null);
+    }
     app.scheduler.render_extract_enabled = false;
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
 
     if (app.resources.get(SdlGpuState)) |state| {
         _ = c.SDL_WaitForGPUIdle(state.device);
+        state.pbr.deinit();
         if (state.depth_texture) |dt| c.SDL_ReleaseGPUTexture(state.device, dt);
 
         for (state.meshes.slots.items) |slot| {
@@ -1381,6 +1418,7 @@ pub fn module() engine.Module {
             .required_capabilities = &.{"engine.window/1"},
         },
         .build = buildModule,
+        .start = startModule,
         .stop = stopModule,
     };
 }
