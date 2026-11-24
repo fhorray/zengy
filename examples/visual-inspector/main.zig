@@ -31,12 +31,7 @@ const shapes = @import("shapes");
 const dev_tools = @import("dev_tools");
 const editor_shell = @import("editor_shell");
 const picking = @import("picking");
-const log = @import("log");
 const remote = @import("remote");
-
-pub const std_options: std.Options = .{
-    .logFn = log.stdLogBridge,
-};
 
 const InspectorState = struct {
     app: *engine.App,
@@ -93,22 +88,13 @@ fn updateInspector(ctx: *engine.SystemContext) !void {
         };
     }
     if (keys.justPressed(.digit_1)) {
-        if (ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| {
-            pp.ssao.enabled = !pp.ssao.enabled;
-            if (ctx.resources.get(log.LogService)) |l| l.emitFmt(.info, "inspector.passes", "SSAO={any}", .{pp.ssao.enabled});
-        }
+        if (ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| pp.ssao.enabled = !pp.ssao.enabled;
     }
     if (keys.justPressed(.digit_2)) {
-        if (ctx.world.get(st.cam_entity, render_3d.pbr.FogSettings)) |fg| {
-            fg.volumetric.enabled = !fg.volumetric.enabled;
-            if (ctx.resources.get(log.LogService)) |l| l.emitFmt(.info, "inspector.passes", "Volumetric={any}", .{fg.volumetric.enabled});
-        }
+        if (ctx.world.get(st.cam_entity, render_3d.pbr.FogSettings)) |fg| fg.volumetric.enabled = !fg.volumetric.enabled;
     }
     if (keys.justPressed(.digit_3)) {
-        if (ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| {
-            pp.bloom.enabled = !pp.bloom.enabled;
-            if (ctx.resources.get(log.LogService)) |l| l.emitFmt(.info, "inspector.passes", "Bloom={any}", .{pp.bloom.enabled});
-        }
+        if (ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| pp.bloom.enabled = !pp.bloom.enabled;
     }
 
     // DPI-aware picking update so HiDPI screens match camera viewport coordinates.
@@ -130,23 +116,6 @@ fn updateInspector(ctx: *engine.SystemContext) !void {
 
     if (keys.justPressed(.key_r) or mouse.justPressed(.left)) {
         queryFocusedRemote(st, focus, rem);
-        if (mouse.justPressed(.left)) {
-            if (focus.focused_entity) |ent| {
-                if (ctx.resources.get(log.LogService)) |l| l.emitFmt(.debug, "picking.3d", "Focused entity index={d}", .{ent.index});
-            }
-        }
-    }
-    if (keys.justPressed(.key_l)) {
-        if (ctx.resources.get(log.LogService)) |l| {
-            l.emit(.info, "inspector", "Queried zengy/get_logs via RemoteInspectorService");
-        }
-        const res = rem.handleRequest(st.app, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"zengy/get_logs\"}", st.app.allocator) catch null;
-        if (res) |r| {
-            defer st.app.allocator.free(r);
-            const n = @min(r.len, st.remote_preview.len);
-            @memcpy(st.remote_preview[0..n], r[0..n]);
-            st.remote_preview_len = n;
-        }
     }
 
     // Draw subtle studio grid + highlight hovered/focused shape with gizmos.
@@ -180,7 +149,7 @@ fn updateInspector(ctx: *engine.SystemContext) !void {
 
     const l2 = std.fmt.bufPrint(
         &st.hud_line2,
-        "[LClick]Pick [Tab]Gizmo:{s} [1]SSAO [2]Vol [3]Bloom [R]Inspect [L]Logs",
+        "[LClick]Pick [Tab]Gizmo:{s} [1]SSAO [2]Volumetric [3]Bloom [R]RemoteInspect",
         .{@tagName(st.gizmo_mode)},
     ) catch "Controls";
     st.hud_line2_len = l2.len;
@@ -246,12 +215,6 @@ pub fn main(init: std.process.Init) !void {
     try app.registerModule(dev_tools.module());
     try app.registerModule(editor_shell.module());
     try app.registerModule(picking.module());
-    try app.resources.insert(log.LogConfig, .{
-        .level = .info,
-        .filter = "sdlgpu=warn,picking=debug,inspector=info",
-        .ansi_colors = true,
-    });
-    try app.registerModule(log.module());
     try app.registerModule(remote.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
@@ -271,9 +234,6 @@ pub fn main(init: std.process.Init) !void {
     if (app.resources.get(gizmos.GizmoService)) |giz| {
         giz.config.line.width = 2.0;
         giz.config.xray_alpha = 0.95;
-    }
-    if (app.resources.get(log.LogService)) |l| {
-        l.emit(.info, "inspector", "Visual Inspector initialized (7 procedural shapes)");
     }
 
     const g_entry = try app.services.getService("engine.graphics.device", 1);

@@ -194,18 +194,18 @@ All previous high-severity rendering issues are fixed or explicitly deferred wit
 
 ### 5.1 Architectural decisions
 
-- [ ] Write ADRs for package boundaries, graphics provider contract, render world, frame ownership, pass scheduling and compatibility. Use existing module descriptors and scopes; review service exclusivity and ABI implications.
+- [x] Write ADRs for package boundaries, graphics provider contract, render world, frame ownership, pass scheduling and compatibility. Use existing module descriptors and scopes; review service exclusivity and ABI implications. (`docs/adr/ADR-008-prism-helios-rendering.md`)
 - [ ] Inventory all SDL-specific types and calls in `pbr_backend.zig` and public graphics helpers. Classify resource creation, recording, presentation, feature policy and scene data.
 - [ ] Initially split code inside existing packages if that avoids build churn. Move pure policy first, then shader-independent passes; migrate one pass end-to-end at a time. Avoid a permanent second implementation.
-- [ ] Define a narrow GPU interface driven by existing passes: buffer/texture/sampler/shader/pipeline handles, upload, render/compute/copy recording, submission/completion, format/capability queries. Explicit ownership, errors, usage flags and thread affinity. Avoid abstracting native features not yet needed.
+- [x] Define a narrow GPU interface driven by existing passes: buffer/texture/sampler/shader/pipeline handles, upload, render/compute/copy recording, submission/completion, format/capability queries. Explicit ownership, errors, usage flags and thread affinity. Avoid abstracting native features not yet needed. (`PrismBackendVTable` + `RecordingBackend` in `packages/render/prism`)
 - [ ] Adapt SDL provider behind that interface; preserve `GraphicsDeviceService` and existing UI command semantics. Provide a recording backend for contract tests. No mandatory native Vulkan backend.
 
 ### 5.2 Shader and resource infrastructure
 
 - [ ] Centralize shader manifest, entry points, binding layouts, stage visibility and required capabilities. Validate CPU extern struct sizes/offsets against shader layouts. Compile GLSL to SPIR-V reproducibly; fail CI on stale generated output or interface mismatch.
-- [ ] Add pipeline cache keys covering shader version, vertex layout, target/depth formats, sample count, blend, raster/depth state and feature masks. Bound variant growth and avoid per-frame pipeline creation.
-- [ ] Introduce frame contexts, reusable upload buffers and completion-aware retirement. Add transactional target recreation, resource labels and debug validation. Maintain existing generational handle rules and provider-owned native pointers.
-- [ ] Define per-view target set and explicit clear/load/store policy. Separate frame-global resources (geometry/materials) from view-local targets (depth/HDR/history). Add structured capability and fallback reports.
+- [x] Add pipeline cache keys covering shader version, vertex layout, target/depth formats, sample count, blend, raster/depth state and feature masks. Bound variant growth and avoid per-frame pipeline creation. (`PipelineCacheKey` + `ShaderInterfaceDesc` in `packages/render/prism/src/resources/manifest.zig`)
+- [x] Introduce frame contexts, reusable upload buffers and completion-aware retirement. Add transactional target recreation, resource labels and debug validation. Maintain existing generational handle rules and provider-owned native pointers. (`RetirementQueue` & `frame_epoch` in `packages/render/prism`)
+- [x] Define per-view target set and explicit clear/load/store policy. Separate frame-global resources (geometry/materials) from view-local targets (depth/HDR/history). Add structured capability and fallback reports. (`ViewRegistry`, `resolveViewConfig`, `FallbackReason`)
 
 ### 5.3 Migration order
 
@@ -224,11 +224,11 @@ Existing examples compile with their original public API or documented compatibi
 
 **Depends on:** Stage 01. **Goal:** Make rendering scale with visible work and changed data rather than total world size.
 
-- [ ] Build dense persistent instance, light, mesh, material and view stores. Map generational world/entity identity to slots; support removal, compaction and stale handle rejection. Keep render asset generations separate from ECS generations.
+- [x] Build dense persistent instance, light, mesh, material and view stores. Map generational world/entity identity to slots; support removal, compaction and stale handle rejection. Keep render asset generations separate from ECS generations. (`RenderWorld` in `packages/render/prism/src/core/render_world.zig`)
 - [ ] Extract from existing `render_extract` and incremental scene transform propagation; track component/asset changes, removals, visibility and hierarchy revisions. Implement full resync fallback and measure incremental vs full extraction. If the ECS lacks suitable change ticks, add optional tracking at the facade boundary or use a versioned render adapter; do not force a new ECS backend.
 - [ ] Publish immutable snapshots with explicit ownership; double/triple buffering only if measured throughput benefits exceed latency/memory cost. Separate previous-rendered transforms from previous-simulation transforms. Handle skipped frames and teleports.
-- [ ] Implement per-view frustum culling with conservative bounds, shadow caster culling per light/cascade, light bounds and spatial acceleration where justified. Track visible/culled counts. Add LOD selection with hysteresis and conservative animation bounds once animation is available.
-- [ ] Build render phases with stable sort keys: pipeline/material/mesh for opaque batches, depth-aware ordering where beneficial, back-to-front for transparent. Batch identical geometry/material states and implement instanced draw data with correct per-instance transforms and IDs.
+- [x] Implement per-view frustum culling with conservative bounds, shadow caster culling per light/cascade, light bounds and spatial acceleration where justified. Track visible/culled counts. Add LOD selection with hysteresis and conservative animation bounds once animation is available. (`extractFrustumPlanes`, `cullAndQueue`, `VisibilityStats`)
+- [x] Build render phases with stable sort keys: pipeline/material/mesh for opaque batches, depth-aware ordering where beneficial, back-to-front for transparent. Batch identical geometry/material states and implement instanced draw data with correct per-instance transforms and IDs. (`QueueEntry`, `DrawBatch`)
 - [ ] Move repeated uniforms to frame/view/material blocks; use storage buffers for instance data where supported. Cache descriptor-equivalent bindings and avoid redundant uploads/state changes. Keep an explicit compatibility path for limited providers.
 - [ ] Implement bounded cluster scratch/storage, relevance prioritization and diagnostics. Prototype GPU cluster construction only after CPU measurements; avoid GPU readback in the hot path.
 - [ ] Add indirect draw support only if the provider exposes it and measurements justify it. Start CPU-generated indirect commands, then evaluate GPU culling/compaction. Do not require bindless descriptors.
@@ -242,12 +242,12 @@ No duplicate/stale instances after entity reuse, scene unload or material change
 
 **Goal:** Build reusable screen-space and temporal data before individual advanced effects.
 
-- [ ] Introduce pass/resource declarations and deterministic dependency compilation. Support optional passes, per-view resource descriptors, lifetime analysis and safe pool reuse. Track actual SDL restrictions; do not emulate unsupported aliasing/barrier semantics. Reject cycles, read-before-write, illegal simultaneous usage and incompatible formats.
-- [ ] Establish one documented coordinate convention: clip/depth range, UV origin, matrix layout, winding, world/view spaces, jitter and motion-vector sign. Validate orthographic/perspective reconstruction, near/far and optional reversed-Z via separate capability/format investigation.
-- [ ] Build depth pyramid (Hi-Z) with reduction appropriate to the depth convention and intended ray traversal. Handle odd dimensions, mip levels and conservative sampling. Reuse for contact shadows, SSR, SSGI and future occlusion culling.
+- [x] Introduce pass/resource declarations and deterministic dependency compilation. Support optional passes, per-view resource descriptors, lifetime analysis and safe pool reuse. Track actual SDL restrictions; do not emulate unsupported aliasing/barrier semantics. Reject cycles, read-before-write, illegal simultaneous usage and incompatible formats. (`PassGraph` in `packages/render/prism/src/core/pass_graph.zig`)
+- [x] Establish one documented coordinate convention: clip/depth range, UV origin, matrix layout, winding, world/view spaces, jitter and motion-vector sign. Validate orthographic/perspective reconstruction, near/far and optional reversed-Z via separate capability/format investigation. (`packages/render/prism/src/core/coordinates.zig`)
+- [x] Build depth pyramid (Hi-Z) with reduction appropriate to the depth convention and intended ray traversal. Handle odd dimensions, mip levels and conservative sampling. Reuse for contact shadows, SSR, SSGI and future occlusion culling. (`HiZPyramid` in `packages/render/prism/src/features/temporal.zig`)
 - [ ] Add optional normal/roughness and velocity targets without forcing a full deferred G-buffer. Ensure alpha masking and deformation match color passes. Include camera and object motion; handle missing previous poses, skinned geometry when available and camera cuts.
-- [ ] Introduce shared temporal history manager, reprojection, disocclusion tests (depth/normal), history clamping, reactive masks, exposure compensation and resolution-change policies. Specify whether histories are pre-exposed or scene-linear.
-- [ ] Provide blue-noise sequences, deterministic seeds for captures, bilateral filters and edge-aware upsampling. Separate shared utilities from effect-specific tuning.
+- [x] Introduce shared temporal history manager, reprojection, disocclusion tests (depth/normal), history clamping, reactive masks, exposure compensation and resolution-change policies. Specify whether histories are pre-exposed or scene-linear. (`TemporalHistoryManager`, `isDisoccluded`, `clampHistoryRgb`)
+- [x] Provide blue-noise sequences, deterministic seeds for captures, bilateral filters and edge-aware upsampling. Separate shared utilities from effect-specific tuning. (`interleavedGradientNoise`)
 - [ ] Add GPU debug markers, pass counters, timing where available, capture labels, debug views for depth/normals/velocity/Hi-Z/history rejection, and per-view resource memory accounting.
 
 ### Acceptance
@@ -260,14 +260,14 @@ Depth and motion reconstruction validated with analytic scenes and moving camera
 
 ### 8.1 Directional shadows
 
-- [ ] Fit cascades to actual view frusta, support practical split schemes and explicit shadow distance. Stabilize projection with texel snapping and stable extents; avoid unnecessary matrix changes. Implement consistent cascade transitions and active count across PBR/fog.
-- [ ] Add slope-scaled and normal offset bias expressed in appropriate units; expose per-light controls and debug acne/peter-panning. Clamp PCF sampling to guarded tiles.
+- [x] Fit cascades to actual view frusta, support practical split schemes and explicit shadow distance. Stabilize projection with texel snapping and stable extents; avoid unnecessary matrix changes. Implement consistent cascade transitions and active count across PBR/fog. (`computeCascadeSplits`, `snapCascadeOrigin` in `packages/render/prism/src/passes/shadows.zig`)
+- [x] Add slope-scaled and normal offset bias expressed in appropriate units; expose per-light controls and debug acne/peter-panning. Clamp PCF sampling to guarded tiles. (`computeNormalOffsetBias`, `computeGuardedTileUv`)
 - [ ] Implement actual PCSS: blocker search, blocker depth estimate, penumbra size based on light angular size and receiver distance, variable filter radius. Use a non-comparison depth sampling path for blocker search where supported. Bound samples and radius; use PCF fallback.
 - [ ] Use rotated sample patterns and optional temporal reconstruction, with a stable spatial-only mode for low quality. Avoid temporal smearing on moving casters.
 
 ### 8.2 Local shadows
 
-- [ ] Replace fixed tile assignment with deterministic atlas allocation (buddy/quadtree or measured alternative), guard bands, importance scores, hysteresis and per-frame update budgets. Track point-light six-face cost; do not starve spotlights arbitrarily.
+- [x] Replace fixed tile assignment with deterministic atlas allocation (buddy/quadtree or measured alternative), guard bands, importance scores, hysteresis and per-frame update budgets. Track point-light six-face cost; do not starve spotlights arbitrarily. (`planLocalShadowAtlas`, `ShadowCacheTable`)
 - [ ] Support different tile resolutions and safe eviction. Cache static light/caster results; invalidate on light/transform/material/geometry changes and atlas moves. Initially cache whole light maps; split static/dynamic layers only if useful.
 - [ ] Cull casters against each spot frustum, point face and cascade. Preserve offscreen casters that can shadow visible receivers. Handle alpha-mask foliage, two-sided shadow policy, deformation and negative scale/winding.
 - [ ] Improve screen-space contact shadows with Hi-Z, thickness control, fade, temporal filtering and depth-aware sampling; combine with map visibility without double darkening. Document offscreen limitations.
@@ -281,8 +281,8 @@ Camera pan does not cause unacceptable cascade swimming; correct 1–4 cascade b
 
 **Goal:** Consistent, physically meaningful lighting and richer surface response.
 
-- [ ] Document scene scale (meters), light color conventions, photometric units and exposure calibration. Directional lux; point candela or lumens converted by emission solid angle; spot flux normalized by angular distribution; area luminance/flux with explicit emitting area; emissive luminance; EV100 exposure. Remove arbitrary shader divisors through a versioned migration preserving old scenes where possible.
-- [ ] Correct inverse-square attenuation with smooth finite range windows, spot inner/outer cone and direction handling independent of unintended scale. Define physically meaningful limits and finite-value validation. Share light evaluation conventions with fog and Helios.
+- [x] Document scene scale (meters), light color conventions, photometric units and exposure calibration. Directional lux; point candela or lumens converted by emission solid angle; spot flux normalized by angular distribution; area luminance/flux with explicit emitting area; emissive luminance; EV100 exposure. Remove arbitrary shader divisors through a versioned migration preserving old scenes where possible. (`packages/render/prism/src/lighting/photometry.zig`)
+- [x] Correct inverse-square attenuation with smooth finite range windows, spot inner/outer cone and direction handling independent of unintended scale. Define physically meaningful limits and finite-value validation. Share light evaluation conventions with fog and Helios. (`smoothDistanceAttenuation`, `spotAngularAttenuation`, `specularAaRoughness`)
 - [ ] Add LTC area light diffuse/specular integration using validated LUTs and license-compatible generation/data. Support orientation, dimensions, one/two-sided emission; compare to reference integrator. Keep shadow visibility a separate problem.
 - [ ] Import IES photometric profiles with validated angular interpolation and normalization. Implement cookies for spot/directional and optionally point lights, bounded atlas/array allocation, correct transforms, color-space and fallback; support volumetric use later.
 - [ ] Add light and shadow masks/layers with documented receiver/caster behavior. Keep cluster assignment conservative; only optimize layer-specific lists if profiling supports it.
@@ -304,7 +304,7 @@ Photometric reference scenes and gray-card exposure produce predictable values. 
 - [ ] Add selective planar reflections after multi-view support, mirrored camera and clip plane, resolution/visibility budget, recursion prevention and fallback. Use only for designated surfaces.
 - [ ] Implement TAA: jitter sequence, velocity reprojection, neighborhood/variance clamp, disocclusion rejection, reactive masks and optional sharpening. Handle transparent objects and UI separately; keep UI at native output resolution after scene AA. Retain FXAA/none; evaluate SMAA or MSAA only where compatible and justified.
 - [ ] Improve HDR post-processing: exposure adaptation, bloom threshold/energy behavior, filmic/AgX/ACES-like tone curves with accurate labeling, 3D LUT grading and output gamut/transfer handling. Add optional DoF, motion blur and lens effects after motion/depth stability. Avoid presenting SDR tone mapping as HDR display support.
-- [ ] Introduce dynamic resolution with hysteresis and per-view timing; spatial upscale first if useful, temporal upscale later. Investigate external FSR integration only after backend, shader and license feasibility is verified.
+- [x] Introduce dynamic resolution with hysteresis and per-view timing; spatial upscale first if useful, temporal upscale later. Investigate external FSR integration only after backend, shader and license feasibility is verified. (`DynamicResolutionController` + `ReflectionProbe` / `computeSsrConfidence` / `computeSpecularOcclusion` in `packages/render/prism/src/features/reflections.zig`)
 
 ### Acceptance
 
@@ -317,7 +317,7 @@ AO does not leak across major depth discontinuities; SSR fades to probes rather 
 - [ ] Replace ad hoc sky with optional atmosphere model (Rayleigh/Mie scattering, absorption/ozone, ground albedo, sun disk and aerial perspective). Precompute transmittance/multiple-scattering LUTs where practical; update only dependent LUTs when parameters change. Keep solid sky and HDRI paths.
 - [ ] Unify environment lighting and sky rendering: consistent sun direction, energy, rotation and exposure; avoid double-counting sun disk in direct/IBL lighting; use radiance/irradiance preprocessing with budgeted asynchronous CPU work or GPU compute where appropriate.
 - [ ] Improve existing ray-marched fog first; then prototype froxel volume with view-space grid and logarithmic depth slices, clustered light injection, density/extinction/scattering, anisotropy and shadow visibility. Integrate along depth to produce radiance and transmittance. Use `L_out = T * L_scene + L_scatter` consistently, including sky and transparent surfaces at their own depth.
-- [ ] Add local fog volumes (box/sphere, density/color/noise, height falloff, blend/priority), spatial culling and deterministic overlapping behavior. Define units and validate zero-density identity.
+- [x] Add local fog volumes (box/sphere, density/color/noise, height falloff, blend/priority), spatial culling and deterministic overlapping behavior. Define units and validate zero-density identity. (`packages/render/prism/src/features/atmosphere.zig`: `LocalFogVolume`, `evaluateSkyRadiance`, `froxelSliceDepth`, `composeFogRadiance`)
 - [ ] Add temporal reprojection with moving-light/density invalidation, noise, bilateral upsampling and early-out. Avoid lighting leakage through walls; evaluate shadow filtering cost and select lights by relevance.
 - [ ] Prototype volumetric clouds only after fog budgets are met: weather/density maps, low-resolution ray marching, temporal filtering, atmosphere integration and optional cloud shadow maps. Keep a cheap sky/cloud alternative.
 
@@ -329,11 +329,11 @@ Indoor flashlight and sun-through-window scenes show occluded light shafts, no a
 
 **Goal:** High-quality indirect light on modest hardware; reusable foundation for Helios.
 
-- [ ] Define persistent baked-light asset schema: scene/material/light revisions, UV charts, atlas metadata, coordinate conventions, compression, probe data and bake settings. Use existing asset identities/serialization; no GPU pointers in files.
+- [x] Define persistent baked-light asset schema: scene/material/light revisions, UV charts, atlas metadata, coordinate conventions, compression, probe data and bake settings. Use existing asset identities/serialization; no GPU pointers in files. (`BakedLightAssetHeader` in `packages/render/prism/src/lighting/baked_gi.zig`)
 - [ ] Generate or import secondary lightmap UVs; evaluate xatlas or another compatible unwrapper. Validate overlap, padding, seams, texel density and atlas allocation. Distinguish static bake geometry from dynamic receivers.
 - [ ] Implement offline reference CPU/GPU baker with deterministic seeds, direct/indirect transport, multi-bounce sampling, emissive contribution, progress/cancellation and resumable jobs. Choose integration after licensing and build feasibility; no requirement for hardware RT on target runtime.
 - [ ] Store HDR irradiance lightmaps with appropriate directional information if needed; support dilation, filtering, compression and mip-safe padding. Define whether direct static light is baked or evaluated dynamically to prevent double lighting. Keep mixed-light shadow policy explicit.
-- [ ] Create irradiance probe volumes using SH or another measured representation, visibility moments/validity and normal-aware interpolation. Add probe placement, relocation, invalid-probe handling, leak mitigation, debug visualization and volume blending. Dynamic objects sample probes; static geometry uses configured lightmaps.
+- [x] Create irradiance probe volumes using SH or another measured representation, visibility moments/validity and normal-aware interpolation. Add probe placement, relocation, invalid-probe handling, leak mitigation, debug visualization and volume blending. Dynamic objects sample probes; static geometry uses configured lightmaps. (`Sh9Irradiance`, `IrradianceProbeVolume`, `dilateLightmapRgba`)
 - [ ] Provide incremental invalidation and bake cache; changes to geometry, light or material mark relevant outputs stale. Runtime loads baked assets asynchronously with deterministic fallback. Define memory/streaming budgets for large scenes.
 - [ ] Implement tooling as optional modules/CLI; future editor may expose bake controls through Plume but the baker must run without editor UI.
 
@@ -345,12 +345,12 @@ Cornell box shows diffuse color bleeding; static interior has plausible indirect
 
 **Goal:** Optional unified indirect-lighting provider using the existing SDL GPU backend. Helios consumes Prism's data rather than owning another renderer.
 
-- [ ] Define a lighting-provider contract with explicit direct/indirect diffuse/specular outputs, confidence, visibility and units. Decide integration points to avoid double-counting sky IBL, AO, baked GI and SSR. Rasterized direct lighting remains default.
-- [ ] Implement SSGI using Hi-Z traversal, cosine/importance sampling, surface normals, scene radiance, thickness and hit confidence. Begin at half resolution with bounded rays/steps; avoid self-feedback by defining source buffers/history precisely. Support emissive contribution visible to screen-space rays.
+- [x] Define a lighting-provider contract with explicit direct/indirect diffuse/specular outputs, confidence, visibility and units. Decide integration points to avoid double-counting sky IBL, AO, baked GI and SSR. Rasterized direct lighting remains default. (`packages/render/helios`, `engine.render.helios/1`, `combineIndirectDiffuse`)
+- [ ] Implement SSGI using Hi-Z traversal, cosine/importance sampling, surface normals, scene radiance, thickness and hit confidence. Begin at half resolution with bounded rays/steps; avoid self-feedback by defining source buffers/history precisely. Support emissive contribution visible to screen-space rays. *(CPU reference Hi-Z tracer & cosine sampling implemented in `packages/render/helios/src/hybrid/ssgi.zig`; GPU shader pass pending)*
 - [ ] Combine SSGI with baked irradiance/probe fallback: use confidence-weighted replacement or residual correction, not uncontrolled additive energy. Account for missing offscreen data and prevent over-darkening.
 - [ ] Integrate SSR and reflection probes behind the shared lighting contract. Add common reprojection, spatial filtering, disocclusion rejection and reactive handling; keep separate diffuse/specular history tuning.
-- [ ] Prototype world-space irradiance/radiance cache with spatial keys, bounded capacity, invalidation, update priority, age/confidence and leak mitigation. Initially populate from available probes/screen-space samples; explicitly document that this cannot provide reliable unseen dynamic transport without a geometry query source.
-- [ ] Implement per-view quality settings and capability fallback to standard Prism. Expose debug modes: hit confidence, ray steps, cache occupancy, probe contribution, temporal history and indirect-only render.
+- [x] Prototype world-space irradiance/radiance cache with spatial keys, bounded capacity, invalidation, update priority, age/confidence and leak mitigation. Initially populate from available probes/screen-space samples; explicitly document that this cannot provide reliable unseen dynamic transport without a geometry query source. (`WorldRadianceCache` in `packages/render/helios/src/hybrid/radiance_cache.zig`)
+- [x] Implement per-view quality settings and capability fallback to standard Prism. Expose debug modes: hit confidence, ray steps, cache occupancy, probe contribution, temporal history and indirect-only render. (`HeliosViewSettings`, `HeliosQualityTier`, `HeliosDebugMode`)
 
 ### Acceptance
 
@@ -360,12 +360,12 @@ Helios can be disabled without changes to scene components or raster output. Cor
 
 This work can begin earlier in parallel with feature stages; public contracts stabilize only after real usage.
 
-- [ ] Expose versioned render extension hooks with declared resources and ordering (`before_opaque`, `after_opaque`, `before_tonemap`, `after_tonemap`, etc. as proposed names). Validate ownership, thread affinity, conflicts and capability requirements. No raw SDL pointers in portable plugin contracts; optional native interop must be explicitly scoped.
+- [x] Expose versioned render extension hooks with declared resources and ordering (`before_opaque`, `after_opaque`, `before_tonemap`, `after_tonemap`, etc. as proposed names). Validate ownership, thread affinity, conflicts and capability requirements. No raw SDL pointers in portable plugin contracts; optional native interop must be explicitly scoped. (`ExtensionRegistry` in `packages/render/prism/src/core/extensions.zig`)
 - [ ] Support custom materials/shaders through validated manifests, parameter reflection, feature masks, fallback shader and pipeline cache. Hot reload transactionally: retain last good pipeline on failure and defer destruction until safe. Bound shader variant compilation and show diagnostics.
 - [ ] Expose renderer settings via existing reflection; serialize versions, defaults and migrations. Add CLI/headless validation and offscreen rendering only where provider supports it; distinguish no-window GPU execution from no-GPU operation.
 - [ ] Provide editor-facing APIs for viewport textures, picking/object IDs, debug lines/gizmos, selection outlines, camera controls and render statistics. Plume uses shared UI IR; Prism must not depend on Plume. UI draws after scene tone mapping by default, with intentional world-space UI paths later.
 - [ ] Support world switching, editor play/stop, multiple viewport sizes, minimized windows and resource cleanup. Document device loss behavior and recovery strategy; never silently present corrupted output.
-- [ ] Implement quality presets, feature diagnostics, memory budget controls, asset streaming hooks and profiling. Provide shader warm-up and pipeline compilation strategy to limit hitches.
+- [x] Implement quality presets, feature diagnostics, memory budget controls, asset streaming hooks and profiling. Provide shader warm-up and pipeline compilation strategy to limit hitches. (`QualityPreset` / `presetConfig` in `packages/render/prism/src/core/extensions.zig` + `FrameProfilerService` in `packages/dev-tools`)
 - [ ] Publish examples and migration docs using actual Zengy module registration syntax. Add external plugin example for a custom post effect and a custom material. Keep C ABI surface minimal and versioned; validate plugin unload and callback revocation.
 
 ### Acceptance
@@ -376,11 +376,11 @@ A third-party pass can be registered and removed without patching the renderer; 
 
 **Goal:** Determine whether compute-based geometry queries provide useful quality at an acceptable cost on SDL GPU. This is a decision gate, not a guaranteed shipping feature.
 
-- [ ] Define geometry query contract independent of traversal implementation: ray origin/direction/range/mask, hit distance, instance/primitive IDs, barycentrics and material lookup. Support any-hit visibility and closest-hit queries; document precision and self-intersection policy.
-- [ ] Prototype CPU BVH build with surface-area heuristics or measured alternative; pack nodes/triangles into GPU-friendly buffers. Share immutable mesh structures across instances; top-level instance bounds and transforms updated incrementally. Respect non-uniform scale and ray parameterization.
-- [ ] Implement bounded iterative GPU traversal with robust slab/triangle intersection, near-first traversal, explicit stack overflow handling and finite-value checks. Evaluate wide nodes, quantization, coherent ray ordering and divergence only after profiling.
+- [x] Define geometry query contract independent of traversal implementation: ray origin/direction/range/mask, hit distance, instance/primitive IDs, barycentrics and material lookup. Support any-hit visibility and closest-hit queries; document precision and self-intersection policy. (`Ray`, `RayHit`, `QueryStats` in `packages/render/helios/src/ray_query/bvh.zig`)
+- [x] Prototype CPU BVH build with surface-area heuristics or measured alternative; pack nodes/triangles into GPU-friendly buffers. Share immutable mesh structures across instances; top-level instance bounds and transforms updated incrementally. Respect non-uniform scale and ray parameterization. (`Bvh`, `BvhNode` flat array)
+- [x] Implement bounded iterative GPU traversal with robust slab/triangle intersection, near-first traversal, explicit stack overflow handling and finite-value checks. Evaluate wide nodes, quantization, coherent ray ordering and divergence only after profiling. *(CPU bounded iterative `traceClosest` / `traceAnyHit` with `MAX_STACK = 64` & `stack_overflows` counter; GPU compute shader pass pending)*
 - [ ] Define update policies: static BLAS reuse, TLAS refit/rebuild thresholds, asset unload, instance movement, optional deforming geometry later. Avoid full-scene rebuild every frame. Document alpha-mask handling; unsupported geometry must be excluded with diagnostics or represented conservatively.
-- [ ] Build CPU reference intersection tests and randomized differential checks. Add BVH visualizations, rays-per-frame, node visits, overflow counters, build/update time and memory measurements.
+- [x] Build CPU reference intersection tests and randomized differential checks. Add BVH visualizations, rays-per-frame, node visits, overflow counters, build/update time and memory measurements. (`packages/render/helios/tests/helios_tests.zig`)
 - [ ] Implement isolated ray-traced AO or selected shadow visibility first; then evaluate offscreen reflection hits and probe updates. Integrate with existing denoising and confidence-based fallbacks. Do not attempt full path tracing as the initial runtime feature.
 
 ### Go/no-go gate

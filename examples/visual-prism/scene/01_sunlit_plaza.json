@@ -1,0 +1,43 @@
+{
+  "name": "01 — Sunlit Material Plaza",
+  "camera_pos": [0.0, 5.2, 13.5],
+  "camera_target": [0.0, 1.4, 0.0],
+  "sky_tint": [0.14, 0.40, 0.88],
+  "horizon_tint": [0.58, 0.76, 0.96],
+  "ground_albedo": [0.16, 0.17, 0.19],
+  "sun_dir": [-0.45, -0.78, -0.42],
+  "sun_color": [1.0, 0.96, 0.88],
+  "sun_lux": 26000.0,
+  "fog_enabled": false,
+  "fog_density": 0.012,
+  "volumetric_enabled": false,
+  "bloom_enabled": true,
+  "ssao_enabled": true,
+  "objects": [
+    { "shape": "plane", "pos": [0.0, 0.0, 0.0], "scale": [36.0, 1.0, 36.0], "color": [0.22, 0.24, 0.27], "roughness": 0.82, "metallic": 0.05 },
+
+    { "shape": "cuboid", "pos": [-7.5, 2.2, -5.5], "scale": [1.1, 4.4, 1.1], "color": [0.76, 0.74, 0.70], "roughness": 0.70, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [-3.75, 2.2, -5.5], "scale": [1.1, 4.4, 1.1], "color": [0.76, 0.74, 0.70], "roughness": 0.70, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [0.0, 2.2, -5.5], "scale": [1.1, 4.4, 1.1], "color": [0.76, 0.74, 0.70], "roughness": 0.70, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [3.75, 2.2, -5.5], "scale": [1.1, 4.4, 1.1], "color": [0.76, 0.74, 0.70], "roughness": 0.70, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [7.5, 2.2, -5.5], "scale": [1.1, 4.4, 1.1], "color": [0.76, 0.74, 0.70], "roughness": 0.70, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [0.0, 4.7, -5.5], "scale": [17.0, 0.7, 1.6], "color": [0.68, 0.66, 0.63], "roughness": 0.72, "metallic": 0.0 },
+
+    { "shape": "sphere", "pos": [-5.0, 1.1, 0.5], "scale": [1.8, 1.8, 1.8], "color": [0.96, 0.78, 0.28], "roughness": 0.14, "metallic": 0.96 },
+    { "shape": "torus", "pos": [-2.5, 1.05, 0.5], "scale": [1.7, 1.7, 1.7], "color": [0.88, 0.48, 0.28], "roughness": 0.18, "metallic": 0.92 },
+    { "shape": "capsule", "pos": [0.0, 1.25, 0.5], "scale": [1.5, 1.5, 1.5], "color": [0.22, 0.80, 0.76], "roughness": 0.28, "metallic": 0.15 },
+    { "shape": "cylinder", "pos": [2.5, 1.0, 0.5], "scale": [1.5, 2.0, 1.5], "color": [0.28, 0.54, 0.94], "roughness": 0.35, "metallic": 0.45 },
+    { "shape": "cone", "pos": [5.0, 1.05, 0.5], "scale": [1.6, 2.1, 1.6], "color": [0.86, 0.28, 0.24], "roughness": 0.40, "metallic": 0.10 },
+
+    { "shape": "sphere", "pos": [-6.5, 0.6, 4.5], "scale": [1.1, 1.1, 1.1], "color": [1.0, 0.95, 0.85], "roughness": 0.20, "metallic": 0.0, "emissive": [4.5, 3.2, 1.2] },
+    { "shape": "sphere", "pos": [6.5, 0.6, 4.5], "scale": [1.1, 1.1, 1.1], "color": [0.75, 0.92, 1.0], "roughness": 0.20, "metallic": 0.0, "emissive": [1.2, 3.4, 5.0] },
+
+    { "shape": "cuboid", "pos": [-3.0, 0.45, 4.2], "scale": [1.4, 0.9, 1.4], "color": [0.35, 0.38, 0.42], "roughness": 0.55, "metallic": 0.2 },
+    { "shape": "cuboid", "pos": [0.0, 0.45, 4.2], "scale": [1.4, 0.9, 1.4], "color": [0.90, 0.90, 0.92], "roughness": 0.12, "metallic": 0.95 },
+    { "shape": "cuboid", "pos": [3.0, 0.45, 4.2], "scale": [1.4, 0.9, 1.4], "color": [0.30, 0.78, 0.42], "roughness": 0.50, "metallic": 0.1 }
+  ],
+  "point_lights": [
+    { "pos": [-6.5, 2.2, 4.5], "color": [1.0, 0.72, 0.35], "lumens": 1800.0, "range": 14.0 },
+    { "pos": [6.5, 2.2, 4.5], "color": [0.32, 0.72, 1.0], "lumens": 1800.0, "range": 14.0 }
+  ]
+}

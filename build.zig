@@ -395,6 +395,21 @@ pub fn build(b: *std.Build) void {
     });
     log_mod.addImport("engine", engine_mod);
 
+    const prism_mod = b.addModule("prism", .{
+        .root_source_file = b.path("packages/render/prism/src/prism.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prism_mod.addImport("engine", engine_mod);
+
+    const helios_mod = b.addModule("helios", .{
+        .root_source_file = b.path("packages/render/helios/src/helios.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    helios_mod.addImport("engine", engine_mod);
+    helios_mod.addImport("prism", prism_mod);
+
     remote_mod.addImport("engine", engine_mod);
     remote_mod.addImport("dev_tools", dev_tools_mod);
     remote_mod.addImport("editor_shell", editor_shell_mod);
@@ -1016,6 +1031,39 @@ pub fn build(b: *std.Build) void {
     const run_visual_inspector_step = b.step("run-visual-inspector", "Open the Visual Shapes, Picking & Profiler Showcase");
     run_visual_inspector_step.dependOn(&run_visual_inspector.step);
 
+    // Visual Prism Stage 01+02 Showcase. Run with `zig build run-visual-prism`.
+    const visual_prism_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-prism/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_prism_mod.addImport("engine", engine_mod);
+    visual_prism_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_prism_mod.addImport("graphics", graphics_mod);
+    visual_prism_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_prism_mod.addImport("input", input_mod);
+    visual_prism_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_prism_mod.addImport("camera", camera_mod);
+    visual_prism_mod.addImport("render_3d", render_3d_mod);
+    visual_prism_mod.addImport("gizmos", gizmos_mod);
+    visual_prism_mod.addImport("shapes", shapes_mod);
+    visual_prism_mod.addImport("dev_tools", dev_tools_mod);
+    visual_prism_mod.addImport("prism", prism_mod);
+    visual_prism_mod.addImport("helios", helios_mod);
+
+    const visual_prism_exe = b.addExecutable(.{
+        .name = "visual-prism",
+        .root_module = visual_prism_mod,
+    });
+    b.installArtifact(visual_prism_exe);
+
+    const run_visual_prism = b.addSystemCommand(&.{"zig-out/bin/visual-prism.exe"});
+    run_visual_prism.setCwd(b.path("."));
+    run_visual_prism.step.dependOn(b.getInstallStep());
+    const run_visual_prism_step = b.step("run-visual-prism", "Open the Visual Prism Stage 01+02 Showcase");
+    run_visual_prism_step.dependOn(&run_visual_prism.step);
+
     // Render regression harness: renders the fixed scenarios of `visual-pbr` and compares them with
     // `tests/golden/visual-pbr` (`capture-check`) or rewrites those goldens (`capture-update`).
     // Needs a GPU and a window; see docs/roadmap/visual-risk-plan.md.
@@ -1274,6 +1322,17 @@ pub fn build(b: *std.Build) void {
     addModuleTest(b, test_step, "packages/log/tests/log_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "log", .mod = log_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/render/prism/tests/prism_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "prism", .mod = prism_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/render/helios/tests/helios_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "prism", .mod = prism_mod },
+        .{ .name = "helios", .mod = helios_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/formats/toml/tests/toml_tests.zig", target, optimize, false, &.{

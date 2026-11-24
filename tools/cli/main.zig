@@ -47,6 +47,8 @@ const OFFICIAL_PACKAGES = [_]OfficialPackageInfo{
     .{ .name = "physics-rapier", .entry = "src/physics_rapier.zig", .summary = "Rapier3D (Rust) solver backend (requires cargo/rustc)" },
     .{ .name = "render-2d", .entry = "src/render_2d.zig", .summary = "Sprite, Visibility & 2D batch extraction (uses camera)" },
     .{ .name = "render-3d", .entry = "src/render_3d.zig", .summary = "3D math, MeshRef, glTF 2.0 & frustum culling (uses camera)" },
+    .{ .name = "render-prism", .entry = "src/prism.zig", .summary = "Prism modular rendering orchestration, PassGraph, ViewRegistry & RetirementQueue" },
+    .{ .name = "render-helios", .entry = "src/helios.zig", .summary = "Helios optional hybrid indirect lighting (SSGI, WorldRadianceCache)" },
     .{ .name = "gizmos", .entry = "src/gizmos.zig", .summary = "Immediate-mode 3D debug & editor gizmos (uses camera)" },
     .{ .name = "shapes", .entry = "src/shapes.zig", .summary = "Procedural 3D primitives (Plane, Cuboid, Sphere, Capsule, Cylinder, Torus, Cone) with UVs & tangents" },
     .{ .name = "dev-tools", .entry = "src/dev_tools.zig", .summary = "Per-pass frame profiler and developer telemetry" },
@@ -97,6 +99,8 @@ fn packageDir(name: []const u8) []const u8 {
         .{ "scripting-python", "scripting/python" },
         .{ "render-2d", "render/2d" },
         .{ "render-3d", "render/3d" },
+        .{ "render-prism", "render/prism" },
+        .{ "render-helios", "render/helios" },
         .{ "text", "render/text" },
         .{ "testing", "testing" },
     };
