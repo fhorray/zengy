@@ -184,6 +184,19 @@ pub fn projectSkyDiffuse(pixels: []const [4]f32, width: u32, height: u32) SkyDif
 
 /// Generates a separable box/gaussian-blurred prefiltered mip chain from base `pixels` (`width x height`).
 /// Caller owns the returned slice of mip slices (free each with `allocator.free`, then `allocator.free(mips)`).
+/// Width and height of mip `lvl` of the prefiltered environment chain (level 0 is the base size).
+pub fn envMipSize(base_w: u32, base_h: u32, lvl: u32) [2]u32 {
+    var w = base_w;
+    var h = base_h;
+    var i: u32 = 0;
+    while (i < lvl) : (i += 1) {
+        w = @max(w / 2, 2);
+        h = @max(h / 2, 2);
+    }
+    return .{ w, h };
+}
+
+/// Builds all `levels` of the prefiltered environment chain. Level 0 is a copy of the base image.
 pub fn buildPrefilteredEnvMips(
     allocator: std.mem.Allocator,
     base_pixels: []const [4]f32,
@@ -197,17 +210,33 @@ pub fn buildPrefilteredEnvMips(
         for (mips[0..initialized]) |m| allocator.free(m);
         allocator.free(mips);
     }
-
     mips[0] = try allocator.dupe([4]f32, base_pixels);
     initialized += 1;
-
-    var prev_w = base_w;
-    var prev_h = base_h;
-    const sample_count: u32 = 16;
     for (1..levels) |lvl| {
-        const cur_w = @max(prev_w / 2, 2);
-        const cur_h = @max(prev_h / 2, 2);
+        mips[lvl] = try buildPrefilteredEnvMipLevel(allocator, base_pixels, base_w, base_h, levels, @intCast(lvl));
+        initialized += 1;
+    }
+    return mips;
+}
+
+/// Builds one prefiltered level (`lvl >= 1`) of the chain; the result is owned by the caller.
+/// Callers that must bound per-frame CPU cost build the chain one level at a time.
+pub fn buildPrefilteredEnvMipLevel(
+    allocator: std.mem.Allocator,
+    base_pixels: []const [4]f32,
+    base_w: u32,
+    base_h: u32,
+    levels: u32,
+    lvl: u32,
+) ![][4]f32 {
+    std.debug.assert(lvl >= 1 and lvl < levels);
+    const sample_count: u32 = 16;
+    {
+        const size = envMipSize(base_w, base_h, lvl);
+        const cur_w = size[0];
+        const cur_h = size[1];
         const dst = try allocator.alloc([4]f32, @as(usize, cur_w) * @as(usize, cur_h));
+        errdefer allocator.free(dst);
         const roughness = @as(f32, @floatFromInt(lvl)) / @as(f32, @floatFromInt(@max(levels - 1, 1)));
 
         for (0..cur_h) |y| {
@@ -265,12 +294,8 @@ pub fn buildPrefilteredEnvMips(
                 dst[y * cur_w + x] = .{ sum[0] * inv_w, sum[1] * inv_w, sum[2] * inv_w, 1.0 };
             }
         }
-        mips[lvl] = dst;
-        initialized += 1;
-        prev_w = cur_w;
-        prev_h = cur_h;
+        return dst;
     }
-    return mips;
 }
 
 fn radicalInverseVdC(bits_in: u32) f32 {

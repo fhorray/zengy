@@ -80,6 +80,13 @@ const Scenario = struct {
     bloom: bool = true,
     aa: bool = true,
     sky_preset: u8 = 0,
+    /// Render with `RenderQuality.reuse_depth_prepass`.
+    reuse_depth: bool = false,
+    /// Rebuild the environment with the time-sliced budget.
+    sliced_ibl: bool = false,
+    /// Compare against the golden of this other scenario instead of owning one. Switches that must not change
+    /// the picture (depth reuse, sliced IBL) are checked this way, with the normal tolerances.
+    golden_of: ?[]const u8 = null,
 };
 
 const SCENARIOS = [_]Scenario{
@@ -97,6 +104,13 @@ const SCENARIOS = [_]Scenario{
     .{ .name = "materials_default", .pose = .materials },
     .{ .name = "materials_fog_off", .pose = .materials, .fog = false },
     .{ .name = "materials_shadows_off", .pose = .materials, .shadows = false },
+    // Must look like their `golden_of` scenario: silhouette integrity for depth reuse, and the settled result of
+    // a time-sliced environment rebuild (the preceding scenarios use another sky, so a rebuild happens).
+    .{ .name = "gallery_reuse_depth", .reuse_depth = true, .golden_of = "gallery_default" },
+    .{ .name = "closeup_reuse_depth", .pose = .closeup, .reuse_depth = true, .golden_of = "closeup_default" },
+    .{ .name = "materials_reuse_depth", .pose = .materials, .reuse_depth = true, .golden_of = "materials_default" },
+    .{ .name = "vol_room_reuse_depth", .pose = .vol_room, .reuse_depth = true, .golden_of = "vol_room_default" },
+    .{ .name = "gallery_dusk_sliced_ibl", .sky_preset = 2, .sliced_ibl = true, .golden_of = "gallery_dusk" },
 };
 
 const CaptureStage = enum { warmup, wait_final, wait_hdr };
@@ -157,7 +171,8 @@ const CaptureRunner = struct {
         self.final_h = img.height;
         if (self.update_goldens) return;
 
-        const golden_bytes = self.readFile(self.golden_dir, sc.name, ".png") orelse {
+        const golden_name = sc.golden_of orelse sc.name;
+        const golden_bytes = self.readFile(self.golden_dir, golden_name, ".png") orelse {
             self.fail(sc.name, "no golden image in {s} (run with ZENGY_CAPTURE_UPDATE=1 to create it)", .{self.golden_dir});
             return;
         };
@@ -203,12 +218,14 @@ const CaptureRunner = struct {
         }
 
         if (self.update_goldens) {
+            // Scenarios that borrow another golden never own one.
+            if (sc.golden_of != null) return;
             if (self.final_rgb) |rgb| try self.writePng(self.golden_dir, sc.name, ".png", self.final_w, self.final_h, rgb);
             try self.writeFile(self.golden_dir, sc.name, ".stats.txt", text);
             return;
         }
 
-        const golden_text = self.readFile(self.golden_dir, sc.name, ".stats.txt") orelse return;
+        const golden_text = self.readFile(self.golden_dir, sc.golden_of orelse sc.name, ".stats.txt") orelse return;
         defer self.allocator.free(golden_text);
         if (capture.statValue(golden_text, "speckle")) |g| {
             const limit = @max(g * 1.5, g + 50.0);
@@ -283,6 +300,8 @@ fn applyScenario(
     pp.contact_shadows.enabled = sc.ssao;
     pp.bloom.enabled = sc.bloom;
     pp.anti_aliasing = if (sc.aa) .fxaa else .none;
+    pp.quality.reuse_depth_prepass = sc.reuse_depth;
+    pp.quality.ibl_rebuild_budget = if (sc.sliced_ibl) .sliced else .unlimited;
     sun.shadows_enabled = sc.shadows;
     if (sky) |s_env| applySkyPreset(s_env, sun, sc.sky_preset);
 }

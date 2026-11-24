@@ -40,6 +40,28 @@ const ENV_W: u32 = 128;
 const ENV_H: u32 = 64;
 const ENV_MIPS: u32 = 5;
 const BRDF_LUT_SIZE: u32 = 128;
+/// HDRI texels converted to half floats per frame while an environment rebuild is time-sliced.
+const HDRI_PIXELS_PER_SLICE: usize = 1 << 18;
+
+/// In-flight environment rebuild. Stages: convert a new HDRI to a GPU texture (only when its content changed),
+/// build the equirectangular sky, prefilter one mip per step, then upload and swap everything at once.
+const IblJob = struct {
+    const Stage = enum { hdri_convert, sky, mips, finish };
+    stage: Stage,
+    sun_dir: [3]f32,
+    sun_col: [3]f32,
+    sun_int: f32,
+    /// Content key of the HDRI this job converts (valid while a new texture is pending).
+    hdri_ptr: usize,
+    hdri_hash: u64,
+    /// New HDRI texture and its staging buffer; the active sky texture stays in use until `finish`.
+    new_tex: ?*c.SDL_GPUTexture = null,
+    staging: ?*c.SDL_GPUTransferBuffer = null,
+    next_pixel: usize = 0,
+    sky: ?[][4]f32 = null,
+    mips: [ENV_MIPS]?[][4]f32 = @splat(null),
+    next_level: u32 = 1,
+};
 
 const PbrVertUniforms = extern struct {
     model: [16]f32,
@@ -269,6 +291,9 @@ pub const PbrGpuState = struct {
     pbr_pipeline: *c.SDL_GPUGraphicsPipeline,
     pbr_double_sided_pipeline: *c.SDL_GPUGraphicsPipeline,
     pbr_blend_pipeline: *c.SDL_GPUGraphicsPipeline,
+    /// Opaque variants that pass on equal depth, used when the lit pass reuses the depth prepass.
+    pbr_reuse_pipeline: *c.SDL_GPUGraphicsPipeline,
+    pbr_reuse_double_sided_pipeline: *c.SDL_GPUGraphicsPipeline,
     sky_pipeline: *c.SDL_GPUGraphicsPipeline,
     shadow_pipeline: *c.SDL_GPUGraphicsPipeline,
     /// Opaque casters with culling disabled (double-sided materials cast from both sides).
@@ -298,6 +323,12 @@ pub const PbrGpuState = struct {
     brdf_lut_texture: *c.SDL_GPUTexture,
     env_prefilter_texture: *c.SDL_GPUTexture,
     hdri_sky_texture: ?*c.SDL_GPUTexture = null,
+    /// Content key of `hdri_sky_texture`, so rotation and exposure changes do not re-upload the whole HDRI.
+    hdri_tex_ptr: usize = 0,
+    hdri_tex_hash: u64 = 0,
+    hdri_tex_w: u32 = 0,
+    hdri_tex_h: u32 = 0,
+    ibl_job: ?IblJob = null,
     last_hdri_ptr: usize = 0,
     last_hdri_hash: u64 = 0,
     last_hdri_rot: f32 = 0.0,
@@ -379,12 +410,16 @@ pub const PbrGpuState = struct {
         defer c.SDL_ReleaseGPUShader(device, pbr_vs);
         const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 10, 4, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_fs);
-        const pbr_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false);
+        const pbr_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_pipe);
-        const pbr_ds_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, false);
+        const pbr_ds_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, false, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_ds_pipe);
-        const pbr_blend_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, true);
+        const pbr_blend_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, true, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_blend_pipe);
+        const pbr_reuse_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false, true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_reuse_pipe);
+        const pbr_reuse_ds_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, false, true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_reuse_ds_pipe);
 
         const sky_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, SKY_VERT_SPV, 0, 0);
         defer c.SDL_ReleaseGPUShader(device, sky_vs);
@@ -586,6 +621,8 @@ pub const PbrGpuState = struct {
             .pbr_pipeline = pbr_pipe,
             .pbr_double_sided_pipeline = pbr_ds_pipe,
             .pbr_blend_pipeline = pbr_blend_pipe,
+            .pbr_reuse_pipeline = pbr_reuse_pipe,
+            .pbr_reuse_double_sided_pipeline = pbr_reuse_ds_pipe,
             .sky_pipeline = sky_pipe,
             .shadow_pipeline = sh_pipe,
             .shadow_double_sided_pipeline = sh_ds_pipe,
@@ -621,6 +658,8 @@ pub const PbrGpuState = struct {
     }
 
     pub fn deinit(self: *PbrGpuState) void {
+        self.cancelIblJob();
+        if (self.hdri_sky_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         self.queued_draws.deinit(self.allocator);
         self.cluster_scratch.deinit(self.allocator);
         if (self.capture_pending) |p| c.SDL_ReleaseGPUTransferBuffer(self.device, p.transfer);
@@ -672,6 +711,8 @@ pub const PbrGpuState = struct {
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.shadow_double_sided_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.shadow_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.sky_pipeline);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pbr_reuse_double_sided_pipeline);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pbr_reuse_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pbr_blend_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pbr_double_sided_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pbr_pipeline);
@@ -960,7 +1001,10 @@ pub const PbrGpuState = struct {
             self.last_sun_size != sky_cfg.sun_size or
             self.last_sun_disk != sky_cfg.sun_disk;
         if (sky_changed) {
-            try self.updateEnvIbl(sun_dir, sun_col, sun_int);
+            // The very first build is always synchronous: there is no previous environment to keep showing.
+            const first_build = !self.ibl_initialized;
+            try self.startIblJob(sun_dir, sun_col, sun_int, hdri_ptr, hdri_hash);
+            if (first_build) try self.advanceIblJob(.unlimited);
             self.last_sun_dir = sun_dir;
             self.last_sun_col = sun_col;
             self.last_sun_int = sun_int;
@@ -978,6 +1022,7 @@ pub const PbrGpuState = struct {
             self.last_sun_disk = sky_cfg.sun_disk;
             self.ibl_initialized = true;
         }
+        try self.advanceIblJob(pp.quality.ibl_rebuild_budget);
 
         // 1. 4-Cascade Exponential Directional Shadow Map Atlas Pass (2x2 quadrants of 1024x1024)
         var light_vps: [4]math3d.Mat4 = @splat(math3d.Mat4.identity());
@@ -1052,9 +1097,9 @@ pub const PbrGpuState = struct {
             if (pl.shadows_enabled and next_tile + 6 <= 16) {
                 tile_id = @floatFromInt(next_tile);
                 const dirs = [6]math3d.Vec3{
-                    .{ .x = 1, .y = 0, .z = 0 },  .{ .x = -1, .y = 0, .z = 0 },
-                    .{ .x = 0, .y = 1, .z = 0 },  .{ .x = 0, .y = -1, .z = 0 },
-                    .{ .x = 0, .y = 0, .z = 1 },  .{ .x = 0, .y = 0, .z = -1 },
+                    .{ .x = 1, .y = 0, .z = 0 }, .{ .x = -1, .y = 0, .z = 0 },
+                    .{ .x = 0, .y = 1, .z = 0 }, .{ .x = 0, .y = -1, .z = 0 },
+                    .{ .x = 0, .y = 0, .z = 1 }, .{ .x = 0, .y = 0, .z = -1 },
                 };
                 const ups = [6]math3d.Vec3{
                     .{ .x = 0, .y = 1, .z = 0 },  .{ .x = 0, .y = 1, .z = 0 },
@@ -1205,7 +1250,9 @@ pub const PbrGpuState = struct {
         }
 
         // 1.5 Depth Prepass + SSAO + Contact Shadows + Bilateral Blur
-        if (pp.ssao.enabled or pp.contact_shadows.enabled) {
+        const prepass_ran = pp.ssao.enabled or pp.contact_shadows.enabled;
+        const reuse_depth = prepass_ran and pp.quality.reuse_depth_prepass;
+        if (prepass_ran) {
             const pre_depth = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
                 .texture = depth_tex,
                 .clear_depth = 1.0,
@@ -1300,7 +1347,7 @@ pub const PbrGpuState = struct {
                     if (sky.kind == .solid_color) sky.solid_color[0] else sky.ground_albedo[0],
                     if (sky.kind == .solid_color) sky.solid_color[1] else sky.ground_albedo[1],
                     if (sky.kind == .solid_color) sky.solid_color[2] else sky.ground_albedo[2],
-                    @floatFromInt(@intFromEnum(sky.sun_disk)),
+                    @floatFromInt(@backingInt(sky.sun_disk)),
                 },
                 .sun_col_intensity = .{ sun_col[0], sun_col[1], sun_col[2], if (sky.kind == .hdri) sky.hdri_exposure_ev else sun_int },
                 .hdri_rotation = .{ sky.hdri_rotation_rad / (2.0 * std.math.pi), 0, 0, 0 },
@@ -1322,16 +1369,17 @@ pub const PbrGpuState = struct {
             const hdr_depth = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
                 .texture = depth_tex,
                 .clear_depth = 1.0,
-                // The prepass depth is not reused: silhouette pixels can fail the equal-depth test against it
-                // and let the sky show through as a speckled outline. Clear and redraw for a stable image.
-                .load_op = c.SDL_GPU_LOADOP_CLEAR,
+                // Reusing the prepass depth (`RenderQuality.reuse_depth_prepass`) relies on both passes producing
+                // identical depth (same MVP, invariant gl_Position, same alpha-mask discard) and on the
+                // less-or-equal pipelines. Off by default; the plain path clears and redraws.
+                .load_op = @as(c_uint, if (reuse_depth) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR),
                 .store_op = c.SDL_GPU_STOREOP_STORE,
                 .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
                 .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
             });
             const pbr_pass = c.SDL_BeginGPURenderPass(cmd_buf, &hdr_col, 1, &hdr_depth) orelse return error.SdlGpuFailure;
             c.SDL_SetGPUViewport(pbr_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(tex_w), .h = @floatFromInt(tex_h), .min_depth = 0, .max_depth = 1 });
-            c.SDL_BindGPUGraphicsPipeline(pbr_pass, self.pbr_pipeline);
+            c.SDL_BindGPUGraphicsPipeline(pbr_pass, if (reuse_depth) self.pbr_reuse_pipeline else self.pbr_pipeline);
 
             var pt_pos: [4][4]f32 = @splat(.{ 0, 0, 0, 1 });
             var pt_col: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
@@ -1405,9 +1453,9 @@ pub const PbrGpuState = struct {
                 const want_pipe: *c.SDL_GPUGraphicsPipeline = if (mat.alpha_mode == .blend)
                     self.pbr_blend_pipeline
                 else if (mat.double_sided)
-                    self.pbr_double_sided_pipeline
+                    (if (reuse_depth) self.pbr_reuse_double_sided_pipeline else self.pbr_double_sided_pipeline)
                 else
-                    self.pbr_pipeline;
+                    (if (reuse_depth) self.pbr_reuse_pipeline else self.pbr_pipeline);
                 if (active_pipe != want_pipe) {
                     c.SDL_BindGPUGraphicsPipeline(pbr_pass, want_pipe);
                     active_pipe = want_pipe;
@@ -1703,7 +1751,7 @@ pub const PbrGpuState = struct {
             c.SDL_BindGPUFragmentSamplers(pf_pass, 0, &pf_samplers, pf_samplers.len);
             const pf_u = PostFxParams{
                 .bloom_tint_int = .{ pp.bloom.tint[0], pp.bloom.tint[1], pp.bloom.tint[2], if (pp.bloom.enabled) pp.bloom.intensity else 0.0 },
-                .grade_params = .{ pp.color_adjustments.exposure_ev, pp.color_adjustments.contrast, pp.color_adjustments.saturation, @floatFromInt(@intFromEnum(pp.tonemap_mode)) },
+                .grade_params = .{ pp.color_adjustments.exposure_ev, pp.color_adjustments.contrast, pp.color_adjustments.saturation, @floatFromInt(@backingInt(pp.tonemap_mode)) },
                 .grade_tint_look = .{ pp.color_adjustments.filter_tint[0], pp.color_adjustments.filter_tint[1], pp.color_adjustments.filter_tint[2], if (pp.tonemap_look == .punchy) 1.0 else 0.0 },
                 .vignette_params = .{ pp.vignette.color[0], pp.vignette.color[1], pp.vignette.color[2], if (pp.vignette.enabled) pp.vignette.intensity else 0.0 },
                 .vignette_extra = .{ pp.vignette.smoothness, if (pp.auto_exposure.enabled) 1.0 else 0.0, if (pp.anti_aliasing == .fxaa) 1.0 else 0.0, 0.0 },
@@ -1816,116 +1864,182 @@ pub const PbrGpuState = struct {
         self.capture_result = .{ .width = p.width, .height = p.height, .rgba = rgba };
     }
 
-    fn updateEnvIbl(self: *PbrGpuState, sun_dir: [3]f32, sun_col: [3]f32, sun_int: f32) !void {
-        const sky_f32: [][4]f32 = if (self.frame_data.sky.kind == .hdri and self.frame_data.sky.hdri_pixels != null and self.frame_data.sky.hdri_width > 0 and self.frame_data.sky.hdri_height > 0) blk: {
-            const hp = self.frame_data.sky.hdri_pixels.?;
-            const hw = self.frame_data.sky.hdri_width;
-            const hh = self.frame_data.sky.hdri_height;
-            if (self.hdri_sky_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
-            const htex = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
-                .type = c.SDL_GPU_TEXTURETYPE_2D,
-                .format = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
-                .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
-                .width = hw,
-                .height = hh,
-                .layer_count_or_depth = 1,
-                .num_levels = 1,
-            })) orelse return error.SdlGpuFailure;
-            self.hdri_sky_texture = htex;
+    fn cancelIblJob(self: *PbrGpuState) void {
+        const job = &(self.ibl_job orelse return);
+        if (job.new_tex) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+        if (job.staging) |t| c.SDL_ReleaseGPUTransferBuffer(self.device, t);
+        if (job.sky) |sky| self.allocator.free(sky);
+        for (job.mips) |m| if (m) |mm| self.allocator.free(mm);
+        self.ibl_job = null;
+    }
 
-            const px_count: usize = @as(usize, hw) * @as(usize, hh);
-            const byte_len: u32 = @intCast(px_count * 4 * @sizeOf(f16));
-            const tb = c.SDL_CreateGPUTransferBuffer(self.device, &std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo, .{
-                .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-                .size = byte_len,
-            })) orelse return error.SdlGpuFailure;
-            defer c.SDL_ReleaseGPUTransferBuffer(self.device, tb);
-            const ptr = c.SDL_MapGPUTransferBuffer(self.device, tb, false) orelse return error.SdlGpuFailure;
-            const dst: [*]f16 = @ptrCast(@alignCast(ptr));
-            for (0..px_count) |k| {
-                dst[k * 4 + 0] = clampToF16(hp[k][0]);
-                dst[k * 4 + 1] = clampToF16(hp[k][1]);
-                dst[k * 4 + 2] = clampToF16(hp[k][2]);
-                dst[k * 4 + 3] = clampToF16(hp[k][3]);
+    /// Begins an environment rebuild, replacing any rebuild still in flight. The HDRI is only converted to a
+    /// new GPU texture when its content (pointer, sampled hash, size) differs from the texture already resident.
+    fn startIblJob(self: *PbrGpuState, sun_dir: [3]f32, sun_col: [3]f32, sun_int: f32, hdri_ptr: usize, hdri_hash: u64) !void {
+        self.cancelIblJob();
+        const sky = self.frame_data.sky;
+        var job = IblJob{
+            .stage = .sky,
+            .sun_dir = sun_dir,
+            .sun_col = sun_col,
+            .sun_int = sun_int,
+            .hdri_ptr = hdri_ptr,
+            .hdri_hash = hdri_hash,
+        };
+        const has_hdri = sky.kind == .hdri and sky.hdri_pixels != null and sky.hdri_width > 0 and sky.hdri_height > 0;
+        if (has_hdri) {
+            const resident = self.hdri_sky_texture != null and self.hdri_tex_ptr == hdri_ptr and self.hdri_tex_hash == hdri_hash and
+                self.hdri_tex_w == sky.hdri_width and self.hdri_tex_h == sky.hdri_height;
+            if (!resident) {
+                const tex = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+                    .type = c.SDL_GPU_TEXTURETYPE_2D,
+                    .format = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                    .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+                    .width = sky.hdri_width,
+                    .height = sky.hdri_height,
+                    .layer_count_or_depth = 1,
+                    .num_levels = 1,
+                })) orelse return error.SdlGpuFailure;
+                errdefer c.SDL_ReleaseGPUTexture(self.device, tex);
+                const px_count: usize = @as(usize, sky.hdri_width) * @as(usize, sky.hdri_height);
+                const tb = c.SDL_CreateGPUTransferBuffer(self.device, &std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo, .{
+                    .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+                    .size = @as(u32, @intCast(px_count * 4 * @sizeOf(f16))),
+                })) orelse return error.SdlGpuFailure;
+                job.new_tex = tex;
+                job.staging = tb;
+                job.stage = .hdri_convert;
             }
-            c.SDL_UnmapGPUTransferBuffer(self.device, tb);
-            const cmd_h = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return error.SdlGpuFailure;
-            const cp_h = c.SDL_BeginGPUCopyPass(cmd_h) orelse return error.SdlGpuFailure;
-            c.SDL_UploadToGPUTexture(
-                cp_h,
-                &.{ .transfer_buffer = tb, .offset = 0, .pixels_per_row = hw, .rows_per_layer = hh },
-                &.{ .texture = htex, .mip_level = 0, .layer = 0, .x = 0, .y = 0, .z = 0, .w = hw, .h = hh, .d = 1 },
-                false,
-            );
-            c.SDL_EndGPUCopyPass(cp_h);
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd_h);
+        }
+        self.ibl_job = job;
+    }
 
-            const ds = try ibl.downsampleEquirectRgba32f(self.allocator, hp, hw, hh, ENV_W, ENV_H);
-            // Same rotation as the sky shader, so reflections and the visible sky agree.
-            try ibl.rotateEquirectColumns(self.allocator, ds, ENV_W, ENV_H, self.frame_data.sky.hdri_rotation_rad / (2.0 * std.math.pi));
-            const ev_scale = std.math.pow(f32, 2.0, self.frame_data.sky.hdri_exposure_ev);
-            if (@abs(ev_scale - 1.0) > 1e-4) {
-                for (ds) |*px_val| {
-                    px_val[0] *= ev_scale;
-                    px_val[1] *= ev_scale;
-                    px_val[2] *= ev_scale;
+    /// Runs the rebuild: to completion for `.unlimited`, one step per call for `.sliced`.
+    fn advanceIblJob(self: *PbrGpuState, budget: pbr.IblRebuildBudget) !void {
+        while (self.ibl_job != null) {
+            self.stepIblJob(budget) catch |err| {
+                self.cancelIblJob();
+                return err;
+            };
+            if (budget == .sliced) return;
+        }
+    }
+
+    fn stepIblJob(self: *PbrGpuState, budget: pbr.IblRebuildBudget) !void {
+        const job = &self.ibl_job.?;
+        const sky_cfg = self.frame_data.sky;
+        switch (job.stage) {
+            .hdri_convert => {
+                const hp = sky_cfg.hdri_pixels.?;
+                const total: usize = @as(usize, sky_cfg.hdri_width) * @as(usize, sky_cfg.hdri_height);
+                const end = if (budget == .sliced) @min(job.next_pixel + HDRI_PIXELS_PER_SLICE, total) else total;
+                const ptr = c.SDL_MapGPUTransferBuffer(self.device, job.staging.?, false) orelse return error.SdlGpuFailure;
+                const dst: [*]f16 = @ptrCast(@alignCast(ptr));
+                for (job.next_pixel..end) |k| {
+                    dst[k * 4 + 0] = clampToF16(hp[k][0]);
+                    dst[k * 4 + 1] = clampToF16(hp[k][1]);
+                    dst[k * 4 + 2] = clampToF16(hp[k][2]);
+                    dst[k * 4 + 3] = clampToF16(hp[k][3]);
                 }
-            }
-            break :blk ds;
-        } else try ibl.generateProceduralEquirectSky(
-            self.allocator,
-            self.frame_data.sky,
-            sun_dir,
-            sun_col,
-            sun_int,
-            ENV_W,
-            ENV_H,
-        );
-        defer self.allocator.free(sky_f32);
+                c.SDL_UnmapGPUTransferBuffer(self.device, job.staging.?);
+                job.next_pixel = end;
+                if (end < total) return;
 
-        self.sky_sh = ibl.projectSkyDiffuse(sky_f32, ENV_W, ENV_H);
+                const cmd_h = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return error.SdlGpuFailure;
+                const cp_h = c.SDL_BeginGPUCopyPass(cmd_h) orelse return error.SdlGpuFailure;
+                c.SDL_UploadToGPUTexture(
+                    cp_h,
+                    &.{ .transfer_buffer = job.staging.?, .offset = 0, .pixels_per_row = sky_cfg.hdri_width, .rows_per_layer = sky_cfg.hdri_height },
+                    &.{ .texture = job.new_tex.?, .mip_level = 0, .layer = 0, .x = 0, .y = 0, .z = 0, .w = sky_cfg.hdri_width, .h = sky_cfg.hdri_height, .d = 1 },
+                    false,
+                );
+                c.SDL_EndGPUCopyPass(cp_h);
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd_h);
+                c.SDL_ReleaseGPUTransferBuffer(self.device, job.staging.?);
+                job.staging = null;
+                job.stage = .sky;
+            },
+            .sky => {
+                const has_hdri = sky_cfg.kind == .hdri and sky_cfg.hdri_pixels != null and sky_cfg.hdri_width > 0 and sky_cfg.hdri_height > 0;
+                const sky_f32: [][4]f32 = if (has_hdri) blk: {
+                    const ds = try ibl.downsampleEquirectRgba32f(self.allocator, sky_cfg.hdri_pixels.?, sky_cfg.hdri_width, sky_cfg.hdri_height, ENV_W, ENV_H);
+                    errdefer self.allocator.free(ds);
+                    // Same rotation as the sky shader, so reflections and the visible sky agree.
+                    try ibl.rotateEquirectColumns(self.allocator, ds, ENV_W, ENV_H, sky_cfg.hdri_rotation_rad / (2.0 * std.math.pi));
+                    const ev_scale = std.math.pow(f32, 2.0, sky_cfg.hdri_exposure_ev);
+                    if (@abs(ev_scale - 1.0) > 1e-4) {
+                        for (ds) |*px_val| {
+                            px_val[0] *= ev_scale;
+                            px_val[1] *= ev_scale;
+                            px_val[2] *= ev_scale;
+                        }
+                    }
+                    break :blk ds;
+                } else try ibl.generateProceduralEquirectSky(self.allocator, sky_cfg, job.sun_dir, job.sun_col, job.sun_int, ENV_W, ENV_H);
+                job.sky = sky_f32;
+                job.mips[0] = try self.allocator.dupe([4]f32, sky_f32);
+                job.next_level = 1;
+                job.stage = .mips;
+            },
+            .mips => {
+                const sky_f32 = job.sky.?;
+                // One level per step; for `.unlimited` the caller loops until the job finishes.
+                job.mips[job.next_level] = try ibl.buildPrefilteredEnvMipLevel(self.allocator, sky_f32, ENV_W, ENV_H, ENV_MIPS, job.next_level);
+                job.next_level += 1;
+                if (job.next_level >= ENV_MIPS) job.stage = .finish;
+            },
+            .finish => {
+                const cmd = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return error.SdlGpuFailure;
+                const cp = c.SDL_BeginGPUCopyPass(cmd) orelse return error.SdlGpuFailure;
+                var mw = ENV_W;
+                var mh = ENV_H;
+                for (0..ENV_MIPS) |lvl| {
+                    const px_count: usize = @as(usize, mw) * @as(usize, mh);
+                    const byte_len: u32 = @intCast(px_count * 4 * @sizeOf(f16));
+                    const tb = c.SDL_CreateGPUTransferBuffer(self.device, &std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo, .{
+                        .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+                        .size = byte_len,
+                    })) orelse return error.SdlGpuFailure;
+                    defer c.SDL_ReleaseGPUTransferBuffer(self.device, tb);
 
-        const mips = try ibl.buildPrefilteredEnvMips(self.allocator, sky_f32, ENV_W, ENV_H, ENV_MIPS);
-        defer {
-            for (mips) |m| self.allocator.free(m);
-            self.allocator.free(mips);
+                    const ptr = c.SDL_MapGPUTransferBuffer(self.device, tb, false) orelse return error.SdlGpuFailure;
+                    const dst: [*]f16 = @ptrCast(@alignCast(ptr));
+                    const mip = job.mips[lvl].?;
+                    for (0..px_count) |k| {
+                        const px = mip[k];
+                        dst[k * 4 + 0] = clampToF16(px[0]);
+                        dst[k * 4 + 1] = clampToF16(px[1]);
+                        dst[k * 4 + 2] = clampToF16(px[2]);
+                        dst[k * 4 + 3] = clampToF16(px[3]);
+                    }
+                    c.SDL_UnmapGPUTransferBuffer(self.device, tb);
+
+                    c.SDL_UploadToGPUTexture(
+                        cp,
+                        &.{ .transfer_buffer = tb, .offset = 0, .pixels_per_row = mw, .rows_per_layer = mh },
+                        &.{ .texture = self.env_prefilter_texture, .mip_level = @intCast(lvl), .layer = 0, .x = 0, .y = 0, .z = 0, .w = mw, .h = mh, .d = 1 },
+                        false,
+                    );
+                    mw = @max(mw / 2, 1);
+                    mh = @max(mh / 2, 1);
+                }
+                c.SDL_EndGPUCopyPass(cp);
+                _ = c.SDL_SubmitGPUCommandBuffer(cmd);
+
+                // Swap: diffuse SH, prefiltered mips and (if converted) the sky texture change in the same frame.
+                self.sky_sh = ibl.projectSkyDiffuse(job.sky.?, ENV_W, ENV_H);
+                if (job.new_tex) |t| {
+                    if (self.hdri_sky_texture) |old| c.SDL_ReleaseGPUTexture(self.device, old);
+                    self.hdri_sky_texture = t;
+                    job.new_tex = null;
+                    self.hdri_tex_ptr = job.hdri_ptr;
+                    self.hdri_tex_hash = job.hdri_hash;
+                    self.hdri_tex_w = sky_cfg.hdri_width;
+                    self.hdri_tex_h = sky_cfg.hdri_height;
+                }
+                self.cancelIblJob();
+            },
         }
-
-        const cmd = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return error.SdlGpuFailure;
-        const cp = c.SDL_BeginGPUCopyPass(cmd) orelse return error.SdlGpuFailure;
-        var mw = ENV_W;
-        var mh = ENV_H;
-        for (0..ENV_MIPS) |lvl| {
-            const px_count: usize = @as(usize, mw) * @as(usize, mh);
-            const byte_len: u32 = @intCast(px_count * 4 * @sizeOf(f16));
-            const tb = c.SDL_CreateGPUTransferBuffer(self.device, &std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo, .{
-                .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-                .size = byte_len,
-            })) orelse return error.SdlGpuFailure;
-            defer c.SDL_ReleaseGPUTransferBuffer(self.device, tb);
-
-            const ptr = c.SDL_MapGPUTransferBuffer(self.device, tb, false) orelse return error.SdlGpuFailure;
-            const dst: [*]f16 = @ptrCast(@alignCast(ptr));
-            for (0..px_count) |k| {
-                const px = mips[lvl][k];
-                dst[k * 4 + 0] = clampToF16(px[0]);
-                dst[k * 4 + 1] = clampToF16(px[1]);
-                dst[k * 4 + 2] = clampToF16(px[2]);
-                dst[k * 4 + 3] = clampToF16(px[3]);
-            }
-            c.SDL_UnmapGPUTransferBuffer(self.device, tb);
-
-            c.SDL_UploadToGPUTexture(
-                cp,
-                &.{ .transfer_buffer = tb, .offset = 0, .pixels_per_row = mw, .rows_per_layer = mh },
-                &.{ .texture = self.env_prefilter_texture, .mip_level = @intCast(lvl), .layer = 0, .x = 0, .y = 0, .z = 0, .w = mw, .h = mh, .d = 1 },
-                false,
-            );
-            mw = @max(mw / 2, 1);
-            mh = @max(mh / 2, 1);
-        }
-        c.SDL_EndGPUCopyPass(cp);
-        _ = c.SDL_SubmitGPUCommandBuffer(cmd);
     }
 };
 
@@ -2010,10 +2124,10 @@ fn perspectiveMat(fov_rad: f32, aspect: f32, near: f32, far: f32) math3d.Mat4 {
     const f = 1.0 / @tan(fov_rad * 0.5);
     const fn_ = near - far;
     return .{ .m = .{
-        f / aspect, 0, 0,                           0,
-        0,          f, 0,                           0,
-        0,          0, far / fn_,                   -1,
-        0,          0, (near * far) / fn_,          0,
+        f / aspect, 0, 0,                  0,
+        0,          f, 0,                  0,
+        0,          0, far / fn_,          -1,
+        0,          0, (near * far) / fn_, 0,
     } };
 }
 
@@ -2027,10 +2141,10 @@ fn orthoMat(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) m
     const tb = top - bottom;
     const fn_ = far - near;
     return .{ .m = .{
-        2.0 / rl,              0,                     0,                     0,
-        0,                     2.0 / tb,              0,                     0,
-        0,                     0,                     -1.0 / fn_,            0,
-        -(right + left) / rl,  -(top + bottom) / tb,  -near / fn_,           1,
+        2.0 / rl,             0,                    0,           0,
+        0,                    2.0 / tb,             0,           0,
+        0,                    0,                    -1.0 / fn_,  0,
+        -(right + left) / rl, -(top + bottom) / tb, -near / fn_, 1,
     } };
 }
 
@@ -2134,6 +2248,8 @@ fn createMeshPbrPipeline(
     depth_fmt: c.SDL_GPUTextureFormat,
     double_sided: bool,
     alpha_blend: bool,
+    /// Pass on equal depth, for a lit pass that starts from the depth prepass.
+    depth_equal_ok: bool,
 ) !*c.SDL_GPUGraphicsPipeline {
     const vb_desc = [_]c.SDL_GPUVertexBufferDescription{.{
         .slot = 0,
@@ -2174,7 +2290,7 @@ fn createMeshPbrPipeline(
             .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE,
         }),
         .depth_stencil_state = std.mem.zeroInit(c.SDL_GPUDepthStencilState, .{
-            .compare_op = c.SDL_GPU_COMPAREOP_LESS,
+            .compare_op = @as(c_uint, if (depth_equal_ok) c.SDL_GPU_COMPAREOP_LESS_OR_EQUAL else c.SDL_GPU_COMPAREOP_LESS),
             .enable_depth_test = true,
             .enable_depth_write = !alpha_blend,
         }),

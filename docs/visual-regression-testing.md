@@ -38,6 +38,10 @@ Scenarios (`SCENARIOS` in `examples/visual-pbr/main.zig`): gallery, close-up and
 fog / SSAO / shadows / bloom / FXAA on and off, a dusk sky, and a materials pose with an alpha-masked
 double-sided panel and an alpha-blended pane.
 
+Scenarios with `golden_of` own no golden: they must match another scenario within the normal tolerances. They guard
+switches that may not change the picture: `*_reuse_depth` (`quality.reuse_depth_prepass`) and
+`gallery_dusk_sliced_ibl` (`quality.ibl_rebuild_budget = .sliced`).
+
 ## Reading a failure
 
 Open `<scenario>.diff.png` next to `<scenario>.png`, then the matching `.hdr.png` to tell a post-process problem

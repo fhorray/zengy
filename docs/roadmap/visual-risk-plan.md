@@ -119,3 +119,18 @@ reviewed.
   statistics checks (NaN/Inf, speckle, contrast, mean luminance) run in every capture. Not done: frame/pass
   time trends (see limits in the harness doc), and the capture suite is not part of `zig build test` because it
   needs a GPU and a window.
+- **Phase 2 - done, default off.** `PostProcessSettings.quality.reuse_depth_prepass` loads the prepass depth in the
+  lit pass and uses less-or-equal opaque pipelines (blend pipeline unchanged). Scenarios `*_reuse_depth` are
+  compared with the golden of the matching default scenario: max channel delta 2/255 and no speckle change on
+  the real GPU. Acceptance check: forcing the equal-depth pipelines back to less-than fails all four scenarios
+  (88-99% of pixels differ), so the check does see a broken silhouette. Not yet run on a second GPU or lavapipe,
+  so the default stays off.
+- **Phase 3 - done, default `.unlimited`.** `quality.ibl_rebuild_budget = .sliced` turns the rebuild into a job:
+  HDRI half-float conversion in 256k-texel slices into a staging texture, then the sky, one prefiltered mip per
+  frame, and a single-frame swap of the mips, diffuse SH and sky texture. The first build is always synchronous.
+  Independent of the budget, rotation, exposure and sun changes no longer re-upload an unchanged HDRI (it is keyed
+  by pointer, sampled hash and size), which was the largest per-change cost. `gallery_dusk_sliced_ibl` matches
+  the synchronous golden (max delta 7/255, under 0.0001% of pixels). Not measured: frame-time spike (no
+  frame-time capture yet), and the sliced HDRI conversion path is covered by code review only because the demo
+  keeps one resident HDRI.
+

@@ -347,6 +347,24 @@ pub const AntiAliasingMode = enum(u32) {
     fxaa = 1,
 };
 
+/// How the CPU work of an environment (IBL) rebuild is scheduled.
+pub const IblRebuildBudget = enum(u32) {
+    /// Rebuild everything in the frame that notices the change. Simple, but a large HDRI causes one long frame.
+    unlimited = 0,
+    /// Spread the rebuild over several frames (HDRI conversion in slices, one prefiltered mip per frame).
+    /// The old environment stays visible until the new one is complete, then both swap in one frame.
+    sliced = 1,
+};
+
+/// Quality and cost switches that do not change what the scene means, only how the backend renders it.
+pub const RenderQuality = struct {
+    /// Reuse the depth prepass (written for SSAO and contact shadows) as the depth buffer of the lit pass, so
+    /// opaque fragments are shaded once. Only takes effect while the prepass runs. Off by default until the
+    /// capture suite shows identical silhouettes on the target GPUs.
+    reuse_depth_prepass: bool = false,
+    ibl_rebuild_budget: IblRebuildBudget = .unlimited,
+};
+
 pub const PostProcessSettings = struct {
     auto_exposure: AutoExposureSettings = .{},
     bloom: BloomSettings = .{},
@@ -357,6 +375,7 @@ pub const PostProcessSettings = struct {
     ssao: SsaoSettings = .{},
     contact_shadows: ContactShadowSettings = .{},
     anti_aliasing: AntiAliasingMode = .fxaa,
+    quality: RenderQuality = .{},
 };
 
 /// Extracted directional light snapshot for backend submission.

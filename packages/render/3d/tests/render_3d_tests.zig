@@ -468,3 +468,37 @@ test "IBL HDRI rotation shifts equirect columns along +u and wraps around" {
     try render_3d.ibl.rotateEquirectColumns(testing.allocator, &px, 4, 1, 1.0);
     try testing.expectApproxEqAbs(@as(f32, 1), px[0][0], 1e-6);
 }
+
+test "IBL per-level prefilter matches the whole-chain build and mip sizes follow the chain" {
+    const w: u32 = 16;
+    const h: u32 = 8;
+    const levels: u32 = 3;
+    var base: [w * h][4]f32 = undefined;
+    for (&base, 0..) |*p, i| {
+        const f: f32 = @floatFromInt(i);
+        p.* = .{ f * 0.01, 1.0 - f * 0.005, 0.25, 1.0 };
+    }
+    const chain = try render_3d.ibl.buildPrefilteredEnvMips(testing.allocator, &base, w, h, levels);
+    defer {
+        for (chain) |m| testing.allocator.free(m);
+        testing.allocator.free(chain);
+    }
+    for (1..levels) |lvl| {
+        const one = try render_3d.ibl.buildPrefilteredEnvMipLevel(testing.allocator, &base, w, h, levels, @intCast(lvl));
+        defer testing.allocator.free(one);
+        const size = render_3d.ibl.envMipSize(w, h, @intCast(lvl));
+        try testing.expectEqual(@as(usize, size[0]) * size[1], one.len);
+        try testing.expectEqual(chain[lvl].len, one.len);
+        for (one, chain[lvl]) |a, b| {
+            for (0..4) |ch| try testing.expectEqual(b[ch], a[ch]);
+        }
+    }
+    try testing.expectEqual([2]u32{ 16, 8 }, render_3d.ibl.envMipSize(w, h, 0));
+    try testing.expectEqual([2]u32{ 4, 2 }, render_3d.ibl.envMipSize(w, h, 2));
+}
+
+test "RenderQuality defaults keep the established rendering path" {
+    const q = render_3d.pbr.RenderQuality{};
+    try testing.expect(!q.reuse_depth_prepass);
+    try testing.expectEqual(render_3d.pbr.IblRebuildBudget.unlimited, q.ibl_rebuild_budget);
+}

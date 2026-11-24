@@ -1463,7 +1463,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = PROVIDER_ID,
-            .version = "0.1.2",
+            .version = "0.1.3",
             .provides_capabilities = &.{"engine.graphics.device/1"},
             .required_capabilities = &.{"engine.window/1"},
         },
