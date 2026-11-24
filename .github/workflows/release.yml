@@ -110,6 +110,17 @@ jobs:
           STAGE="dist/zigeng-${TAG}-arm64-macos"
           mkdir -p "$STAGE/include"
           cp zig-out/bin/zigeng zig-out/bin/zigeng-runtime "$STAGE/"
+          SDL3_PREFIX="$(brew --prefix sdl3)"
+          cp -L "$SDL3_PREFIX/lib/libSDL3.0.dylib" "$STAGE/libSDL3.0.dylib"
+          chmod 755 "$STAGE/libSDL3.0.dylib"
+          install_name_tool -id "@rpath/libSDL3.0.dylib" "$STAGE/libSDL3.0.dylib"
+          SDL3_DEP="$(otool -L "$STAGE/zigeng-runtime" | awk '/libSDL3/{print $1; exit}')"
+          if [ -n "$SDL3_DEP" ]; then
+            install_name_tool -change "$SDL3_DEP" "@executable_path/libSDL3.0.dylib" "$STAGE/zigeng-runtime"
+          fi
+          codesign --force --sign - "$STAGE/libSDL3.0.dylib"
+          codesign --force --sign - "$STAGE/zigeng-runtime"
+          otool -L "$STAGE/zigeng-runtime"
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
           tar -czf "dist/zigeng-${TAG}-arm64-macos.tar.gz" -C dist "zigeng-${TAG}-arm64-macos"
