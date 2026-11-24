@@ -60,6 +60,12 @@ const GalleryState = struct {
     sheet_btn: ui_core.UiNodeId = undefined,
     cmd_btn: ui_core.UiNodeId = undefined,
     anim_phase: f32 = 0.0,
+
+    /// Frees the draw-command list. The registry owns the resource (inserted by value), so this runs
+    /// on the live copy that the systems mutate, not on the stack original in `main`.
+    pub fn deinit(self: *GalleryState) void {
+        self.cmds.deinit(self.app.allocator);
+    }
 };
 
 fn galleryUpdate(ctx: *engine.SystemContext) !void {
@@ -210,7 +216,6 @@ pub fn main() !void {
         .rt = try gfx.createSurface(1, 1560, 840),
         .cmds = .empty,
     };
-    defer st.cmds.deinit(allocator);
 
     const root = try tree.createNode(null, .{
         .id = "root",
