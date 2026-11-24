@@ -472,7 +472,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.physics",
-            .version = "0.1.0",
+            .version = "0.2.0",
             .provides_capabilities = &.{ "engine.physics/1", "engine.physics.backend/1" },
         },
         .build = buildModule,

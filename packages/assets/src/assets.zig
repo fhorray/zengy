@@ -292,7 +292,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.assets",
-            .version = "0.1.0",
+            .version = "0.1.1",
             .provides_capabilities = &.{"engine.assets/1"},
         },
         .build = buildModule,

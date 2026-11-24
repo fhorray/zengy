@@ -8,3 +8,4 @@ Optional asset management and importer registry package (`engine.assets/1`).
 - **Extensible importers**: `ImporterDescriptor` registry with extension matching and priority selection.
 - **Generational handles**: `AssetHandle` prevents dangling raw pointers across plugins.
 - **Deduplication & hot reload**: Content/URI cache with safe `reload()` swap.
+- **Allocation-failure safety**: `loadFromBytes`, `reload`, and `unload` reserve capacity before mutating state, so an out-of-memory error never double-frees, leaks a slot, or drops the previous payload. `unload` returns `false` (asset stays loaded) if bookkeeping cannot be reserved; retired payloads stay valid until `collectGarbage()`.

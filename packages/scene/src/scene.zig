@@ -111,6 +111,7 @@ pub const SceneSnapshot = struct {
     }
 };
 
+/// 2x3 affine matrix used for 2D transform composition, inversion, and decomposition.
 pub const Mat2D = struct {
     // 2x3 affine matrix: [ a c tx ; b d ty ]
     a: f32,
@@ -120,6 +121,7 @@ pub const Mat2D = struct {
     tx: f32,
     ty: f32,
 
+    /// The identity transform.
     pub const identity: Mat2D = .{ .a = 1, .b = 0, .c = 0, .d = 1, .tx = 0, .ty = 0 };
 
     /// Matrix of the *world-space* fields (`world_x`, `world_rotation_rad`, ...) of `t`.
@@ -166,6 +168,7 @@ pub const Mat2D = struct {
         };
     }
 
+    /// Matrix of the *local* fields (`x`, `y`, `rotation_rad`, `scale_*`) of `t`.
     pub fn fromTransform(t: Transform2D) Mat2D {
         const cos_r = @cos(t.rotation_rad);
         const sin_r = @sin(t.rotation_rad);
@@ -179,6 +182,7 @@ pub const Mat2D = struct {
         };
     }
 
+    /// Returns `parent_m * local_m` (apply `local_m` first, then `parent_m`).
     pub fn mul(parent_m: Mat2D, local_m: Mat2D) Mat2D {
         return .{
             .a = parent_m.a * local_m.a + parent_m.c * local_m.b,
@@ -315,7 +319,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.scene",
-            .version = "0.1.0",
+            .version = "0.2.0",
             .provides_capabilities = &.{"engine.scene.2d/1"},
         },
         .build = buildModule,

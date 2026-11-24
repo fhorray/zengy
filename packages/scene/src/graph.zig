@@ -71,6 +71,7 @@ pub const ChildIterator = struct {
     world: *const World,
     next_child: EntityHandle,
 
+    /// Returns the next direct child, or null when the list ends or a link is stale.
     pub fn next(self: *ChildIterator) ?EntityHandle {
         if (!self.world.isAlive(self.next_child)) return null;
         const cur = self.next_child;
@@ -80,6 +81,7 @@ pub const ChildIterator = struct {
     }
 };
 
+/// Returns an iterator over the direct children of `parent`.
 pub fn children(world: *const World, parent: EntityHandle) ChildIterator {
     const links = world.getConst(parent, HierarchyLinks);
     return .{ .world = world, .next_child = if (links) |l| l.first_child else EntityHandle.invalid };
