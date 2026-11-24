@@ -164,10 +164,14 @@ pub const AssetService = struct {
         errdefer self.allocator.free(uri_copy);
 
         const hash = std.hash.Wyhash.hash(0, raw_source);
+        // Reserve every container slot first so no failure can happen after state is modified.
+        try self.uri_to_index.ensureUnusedCapacity(self.allocator, 1);
+        if (self.free_indices.items.len == 0) try self.assets.ensureUnusedCapacity(self.allocator, 1);
+
         if (self.free_indices.pop()) |reused_idx| {
             const slot = &self.assets.items[reused_idx];
             const gen = if (slot.generation == 0) @as(u32, 1) else slot.generation;
-            try self.uri_to_index.put(self.allocator, uri_copy, reused_idx);
+            self.uri_to_index.putAssumeCapacity(uri_copy, reused_idx);
             slot.* = .{
                 .uri = uri_copy,
                 .kind = artifact.kind,
@@ -181,7 +185,7 @@ pub const AssetService = struct {
         }
 
         const idx: u32 = @intCast(self.assets.items.len);
-        try self.assets.append(self.allocator, .{
+        self.assets.appendAssumeCapacity(.{
             .uri = uri_copy,
             .kind = artifact.kind,
             .bytes = artifact.bytes,
@@ -190,9 +194,7 @@ pub const AssetService = struct {
             .generation = 1,
             .alive = true,
         });
-        errdefer _ = self.assets.pop();
-        try self.uri_to_index.put(self.allocator, uri_copy, idx);
-
+        self.uri_to_index.putAssumeCapacity(uri_copy, idx);
         return .{ .index = idx, .generation = 1 };
     }
 
@@ -207,8 +209,11 @@ pub const AssetService = struct {
             self.allocator.free(artifact.bytes);
         }
 
-        try self.retired_allocs.append(self.allocator, @constCast(slot.kind));
-        try self.retired_allocs.append(self.allocator, slot.bytes);
+        // Reserve both retirement entries before swapping so a failure cannot leave a buffer
+        // owned by both the slot and the retired list (double-free) or free the old payload early.
+        try self.retired_allocs.ensureUnusedCapacity(self.allocator, 2);
+        self.retired_allocs.appendAssumeCapacity(@constCast(slot.kind));
+        self.retired_allocs.appendAssumeCapacity(slot.bytes);
         slot.kind = artifact.kind;
         slot.bytes = artifact.bytes;
         slot.content_hash = std.hash.Wyhash.hash(0, new_source);
@@ -216,19 +221,26 @@ pub const AssetService = struct {
     }
 
     /// Releases an asset, bumps its generation so stale handles are rejected, and queues slot reuse.
+    ///
+    /// Payloads are retired (not freed) so slices from `getBytes` stay valid until
+    /// `collectGarbage()`. Returns false, leaving the asset loaded and unchanged, when the handle
+    /// is stale or the bookkeeping memory could not be reserved.
     pub fn unload(self: *AssetService, handle: AssetHandle) bool {
         const slot = self.getSlotMut(handle) orelse return false;
+        self.retired_allocs.ensureUnusedCapacity(self.allocator, 2) catch return false;
+        self.free_indices.ensureUnusedCapacity(self.allocator, 1) catch return false;
+
         _ = self.uri_to_index.remove(slot.uri);
         self.allocator.free(slot.uri);
         slot.uri = &.{};
-        self.retired_allocs.append(self.allocator, @constCast(slot.kind)) catch self.allocator.free(slot.kind);
+        self.retired_allocs.appendAssumeCapacity(@constCast(slot.kind));
         slot.kind = &.{};
-        self.retired_allocs.append(self.allocator, slot.bytes) catch self.allocator.free(slot.bytes);
+        self.retired_allocs.appendAssumeCapacity(slot.bytes);
         slot.bytes = &.{};
         slot.alive = false;
         slot.generation +%= 1;
         if (slot.generation == 0) slot.generation = 1;
-        self.free_indices.append(self.allocator, handle.index) catch {};
+        self.free_indices.appendAssumeCapacity(handle.index);
         return true;
     }
 

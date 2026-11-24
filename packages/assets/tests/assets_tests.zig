@@ -103,3 +103,44 @@ test "AssetService reuses unloaded slots and keeps reloaded bytes alive until co
     try testing.expectEqual(a.index, b.index);
     try testing.expect(a.generation != b.generation);
 }
+
+test "AssetService survives allocation failures at every point without leaks, double-frees, or lost slots" {
+    const RawImp = struct {
+        fn importFn(allocator: std.mem.Allocator, _: []const u8, raw: []const u8) !assets.AssetArtifact {
+            const kind = try allocator.dupe(u8, "raw");
+            errdefer allocator.free(kind);
+            return .{ .kind = kind, .bytes = try allocator.dupe(u8, raw) };
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var svc = assets.AssetService.init(failing.allocator());
+        defer svc.deinit();
+        svc.registerImporter(.{ .id = "raw", .extension = ".raw", .import_fn = RawImp.importFn }) catch continue;
+
+        for (0..3) |round| {
+            const h = svc.loadFromBytes("project://a.raw", "one") catch continue;
+            const before = svc.getBytes(h).?;
+            const version_before = svc.getVersion(h).?;
+            svc.reload(h, "two") catch {
+                // A failed reload must keep the previous payload and version intact.
+                try testing.expectEqualStrings(before, svc.getBytes(h).?);
+                try testing.expectEqual(version_before, svc.getVersion(h).?);
+            };
+            if (!svc.unload(h)) {
+                // Bookkeeping could not be reserved: asset must remain loaded and valid.
+                try testing.expect(svc.getBytes(h) != null);
+                _ = svc.unload(h);
+            }
+            if (round == 1) svc.collectGarbage();
+        }
+        // No slot may be permanently lost: slots == live + free list.
+        var live: usize = 0;
+        for (svc.assets.items) |s| {
+            if (s.alive) live += 1;
+        }
+        try testing.expectEqual(svc.assets.items.len, live + svc.free_indices.items.len);
+    }
+}
