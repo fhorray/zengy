@@ -1150,11 +1150,22 @@ fn buildModule(raw_app: *anyopaque) !void {
     errdefer c.SDL_ReleaseWindowFromGPUDevice(device, sdl_window);
 
     const swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(device, sdl_window);
+    const depth_usage = c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER;
     const depth_format: c.SDL_GPUTextureFormat = if (c.SDL_GPUTextureSupportsFormat(
+        device,
+        c.SDL_GPU_TEXTUREFORMAT_D32_FLOAT,
+        c.SDL_GPU_TEXTURETYPE_2D,
+        depth_usage,
+    )) c.SDL_GPU_TEXTUREFORMAT_D32_FLOAT else if (c.SDL_GPUTextureSupportsFormat(
+        device,
+        c.SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT,
+        c.SDL_GPU_TEXTURETYPE_2D,
+        depth_usage,
+    )) c.SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT else if (c.SDL_GPUTextureSupportsFormat(
         device,
         c.SDL_GPU_TEXTUREFORMAT_D24_UNORM,
         c.SDL_GPU_TEXTURETYPE_2D,
-        c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+        depth_usage,
     )) c.SDL_GPU_TEXTUREFORMAT_D24_UNORM else c.SDL_GPU_TEXTUREFORMAT_D16_UNORM;
     logDiag(&app.diagnostics, .info, "Claimed window for SDL_GPU (swapchain: {d}, depth: {d})", .{ swapchain_format, depth_format });
 

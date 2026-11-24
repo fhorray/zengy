@@ -220,6 +220,9 @@ pub const SkyEnvironment = struct {
     ground_albedo: [3]f32 = .{ 0.06, 0.06, 0.07 },
     solid_color: [3]f32 = .{ 0.07, 0.09, 0.13 },
     hdri_texture: u64 = 0,
+    hdri_pixels: ?[]const [4]f32 = null,
+    hdri_width: u32 = 0,
+    hdri_height: u32 = 0,
     hdri_exposure_ev: f32 = 0.0,
     hdri_rotation_rad: f32 = 0.0,
 };

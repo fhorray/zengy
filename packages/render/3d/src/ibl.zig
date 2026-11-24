@@ -322,3 +322,131 @@ pub fn generateBrdfLutRgba8(allocator: std.mem.Allocator, size: u32) ![]u8 {
     }
     return out;
 }
+
+/// Decoded linear HDR equirectangular image.
+pub const HdriImage = struct {
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    pixels: [][4]f32,
+
+    pub fn deinit(self: *HdriImage) void {
+        self.allocator.free(self.pixels);
+    }
+};
+
+fn rgbeToLinear(r: u8, g: u8, b: u8, e: u8) [4]f32 {
+    if (e == 0) return .{ 0, 0, 0, 1 };
+    const f = std.math.ldexp(@as(f32, 1.0), @as(i32, e) - 128 - 8);
+    return .{
+        @as(f32, @floatFromInt(r)) * f,
+        @as(f32, @floatFromInt(g)) * f,
+        @as(f32, @floatFromInt(b)) * f,
+        1.0,
+    };
+}
+
+/// Decodes a Radiance `.hdr` (RGBE / RLE) image from memory into linear `[4]f32` pixels.
+pub fn loadRadianceHdrFromMemory(allocator: std.mem.Allocator, data: []const u8) !HdriImage {
+    var pos: usize = 0;
+    // Skip header lines until blank line.
+    while (pos < data.len) {
+        const nl = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse return error.InvalidHdriHeader;
+        const line = std.mem.trimEnd(u8, data[pos..nl], "\r");
+        pos = nl + 1;
+        if (line.len == 0) break;
+    }
+    const res_nl = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse return error.InvalidHdriHeader;
+    const res_line = std.mem.trim(u8, data[pos..res_nl], " \r\t");
+    pos = res_nl + 1;
+
+    var it = std.mem.tokenizeScalar(u8, res_line, ' ');
+    _ = it.next() orelse return error.InvalidHdriHeader; // -Y
+    const h_str = it.next() orelse return error.InvalidHdriHeader;
+    _ = it.next() orelse return error.InvalidHdriHeader; // +X
+    const w_str = it.next() orelse return error.InvalidHdriHeader;
+    const height = try std.fmt.parseInt(u32, h_str, 10);
+    const width = try std.fmt.parseInt(u32, w_str, 10);
+
+    const pixels = try allocator.alloc([4]f32, @as(usize, width) * @as(usize, height));
+    errdefer allocator.free(pixels);
+    const scanline = try allocator.alloc(u8, @as(usize, width) * 4);
+    defer allocator.free(scanline);
+
+    for (0..height) |y| {
+        if (pos + 4 > data.len) return error.UnexpectedEof;
+        if (data[pos] == 2 and data[pos + 1] == 2 and width >= 8 and width <= 0x7fff) {
+            pos += 4;
+            for (0..4) |ch| {
+                var x: usize = 0;
+                while (x < width) {
+                    if (pos >= data.len) return error.UnexpectedEof;
+                    const cnt = data[pos];
+                    pos += 1;
+                    if (cnt > 128) {
+                        const run: usize = cnt - 128;
+                        if (pos >= data.len or x + run > width) return error.UnexpectedEof;
+                        const val = data[pos];
+                        pos += 1;
+                        for (0..run) |k| scanline[(x + k) * 4 + ch] = val;
+                        x += run;
+                    } else {
+                        const run: usize = cnt;
+                        if (run == 0 or pos + run > data.len or x + run > width) return error.UnexpectedEof;
+                        for (0..run) |k| scanline[(x + k) * 4 + ch] = data[pos + k];
+                        pos += run;
+                        x += run;
+                    }
+                }
+            }
+        } else {
+            const bytes = @as(usize, width) * 4;
+            if (pos + bytes > data.len) return error.UnexpectedEof;
+            @memcpy(scanline, data[pos..][0..bytes]);
+            pos += bytes;
+        }
+
+        for (0..width) |x| {
+            const s = x * 4;
+            pixels[y * width + x] = rgbeToLinear(scanline[s], scanline[s + 1], scanline[s + 2], scanline[s + 3]);
+        }
+    }
+
+    return .{ .allocator = allocator, .width = width, .height = height, .pixels = pixels };
+}
+
+/// Resizes an equirectangular HDR image using bilinear filtering for fast IBL projection.
+pub fn downsampleEquirectRgba32f(
+    allocator: std.mem.Allocator,
+    src: []const [4]f32,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) ![][4]f32 {
+    const dst = try allocator.alloc([4]f32, @as(usize, dst_w) * @as(usize, dst_h));
+    for (0..dst_h) |y| {
+        const fy = (@as(f32, @floatFromInt(y)) + 0.5) / @as(f32, @floatFromInt(dst_h)) * @as(f32, @floatFromInt(src_h)) - 0.5;
+        const y0: usize = @intCast(std.math.clamp(@as(isize, @intFromFloat(@floor(fy))), 0, @as(isize, @intCast(src_h - 1))));
+        const y1: usize = @min(y0 + 1, src_h - 1);
+        const wy = std.math.clamp(fy - @floor(fy), 0.0, 1.0);
+        for (0..dst_w) |x| {
+            const fx = (@as(f32, @floatFromInt(x)) + 0.5) / @as(f32, @floatFromInt(dst_w)) * @as(f32, @floatFromInt(src_w)) - 0.5;
+            const x0: usize = @intCast(@mod(@as(isize, @intFromFloat(@floor(fx))), @as(isize, @intCast(src_w))));
+            const x1: usize = (x0 + 1) % src_w;
+            const wx = fx - @floor(fx);
+            const p00 = src[y0 * src_w + x0];
+            const p10 = src[y0 * src_w + x1];
+            const p01 = src[y1 * src_w + x0];
+            const p11 = src[y1 * src_w + x1];
+            var out: [4]f32 = .{ 0, 0, 0, 1 };
+            for (0..3) |c_i| {
+                const top = p00[c_i] * (1.0 - wx) + p10[c_i] * wx;
+                const bot = p01[c_i] * (1.0 - wx) + p11[c_i] * wx;
+                out[c_i] = top * (1.0 - wy) + bot * wy;
+            }
+            dst[y * dst_w + x] = out;
+        }
+    }
+    return dst;
+}

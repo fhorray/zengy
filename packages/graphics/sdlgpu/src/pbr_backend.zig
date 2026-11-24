@@ -180,6 +180,8 @@ pub const PbrGpuState = struct {
     black_texture: *c.SDL_GPUTexture,
     brdf_lut_texture: *c.SDL_GPUTexture,
     env_prefilter_texture: *c.SDL_GPUTexture,
+    hdri_sky_texture: ?*c.SDL_GPUTexture = null,
+    last_hdri_ptr: usize = 0,
     shadow_sampler: *c.SDL_GPUSampler,
     ibl_sampler: *c.SDL_GPUSampler,
     histogram_buffer: *c.SDL_GPUBuffer,
@@ -232,7 +234,7 @@ pub const PbrGpuState = struct {
 
         const sky_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, SKY_VERT_SPV, 0, 0);
         defer c.SDL_ReleaseGPUShader(device, sky_vs);
-        const sky_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, SKY_FRAG_SPV, 0, 1);
+        const sky_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, SKY_FRAG_SPV, 1, 1);
         defer c.SDL_ReleaseGPUShader(device, sky_fs);
         const sky_pipe = try createFullscreenPipeline(device, sky_vs, sky_fs, hdr_format, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, sky_pipe);
@@ -431,6 +433,7 @@ pub const PbrGpuState = struct {
         if (self.hdr_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         if (self.ssao_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         if (self.ssao_blur_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+        if (self.hdri_sky_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         for (self.bloom_textures) |bt| if (bt) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         c.SDL_ReleaseGPUTransferBuffer(self.device, self.cluster_transfer_buffer);
         c.SDL_ReleaseGPUBuffer(self.device, self.local_shadow_buffer);
@@ -615,14 +618,16 @@ pub const PbrGpuState = struct {
         else
             1.0;
 
-        // 0. Rebuild procedural equirectangular IBL + SH9 when sun or sky changes
+        // 0. Rebuild equirectangular IBL + SH9 when sun, sky, or HDRI changes
+        const hdri_ptr: usize = if (self.frame_data.sky.hdri_pixels) |px| @intFromPtr(px.ptr) else 0;
         const sky_energy = self.frame_data.sky.sky_tint[1] + self.frame_data.sky.horizon_tint[1] + sun_int;
         const dsun = @abs(sun_dir[0] - self.last_sun_dir[0]) + @abs(sun_dir[1] - self.last_sun_dir[1]) + @abs(sun_dir[2] - self.last_sun_dir[2]);
-        if (!self.ibl_initialized or dsun > 0.02 or self.last_sky_kind != self.frame_data.sky.kind or @abs(sky_energy - self.last_sky_energy) > 0.02) {
+        if (!self.ibl_initialized or dsun > 0.02 or self.last_sky_kind != self.frame_data.sky.kind or @abs(sky_energy - self.last_sky_energy) > 0.02 or hdri_ptr != self.last_hdri_ptr) {
             try self.updateEnvIbl(sun_dir, sun_col, sun_int);
             self.last_sun_dir = sun_dir;
             self.last_sky_kind = self.frame_data.sky.kind;
             self.last_sky_energy = sky_energy;
+            self.last_hdri_ptr = hdri_ptr;
             self.ibl_initialized = true;
         }
 
@@ -945,19 +950,26 @@ pub const PbrGpuState = struct {
             c.SDL_SetGPUViewport(sky_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(tex_w), .h = @floatFromInt(tex_h), .min_depth = 0, .max_depth = 1 });
             c.SDL_BindGPUGraphicsPipeline(sky_pass, self.sky_pipeline);
             const sky = self.frame_data.sky;
+            const sky_mode: f32 = switch (sky.kind) {
+                .procedural => 0.0,
+                .solid_color => 1.0,
+                .hdri => 2.0,
+            };
             const sky_u = SkyUniforms{
                 .inv_view_proj = invertMat4(self.frame_data.view_proj),
                 .sun_dir_size = .{ sun_dir[0], sun_dir[1], sun_dir[2], sky.sun_size },
                 .sky_zenith_thick = .{ sky.sky_tint[0], sky.sky_tint[1], sky.sky_tint[2], sky.atmosphere_thickness },
-                .sky_horizon_mode = .{ sky.horizon_tint[0], sky.horizon_tint[1], sky.horizon_tint[2], if (sky.kind == .solid_color) 1.0 else 0.0 },
+                .sky_horizon_mode = .{ sky.horizon_tint[0], sky.horizon_tint[1], sky.horizon_tint[2], sky_mode },
                 .ground_solid = .{
                     if (sky.kind == .solid_color) sky.solid_color[0] else sky.ground_albedo[0],
                     if (sky.kind == .solid_color) sky.solid_color[1] else sky.ground_albedo[1],
                     if (sky.kind == .solid_color) sky.solid_color[2] else sky.ground_albedo[2],
                     @floatFromInt(@intFromEnum(sky.sun_disk)),
                 },
-                .sun_col_intensity = .{ sun_col[0], sun_col[1], sun_col[2], sun_int },
+                .sun_col_intensity = .{ sun_col[0], sun_col[1], sun_col[2], if (sky.kind == .hdri) sky.hdri_exposure_ev else sun_int },
             };
+            const sky_samplers = [_]c.SDL_GPUTextureSamplerBinding{.{ .texture = self.hdri_sky_texture orelse self.black_texture, .sampler = self.ibl_sampler }};
+            c.SDL_BindGPUFragmentSamplers(sky_pass, 0, &sky_samplers, 1);
             c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &sky_u, @sizeOf(SkyUniforms));
             c.SDL_DrawGPUPrimitives(sky_pass, 3, 1, 0, 0);
             c.SDL_EndGPURenderPass(sky_pass);
@@ -1209,7 +1221,51 @@ pub const PbrGpuState = struct {
     }
 
     fn updateEnvIbl(self: *PbrGpuState, sun_dir: [3]f32, sun_col: [3]f32, sun_int: f32) !void {
-        const sky_f32 = try ibl.generateProceduralEquirectSky(
+        const sky_f32: [][4]f32 = if (self.frame_data.sky.kind == .hdri and self.frame_data.sky.hdri_pixels != null and self.frame_data.sky.hdri_width > 0 and self.frame_data.sky.hdri_height > 0) blk: {
+            const hp = self.frame_data.sky.hdri_pixels.?;
+            const hw = self.frame_data.sky.hdri_width;
+            const hh = self.frame_data.sky.hdri_height;
+            if (self.hdri_sky_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+            const htex = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+                .type = c.SDL_GPU_TEXTURETYPE_2D,
+                .format = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+                .width = hw,
+                .height = hh,
+                .layer_count_or_depth = 1,
+                .num_levels = 1,
+            })) orelse return error.SdlGpuFailure;
+            self.hdri_sky_texture = htex;
+
+            const px_count: usize = @as(usize, hw) * @as(usize, hh);
+            const byte_len: u32 = @intCast(px_count * 4 * @sizeOf(f16));
+            const tb = c.SDL_CreateGPUTransferBuffer(self.device, &std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo, .{
+                .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+                .size = byte_len,
+            })) orelse return error.SdlGpuFailure;
+            defer c.SDL_ReleaseGPUTransferBuffer(self.device, tb);
+            const ptr = c.SDL_MapGPUTransferBuffer(self.device, tb, false) orelse return error.SdlGpuFailure;
+            const dst: [*]f16 = @ptrCast(@alignCast(ptr));
+            for (0..px_count) |k| {
+                dst[k * 4 + 0] = @floatCast(hp[k][0]);
+                dst[k * 4 + 1] = @floatCast(hp[k][1]);
+                dst[k * 4 + 2] = @floatCast(hp[k][2]);
+                dst[k * 4 + 3] = @floatCast(hp[k][3]);
+            }
+            c.SDL_UnmapGPUTransferBuffer(self.device, tb);
+            const cmd_h = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return error.SdlGpuFailure;
+            const cp_h = c.SDL_BeginGPUCopyPass(cmd_h) orelse return error.SdlGpuFailure;
+            c.SDL_UploadToGPUTexture(
+                cp_h,
+                &.{ .transfer_buffer = tb, .offset = 0, .pixels_per_row = hw, .rows_per_layer = hh },
+                &.{ .texture = htex, .mip_level = 0, .layer = 0, .x = 0, .y = 0, .z = 0, .w = hw, .h = hh, .d = 1 },
+                false,
+            );
+            c.SDL_EndGPUCopyPass(cp_h);
+            _ = c.SDL_SubmitGPUCommandBuffer(cmd_h);
+
+            break :blk try ibl.downsampleEquirectRgba32f(self.allocator, hp, hw, hh, ENV_W, ENV_H);
+        } else try ibl.generateProceduralEquirectSky(
             self.allocator,
             self.frame_data.sky,
             sun_dir,

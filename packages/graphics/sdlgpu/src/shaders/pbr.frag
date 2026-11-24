@@ -249,7 +249,7 @@ float sampleLocalTile(int tile_idx, vec3 world_pos, float bias, float rot) {
     return s / 6.0;
 }
 
-float samplePointShadow(int base_tile, vec3 light_pos, float range, float rot) {
+float samplePointShadow(int base_tile, vec3 light_pos, vec3 N, vec3 L, float rot) {
     if (base_tile < 0 || base_tile > 10) return 1.0;
     vec3 d = v_world_pos - light_pos;
     vec3 ad = abs(d);
@@ -261,7 +261,8 @@ float samplePointShadow(int base_tile, vec3 light_pos, float range, float rot) {
     } else {
         face = (d.z > 0.0) ? 4 : 5;
     }
-    float bias = 0.0025 / max(range * 0.05, 1.0);
+    float slope = 1.0 - max(dot(N, L), 0.0);
+    float bias = 0.0015 + slope * 0.0045;
     return sampleLocalTile(base_tile + face, v_world_pos, bias, rot);
 }
 
@@ -346,8 +347,9 @@ void main() {
             if (dist < range) {
                 float att = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
                 att = (att * att) / (dist * dist + 1.0);
-                float vis = (pl.col_radius.w >= 0.0) ? samplePointShadow(int(pl.col_radius.w + 0.5), pl.pos_range.xyz, range, rot) : 1.0;
-                Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, to_l / max(dist, 0.0001), pl.col_radius.rgb * att) * vis;
+                vec3 L = to_l / max(dist, 0.0001);
+                float vis = (pl.col_radius.w >= 0.0) ? samplePointShadow(int(pl.col_radius.w + 0.5), pl.pos_range.xyz, N, L, rot) : 1.0;
+                Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, pl.col_radius.rgb * att) * vis;
             }
         }
 
@@ -365,7 +367,8 @@ void main() {
                 float cone = clamp((theta - sl.col_cos_outer.w) / eps, 0.0, 1.0);
                 float att = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
                 att = (att * att) / (dist * dist + 1.0);
-                float vis = (sl.shadow_params.x >= 0.0) ? sampleLocalTile(int(sl.shadow_params.x + 0.5), v_world_pos, sl.shadow_params.y * 0.02, rot) : 1.0;
+                float spot_bias = 0.0012 + (1.0 - max(dot(N, L), 0.0)) * 0.004;
+                float vis = (sl.shadow_params.x >= 0.0) ? sampleLocalTile(int(sl.shadow_params.x + 0.5), v_world_pos, spot_bias, rot) : 1.0;
                 Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, sl.col_cos_outer.rgb * att * cone) * vis;
             }
         }

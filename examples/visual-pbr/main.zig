@@ -8,7 +8,7 @@
 //! - F: Toggle Atmospheric Distance Fog
 //! - G: Toggle Directional CSM Shadows
 //! - O: Toggle Screen-Space Ambient Occlusion (SSAO)
-//! - N: Cycle Sky Brightness (Day -> Dusk -> Night)
+//! - N: Cycle Sky Brightness (HDRI -> Day -> Dusk -> Night)
 //! - V: Toggle Vignette
 //! - R: Toggle Sun Rotation (Day/Sunset cycle)
 //!
@@ -24,6 +24,8 @@ const input_sdl3 = @import("input_sdl3");
 const camera = @import("camera");
 const render_3d = @import("render_3d");
 
+const SKY_HDR_BYTES = @embedFile("assets/sky.hdr");
+
 const PbrDemoState = struct {
     app: *engine.App,
     gfx: *graphics.GraphicsDeviceService,
@@ -32,7 +34,7 @@ const PbrDemoState = struct {
     sun_entity: engine.EntityHandle,
     sun_angle: f32 = 0.75,
     rotate_sun: bool = false,
-    sky_preset: u8 = 0, // 0=Day, 1=Dusk, 2=Night
+    sky_preset: u8 = 0, // 0=HDRI, 1=Day, 2=Dusk, 3=Night
     hud1: [180]u8 = @splat(0),
     hud1_len: usize = 0,
     hud2: [180]u8 = @splat(0),
@@ -117,17 +119,24 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
     if (keys.justPressed(.key_g)) sun.shadows_enabled = !sun.shadows_enabled;
     if (keys.justPressed(.key_o)) pp.ssao.enabled = !pp.ssao.enabled;
     if (keys.justPressed(.key_n)) {
-        st.sky_preset = (st.sky_preset + 1) % 3;
+        st.sky_preset = (st.sky_preset + 1) % 4;
         if (ctx.resources.get(render_3d.pbr.SkyEnvironment)) |sky| {
             switch (st.sky_preset) {
                 0 => {
+                    sky.kind = .hdri;
+                    sun.illuminance_lux = 8500.0;
+                    sun.color = .{ 1.0, 0.96, 0.90 };
+                },
+                1 => {
+                    sky.kind = .procedural;
                     sky.sky_tint = .{ 0.14, 0.38, 0.85 };
                     sky.horizon_tint = .{ 0.52, 0.70, 0.92 };
                     sky.ground_albedo = .{ 0.14, 0.14, 0.16 };
                     sun.illuminance_lux = 8500.0;
                     sun.color = .{ 1.0, 0.96, 0.90 };
                 },
-                1 => {
+                2 => {
+                    sky.kind = .procedural;
                     sky.sky_tint = .{ 0.05, 0.10, 0.28 };
                     sky.horizon_tint = .{ 0.35, 0.20, 0.18 };
                     sky.ground_albedo = .{ 0.04, 0.04, 0.05 };
@@ -135,6 +144,7 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
                     sun.color = .{ 1.0, 0.62, 0.38 };
                 },
                 else => {
+                    sky.kind = .procedural;
                     sky.sky_tint = .{ 0.01, 0.02, 0.06 };
                     sky.horizon_tint = .{ 0.03, 0.05, 0.12 };
                     sky.ground_albedo = .{ 0.01, 0.01, 0.015 };
@@ -153,8 +163,9 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
     }
 
     const sky_label: []const u8 = switch (st.sky_preset) {
-        0 => "Day",
-        1 => "Dusk",
+        0 => "HDRI",
+        1 => "Day",
+        2 => "Dusk",
         else => "Night",
     };
     const look_tag: []const u8 = if (pp.tonemap_mode == .agx and pp.tonemap_look == .punchy) " (Punchy)" else "";
@@ -240,8 +251,14 @@ pub fn main(init: std.process.Init) !void {
         .tonemap_look = .base,
     });
 
-    // Directional Sun Light + Rich Sky Environment.
+    // Directional Sun Light + HDRI Sky Environment.
+    var hdri = try render_3d.ibl.loadRadianceHdrFromMemory(allocator, SKY_HDR_BYTES);
+    defer hdri.deinit();
     try app.resources.insert(render_3d.pbr.SkyEnvironment, .{
+        .kind = .hdri,
+        .hdri_pixels = hdri.pixels,
+        .hdri_width = hdri.width,
+        .hdri_height = hdri.height,
         .sky_tint = .{ 0.14, 0.38, 0.85 },
         .horizon_tint = .{ 0.52, 0.70, 0.92 },
         .ground_albedo = .{ 0.14, 0.14, 0.16 },
@@ -324,8 +341,8 @@ pub fn main(init: std.process.Init) !void {
     try app.world.set(pl1, render_3d.pbr.PointLight, .{ .color = .{ 0.25, 0.65, 1.0 }, .intensity_lumens = 2500.0, .range = 16.0 });
 
     const pl2 = try app.world.spawn();
-    try app.world.set(pl2, render_3d.Transform3D, .{ .position = .{ 5.5, 2.5, -2.0 } });
-    try app.world.set(pl2, render_3d.pbr.PointLight, .{ .color = .{ 1.0, 0.45, 0.20 }, .intensity_lumens = 2500.0, .range = 16.0 });
+    try app.world.set(pl2, render_3d.Transform3D, .{ .position = .{ 9.5, 2.5, -0.5 } });
+    try app.world.set(pl2, render_3d.pbr.PointLight, .{ .color = .{ 1.0, 0.45, 0.20 }, .intensity_lumens = 2500.0, .range = 16.0, .shadows_enabled = true });
 
     // Procedural architectural tile floor texture (256x256).
     var floor_pixels: [256 * 256 * 4]u8 = undefined;
