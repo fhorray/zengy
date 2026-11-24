@@ -81,7 +81,7 @@ try window_sdl3.runVisualLoop(&app);
 ## 4. Next Reading
 
 - [Package Catalog](../packages/README.md)
-- [PocketPy Python Scripting]( ../packages/scripting-python/README.md)
-- [SDL_GPU Backend](../packages/graphics-sdlgpu/README.md)
-- [2D Renderer](../packages/render-2d/README.md) & [3D Renderer](../packages/render-3d/README.md)
+- [PocketPy Python Scripting]( ../packages/scripting/python/README.md)
+- [SDL_GPU Backend](../packages/graphics/sdlgpu/README.md)
+- [2D Renderer](../packages/render/2d/README.md) & [3D Renderer](../packages/render/3d/README.md)
 - [Releasing & Distribution Guide](releasing.md)

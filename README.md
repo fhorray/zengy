@@ -126,6 +126,6 @@ zigeng add physics
 
 - **[Getting Started Guide](docs/getting-started.md)** — Setup, running demos, and composing headless vs visual apps
 - **[Package Catalog](packages/README.md)** — Overview of every optional module
-- **[Scripting with Python (PocketPy)](packages/scripting-python/README.md)** — Optional Python scripting guide
+- **[Scripting with Python (PocketPy)](packages/scripting/python/README.md)** — Optional Python scripting guide
 - **[Releasing & Distribution](docs/releasing.md)** — How CI builds and publishes releases
 - **[Full Documentation Index](docs/README.md)** — API reference, architecture plan, and ADRs

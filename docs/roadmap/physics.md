@@ -1,6 +1,6 @@
 # Agnostic Physics Roadmap (`zigeng`)
 
-This document outlines how the `zigeng` physics subsystem will be implemented using an **ECS-first + Plugin** developer experience backed by a **pluggable `PhysicsBackendVTable`** (matching the pattern already used in `packages/graphics/`).
+This document outlines how the `zigeng` physics subsystem will be implemented using an **ECS-first + Plugin** developer experience backed by a **pluggable `PhysicsBackendVTable`** (matching the pattern already used in `packages/graphics/core/`).
 
 ## 1. Architecture Principles
 
@@ -12,13 +12,13 @@ This document outlines how the `zigeng` physics subsystem will be implemented us
      - `Velocity`, `ExternalForce`, `GravityScale`
      - `Transform2D` (from `official.scene`) or `Transform3D` (future 3D scene component)
 2. **Decoupled via `PhysicsBackendVTable`:**
-   - `packages/physics/` (`official.physics`, capability `engine.physics/1`) defines the public components, events (`CollisionEvent`), spatial queries (`RaycastDesc` / `RaycastHit`), and `PhysicsBackendVTable`.
+   - `packages/physics/core/` (`official.physics`, capability `engine.physics/1`) defines the public components, events (`CollisionEvent`), spatial queries (`RaycastDesc` / `RaycastHit`), and `PhysicsBackendVTable`.
    - Solver backends only implement `PhysicsBackendVTable` and register with `PhysicsService`.
 3. **Deterministic `.fixed_update` Execution:**
    - The core scheduler (`src/core/scheduler.zig`) already provides a `.fixed_update` stage with a fixed-timestep accumulator (`fixed_dt`).
    - All physics stepping runs in `.fixed_update`, decoupled from rendering frame rate.
 4. **Headless-First:**
-   - Without an attached backend, `packages/physics/` compiles with zero C/C++ dependencies and runs as a deterministic no-op for CI and headless simulations.
+   - Without an attached backend, `packages/physics/core/` compiles with zero C/C++ dependencies and runs as a deterministic no-op for CI and headless simulations.
 
 ---
 
@@ -64,14 +64,14 @@ To ensure swapping `physics-simple` for `physics-box2d` or `physics-jolt` does n
 ## 5. Implementation Phases
 
 - **Phase P1 (Preparation — `feat/physics` branch):**
-  - `packages/physics/` skeleton with ECS components, `CollisionEvent`, `RaycastDesc` / `RaycastHit`, `PhysicsBackendVTable`, `PhysicsService`, `module()`, and headless unit tests.
+  - `packages/physics/core/` skeleton with ECS components, `CollisionEvent`, `RaycastDesc` / `RaycastHit`, `PhysicsBackendVTable`, `PhysicsService`, `module()`, and headless unit tests.
 - **Phase P2 (Pure Zig Solver — `physics-simple`):**
   - Pure Zig AABB / Sphere / Raycast solver.
   - Automatic `Transform2D` (`packages/scene/`) synchronization.
   - `visual-physics` demo (falling boxes, ground collision, mouse raycast).
 - **Phase P3 (Optional Native Backends):**
   - `packages/physics-box2d` (full 2D: polygons, joints, continuous rotation).
-  - `packages/physics-jolt` (full 3D: meshes, capsules, character controller).
+  - `packages/physics/jolt` (full 3D: meshes, capsules, character controller).
 - **Phase P4 (Scripting & CLI):**
   - Bindings in `scripting-host` / `scripting-python` / `scripting-lua` (`add_force`, `apply_impulse`, `raycast`, `on_collision` callbacks).
   - CLI catalog integration (`zigeng add physics`, `zigeng add physics-simple`) and `plugins = ["physics"]` in `game.toml`.

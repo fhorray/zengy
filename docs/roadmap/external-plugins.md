@@ -1,6 +1,6 @@
 # External Plugins & Local Compilation Workflow (`zigeng`)
 
-`zigeng` keeps its core and contract packages (`src/core/`, `packages/physics/`, `packages/graphics/`, `packages/window/`, `packages/scripting-host/`) strictly agnostic. Concrete backends (physics solvers, scripting runtimes, audio backends, renderers) live as **external plugins** compiled on the user's machine by `zig`.
+`zigeng` keeps its core and contract packages (`src/core/`, `packages/physics/core/`, `packages/graphics/core/`, `packages/window/core/`, `packages/scripting/host/`) strictly agnostic. Concrete backends (physics solvers, scripting runtimes, audio backends, renderers) live as **external plugins** compiled on the user's machine by `zig`.
 
 ## 1. Design Principles
 
@@ -34,7 +34,7 @@
    ```
 3. **Local plugin directory (for plugin authors):**
    ```bash
-   zigeng add ./packages/physics-jolt
+   zigeng add ./packages/physics/jolt
    ```
 
 When adding a shared-library plugin, `zigeng`:

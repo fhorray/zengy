@@ -65,18 +65,48 @@ fn findOfficialPackage(name: []const u8) ?OfficialPackageInfo {
     return null;
 }
 
+/// Directory of an official package below `packages/`. Related packages are grouped by category
+/// (`physics/jolt`, `ui/core`, ...); the public package name (`physics-jolt`) never changes.
+fn packageDir(name: []const u8) []const u8 {
+    const dirs = [_]struct { []const u8, []const u8 }{
+        .{ "physics", "physics/core" },
+        .{ "physics-jolt", "physics/jolt" },
+        .{ "physics-rapier", "physics/rapier" },
+        .{ "ui-core", "ui/core" },
+        .{ "ui-markup", "ui/markup" },
+        .{ "ui-novaui", "ui/novaui" },
+        .{ "ui-immediate", "ui/immediate" },
+        .{ "window", "window/core" },
+        .{ "window-sdl3", "window/sdl3" },
+        .{ "graphics", "graphics/core" },
+        .{ "graphics-sdlgpu", "graphics/sdlgpu" },
+        .{ "scripting-host", "scripting/host" },
+        .{ "scripting-lua", "scripting/lua" },
+        .{ "scripting-python", "scripting/python" },
+        .{ "render-2d", "render/2d" },
+        .{ "render-3d", "render/3d" },
+        .{ "text", "render/text" },
+        .{ "testing", "testing" },
+    };
+    for (dirs) |e| {
+        if (std.mem.eql(u8, e[0], name)) return e[1];
+    }
+    return name;
+}
+
 fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: OfficialPackageInfo) !void {
+    const dir = packageDir(pkg.name);
     const shell_cmd = if (pkg.third_party) |tp|
         try std.fmt.allocPrint(
             allocator,
             "mkdir -p packages && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s} zigeng-main/packages/{s}",
-            .{ pkg.name, tp },
+            .{ dir, packageDir(tp) },
         )
     else
         try std.fmt.allocPrint(
             allocator,
             "mkdir -p packages && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s}",
-            .{pkg.name},
+            .{dir},
         );
     defer allocator.free(shell_cmd);
 
@@ -97,15 +127,15 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
         else => return error.PackageDownloadFailed,
     }
 
-    std.debug.print("Installed official package into ./packages/{s}/\n", .{pkg.name});
+    std.debug.print("Installed official package into ./packages/{s}/\n", .{dir});
     if (pkg.third_party) |tp| {
-        std.debug.print("Installed required dependency into ./packages/{s}/\n", .{tp});
-        const tp_dir = try std.fmt.allocPrint(allocator, "packages/{s}", .{tp});
+        std.debug.print("Installed required dependency into ./packages/{s}/\n", .{packageDir(tp)});
+        const tp_dir = try std.fmt.allocPrint(allocator, "packages/{s}", .{packageDir(tp)});
         defer allocator.free(tp_dir);
         try provisionPackageDir(allocator, io, tp_dir);
     }
 
-    const pkg_dir = try std.fmt.allocPrint(allocator, "packages/{s}", .{pkg.name});
+    const pkg_dir = try std.fmt.allocPrint(allocator, "packages/{s}", .{dir});
     defer allocator.free(pkg_dir);
     if (fileExists(allocator, io, pkg_dir, "build.zig") or fileExists(allocator, io, pkg_dir, "Cargo.toml")) {
         try compileAndInstallPluginDir(allocator, io, pkg_dir, pkg.name);
@@ -114,7 +144,7 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
 
     std.debug.print("\nAdd to your build.zig:\n  const pkg_mod = b.addModule(\"{s}\", .{{\n      .root_source_file = b.path(\"packages/{s}/{s}\"),\n      .target = target,\n      .optimize = optimize,\n  }});\n", .{
         pkg.name,
-        pkg.name,
+        dir,
         pkg.entry,
     });
 }

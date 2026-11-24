@@ -3,4 +3,4 @@ title = "jolt-test"
 width = 1280
 height = 720
 mode = "2d"
-plugins = ["physics", "../../packages/physics-jolt"]
+plugins = ["physics", "../../packages/physics/jolt"]
