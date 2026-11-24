@@ -1132,6 +1132,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "gpu_resources", .mod = gpu_resources_mod },
     }, null);
 
+    // Pure volumetric light ranking; no SDL or engine imports, so it runs headless.
+    addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/volumetric_lights.zig", target, optimize, false, &.{}, null);
+    addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/shadow_cull.zig", target, optimize, false, &.{}, null);
+
     addModuleTest(b, test_step, "packages/render/text/tests/text_tests.zig", target, optimize, false, &.{
         .{ .name = "text", .mod = text_mod },
     }, null);

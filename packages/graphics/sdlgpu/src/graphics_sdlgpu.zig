@@ -18,6 +18,7 @@ const window_sdl3 = @import("window_sdl3");
 const text_pkg = @import("text");
 const render_3d = @import("render_3d");
 const c = @import("sdl3_c");
+const shadow_cull = @import("shadow_cull.zig");
 pub const gpu_resources = @import("gpu_resources.zig");
 pub const pbr_backend = @import("pbr_backend.zig");
 
@@ -58,6 +59,8 @@ const GpuMesh = struct {
     vertex_buffer: *c.SDL_GPUBuffer,
     index_buffer: *c.SDL_GPUBuffer,
     index_count: u32,
+    /// Local-space bounding sphere, used to cull shadow casters outside a light's frustum.
+    bounds: shadow_cull.Sphere = .{},
 };
 
 const MeshPool = gpu_resources.GenerationalPool(GpuMesh, GpuMeshHandle);
@@ -1106,6 +1109,8 @@ pub fn createMesh3D(app: *engine.App, vertex_bytes: []const u8, indices: []const
         .vertex_buffer = vb,
         .index_buffer = ib,
         .index_count = @intCast(indices.len),
+        // 3D vertices are 32 bytes: position, normal, uv.
+        .bounds = shadow_cull.sphereFromVertices(vertex_bytes, 32),
     });
 }
 
@@ -1442,7 +1447,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = PROVIDER_ID,
-            .version = "0.1.1",
+            .version = "0.1.2",
             .provides_capabilities = &.{"engine.graphics.device/1"},
             .required_capabilities = &.{"engine.window/1"},
         },

@@ -11,6 +11,9 @@ layout(std140, set = 1, binding = 0) uniform PbrVertUniforms {
     mat4 light_vp[4];
 };
 
+// Position must match bit-for-bit with shadow.vert, because the lit pass depth-tests against the prepass.
+invariant gl_Position;
+
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_world_normal;
 layout(location = 2) out vec2 v_uv;

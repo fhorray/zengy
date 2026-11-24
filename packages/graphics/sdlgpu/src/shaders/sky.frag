@@ -11,6 +11,7 @@ layout(std140, set = 3, binding = 0) uniform SkyUniforms {
     vec4 sky_horizon_mode;    // xyz=horizon, w=mode (0=proc, 1=solid, 2=hdri)
     vec4 ground_solid;        // xyz=ground/solid, w=disk_mode (0=none,1=simple,2=hq) or hdri_ev
     vec4 sun_col_intensity;   // xyz=sun_color, w=intensity
+    vec4 hdri_rotation;       // x=HDRI rotation in turns (same convention as ibl.rotateEquirectColumns)
 };
 
 layout(location = 0) out vec4 frag_color;
@@ -28,7 +29,8 @@ void main() {
     vec3 dir = normalize(far_p.xyz / far_p.w - near_p.xyz / near_p.w);
 
     if (sky_horizon_mode.w >= 1.5) {
-        float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5;
+        // The sampler repeats in U, so the rotated coordinate can leave [0, 1] safely.
+        float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5 + hdri_rotation.x;
         float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
         vec3 col = textureLod(u_sky_hdri, vec2(u, v), 0.0).rgb * exp2(sun_col_intensity.w);
         frag_color = vec4(clamp(col, vec3(0.0), vec3(65000.0)), 1.0);

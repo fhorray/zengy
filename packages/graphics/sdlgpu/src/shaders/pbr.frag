@@ -86,6 +86,7 @@ layout(std140, set = 3, binding = 0) uniform PbrFragUniforms {
     vec4 cascade_depth_ranges; // 4 cascade depth ranges in metres
     vec4 cluster_factors;    // x=z_scale, y=z_bias, z=clustered_on, w=0
     vec4 probe_volumetric;   // x=probe_count, y=pcss_on, z=vol_fog_on, w=vol_scattering
+    vec4 cascade_info;       // x=number of cascades rendered this frame (0..4)
 };
 
 layout(location = 0) out vec4 frag_color;
@@ -182,7 +183,7 @@ float sampleCascadePCF(int c_idx, vec3 N, vec3 L, float rot, float view_depth) {
     uv = mix(q_min, q_max, uv);
     float slope = 1.0 - max(dot(N, L), 0.0);
     float depth_range = max(cascade_depth_ranges[c_idx], 1.0);
-    float bias_m = max(0.025, mat_flags.z * 5.0) * (1.0 + slope * 2.5);
+    float bias_m = max(0.055, mat_flags.z * 8.0) * (1.0 + slope * 3.5) * (1.0 + float(c_idx) * 0.65);
     float bias = bias_m / depth_range;
     vec2 texel = 1.0 / vec2(textureSize(u_shadow_tex, 0));
     float pcss_boost = (probe_volumetric.y > 0.5) ? (1.0 + clamp(view_depth / 30.0, 0.0, 1.5)) : 1.0;
@@ -198,24 +199,26 @@ float sampleCascadePCF(int c_idx, vec3 N, vec3 L, float rot, float view_depth) {
 }
 
 float sampleShadowCSM(vec3 N, vec3 L, float view_depth) {
-    if (mat_flags.w < 0.5) return 1.0;
-    float max_dist = max(cascade_splits.w, 1.0);
+    // Only cascades rendered this frame are sampled; the rest of the atlas is never read.
+    int count = clamp(int(cascade_info.x + 0.5), 0, 4);
+    if (mat_flags.w < 0.5 || count == 0) return 1.0;
+    float max_dist = max(cascade_splits[count - 1], 1.0);
     if (view_depth > max_dist) return 1.0;
 
     int idx = 0;
     for (int i = 0; i < 3; ++i) {
-        if (view_depth > cascade_splits[i]) idx = i + 1;
+        if (i < count - 1 && view_depth > cascade_splits[i]) idx = i + 1;
     }
 
     float rot = ign(gl_FragCoord.xy) * 6.2831853;
     float lit = sampleCascadePCF(idx, N, L, rot, view_depth);
     if (lit < 0.0) {
-        for (int k = idx + 1; k < 4; ++k) {
+        for (int k = idx + 1; k < count; ++k) {
             lit = sampleCascadePCF(k, N, L, rot, view_depth);
             if (lit >= 0.0) break;
         }
         if (lit < 0.0) lit = 1.0;
-    } else if (idx < 3) {
+    } else if (idx < count - 1) {
         float prev_b = (idx == 0) ? 0.0 : cascade_splits[idx - 1];
         float split = cascade_splits[idx];
         float band = max((split - prev_b) * clamp(camera_fwd_overlap.w, 0.02, 0.4), 0.5);
@@ -318,6 +321,10 @@ void main() {
     float metallic = clamp(mat_params.x * mr.b, 0.0, 1.0);
     float roughness = clamp(mat_params.y * mr.g, 0.045, 1.0);
     vec3 N = normalize(v_world_normal);
+    // Double-sided back faces are visible only when culling is off; light them as if they faced the viewer.
+    if (!gl_FrontFacing) {
+        N = -N;
+    }
     vec3 V = normalize(camera_pos_fog.xyz - v_world_pos);
     if (mat_flags.y > 0.0) {
         N = perturbNormal(N, V, v_uv);
@@ -438,16 +445,12 @@ void main() {
     vec3 ambient = kD_env * diffuse_ibl * diff_ao + specular_ibl * spec_ao;
     vec3 color = ambient + Lo + emissive_rgb;
 
-    if (camera_pos_fog.w > 0.5) {
+    // With ray-marched volumetric fog on, the composite pass applies transmittance and in-scatter
+    // (L = L_scene * T + L_scatter). Applying distance fog here too would extinguish the scene twice.
+    if (camera_pos_fog.w > 0.5 && probe_volumetric.z < 0.5) {
         float d = max(length(camera_pos_fog.xyz - v_world_pos) - fog_color_start.w, 0.0);
-        if (probe_volumetric.z > 0.5) {
-            // When ray-marched volumetric fog is active, only apply gentle distance extinction
-            // so shadowed rooms stay dark instead of being washed out by unshadowed fog color.
-            color *= exp(-d * ambient_sky.w * 0.35);
-        } else {
-            float fog_f = 1.0 - exp(-d * ambient_sky.w);
-            color = mix(color, fog_color_start.rgb, clamp(fog_f, 0.0, 1.0));
-        }
+        float fog_f = 1.0 - exp(-d * ambient_sky.w);
+        color = mix(color, fog_color_start.rgb, clamp(fog_f, 0.0, 1.0));
     }
 
     frag_color = vec4(color, albedo_a.a);

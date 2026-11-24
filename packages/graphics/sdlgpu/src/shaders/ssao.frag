@@ -10,6 +10,7 @@ layout(std140, set = 3, binding = 0) uniform SsaoParams {
     vec4 params;         // x=radius, y=bias, z=intensity, w=ssao_enabled
     vec4 sun_view_dir;   // xyz=to_sun in view space, w=contact_length
     vec4 contact_params; // x=opacity, y=thickness, z=sample_count, w=contact_enabled
+    vec4 fade_range;     // x=view distance where the fade starts, y=where it reaches zero
 };
 
 layout(location = 0) out vec4 frag_color;
@@ -42,7 +43,8 @@ void main() {
     vec3 py = reconstructViewPos(uv + vec2(0.0, texel.y), texture(u_depth, uv + vec2(0.0, texel.y)).r);
     vec3 N = normalize(cross(py - pos, px - pos));
 
-    float dist_fade = 1.0 - smoothstep(18.0, 38.0, abs(pos.z));
+    // Shared distance fade for AO and contact shadows, driven by ContactShadowSettings.distance_fade.
+    float dist_fade = 1.0 - smoothstep(fade_range.x, fade_range.y, abs(pos.z));
     float ao = 1.0;
     if (params.w > 0.5 && dist_fade > 0.01) {
         float radius = params.x;

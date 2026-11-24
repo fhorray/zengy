@@ -103,29 +103,35 @@ float interleavedGradientNoise(vec2 p) {
 void main() {
     vec2 uv = vec2(v_ndc.x * 0.5 + 0.5, 0.5 - v_ndc.y * 0.5);
 
-    vec3 hdr = texture(u_hdr, uv).rgb;
-    // Lightweight FXAA-style edge-directed antialiasing on HDR luminance before tonemapping.
+    vec3 hdr = textureLod(u_hdr, uv, 0.0).rgb;
+    // FXAA-style edge filter on gamma-encoded luminance, before tonemapping. Linear HDR luminance lets
+    // highlights dominate the edge test, so the edge decision uses a perceptual proxy instead.
+    // `vignette_extra.z` is the anti-aliasing switch (AntiAliasingMode: 0 = none, 1 = fxaa).
     vec2 texel = 1.0 / vec2(textureSize(u_hdr, 0));
-    vec3 nw = texture(u_hdr, uv + vec2(-1.0, -1.0) * texel).rgb;
-    vec3 ne = texture(u_hdr, uv + vec2( 1.0, -1.0) * texel).rgb;
-    vec3 sw = texture(u_hdr, uv + vec2(-1.0,  1.0) * texel).rgb;
-    vec3 se = texture(u_hdr, uv + vec2( 1.0,  1.0) * texel).rgb;
+    vec3 nw = textureLod(u_hdr, uv + vec2(-1.0, -1.0) * texel, 0.0).rgb;
+    vec3 ne = textureLod(u_hdr, uv + vec2( 1.0, -1.0) * texel, 0.0).rgb;
+    vec3 sw = textureLod(u_hdr, uv + vec2(-1.0,  1.0) * texel, 0.0).rgb;
+    vec3 se = textureLod(u_hdr, uv + vec2( 1.0,  1.0) * texel, 0.0).rgb;
     const vec3 LUMA_W = vec3(0.299, 0.587, 0.114);
-    float l_m = dot(hdr, LUMA_W);
-    float l_nw = dot(nw, LUMA_W);
-    float l_ne = dot(ne, LUMA_W);
-    float l_sw = dot(sw, LUMA_W);
-    float l_se = dot(se, LUMA_W);
+    const vec3 PERCEPTUAL_GAMMA = vec3(1.0 / 2.2);
+    float l_m = dot(pow(max(hdr, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float l_nw = dot(pow(max(nw, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float l_ne = dot(pow(max(ne, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float l_sw = dot(pow(max(sw, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float l_se = dot(pow(max(se, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
     float l_min = min(l_m, min(min(l_nw, l_ne), min(l_sw, l_se)));
     float l_max = max(l_m, max(max(l_nw, l_ne), max(l_sw, l_se)));
-    vec2 aa_dir = vec2(-((l_nw + l_ne) - (l_sw + l_se)), (l_nw + l_sw) - (l_ne + l_se));
-    float dir_reduce = max((l_nw + l_ne + l_sw + l_se) * 0.03125, 1.0 / 128.0);
-    float rcp_dir = 1.0 / (min(abs(aa_dir.x), abs(aa_dir.y)) + dir_reduce);
-    aa_dir = clamp(aa_dir * rcp_dir, vec2(-4.0), vec2(4.0)) * texel;
-    vec3 aa_a = 0.5 * (texture(u_hdr, uv + aa_dir * (1.0 / 3.0 - 0.5)).rgb + texture(u_hdr, uv + aa_dir * (2.0 / 3.0 - 0.5)).rgb);
-    vec3 aa_b = aa_a * 0.5 + 0.25 * (texture(u_hdr, uv + aa_dir * -0.5).rgb + texture(u_hdr, uv + aa_dir * 0.5).rgb);
-    float l_b = dot(aa_b, LUMA_W);
-    hdr = (l_b < l_min || l_b > l_max) ? aa_a : aa_b;
+    // Early exit: flat neighbourhoods have no edge to filter, so the refinement taps are skipped.
+    if (vignette_extra.z > 0.5 && (l_max - l_min) > max(0.0312, 0.125 * l_max)) {
+        vec2 aa_dir = vec2(-((l_nw + l_ne) - (l_sw + l_se)), (l_nw + l_sw) - (l_ne + l_se));
+        float dir_reduce = max((l_nw + l_ne + l_sw + l_se) * 0.03125, 1.0 / 128.0);
+        float rcp_dir = 1.0 / (min(abs(aa_dir.x), abs(aa_dir.y)) + dir_reduce);
+        aa_dir = clamp(aa_dir * rcp_dir, vec2(-4.0), vec2(4.0)) * texel;
+        vec3 aa_a = 0.5 * (textureLod(u_hdr, uv + aa_dir * (1.0 / 3.0 - 0.5), 0.0).rgb + textureLod(u_hdr, uv + aa_dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
+        vec3 aa_b = aa_a * 0.5 + 0.25 * (textureLod(u_hdr, uv + aa_dir * -0.5, 0.0).rgb + textureLod(u_hdr, uv + aa_dir * 0.5, 0.0).rgb);
+        float l_b = dot(pow(max(aa_b, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+        hdr = (l_b < l_min || l_b > l_max) ? aa_a : aa_b;
+    }
 
     vec3 bloom = texture(u_bloom, uv).rgb;
     hdr += bloom * bloom_tint_int.rgb * bloom_tint_int.w;
