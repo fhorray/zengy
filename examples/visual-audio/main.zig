@@ -117,10 +117,10 @@ fn updateSharedControls(ctx: *engine.SystemContext) !void {
     }
 
     if (keys.pressed(.arrow_up)) {
-        svc.master_volume = std.math.clamp(svc.master_volume + 0.8 * time.raw_delta_s, 0.0, 1.5);
+        svc.setMasterVolume(std.math.clamp(svc.master_volume + 0.8 * time.raw_delta_s, 0.0, 1.5));
     }
     if (keys.pressed(.arrow_down)) {
-        svc.master_volume = std.math.clamp(svc.master_volume - 0.8 * time.raw_delta_s, 0.0, 1.5);
+        svc.setMasterVolume(std.math.clamp(svc.master_volume - 0.8 * time.raw_delta_s, 0.0, 1.5));
     }
 
     const triggers = [_]struct { key: input.KeyCode, idx: usize, label: []const u8 }{
