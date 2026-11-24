@@ -151,6 +151,9 @@ pub const DirectionalLight = struct {
     shadow_depth_bias: f32 = 0.005,
     shadow_normal_bias: f32 = 0.02,
     pcss_enabled: bool = false,
+    /// Tangent of the light's apparent half-size for blocker-search PCSS (`ShadowQuality.pcss`); larger values give
+    /// wider penumbrae. 0.03 is a soft, readable default; the real sun is about 0.005.
+    pcss_light_size: f32 = 0.03,
     cascade_count: u8 = 4,
     cascades: CascadeShadowConfig = .{},
 };
@@ -411,6 +414,7 @@ pub const ExtractedDirectionalLight = struct {
     shadow_depth_bias: f32,
     shadow_normal_bias: f32,
     pcss_enabled: bool = false,
+    pcss_light_size: f32 = 0.03,
     cascade_count: u8,
     cascade_bounds: [4]f32 = .{ 10.0, 23.0, 52.0, 120.0 },
     overlap_proportion: f32 = 0.18,

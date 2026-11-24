@@ -239,6 +239,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 .shadow_depth_bias = dl.shadow_depth_bias,
                 .shadow_normal_bias = dl.shadow_normal_bias,
                 .pcss_enabled = dl.pcss_enabled,
+                .pcss_light_size = dl.pcss_light_size,
                 .cascade_count = cfg.cascade_count,
                 .cascade_bounds = pbr.calculateCascadeBounds(cfg),
                 .overlap_proportion = cfg.overlap_proportion,
@@ -452,7 +453,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.render.3d",
-            .version = "0.5.0",
+            .version = "0.5.1",
             .provides_capabilities = &.{"engine.render.3d/1"},
             .required_capabilities = &.{ "engine.graphics.device/1", "engine.camera/1" },
         },

@@ -1012,6 +1012,10 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(plugin_path_tests).step);
 
+    // The render regression suite needs a GPU and a window, so it joins `zig build test` only on request.
+    const capture_in_test = b.option(bool, "capture", "Also run the GPU render regression suite (capture-check) as part of `zig build test`") orelse false;
+    if (capture_in_test) test_step.dependOn(capture_check_step);
+
     const hook_tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/runtime/hook_tracker.zig"),

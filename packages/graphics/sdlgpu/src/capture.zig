@@ -282,6 +282,47 @@ pub fn hdrStats(allocator: std.mem.Allocator, img: Image) !HdrStats {
     return stats;
 }
 
+/// Mean absolute Laplacian of the luma (0..255 scale) over the interior of the image: how much fine-grained
+/// contrast the frame has. Acne stripes, shadow noise and speckle raise it; blur lowers it.
+pub fn highFrequencyEnergy(rgb: []const u8, width: u32, height: u32) f64 {
+    if (width < 3 or height < 3) return 0;
+    const w: usize = width;
+    var sum: f64 = 0;
+    for (1..height - 1) |y| {
+        for (1..w - 1) |x| {
+            const here = lumaAt(rgb, y * w + x);
+            const lap = 4.0 * here - lumaAt(rgb, y * w + x - 1) - lumaAt(rgb, y * w + x + 1) - lumaAt(rgb, (y - 1) * w + x) - lumaAt(rgb, (y + 1) * w + x);
+            sum += @abs(lap);
+        }
+    }
+    return sum / @as(f64, @floatFromInt((w - 2) * (height - 2)));
+}
+
+fn lumaAt(rgb: []const u8, px: usize) f64 {
+    return 0.2126 * @as(f64, @floatFromInt(rgb[px * 3])) + 0.7152 * @as(f64, @floatFromInt(rgb[px * 3 + 1])) + 0.0722 * @as(f64, @floatFromInt(rgb[px * 3 + 2]));
+}
+
+test "highFrequencyEnergy is zero for flat and gradient images and positive for fine detail" {
+    var flat: [8 * 8 * 3]u8 = @splat(100);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), highFrequencyEnergy(&flat, 8, 8), 1e-9);
+    var ramp: [8 * 8 * 3]u8 = undefined;
+    for (0..64) |i| {
+        const v: u8 = @intCast((i % 8) * 10);
+        ramp[i * 3] = v;
+        ramp[i * 3 + 1] = v;
+        ramp[i * 3 + 2] = v;
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, 0), highFrequencyEnergy(&ramp, 8, 8), 1e-9);
+    var checker: [8 * 8 * 3]u8 = undefined;
+    for (0..64) |i| {
+        const v: u8 = if ((i % 8 + i / 8) % 2 == 0) 0 else 200;
+        checker[i * 3] = v;
+        checker[i * 3 + 1] = v;
+        checker[i * 3 + 2] = v;
+    }
+    try std.testing.expect(highFrequencyEnergy(&checker, 8, 8) > 100);
+}
+
 /// Counts isolated bright pixels: a pixel whose luma exceeds every one of its 8 neighbours by more than
 /// `margin` (0..255). Real highlights span several pixels, so a high count points at speckle, dotted
 /// silhouettes or NaN/Inf leakage rather than at scene content.
@@ -452,8 +493,8 @@ test "PNG decoder rejects non-PNG data and unsupported variants" {
 test "hdrStats counts NaN and Inf and excludes them from luminance" {
     const a = std.testing.allocator;
     var px = [_]f32{
-        1, 1, 1, 1,
-        1, 1, 1, 1,
+        1,                 1, 1, 1,
+        1,                 1, 1, 1,
         std.math.nan(f32), 0, 0, 1,
         std.math.inf(f32), 0, 0, 1,
     };

@@ -40,7 +40,11 @@ Scenarios (`SCENARIOS` in `examples/visual-pbr/main.zig`): gallery, close-up and
 fog / SSAO / shadows / bloom / FXAA on and off, a dusk sky, and a materials pose with an alpha-masked
 double-sided panel and an alpha-blended pane.
 
-Scenarios may also set `max_delta` (largest per-channel difference allowed, to catch ghosts that touch few pixels),
+`zig build test -Dcapture=true` runs `capture-check` after the unit tests. Every scenario also writes
+`<name>.timing.txt` (mean and maximum CPU frame delta, trend only).
+
+Scenarios may also set `cut` (camera alternates between two poses so the captured frame follows a cut), `nudge` (a caster
+moves mid warm-up), `hdri_swap` (identical HDRI at another address), `vol_half` and `bias_gate`. They may also set `max_delta` (largest per-channel difference allowed, to catch ghosts that touch few pixels),
 `stability` (a second frame must match the first) and `shake` (camera moves during warm-up, then settles).
 
 Scenarios with `golden_of` own no golden: they must match another scenario within the normal tolerances. They guard

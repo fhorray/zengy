@@ -178,25 +178,54 @@ pub fn plan(points: anytype, spots: anytype, cam: [3]f32, opts: Options) Plan {
     return out;
 }
 
-/// Fingerprint of everything that decides what a shadow caster writes to a shadow map.
+/// Incremental fingerprint of the casters that can reach one shadow map.
 ///
-/// `draws` elements expose `mesh_asset`, `model_matrix: [16]f32`, `tint: [4]f32` and a `material` with
-/// `alpha_mode`, `double_sided`, `alpha_cutoff`, `base_color: [4]f32` and `base_color_tex`. A moved, added, removed
-/// or re-materialled caster changes the hash, which is what invalidates a cached shadow map.
-pub fn hashCasters(draws: anytype) u64 {
-    var h = std.hash.Wyhash.init(0x5ad0_77a1);
-    h.update(std.mem.asBytes(&@as(u64, draws.len)));
-    for (draws) |qm| {
-        h.update(std.mem.asBytes(&qm.mesh_asset));
-        h.update(std.mem.sliceAsBytes(&qm.model_matrix));
-        h.update(std.mem.sliceAsBytes(&qm.tint));
-        h.update(std.mem.sliceAsBytes(&qm.material.base_color));
-        h.update(std.mem.asBytes(&@as(u32, @backingInt(qm.material.alpha_mode))));
-        h.update(std.mem.asBytes(&qm.material.double_sided));
-        h.update(std.mem.asBytes(&qm.material.alpha_cutoff));
-        h.update(std.mem.asBytes(&qm.material.base_color_tex));
+/// A moved, added, removed or re-materialled caster changes the hash, which invalidates the cached map. Callers
+/// feed only the casters that are not culled for this light, so a caster elsewhere does not invalidate it.
+pub const CasterHasher = struct {
+    h: std.hash.Wyhash,
+
+    pub fn init(seed: u64) CasterHasher {
+        return .{ .h = std.hash.Wyhash.init(seed) };
     }
-    return h.final();
+
+    /// Adds a material-carrying draw: `mesh_asset`, `model_matrix: [16]f32`, `tint: [4]f32` and a `material` with
+    /// `alpha_mode`, `double_sided`, `alpha_cutoff`, `base_color: [4]f32` and `base_color_tex`.
+    pub fn addDraw(self: *CasterHasher, qm: anytype) void {
+        self.h.update(&.{1});
+        self.h.update(std.mem.asBytes(&qm.mesh_asset));
+        self.h.update(std.mem.sliceAsBytes(&qm.model_matrix));
+        self.h.update(std.mem.sliceAsBytes(&qm.tint));
+        self.h.update(std.mem.sliceAsBytes(&qm.material.base_color));
+        self.h.update(std.mem.asBytes(&@as(u32, @backingInt(qm.material.alpha_mode))));
+        self.h.update(std.mem.asBytes(&qm.material.double_sided));
+        self.h.update(std.mem.asBytes(&qm.material.alpha_cutoff));
+        self.h.update(std.mem.asBytes(&qm.material.base_color_tex));
+    }
+
+    /// Adds a caster that carries no material (`mesh_asset`, `model_matrix`).
+    pub fn addCaster(self: *CasterHasher, qc: anytype) void {
+        self.h.update(&.{2});
+        self.h.update(std.mem.asBytes(&qc.mesh_asset));
+        self.h.update(std.mem.sliceAsBytes(&qc.model_matrix));
+    }
+
+    pub fn addFloats(self: *CasterHasher, values: []const f32) void {
+        self.h.update(&.{3});
+        self.h.update(std.mem.sliceAsBytes(values));
+    }
+
+    pub fn final(self: *CasterHasher) u64 {
+        return self.h.final();
+    }
+};
+
+/// Fingerprint of every draw in `draws` (see `CasterHasher.addDraw`).
+pub fn hashCasters(draws: anytype) u64 {
+    var hs = CasterHasher.init(0x5ad0_77a1);
+    hs.h.update(std.mem.asBytes(&@as(u64, draws.len)));
+    for (draws) |qm| hs.addDraw(qm);
+    return hs.final();
 }
 
 /// Hash of a float array (light matrices, atlas rects), mixed into a cache key.
@@ -334,4 +363,26 @@ test "caster hash changes when a caster moves or its material changes, and not o
     try std.testing.expect(key.hit(moved, true));
     try std.testing.expect(!key.hit(moved, false)); // disabled never reports a hit
     try std.testing.expect(!key.hit(moved, true)); // and the first enabled frame renders again
+}
+
+test "a caster hasher fed only the reachable casters ignores a caster elsewhere" {
+    const C = struct { mesh_asset: u64, model_matrix: [16]f32 };
+    var near = C{ .mesh_asset = 1, .model_matrix = @splat(0) };
+    var far = C{ .mesh_asset = 2, .model_matrix = @splat(0) };
+    var a = CasterHasher.init(1);
+    a.addCaster(near);
+    a.addFloats(&.{ 1, 2, 3 });
+    const before = a.final();
+
+    far.model_matrix[12] = 50; // moves, but is culled for this light so it is never added
+    var b = CasterHasher.init(1);
+    b.addCaster(near);
+    b.addFloats(&.{ 1, 2, 3 });
+    try std.testing.expectEqual(before, b.final());
+
+    near.model_matrix[12] = 1; // a reachable caster moves
+    var d = CasterHasher.init(1);
+    d.addCaster(near);
+    d.addFloats(&.{ 1, 2, 3 });
+    try std.testing.expect(before != d.final());
 }

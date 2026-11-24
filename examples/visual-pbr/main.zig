@@ -47,6 +47,12 @@ const PbrDemoState = struct {
     hud2: [180]u8 = @splat(0),
     hud2_len: usize = 0,
     in_vol_room: bool = false,
+    /// Entity moved by the `nudge` scenarios (the alpha-masked panel, a shadow caster), and its home position.
+    nudge_entity: engine.EntityHandle,
+    /// The sky HDRI and an identical copy at another address; `hdri_swap` scenarios switch between them to force a
+    /// re-upload without changing the picture.
+    hdri_main: []const [4]f32,
+    hdri_alt: []const [4]f32,
     /// Present only in capture mode (`ZENGY_CAPTURE_DIR`); drives the scenarios instead of the keyboard.
     capture: ?CaptureRunner = null,
 };
@@ -102,6 +108,19 @@ const Scenario = struct {
     /// Largest per-channel difference tolerated against the golden, on top of the pixel-fraction limit. Catches
     /// small but strong artefacts such as ghosts that touch few pixels.
     max_delta: u8 = 255,
+    /// Half-resolution volumetric march.
+    vol_half: bool = false,
+    /// Alternate between two distant poses every frame, so the capture frame is a camera cut for the temporal fog.
+    cut: bool = false,
+    /// Move the panel caster mid warm-up, to check that shadow caches invalidate and match an uncached run.
+    nudge: bool = false,
+    /// Use the identical HDRI copy at another address, forcing the environment job to re-upload the texture.
+    hdri_swap: bool = false,
+    /// Sun normal bias for the normal-offset sweep.
+    normal_bias: f32 = 0.02,
+    /// Part of the normal-offset sweep: compared with `golden_of` by luma and high-frequency energy instead of
+    /// pixel difference, because the offset moves shadow edges on purpose.
+    bias_gate: bool = false,
 };
 
 const SCENARIOS = [_]Scenario{
@@ -138,11 +157,29 @@ const SCENARIOS = [_]Scenario{
     .{ .name = "vol_room_shadow_cache", .pose = .vol_room, .shadow_cache = true, .golden_of = "vol_room_default" },
     .{ .name = "vol_room_shadow_adaptive", .pose = .vol_room, .shadow_adaptive = true, .golden_of = "vol_room_default" },
     .{ .name = "gallery_normal_offset", .shadow_normal_offset = true },
+    // Remaining Phase 3-5 coverage: a cut must not smear history, half-resolution temporal matches half-resolution
+    // single frame, caches match an uncached run after a caster moved, and a re-uploaded HDRI is converted in slices.
+    .{ .name = "gallery_temporal_cut", .temporal = true, .cut = true, .max_delta = 16, .golden_of = "gallery_default" },
+    .{ .name = "gallery_half_res", .vol_half = true },
+    .{ .name = "gallery_temporal_half", .vol_half = true, .temporal = true, .stability = true, .max_delta = 16, .golden_of = "gallery_half_res" },
+    .{ .name = "materials_nudge", .pose = .materials, .nudge = true },
+    .{ .name = "materials_nudge_cache", .pose = .materials, .nudge = true, .shadow_cache = true, .golden_of = "materials_nudge" },
+    .{ .name = "gallery_hdri_swap_sliced", .hdri_swap = true, .sliced_ibl = true, .golden_of = "gallery_default" },
+    // Normal-offset sweep (strength = normal_bias * 50 texels). Gated entries must keep the frame's mean luma within
+    // 2% and its high-frequency energy within 15% of the plain render; the larger values are informational.
+    .{ .name = "bias_sweep_005", .shadow_normal_offset = true, .normal_bias = 0.005, .bias_gate = true, .golden_of = "gallery_default" },
+    .{ .name = "bias_sweep_020", .shadow_normal_offset = true, .normal_bias = 0.02, .bias_gate = true, .golden_of = "gallery_default" },
+    .{ .name = "bias_sweep_080", .shadow_normal_offset = true, .normal_bias = 0.08, .golden_of = "gallery_default" },
+    .{ .name = "bias_sweep_300", .shadow_normal_offset = true, .normal_bias = 0.3, .golden_of = "gallery_default" },
     .{ .name = "gallery_pcss", .shadow_pcss = true },
 };
 
-const CaptureStage = enum { warmup, wait_final, wait_stable, wait_hdr };
+const CaptureStage = enum { warmup, wait_final, hold, wait_stable, wait_hdr };
 /// Warm-up frames at the end of a shake scenario during which the camera holds the exact pose.
+/// Panel position (x) the nudge scenarios start from, the warm-up frame at which it moves, and how far.
+const NUDGE_HOME_X: f32 = -8.0;
+const NUDGE_FRAME: u32 = 40;
+const NUDGE_DISTANCE: f32 = 1.4;
 const SHAKE_SETTLE_FRAMES: u32 = 4;
 /// Allowed fraction of pixels that change between two frames of a stability scenario.
 const MAX_FLICKER_FRACTION: f64 = 0.001;
@@ -165,6 +202,11 @@ const CaptureRunner = struct {
     final_h: u32 = 0,
     speckle: u64 = 0,
     contrast: f32 = 0,
+    hf_energy: f64 = 0,
+    /// Frame-time samples of the running scenario (CPU frame delta, trend only, never a pass/fail gate).
+    dt_sum: f64 = 0,
+    dt_max: f64 = 0,
+    dt_frames: u32 = 0,
 
     fn fail(self: *CaptureRunner, name: []const u8, comptime fmt: []const u8, args: anytype) void {
         _ = self;
@@ -199,6 +241,7 @@ const CaptureRunner = struct {
         try self.writePng(self.out_dir, sc.name, ".png", img.width, img.height, rgb);
         self.speckle = capture.speckleCount(rgb, img.width, img.height, SPECKLE_MARGIN);
         self.contrast = try capture.contrastSpread(self.allocator, rgb);
+        self.hf_energy = capture.highFrequencyEnergy(rgb, img.width, img.height);
         if (self.final_rgb) |old| self.allocator.free(old);
         self.final_rgb = rgb;
         self.final_w = img.width;
@@ -226,12 +269,24 @@ const CaptureRunner = struct {
         if (diff.max_delta > sc.max_delta) {
             self.fail(sc.name, "max channel delta {d} exceeds {d} (localised artefact such as a ghost)", .{ diff.max_delta, sc.max_delta });
         }
-        if (frac > MAX_DIFF_FRACTION) {
+        const sweep = sc.bias_gate or std.mem.startsWith(u8, sc.name, "bias_sweep");
+        if (frac > MAX_DIFF_FRACTION and !sweep) {
             self.fail(sc.name, "{d:.3}% of pixels differ from the golden (limit {d:.3}%)", .{ frac * 100.0, MAX_DIFF_FRACTION * 100.0 });
             const diff_img = try capture.diffImageRgb8(self.allocator, rgb, golden.rgb, PIXEL_THRESHOLD);
             defer self.allocator.free(diff_img);
             try self.writePng(self.out_dir, sc.name, ".diff.png", img.width, img.height, diff_img);
         }
+    }
+
+    /// Writes `<scenario>.timing.txt` and appends a row to `timing.csv` in the output directory.
+    fn writeTiming(self: *CaptureRunner, sc: Scenario) !void {
+        if (self.dt_frames == 0) return;
+        const mean_ms = self.dt_sum / @as(f64, @floatFromInt(self.dt_frames)) * 1000.0;
+        const max_ms = self.dt_max * 1000.0;
+        const text = try std.fmt.allocPrint(self.allocator, "name={s}\nframes={d}\nmean_ms={d:.3}\nmax_ms={d:.3}\n", .{ sc.name, self.dt_frames, mean_ms, max_ms });
+        defer self.allocator.free(text);
+        try self.writeFile(self.out_dir, sc.name, ".timing.txt", text);
+        std.debug.print("[capture] {s}: frame time mean {d:.2} ms, max {d:.2} ms over {d} frames (trend only)\n", .{ sc.name, mean_ms, max_ms, self.dt_frames });
     }
 
     /// Measures the HDR frame, writes the stats file, and checks it against the golden stats.
@@ -243,8 +298,8 @@ const CaptureRunner = struct {
 
         const text = try std.fmt.allocPrint(
             self.allocator,
-            "name={s}\nwidth={d}\nheight={d}\nnan={d}\ninf={d}\nmean_luma={d:.4}\np50_luma={d:.4}\np95_luma={d:.4}\nspeckle={d}\ncontrast={d:.2}\n",
-            .{ sc.name, img.width, img.height, stats.nan_count, stats.inf_count, stats.mean_luma, stats.p50_luma, stats.p95_luma, self.speckle, self.contrast },
+            "name={s}\nwidth={d}\nheight={d}\nnan={d}\ninf={d}\nmean_luma={d:.4}\np50_luma={d:.4}\np95_luma={d:.4}\nspeckle={d}\ncontrast={d:.2}\nhf_energy={d:.4}\n",
+            .{ sc.name, img.width, img.height, stats.nan_count, stats.inf_count, stats.mean_luma, stats.p50_luma, stats.p95_luma, self.speckle, self.contrast, self.hf_energy },
         );
         defer self.allocator.free(text);
         try self.writeFile(self.out_dir, sc.name, ".stats.txt", text);
@@ -278,6 +333,19 @@ const CaptureRunner = struct {
         if (capture.statValue(golden_text, "mean_luma")) |g| {
             if (g > 0 and @abs(@as(f64, stats.mean_luma) - g) / g > 0.25) {
                 self.fail(sc.name, "mean luma {d:.3} is more than 25% away from the golden {d:.3}", .{ stats.mean_luma, g });
+            }
+        }
+        if (capture.statValue(golden_text, "hf_energy")) |g| {
+            std.debug.print("[capture] {s}: hf_energy={d:.4} (golden {d:.4})\n", .{ sc.name, self.hf_energy, g });
+            if (sc.bias_gate) {
+                if (self.hf_energy > g * 1.15) {
+                    self.fail(sc.name, "high-frequency energy {d:.4} is more than 15% above {d:.4} (acne or noise)", .{ self.hf_energy, g });
+                }
+                if (capture.statValue(golden_text, "mean_luma")) |gm| {
+                    if (gm > 0 and @abs(@as(f64, stats.mean_luma) - gm) / gm > 0.02) {
+                        self.fail(sc.name, "mean luma {d:.4} moved more than 2% from {d:.4} (shadow thinning or peter-panning)", .{ stats.mean_luma, gm });
+                    }
+                }
             }
         }
     }
@@ -346,6 +414,8 @@ fn applyScenario(
 ) void {
     cam_pose.* = scenarioPose(sc.pose, 0, 0);
     fog.volumetric.temporal = sc.temporal;
+    fog.volumetric.half_resolution = sc.vol_half;
+    sun.shadow_normal_bias = sc.normal_bias;
     pp.quality.shadows = .{
         .normal_offset = sc.shadow_normal_offset,
         .prioritize_local_lights = sc.shadow_prioritize,
@@ -393,10 +463,32 @@ fn stepCapture(
             if (!cr.applied) {
                 applyScenario(sc, cam_pose, pp, sun, fog, ctx.resources.get(render_3d.pbr.SkyEnvironment));
                 resetFreeCamera(ctx, st);
+                if (ctx.resources.get(render_3d.pbr.SkyEnvironment)) |sky_env| {
+                    sky_env.hdri_pixels = if (sc.hdri_swap) st.hdri_alt else st.hdri_main;
+                }
+                if (ctx.world.get(st.nudge_entity, render_3d.Transform3D)) |tr| tr.position[0] = NUDGE_HOME_X;
+                cr.dt_sum = 0;
+                cr.dt_max = 0;
+                cr.dt_frames = 0;
                 cr.applied = true;
                 cr.frames = 0;
             }
             cr.frames += 1;
+            // The first frame of a scenario absorbs the previous capture's GPU readback stall, so it is not sampled.
+            if (cr.frames > 1) {
+                cr.dt_sum += ctx.dt;
+                cr.dt_max = @max(cr.dt_max, ctx.dt);
+                cr.dt_frames += 1;
+            }
+            if (sc.nudge and cr.frames == NUDGE_FRAME) {
+                if (ctx.world.get(st.nudge_entity, render_3d.Transform3D)) |tr| tr.position[0] = NUDGE_HOME_X + NUDGE_DISTANCE;
+            }
+            if (sc.cut) {
+                // Odd frames use the scenario pose, even frames a bright pose 8 m away (a dark one would also swing the
+                // auto exposure). The final frame is odd, so the captured frame follows a cut.
+                cam_pose.* = if (cr.frames % 2 == 1) scenarioPose(sc.pose, 0, 0) else scenarioPose(.materials, 0, 0);
+                resetFreeCamera(ctx, st);
+            }
             if (sc.shake and cr.frames + SHAKE_SETTLE_FRAMES < WARMUP_FRAMES) {
                 const t: f32 = @floatFromInt(cr.frames);
                 cam_pose.* = scenarioPose(sc.pose, @sin(t * 0.5) * 0.9, @cos(t * 0.31) * 0.6);
@@ -424,6 +516,14 @@ fn stepCapture(
             };
             defer img.deinit(cr.allocator);
             try cr.handleFinal(sc, img);
+            if (sc.cut) {
+                // Hold the scenario pose for a few frames so the HDR capture that follows shows the same view.
+                cam_pose.* = scenarioPose(sc.pose, 0, 0);
+                resetFreeCamera(ctx, st);
+                cr.stage = .hold;
+                cr.frames = 0;
+                return;
+            }
             if (sc.stability) {
                 graphics_sdlgpu.requestCapture(st.app, .final);
                 cr.stage = .wait_stable;
@@ -432,6 +532,14 @@ fn stepCapture(
                 cr.stage = .wait_hdr;
             }
             cr.frames = 0;
+        },
+        .hold => {
+            cr.frames += 1;
+            if (cr.frames >= 3) {
+                graphics_sdlgpu.requestCapture(st.app, .hdr);
+                cr.stage = .wait_hdr;
+                cr.frames = 0;
+            }
         },
         .wait_stable => {
             cr.frames += 1;
@@ -472,6 +580,7 @@ fn stepCapture(
             };
             defer img.deinit(cr.allocator);
             try cr.handleHdr(sc, img);
+            try cr.writeTiming(sc);
             cr.scenario += 1;
             cr.stage = .warmup;
             cr.applied = false;
@@ -686,6 +795,8 @@ pub fn main(init: std.process.Init) !void {
     // Directional Sun Light + HDRI Sky Environment.
     var hdri = try render_3d.ibl.loadRadianceHdrFromMemory(allocator, SKY_HDR_BYTES);
     defer hdri.deinit();
+    const hdri_alt = try allocator.dupe([4]f32, hdri.pixels);
+    defer allocator.free(hdri_alt);
     try app.resources.insert(render_3d.pbr.SkyEnvironment, .{
         .kind = .hdri,
         .hdri_pixels = hdri.pixels,
@@ -941,6 +1052,9 @@ pub fn main(init: std.process.Init) !void {
         .rt = rt,
         .cam_entity = cam_e,
         .sun_entity = sun_e,
+        .nudge_entity = leaf_e,
+        .hdri_main = hdri.pixels,
+        .hdri_alt = hdri_alt,
         .capture = capture_runner,
     });
 

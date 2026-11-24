@@ -1,0 +1,11 @@
+name=gallery_half_res
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=1.4335
+p50_luma=0.7937
+p95_luma=4.6538
+speckle=0
+contrast=146.00
+hf_energy=2.4853

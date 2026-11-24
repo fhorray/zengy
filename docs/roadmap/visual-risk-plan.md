@@ -163,3 +163,28 @@ reviewed.
   5. `pcss`: blocker search through a second, non-comparison view of the cascade depth, penumbra from the
      receiver-blocker gap, 16 taps; used when the light sets `pcss_enabled`. Changes 2.4% of the gallery pixels;
      owns golden `gallery_pcss`. The light size is a shader constant (0.03).
+- **Follow-up pass over the open items.**
+  - *Temporal fog:* `gallery_temporal_cut` alternates the camera between two poses 8 m apart so the captured frame
+    follows a cut; it must match the single-frame golden. Forcing `historyUsable` to always accept history makes it
+    fail (max delta 28 vs limit 16). `gallery_half_res` (own golden) and `gallery_temporal_half` cover half
+    resolution with temporal.
+  - *Normal offset:* sweep scenarios `bias_sweep_005/020/080/300` (strength = bias x 50 texels). The demo scene shows
+    no acne to begin with (high-frequency energy stays within 1% of the plain render at every value), so the sweep only
+    bounds peter-panning: mean luma moves at most 0.1% and 0.04% / 1% / 2% of the pixels change at 0.02 / 0.08 / 0.3.
+    The default 0.02 stays; 005 and 020 are gated (luma within 2%, high-frequency energy within 15%), 080 and 300 are
+    informational. A real acne calibration needs a scene that produces acne, which the 0.055 m floor on the cascade
+    depth bias currently prevents.
+  - *Shadow cache:* invalidation is now per cascade and per local tile. A key hashes only the casters that survive
+    the same frustum cull used for drawing (plus caster-only meshes, which the first version missed), the light matrix
+    and the atlas rect. A kept atlas is reused with LOAD and each missed region is reset by a depth-clear triangle.
+    `materials_nudge_cache` moves the panel mid warm-up and must match the uncached `materials_nudge`; dropping the
+    caster hash makes it fail (3% of pixels, max delta 82).
+  - *PCSS:* the light size is `DirectionalLight.pcss_light_size` (default 0.03, unchanged picture).
+  - *HDRI slices:* `gallery_hdri_swap_sliced` switches to an identical copy at another address, which forces the sliced
+    conversion and upload path, and must match the original sky (max delta 2).
+  - *Harness:* `zig build test -Dcapture=true` also runs `capture-check`. Each scenario writes `<name>.timing.txt` with
+    the mean and maximum CPU frame delta (trend only; the first frame of a scenario is skipped because it absorbs the
+    previous readback). With vsync pacing the maximum is about 17 ms for both the synchronous and the sliced IBL
+    rebuild, so this demo does not show a rebuild spike; the HDRI is small and the engine clamps long frames.
+  - Still open: acne calibration (above), per-light penumbra size beyond the sun, and goldens that do not depend on the
+    GPU (no software Vulkan driver on this machine).

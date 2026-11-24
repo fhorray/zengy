@@ -87,7 +87,7 @@ layout(std140, set = 3, binding = 0) uniform PbrFragUniforms {
     vec4 cascade_depth_ranges; // 4 cascade depth ranges in metres
     vec4 cluster_factors;    // x=z_scale, y=z_bias, z=clustered_on, w=0
     vec4 probe_volumetric;   // x=probe_count, y=pcss_on, z=vol_fog_on, w=vol_scattering
-    vec4 cascade_info;       // x=number of cascades rendered this frame (0..4)
+    vec4 cascade_info;       // x=number of cascades rendered this frame (0..4), y=PCSS light size (tangent of half-angle)
 };
 
 layout(location = 0) out vec4 frag_color;
@@ -207,8 +207,8 @@ float sampleCascadePCF(int c_idx, vec3 N, vec3 L, float rot, float view_depth) {
         }
         if (blocker_n < 0.5) return 1.0;
         float depth_gap_m = (proj.z - blocker_sum / blocker_n) * depth_range;
-        // 0.03 is the tangent of the light's apparent half-size; larger values give wider penumbrae.
-        radius_texels = clamp(depth_gap_m * 0.03 / texel_world, 1.0, 14.0);
+        // cascade_info.y is the tangent of the light's apparent half-size; larger values give wider penumbrae.
+        radius_texels = clamp(depth_gap_m * cascade_info.y / texel_world, 1.0, 14.0);
         taps = 16;
     }
     float shadow = 0.0;

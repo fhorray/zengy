@@ -393,8 +393,12 @@ pub const PbrGpuState = struct {
     vol_prev_fwd: [3]f32 = .{ 0, 0, -1 },
     vol_frame: u32 = 0,
     /// Last render keys of the cached shadow maps (see `ShadowQuality.static_cache`).
-    dir_shadow_cache: shadow_plan.CacheKey = .{},
-    local_shadow_cache: shadow_plan.CacheKey = .{},
+    dir_cascade_cache: [4]shadow_plan.CacheKey = @splat(.{}),
+    dir_atlas_valid: bool = false,
+    local_tile_cache: [shadow_plan.MAX_TILES]shadow_plan.CacheKey = @splat(.{}),
+    local_atlas_valid: bool = false,
+    /// Full-screen depth-only pipeline that resets a scissored region of a shadow atlas to far depth.
+    depth_clear_pipeline: *c.SDL_GPUGraphicsPipeline,
     ssao_blur_texture: ?*c.SDL_GPUTexture = null,
     hdr_w: u32 = 0,
     hdr_h: u32 = 0,
@@ -462,6 +466,8 @@ pub const PbrGpuState = struct {
         const sh_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, SHADOW_VERT_SPV, 0, 1);
         defer c.SDL_ReleaseGPUShader(device, sh_vs);
         const sh_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, SHADOW_FRAG_SPV, 0, 0);
+        const depth_clear_pipe = try createDepthClearPipeline(device, sky_vs, sh_fs, depth_format);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, depth_clear_pipe);
         defer c.SDL_ReleaseGPUShader(device, sh_fs);
         const sh_pipe = try createShadowPipeline(device, sh_vs, sh_fs, depth_format, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, sh_pipe);
@@ -657,6 +663,7 @@ pub const PbrGpuState = struct {
             .pbr_pipeline = pbr_pipe,
             .pbr_double_sided_pipeline = pbr_ds_pipe,
             .pbr_blend_pipeline = pbr_blend_pipe,
+            .depth_clear_pipeline = depth_clear_pipe,
             .volumetric_resolve_pipeline = vol_res_pipe,
             .pbr_reuse_pipeline = pbr_reuse_pipe,
             .pbr_reuse_double_sided_pipeline = pbr_reuse_ds_pipe,
@@ -739,6 +746,7 @@ pub const PbrGpuState = struct {
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.postfx_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.bloom_up_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.bloom_down_pipeline);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.depth_clear_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.volumetric_resolve_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.volumetric_transmittance_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.volumetric_composite_pipeline);
@@ -826,6 +834,25 @@ pub const PbrGpuState = struct {
 
     /// Draws queued materials (and, for `.light`, untyped shadow casters) into an open depth-only pass.
     /// Pipelines and alpha-mask parameters are bound per draw; callers only set viewport and scissor.
+    /// Cache key of one shadow map: the casters that `drawShadowQueue` would draw for `light_vp` (the others cannot
+    /// change the map), the light matrix and `extra` (atlas rect, cascade index and the like).
+    fn shadowMapKey(self: *PbrGpuState, meshes: anytype, light_vp: math3d.Mat4, extra: []const f32) u64 {
+        var hs = shadow_plan.CasterHasher.init(0x5ad0_77a1);
+        for (self.queued_draws.items) |qm| {
+            const gm = meshes.get(@bitCast(qm.mesh_asset)) orelse continue;
+            if (shadow_cull.sphereOutsideLightFrustum(light_vp.m, shadow_cull.transformSphere(qm.model_matrix, gm.bounds))) continue;
+            hs.addDraw(qm);
+        }
+        for (self.shadow_casters.items) |sc| {
+            const gm = meshes.get(@bitCast(sc.mesh_asset)) orelse continue;
+            if (shadow_cull.sphereOutsideLightFrustum(light_vp.m, shadow_cull.transformSphere(sc.model_matrix, gm.bounds))) continue;
+            hs.addCaster(sc);
+        }
+        hs.addFloats(&light_vp.m);
+        hs.addFloats(extra);
+        return hs.final();
+    }
+
     fn drawShadowQueue(
         self: *PbrGpuState,
         cmd_buf: *c.SDL_GPUCommandBuffer,
@@ -1131,33 +1158,47 @@ pub const PbrGpuState = struct {
                 prev_b = far_b;
             }
 
-            // Cached cascades are reused only while casters, cascade matrices and the cascade count are unchanged.
-            var dir_key = shadow_plan.hashCasters(self.queued_draws.items);
-            for (0..active_cascades) |ci| dir_key = shadow_plan.hashFloats(dir_key, &light_vps[ci].m);
-            dir_key = shadow_plan.hashFloats(dir_key, &.{cascade_count});
-            const dir_cached = self.dir_shadow_cache.hit(dir_key, shadow_q.static_cache);
-            if (!dir_cached) {
+            // Cached cascades are reused only while the casters that reach them and their matrices are unchanged.
+            const cache_on = shadow_q.static_cache;
+            var cascade_miss: [4]bool = @splat(true);
+            var any_miss = false;
+            for (0..active_cascades) |ci| {
+                const key = self.shadowMapKey(meshes, light_vps[ci], &.{ @floatFromInt(ci), cascade_count });
+                cascade_miss[ci] = !self.dir_cascade_cache[ci].hit(key, cache_on);
+                any_miss = any_miss or cascade_miss[ci];
+            }
+            for (active_cascades..4) |ci| self.dir_cascade_cache[ci].invalidate();
+            if (any_miss) {
+                // Without the cache every cascade is redrawn into a cleared atlas. With it, an atlas that already holds
+                // valid content is kept and only the missed quadrants are reset and redrawn.
+                const keep = cache_on and self.dir_atlas_valid;
                 const sh_depth = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
                     .texture = self.shadow_texture,
                     .clear_depth = 1.0,
-                    .load_op = c.SDL_GPU_LOADOP_CLEAR,
+                    .load_op = @as(c_uint, if (keep) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR),
                     .store_op = c.SDL_GPU_STOREOP_STORE,
                     .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
                     .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
                 });
                 const sh_pass = c.SDL_BeginGPURenderPass(cmd_buf, null, 0, &sh_depth) orelse return error.SdlGpuFailure;
-                c.SDL_BindGPUGraphicsPipeline(sh_pass, self.shadow_pipeline);
                 for (0..active_cascades) |ci| {
+                    if (!cascade_miss[ci]) continue;
                     const qx_i: i32 = @intCast((ci & 1) * (SHADOW_W / 2));
                     const qy_i: i32 = @intCast((ci >> 1) * (SHADOW_H / 2));
                     c.SDL_SetGPUViewport(sh_pass, &.{ .x = @floatFromInt(qx_i), .y = @floatFromInt(qy_i), .w = half_w, .h = half_h, .min_depth = 0, .max_depth = 1 });
                     c.SDL_SetGPUScissor(sh_pass, &.{ .x = qx_i, .y = qy_i, .w = @intCast(SHADOW_W / 2), .h = @intCast(SHADOW_H / 2) });
+                    if (keep) {
+                        c.SDL_BindGPUGraphicsPipeline(sh_pass, self.depth_clear_pipeline);
+                        c.SDL_DrawGPUPrimitives(sh_pass, 3, 1, 0, 0);
+                    }
                     self.drawShadowQueue(cmd_buf, sh_pass, .light, light_vps[ci], meshes, textures, white_tex, linear_sampler);
                 }
                 c.SDL_EndGPURenderPass(sh_pass);
             }
+            self.dir_atlas_valid = cache_on;
         } else {
-            self.dir_shadow_cache.invalidate();
+            for (&self.dir_cascade_cache) |*k| k.invalidate();
+            self.dir_atlas_valid = false;
         }
 
         // 1.2 Local Shadow Atlas (4x4 tiles of 512x512) + Clustered Forward+ Light/Probe Buffers
@@ -1265,37 +1306,44 @@ pub const PbrGpuState = struct {
             };
         }
 
-        var local_key = shadow_plan.hashCasters(self.queued_draws.items);
-        for (0..next_tile) |t| {
-            local_key = shadow_plan.hashFloats(local_key, &local_sh_data.shadow_vp[t]);
-            local_key = shadow_plan.hashFloats(local_key, &local_sh_data.atlas_rect[t]);
+        // Per-tile cache: a tile is redrawn only when a caster that reaches it, its matrix or its rect changed.
+        var tile_miss: [shadow_plan.MAX_TILES]bool = @splat(true);
+        var any_tile_miss = false;
+        for (0..next_tile) |tidx| {
+            const key = self.shadowMapKey(meshes, .{ .m = local_sh_data.shadow_vp[tidx] }, &local_sh_data.atlas_rect[tidx]);
+            tile_miss[tidx] = !self.local_tile_cache[tidx].hit(key, shadow_q.static_cache);
+            any_tile_miss = any_tile_miss or tile_miss[tidx];
         }
-        local_key = shadow_plan.hashFloats(local_key, &.{@as(f32, @floatFromInt(next_tile))});
-        const local_cached = next_tile > 0 and self.local_shadow_cache.hit(local_key, shadow_q.static_cache);
-        if (next_tile == 0) self.local_shadow_cache.invalidate();
-        if (next_tile > 0 and !local_cached) {
+        for (next_tile..shadow_plan.MAX_TILES) |tidx| self.local_tile_cache[tidx].invalidate();
+        if (any_tile_miss) {
+            const keep = shadow_q.static_cache and self.local_atlas_valid;
             const lsh_depth = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
                 .texture = self.local_shadow_texture,
                 .clear_depth = 1.0,
-                .load_op = c.SDL_GPU_LOADOP_CLEAR,
+                .load_op = @as(c_uint, if (keep) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR),
                 .store_op = c.SDL_GPU_STOREOP_STORE,
                 .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
                 .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
             });
             const lsh_pass = c.SDL_BeginGPURenderPass(cmd_buf, null, 0, &lsh_depth) orelse return error.SdlGpuFailure;
-            c.SDL_BindGPUGraphicsPipeline(lsh_pass, self.shadow_pipeline);
             for (0..next_tile) |tidx| {
+                if (!tile_miss[tidx]) continue;
                 const tr = splan.tiles[tidx];
                 const tx: i32 = @intCast(tr.x);
                 const ty: i32 = @intCast(tr.y);
                 const ts: i32 = @intCast(tr.size);
                 c.SDL_SetGPUViewport(lsh_pass, &.{ .x = @floatFromInt(tx), .y = @floatFromInt(ty), .w = @floatFromInt(ts), .h = @floatFromInt(ts), .min_depth = 0, .max_depth = 1 });
                 c.SDL_SetGPUScissor(lsh_pass, &.{ .x = tx, .y = ty, .w = ts, .h = ts });
+                if (keep) {
+                    c.SDL_BindGPUGraphicsPipeline(lsh_pass, self.depth_clear_pipeline);
+                    c.SDL_DrawGPUPrimitives(lsh_pass, 3, 1, 0, 0);
+                }
                 const lvp = math3d.Mat4{ .m = local_sh_data.shadow_vp[tidx] };
                 self.drawShadowQueue(cmd_buf, lsh_pass, .light, lvp, meshes, textures, white_tex, linear_sampler);
             }
             c.SDL_EndGPURenderPass(lsh_pass);
         }
+        self.local_atlas_valid = shadow_q.static_cache and next_tile > 0;
 
         // Near/far come from the active camera's projection, so the depth slicing matches what is rendered.
         const cluster_range = cluster.perspectiveNearFar(self.frame_data.proj_matrix) orelse cluster.NearFar{ .near = 0.1, .far = 200.0 };
@@ -1604,7 +1652,7 @@ pub const PbrGpuState = struct {
                     .cascade_depth_ranges = cascade_depth_ranges,
                     .cluster_factors = .{ built_clusters.factors.z_scale, built_clusters.factors.z_bias, 1.0, if (mat.alpha_mode == .mask) mat.alpha_cutoff else -1.0 },
                     .probe_volumetric = .{ @floatFromInt(pr_count), pcss_on, vol_on, self.frame_data.fog.volumetric.scattering },
-                    .cascade_info = .{ cascade_count, 0, 0, 0 },
+                    .cascade_info = .{ cascade_count, if (has_dir) self.frame_data.directional_lights[0].pcss_light_size else 0.03, 0, 0 },
                 };
                 c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &fu, @sizeOf(PbrFragUniforms));
                 const pbr_samplers = [_]c.SDL_GPUTextureSamplerBinding{
@@ -2489,6 +2537,30 @@ fn createShadowPipeline(device: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.S
         }),
         .depth_stencil_state = std.mem.zeroInit(c.SDL_GPUDepthStencilState, .{
             .compare_op = c.SDL_GPU_COMPAREOP_LESS,
+            .enable_depth_test = true,
+            .enable_depth_write = true,
+        }),
+        .target_info = std.mem.zeroInit(c.SDL_GPUGraphicsPipelineTargetInfo, .{
+            .num_color_targets = 0,
+            .depth_stencil_format = depth_fmt,
+            .has_depth_stencil_target = true,
+        }),
+    })) orelse error.SdlGpuFailure;
+}
+
+/// Fullscreen triangle at depth 1 that always passes and writes depth: with a scissor it clears one atlas region.
+fn createDepthClearPipeline(device: *c.SDL_GPUDevice, vs: *c.SDL_GPUShader, fs: *c.SDL_GPUShader, depth_fmt: c.SDL_GPUTextureFormat) !*c.SDL_GPUGraphicsPipeline {
+    return c.SDL_CreateGPUGraphicsPipeline(device, &std.mem.zeroInit(c.SDL_GPUGraphicsPipelineCreateInfo, .{
+        .vertex_shader = vs,
+        .fragment_shader = fs,
+        .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .rasterizer_state = std.mem.zeroInit(c.SDL_GPURasterizerState, .{
+            .fill_mode = c.SDL_GPU_FILLMODE_FILL,
+            .cull_mode = c.SDL_GPU_CULLMODE_NONE,
+            .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE,
+        }),
+        .depth_stencil_state = std.mem.zeroInit(c.SDL_GPUDepthStencilState, .{
+            .compare_op = c.SDL_GPU_COMPAREOP_ALWAYS,
             .enable_depth_test = true,
             .enable_depth_write = true,
         }),
