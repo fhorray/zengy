@@ -133,4 +133,33 @@ reviewed.
   the synchronous golden (max delta 7/255, under 0.0001% of pixels). Not measured: frame-time spike (no
   frame-time capture yet), and the sliced HDRI conversion path is covered by code review only because the demo
   keeps one resident HDRI.
-
+- **Harness fix found while doing Phases 4-5.** The free-camera controller rebuilds the pose orientation from its own
+  yaw/pitch every frame, so the Phase 1 scenarios applied the right position but kept the initial view direction.
+  `resetFreeCamera` now makes the controller re-read each scenario pose, and the closeup, vol_room and materials
+  goldens were regenerated (gallery goldens were unaffected). Earlier numbers for those scenarios described the
+  wrong view.
+- **Phase 4 - done, default off.** `fog.volumetric.temporal` (+ `temporal_blend`, default 0.1): golden-ratio jitter per
+  frame, a resolve pass (`volumetric_resolve.frag`) that reprojects the previous result with the previous
+  view-projection, rejects it when the marched distance changed by more than 20%, clips it to the 3x3 mean +- 1.5
+  sigma and blends. History is dropped on resize, toggle, fog off and camera cuts (`historyUsable`: more than 4 m or
+  45 degrees in one frame). Scenarios: `vol_room_temporal` and `gallery_temporal` must match the single-frame
+  goldens and not flicker between consecutive frames; `gallery_temporal_shake` moves the camera and settles for 4
+  frames, so ghosts show. Replacing the previous view-projection with the current one (no reprojection) makes the
+  shake scenario fail on the max-delta check (32 vs the 16 limit) while the pixel-fraction limit alone does not see it.
+  Not covered: first-frame-after-cut equality (only the pure `historyUsable` test) and half-resolution temporal.
+- **Phase 5 - done, every item default off** (`quality.shadows`):
+  1. `normal_offset`: receiver offset along the normal in the vertex shader, `shadow_normal_bias * 50` texels times
+     the slope. Changes 1.4% of the gallery pixels; owns golden `gallery_normal_offset`. No bias sweep with an acne
+     metric yet, so the default strength is not tuned.
+  2. `prioritize_local_lights`: `shadow_plan.plan` ranks shadowed lights by intensity attenuated by camera distance
+     to the range sphere. Unit tested (stable, nearest/brightest keep tiles when over budget).
+  3. `static_cache`: cascades and the local atlas re-render only when the caster hash, light matrices or tile rects
+     change (`hashCasters`). Verified live: one miss then 92 hits in a static scene, output identical to uncached.
+     Granularity is whole passes: any moved caster re-renders the whole map. Unit test: moving a caster or changing
+     its material changes the key.
+  4. `adaptive_atlas`: tile edge 256/512/1024 from apparent size (point cube faces capped at 512), buddy-style cell
+     packing in the 2048 atlas, filter radius scaled with tile size. `vol_room_shadow_adaptive` matches the fixed
+     result (max delta 7). The 16 tile-entry limit is unchanged.
+  5. `pcss`: blocker search through a second, non-comparison view of the cascade depth, penumbra from the
+     receiver-blocker gap, 16 taps; used when the light sets `pcss_enabled`. Changes 2.4% of the gallery pixels;
+     owns golden `gallery_pcss`. The light size is a shader constant (0.03).

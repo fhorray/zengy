@@ -8,6 +8,7 @@ const render_3d = @import("render_3d");
 const gpu_resources = @import("gpu_resources.zig");
 const volumetric_lights = @import("volumetric_lights.zig");
 const shadow_cull = @import("shadow_cull.zig");
+const shadow_plan = @import("shadow_plan.zig");
 const capture = @import("capture.zig");
 const c = @import("sdl3_c");
 
@@ -32,6 +33,7 @@ const POSTFX_FRAG_SPV = @embedFile("shaders/postfx.frag.spv");
 const SSAO_FRAG_SPV = @embedFile("shaders/ssao.frag.spv");
 const SSAO_BLUR_SPV = @embedFile("shaders/ssao_blur.frag.spv");
 const VOL_FOG_SPV = @embedFile("shaders/volumetric_fog.frag.spv");
+const VOL_RESOLVE_SPV = @embedFile("shaders/volumetric_resolve.frag.spv");
 
 const SHADOW_W: u32 = 2048;
 const SHADOW_H: u32 = 2048;
@@ -68,6 +70,20 @@ const PbrVertUniforms = extern struct {
     normal_matrix: [16]f32,
     mvp: [16]f32,
     light_vp: [4][16]f32,
+    /// x = normal-offset strength in shadow texels (0 = off).
+    shadow_offset: [4]f32 = .{ 0, 0, 0, 0 },
+    /// World-space size of one shadow texel for each cascade.
+    cascade_texel: [4]f32 = .{ 0, 0, 0, 0 },
+    /// xyz = direction to the sun.
+    to_sun: [4]f32 = .{ 0, 1, 0, 0 },
+};
+
+/// Uniforms for `volumetric_resolve.frag`; field order must match its std140 block.
+const VolResolveParams = extern struct {
+    inv_view_proj: [16]f32,
+    prev_view_proj: [16]f32,
+    cam_pos_max: [4]f32,
+    size_blend: [4]f32,
 };
 
 const PbrFragUniforms = extern struct {
@@ -291,6 +307,8 @@ pub const PbrGpuState = struct {
     pbr_pipeline: *c.SDL_GPUGraphicsPipeline,
     pbr_double_sided_pipeline: *c.SDL_GPUGraphicsPipeline,
     pbr_blend_pipeline: *c.SDL_GPUGraphicsPipeline,
+    /// Blends this frame's volumetric scatter with the reprojected previous result.
+    volumetric_resolve_pipeline: *c.SDL_GPUGraphicsPipeline,
     /// Opaque variants that pass on equal depth, used when the lit pass reuses the depth prepass.
     pbr_reuse_pipeline: *c.SDL_GPUGraphicsPipeline,
     pbr_reuse_double_sided_pipeline: *c.SDL_GPUGraphicsPipeline,
@@ -364,6 +382,19 @@ pub const PbrGpuState = struct {
     vol_texture: ?*c.SDL_GPUTexture = null,
     vol_w: u32 = 0,
     vol_h: u32 = 0,
+    /// Ping-pong history of the temporal volumetric resolve; `vol_history_read` holds the previous result.
+    vol_history: [2]?*c.SDL_GPUTexture = @splat(null),
+    vol_history_w: u32 = 0,
+    vol_history_h: u32 = 0,
+    vol_history_read: u8 = 0,
+    vol_history_valid: bool = false,
+    vol_prev_view_proj: [16]f32 = @splat(0),
+    vol_prev_cam: [3]f32 = .{ 0, 0, 0 },
+    vol_prev_fwd: [3]f32 = .{ 0, 0, -1 },
+    vol_frame: u32 = 0,
+    /// Last render keys of the cached shadow maps (see `ShadowQuality.static_cache`).
+    dir_shadow_cache: shadow_plan.CacheKey = .{},
+    local_shadow_cache: shadow_plan.CacheKey = .{},
     ssao_blur_texture: ?*c.SDL_GPUTexture = null,
     hdr_w: u32 = 0,
     hdr_h: u32 = 0,
@@ -408,7 +439,7 @@ pub const PbrGpuState = struct {
 
         const pbr_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, PBR_VERT_SPV, 0, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_vs);
-        const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 10, 4, 1);
+        const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 11, 4, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_fs);
         const pbr_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_pipe);
@@ -459,6 +490,11 @@ pub const PbrGpuState = struct {
         // Raymarch writes into a cleared target, so it does not need additive blending.
         const vol_pipe = try createFullscreenPipeline(device, sky_vs, vol_fs, hdr_format, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, vol_pipe);
+
+        const vol_res_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, VOL_RESOLVE_SPV, 3, 1);
+        defer c.SDL_ReleaseGPUShader(device, vol_res_fs);
+        const vol_res_pipe = try createFullscreenPipeline(device, sky_vs, vol_res_fs, hdr_format, false);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, vol_res_pipe);
 
         const vol_comp_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, VOL_COMPOSITE_FRAG_SPV, 2, 1);
         defer c.SDL_ReleaseGPUShader(device, vol_comp_fs);
@@ -621,6 +657,7 @@ pub const PbrGpuState = struct {
             .pbr_pipeline = pbr_pipe,
             .pbr_double_sided_pipeline = pbr_ds_pipe,
             .pbr_blend_pipeline = pbr_blend_pipe,
+            .volumetric_resolve_pipeline = vol_res_pipe,
             .pbr_reuse_pipeline = pbr_reuse_pipe,
             .pbr_reuse_double_sided_pipeline = pbr_reuse_ds_pipe,
             .sky_pipeline = sky_pipe,
@@ -675,6 +712,7 @@ pub const PbrGpuState = struct {
 
         if (self.hdr_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         if (self.vol_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+        for (self.vol_history) |h| if (h) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         if (self.ssao_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         if (self.ssao_blur_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         if (self.hdri_sky_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
@@ -701,6 +739,7 @@ pub const PbrGpuState = struct {
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.postfx_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.bloom_up_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.bloom_down_pipeline);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.volumetric_resolve_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.volumetric_transmittance_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.volumetric_composite_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.volumetric_pipeline);
@@ -873,6 +912,30 @@ pub const PbrGpuState = struct {
         self.vol_h = h;
     }
 
+    /// Keeps the two temporal history targets at `w x h`. A size change drops the history.
+    fn ensureVolumetricHistory(self: *PbrGpuState, w: u32, h: u32) !void {
+        if (self.vol_history[0] != null and self.vol_history_w == w and self.vol_history_h == h) return;
+        var created: [2]?*c.SDL_GPUTexture = .{ null, null };
+        errdefer for (created) |t| if (t) |tt| c.SDL_ReleaseGPUTexture(self.device, tt);
+        for (&created) |*slot| {
+            slot.* = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+                .type = c.SDL_GPU_TEXTURETYPE_2D,
+                .format = c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,
+                .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+                .width = w,
+                .height = h,
+                .layer_count_or_depth = 1,
+                .num_levels = 1,
+            })) orelse return error.SdlGpuFailure;
+        }
+        for (self.vol_history) |t| if (t) |tt| c.SDL_ReleaseGPUTexture(self.device, tt);
+        self.vol_history = created;
+        self.vol_history_w = w;
+        self.vol_history_h = h;
+        self.vol_history_read = 0;
+        self.vol_history_valid = false;
+    }
+
     fn ensureHdrTargets(self: *PbrGpuState, w: u32, h: u32) !void {
         if (self.hdr_texture == null or self.hdr_w != w or self.hdr_h != h) {
             const new_hdr = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
@@ -1028,31 +1091,24 @@ pub const PbrGpuState = struct {
         var light_vps: [4]math3d.Mat4 = @splat(math3d.Mat4.identity());
         var cascade_splits: [4]f32 = .{ 10.0, 23.0, 52.0, 120.0 };
         var cascade_depth_ranges: [4]f32 = .{ 80.0, 100.0, 140.0, 220.0 };
+        var cascade_texel_world: [4]f32 = @splat(0.0);
         var cascade_overlap: f32 = 0.18;
         var shadows_enabled: f32 = 0.0;
         // Cascades rendered this frame; shaders must not sample beyond this count.
         var cascade_count: f32 = 0.0;
         var shadow_bias: f32 = 0.005;
+        var normal_offset_texels: f32 = 0.0;
+        const shadow_q = pp.quality.shadows;
         if (self.frame_data.directional_lights.len > 0 and self.frame_data.directional_lights[0].shadows_enabled) {
             const dl = self.frame_data.directional_lights[0];
             shadows_enabled = 1.0;
             shadow_bias = dl.shadow_depth_bias;
+            if (shadow_q.normal_offset) normal_offset_texels = dl.shadow_normal_bias * 50.0;
             cascade_splits = dl.cascade_bounds;
             cascade_overlap = dl.overlap_proportion;
             const ldir = math3d.Vec3.normalize(.{ .x = dl.direction[0], .y = dl.direction[1], .z = dl.direction[2] });
             const cam_p = math3d.Vec3{ .x = self.frame_data.camera_position[0], .y = self.frame_data.camera_position[1], .z = self.frame_data.camera_position[2] };
             const cam_f = math3d.Vec3.normalize(.{ .x = self.frame_data.camera_forward[0], .y = self.frame_data.camera_forward[1], .z = self.frame_data.camera_forward[2] });
-
-            const sh_depth = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
-                .texture = self.shadow_texture,
-                .clear_depth = 1.0,
-                .load_op = c.SDL_GPU_LOADOP_CLEAR,
-                .store_op = c.SDL_GPU_STOREOP_STORE,
-                .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
-                .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
-            });
-            const sh_pass = c.SDL_BeginGPURenderPass(cmd_buf, null, 0, &sh_depth) orelse return error.SdlGpuFailure;
-            c.SDL_BindGPUGraphicsPipeline(sh_pass, self.shadow_pipeline);
 
             const half_w: f32 = @floatFromInt(SHADOW_W / 2);
             const half_h: f32 = @floatFromInt(SHADOW_H / 2);
@@ -1070,16 +1126,38 @@ pub const PbrGpuState = struct {
                 const half_ext = @max(far_b * 1.25, 12.0);
                 const d_range = @max(far_b * 2.5, 100.0);
                 cascade_depth_ranges[ci] = d_range;
+                cascade_texel_world[ci] = 2.0 * half_ext / half_w;
                 light_vps[ci] = computeCascadeMatrix(ldir, center, half_ext, half_w, d_range);
                 prev_b = far_b;
-
-                const qx_i: i32 = @intCast((ci & 1) * (SHADOW_W / 2));
-                const qy_i: i32 = @intCast((ci >> 1) * (SHADOW_H / 2));
-                c.SDL_SetGPUViewport(sh_pass, &.{ .x = @floatFromInt(qx_i), .y = @floatFromInt(qy_i), .w = half_w, .h = half_h, .min_depth = 0, .max_depth = 1 });
-                c.SDL_SetGPUScissor(sh_pass, &.{ .x = qx_i, .y = qy_i, .w = @intCast(SHADOW_W / 2), .h = @intCast(SHADOW_H / 2) });
-                self.drawShadowQueue(cmd_buf, sh_pass, .light, light_vps[ci], meshes, textures, white_tex, linear_sampler);
             }
-            c.SDL_EndGPURenderPass(sh_pass);
+
+            // Cached cascades are reused only while casters, cascade matrices and the cascade count are unchanged.
+            var dir_key = shadow_plan.hashCasters(self.queued_draws.items);
+            for (0..active_cascades) |ci| dir_key = shadow_plan.hashFloats(dir_key, &light_vps[ci].m);
+            dir_key = shadow_plan.hashFloats(dir_key, &.{cascade_count});
+            const dir_cached = self.dir_shadow_cache.hit(dir_key, shadow_q.static_cache);
+            if (!dir_cached) {
+                const sh_depth = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
+                    .texture = self.shadow_texture,
+                    .clear_depth = 1.0,
+                    .load_op = c.SDL_GPU_LOADOP_CLEAR,
+                    .store_op = c.SDL_GPU_STOREOP_STORE,
+                    .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
+                    .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+                });
+                const sh_pass = c.SDL_BeginGPURenderPass(cmd_buf, null, 0, &sh_depth) orelse return error.SdlGpuFailure;
+                c.SDL_BindGPUGraphicsPipeline(sh_pass, self.shadow_pipeline);
+                for (0..active_cascades) |ci| {
+                    const qx_i: i32 = @intCast((ci & 1) * (SHADOW_W / 2));
+                    const qy_i: i32 = @intCast((ci >> 1) * (SHADOW_H / 2));
+                    c.SDL_SetGPUViewport(sh_pass, &.{ .x = @floatFromInt(qx_i), .y = @floatFromInt(qy_i), .w = half_w, .h = half_h, .min_depth = 0, .max_depth = 1 });
+                    c.SDL_SetGPUScissor(sh_pass, &.{ .x = qx_i, .y = qy_i, .w = @intCast(SHADOW_W / 2), .h = @intCast(SHADOW_H / 2) });
+                    self.drawShadowQueue(cmd_buf, sh_pass, .light, light_vps[ci], meshes, textures, white_tex, linear_sampler);
+                }
+                c.SDL_EndGPURenderPass(sh_pass);
+            }
+        } else {
+            self.dir_shadow_cache.invalidate();
         }
 
         // 1.2 Local Shadow Atlas (4x4 tiles of 512x512) + Clustered Forward+ Light/Probe Buffers
@@ -1087,15 +1165,35 @@ pub const PbrGpuState = struct {
         defer self.allocator.destroy(cl_lights);
         cl_lights.* = .{};
         var local_sh_data = LocalShadowBuffer{};
-        var next_tile: u32 = 0;
-
         const pt_count = @min(self.frame_data.point_lights.len, 256);
+        const sp_count = @min(self.frame_data.spot_lights.len, 256);
+        // Which shadowed lights get atlas tiles, how big, and where (see shadow_plan.zig).
+        const splan = shadow_plan.plan(
+            self.frame_data.point_lights[0..pt_count],
+            self.frame_data.spot_lights[0..sp_count],
+            self.frame_data.camera_position,
+            .{ .prioritize = shadow_q.prioritize_local_lights, .adaptive = shadow_q.adaptive_atlas },
+        );
+        const next_tile: u32 = splan.tile_count;
+        const atlas_f: f32 = @floatFromInt(shadow_plan.ATLAS);
+        for (0..next_tile) |t| {
+            const r = splan.tiles[t];
+            local_sh_data.atlas_rect[t] = .{
+                @as(f32, @floatFromInt(r.x)) / atlas_f,
+                @as(f32, @floatFromInt(r.y)) / atlas_f,
+                @as(f32, @floatFromInt(r.size)) / atlas_f,
+                @as(f32, @floatFromInt(r.size)) / atlas_f,
+            };
+        }
+
         for (0..pt_count) |i| {
             const pl = self.frame_data.point_lights[i];
             const sc = pl.intensity_lumens / 100.0;
             var tile_id: f32 = -1.0;
-            if (pl.shadows_enabled and next_tile + 6 <= 16) {
-                tile_id = @floatFromInt(next_tile);
+            const asg = splan.point[i];
+            if (asg.first_tile >= 0) {
+                const first: usize = @intCast(asg.first_tile);
+                tile_id = @floatFromInt(first);
                 const dirs = [6]math3d.Vec3{
                     .{ .x = 1, .y = 0, .z = 0 }, .{ .x = -1, .y = 0, .z = 0 },
                     .{ .x = 0, .y = 1, .z = 0 }, .{ .x = 0, .y = -1, .z = 0 },
@@ -1110,14 +1208,9 @@ pub const PbrGpuState = struct {
                 const p_proj = perspectiveMat(std.math.pi * 0.512, 1.0, 0.1, @max(pl.range, 1.0));
                 const eye = math3d.Vec3{ .x = pl.position[0], .y = pl.position[1], .z = pl.position[2] };
                 for (0..6) |f| {
-                    const tidx = next_tile + f;
                     const tgt = math3d.Vec3{ .x = eye.x + dirs[f].x, .y = eye.y + dirs[f].y, .z = eye.z + dirs[f].z };
-                    local_sh_data.shadow_vp[tidx] = math3d.Mat4.mul(p_proj, math3d.Mat4.lookAt(eye, tgt, ups[f])).m;
-                    const tx: f32 = @floatFromInt(tidx % 4);
-                    const ty: f32 = @floatFromInt(tidx / 4);
-                    local_sh_data.atlas_rect[tidx] = .{ tx * 0.25, ty * 0.25, 0.25, 0.25 };
+                    local_sh_data.shadow_vp[first + f] = math3d.Mat4.mul(p_proj, math3d.Mat4.lookAt(eye, tgt, ups[f])).m;
                 }
-                next_tile += 6;
             }
             cl_lights.points[i] = .{
                 .pos_range = .{ pl.position[0], pl.position[1], pl.position[2], pl.range },
@@ -1125,23 +1218,20 @@ pub const PbrGpuState = struct {
             };
         }
 
-        const sp_count = @min(self.frame_data.spot_lights.len, 256);
         for (0..sp_count) |i| {
             const sl = self.frame_data.spot_lights[i];
             const sc = sl.intensity_lumens / 100.0;
             var tile_id: f32 = -1.0;
-            if (sl.shadows_enabled and next_tile < 16) {
-                tile_id = @floatFromInt(next_tile);
+            const asg = splan.spot[i];
+            if (asg.first_tile >= 0) {
+                const tile: usize = @intCast(asg.first_tile);
+                tile_id = @floatFromInt(tile);
                 const eye = math3d.Vec3{ .x = sl.position[0], .y = sl.position[1], .z = sl.position[2] };
                 const dir = math3d.Vec3.normalize(.{ .x = sl.direction[0], .y = sl.direction[1], .z = sl.direction[2] });
                 const up = math3d.Vec3{ .x = 0, .y = if (@abs(dir.y) > 0.95) 0.0 else 1.0, .z = if (@abs(dir.y) > 0.95) 1.0 else 0.0 };
                 const tgt = math3d.Vec3{ .x = eye.x + dir.x, .y = eye.y + dir.y, .z = eye.z + dir.z };
                 const s_proj = perspectiveMat(std.math.clamp(sl.outer_angle_rad * 2.0, 0.2, std.math.pi * 0.9), 1.0, 0.1, @max(sl.range, 1.0));
-                local_sh_data.shadow_vp[next_tile] = math3d.Mat4.mul(s_proj, math3d.Mat4.lookAt(eye, tgt, up)).m;
-                const tx: f32 = @floatFromInt(next_tile % 4);
-                const ty: f32 = @floatFromInt(next_tile / 4);
-                local_sh_data.atlas_rect[next_tile] = .{ tx * 0.25, ty * 0.25, 0.25, 0.25 };
-                next_tile += 1;
+                local_sh_data.shadow_vp[tile] = math3d.Mat4.mul(s_proj, math3d.Mat4.lookAt(eye, tgt, up)).m;
             }
             cl_lights.spots[i] = .{
                 .pos_range = .{ sl.position[0], sl.position[1], sl.position[2], sl.range },
@@ -1175,7 +1265,15 @@ pub const PbrGpuState = struct {
             };
         }
 
-        if (next_tile > 0) {
+        var local_key = shadow_plan.hashCasters(self.queued_draws.items);
+        for (0..next_tile) |t| {
+            local_key = shadow_plan.hashFloats(local_key, &local_sh_data.shadow_vp[t]);
+            local_key = shadow_plan.hashFloats(local_key, &local_sh_data.atlas_rect[t]);
+        }
+        local_key = shadow_plan.hashFloats(local_key, &.{@as(f32, @floatFromInt(next_tile))});
+        const local_cached = next_tile > 0 and self.local_shadow_cache.hit(local_key, shadow_q.static_cache);
+        if (next_tile == 0) self.local_shadow_cache.invalidate();
+        if (next_tile > 0 and !local_cached) {
             const lsh_depth = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
                 .texture = self.local_shadow_texture,
                 .clear_depth = 1.0,
@@ -1187,10 +1285,12 @@ pub const PbrGpuState = struct {
             const lsh_pass = c.SDL_BeginGPURenderPass(cmd_buf, null, 0, &lsh_depth) orelse return error.SdlGpuFailure;
             c.SDL_BindGPUGraphicsPipeline(lsh_pass, self.shadow_pipeline);
             for (0..next_tile) |tidx| {
-                const tx: i32 = @intCast(tidx % 4);
-                const ty: i32 = @intCast(tidx / 4);
-                c.SDL_SetGPUViewport(lsh_pass, &.{ .x = @floatFromInt(tx * 512), .y = @floatFromInt(ty * 512), .w = 512.0, .h = 512.0, .min_depth = 0, .max_depth = 1 });
-                c.SDL_SetGPUScissor(lsh_pass, &.{ .x = tx * 512, .y = ty * 512, .w = 512, .h = 512 });
+                const tr = splan.tiles[tidx];
+                const tx: i32 = @intCast(tr.x);
+                const ty: i32 = @intCast(tr.y);
+                const ts: i32 = @intCast(tr.size);
+                c.SDL_SetGPUViewport(lsh_pass, &.{ .x = @floatFromInt(tx), .y = @floatFromInt(ty), .w = @floatFromInt(ts), .h = @floatFromInt(ts), .min_depth = 0, .max_depth = 1 });
+                c.SDL_SetGPUScissor(lsh_pass, &.{ .x = tx, .y = ty, .w = ts, .h = ts });
                 const lvp = math3d.Mat4{ .m = local_sh_data.shadow_vp[tidx] };
                 self.drawShadowQueue(cmd_buf, lsh_pass, .light, lvp, meshes, textures, white_tex, linear_sampler);
             }
@@ -1417,7 +1517,8 @@ pub const PbrGpuState = struct {
             sh_arr[2][3] = 1.0 / @as(f32, @floatFromInt(tex_h));
             sh_arr[3][3] = if (pp.contact_shadows.enabled) 1.0 else 0.0;
             const ssao_tex = if (pp.ssao.enabled or pp.contact_shadows.enabled) (self.ssao_blur_texture orelse white_tex) else white_tex;
-            const pcss_on: f32 = if (has_dir and self.frame_data.directional_lights[0].pcss_enabled) 1.0 else 0.0;
+            // 1 = distance-widened filter, 2 = blocker-search PCSS (needs the quality switch as well).
+            const pcss_on: f32 = if (has_dir and self.frame_data.directional_lights[0].pcss_enabled) (if (shadow_q.pcss) 2.0 else 1.0) else 0.0;
             const vol_on: f32 = if (self.frame_data.fog.volumetric.enabled) 1.0 else 0.0;
 
             const pbr_ssbos = [_]*c.SDL_GPUBuffer{
@@ -1474,6 +1575,9 @@ pub const PbrGpuState = struct {
                     .normal_matrix = normalMatrixFromModel(qm.model_matrix),
                     .mvp = qm.mvp_matrix,
                     .light_vp = .{ light_vps[0].m, light_vps[1].m, light_vps[2].m, light_vps[3].m },
+                    .shadow_offset = .{ normal_offset_texels, 0, 0, 0 },
+                    .cascade_texel = cascade_texel_world,
+                    .to_sun = .{ dl_dir[0], dl_dir[1], dl_dir[2], 0 },
                 };
                 c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &vu, @sizeOf(PbrVertUniforms));
 
@@ -1514,6 +1618,8 @@ pub const PbrGpuState = struct {
                     .{ .texture = self.local_shadow_texture, .sampler = self.shadow_sampler },
                     .{ .texture = ao_t, .sampler = self.material_sampler },
                     .{ .texture = em_t, .sampler = self.material_sampler },
+                    // Raw (non-comparison) view of the cascade depth for the PCSS blocker search.
+                    .{ .texture = self.shadow_texture, .sampler = nearest_sampler },
                 };
                 c.SDL_BindGPUFragmentSamplers(pbr_pass, 0, &pbr_samplers, pbr_samplers.len);
                 c.SDL_DrawGPUIndexedPrimitives(pbr_pass, gm.index_count, 1, 0, 0, 0);
@@ -1528,6 +1634,12 @@ pub const PbrGpuState = struct {
             const vol_w: u32 = if (vol_half) @max(tex_w / 2, 1) else tex_w;
             const vol_h: u32 = if (vol_half) @max(tex_h / 2, 1) else tex_h;
             try self.ensureVolumetricTarget(vol_w, vol_h);
+            const vol_cfg = self.frame_data.fog.volumetric;
+            const temporal = vol_cfg.temporal;
+            if (temporal) try self.ensureVolumetricHistory(vol_w, vol_h);
+            // Golden-ratio sequence: successive frames sample different positions along each ray.
+            self.vol_frame +%= 1;
+            const jitter_offset: f32 = if (temporal) @floatCast(@mod(@as(f64, @floatFromInt(self.vol_frame)) * 0.6180339887498949, 1.0)) else 0.0;
 
             const vf_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
                 .texture = self.vol_texture.?,
@@ -1598,7 +1710,7 @@ pub const PbrGpuState = struct {
                 .local_vp = local_sh_data.shadow_vp,
                 .local_rect = local_sh_data.atlas_rect,
                 .point_shadow = vf_pt_shadow,
-                .cascade_info = .{ cascade_count, 0, 0, 0 },
+                .cascade_info = .{ cascade_count, jitter_offset, 0, 0 },
             };
             const vf_samplers = [_]c.SDL_GPUTextureSamplerBinding{
                 .{ .texture = depth_tex, .sampler = nearest_sampler },
@@ -1610,6 +1722,48 @@ pub const PbrGpuState = struct {
             c.SDL_DrawGPUPrimitives(vf_pass, 3, 1, 0, 0);
             c.SDL_EndGPURenderPass(vf_pass);
 
+            // Temporal resolve: reproject the previous result, clip it to this frame's neighbourhood and blend.
+            var vol_final: *c.SDL_GPUTexture = self.vol_texture.?;
+            if (temporal) {
+                const cam_now = self.frame_data.camera_position;
+                const fwd_now = self.frame_data.camera_forward;
+                const usable = self.vol_history_valid and volumetric_lights.historyUsable(self.vol_prev_cam, self.vol_prev_fwd, cam_now, fwd_now);
+                const read_idx: usize = self.vol_history_read;
+                const write_idx: usize = 1 - read_idx;
+                const res_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
+                    .texture = self.vol_history[write_idx].?,
+                    .load_op = c.SDL_GPU_LOADOP_DONT_CARE,
+                    .store_op = c.SDL_GPU_STOREOP_STORE,
+                });
+                const res_pass = c.SDL_BeginGPURenderPass(cmd_buf, &res_col, 1, null) orelse return error.SdlGpuFailure;
+                c.SDL_SetGPUViewport(res_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(vol_w), .h = @floatFromInt(vol_h), .min_depth = 0, .max_depth = 1 });
+                c.SDL_BindGPUGraphicsPipeline(res_pass, self.volumetric_resolve_pipeline);
+                const res_samplers = [_]c.SDL_GPUTextureSamplerBinding{
+                    .{ .texture = self.vol_texture.?, .sampler = nearest_sampler },
+                    .{ .texture = self.vol_history[read_idx].?, .sampler = linear_sampler },
+                    .{ .texture = depth_tex, .sampler = nearest_sampler },
+                };
+                c.SDL_BindGPUFragmentSamplers(res_pass, 0, &res_samplers, res_samplers.len);
+                const res_u = VolResolveParams{
+                    .inv_view_proj = invertMat4(self.frame_data.view_proj),
+                    .prev_view_proj = self.vol_prev_view_proj,
+                    .cam_pos_max = .{ cam_now[0], cam_now[1], cam_now[2], vol_cfg.max_distance },
+                    .size_blend = .{ @floatFromInt(vol_w), @floatFromInt(vol_h), std.math.clamp(vol_cfg.temporal_blend, 0.02, 1.0), if (usable) 1.0 else 0.0 },
+                };
+                c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &res_u, @sizeOf(VolResolveParams));
+                c.SDL_DrawGPUPrimitives(res_pass, 3, 1, 0, 0);
+                c.SDL_EndGPURenderPass(res_pass);
+
+                vol_final = self.vol_history[write_idx].?;
+                self.vol_history_read = @intCast(write_idx);
+                self.vol_history_valid = true;
+                self.vol_prev_view_proj = self.frame_data.view_proj;
+                self.vol_prev_cam = cam_now;
+                self.vol_prev_fwd = fwd_now;
+            } else {
+                self.vol_history_valid = false;
+            }
+
             // Physically based composition on the HDR scene: L = L_scene * T + L_scatter.
             // Pass 0 multiplies by T; pass 1 adds the upsampled in-scatter plus the ambient fog colour (1 - T) * C.
             const vc_base = VolCompositeParams{
@@ -1619,7 +1773,7 @@ pub const PbrGpuState = struct {
                 .fog_color_density = .{ self.frame_data.fog.color[0], self.frame_data.fog.color[1], self.frame_data.fog.color[2], self.frame_data.fog.density },
             };
             const vc_samplers = [_]c.SDL_GPUTextureSamplerBinding{
-                .{ .texture = self.vol_texture.?, .sampler = nearest_sampler },
+                .{ .texture = vol_final, .sampler = nearest_sampler },
                 .{ .texture = depth_tex, .sampler = nearest_sampler },
             };
             inline for (.{ .{ 0.0, self.volumetric_transmittance_pipeline }, .{ 1.0, self.volumetric_composite_pipeline } }) |pass_desc| {
@@ -1638,6 +1792,8 @@ pub const PbrGpuState = struct {
                 c.SDL_DrawGPUPrimitives(vc_pass, 3, 1, 0, 0);
                 c.SDL_EndGPURenderPass(vc_pass);
             }
+        } else {
+            self.vol_history_valid = false;
         }
 
         // 4. Compute Auto-Exposure (Histogram -> EV100 Adaptation)

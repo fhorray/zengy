@@ -85,3 +85,29 @@ test "selectRelevantLights on an empty slice returns no lights" {
     const sel = selectRelevantLights(&lights, .{ 0, 0, 0 });
     try std.testing.expectEqual(@as(usize, 0), sel.count);
 }
+
+/// Largest camera translation (metres) in one frame for which temporal volumetric history is still trusted.
+pub const HISTORY_MAX_MOVE: f32 = 4.0;
+/// Smallest dot product between consecutive view directions (about 45 degrees) for trusted history.
+pub const HISTORY_MIN_FORWARD_DOT: f32 = 0.7;
+
+/// Whether the previous frame's volumetric result may be reprojected into this frame.
+/// A teleport or a very fast turn is treated as a camera cut: reprojection would smear unrelated content.
+pub fn historyUsable(prev_pos: [3]f32, prev_fwd: [3]f32, pos: [3]f32, fwd: [3]f32) bool {
+    const dx = pos[0] - prev_pos[0];
+    const dy = pos[1] - prev_pos[1];
+    const dz = pos[2] - prev_pos[2];
+    if (dx * dx + dy * dy + dz * dz > HISTORY_MAX_MOVE * HISTORY_MAX_MOVE) return false;
+    const pl = @sqrt(prev_fwd[0] * prev_fwd[0] + prev_fwd[1] * prev_fwd[1] + prev_fwd[2] * prev_fwd[2]);
+    const nl = @sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+    if (pl < 1e-6 or nl < 1e-6) return false;
+    const d = (prev_fwd[0] * fwd[0] + prev_fwd[1] * fwd[1] + prev_fwd[2] * fwd[2]) / (pl * nl);
+    return d >= HISTORY_MIN_FORWARD_DOT;
+}
+
+test "historyUsable accepts small motion and rejects teleports and fast turns" {
+    try std.testing.expect(historyUsable(.{ 0, 0, 0 }, .{ 0, 0, -1 }, .{ 0.1, 0, 0 }, .{ 0.05, 0, -1 }));
+    try std.testing.expect(!historyUsable(.{ 0, 0, 0 }, .{ 0, 0, -1 }, .{ 10, 0, 0 }, .{ 0, 0, -1 }));
+    try std.testing.expect(!historyUsable(.{ 0, 0, 0 }, .{ 0, 0, -1 }, .{ 0, 0, 0 }, .{ 1, 0, 0 }));
+    try std.testing.expect(!historyUsable(.{ 0, 0, 0 }, .{ 0, 0, -1 }, .{ 0, 0, 0 }, .{ 0, 0, 0 }));
+}

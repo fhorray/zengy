@@ -236,6 +236,12 @@ pub const VolumetricFogConfig = struct {
     /// Ray-march at half resolution and upsample depth-aware (about 4x fewer marched pixels).
     /// Off by default: full resolution keeps thin shafts sharp; opt in on GPUs where the cost matters.
     half_resolution: bool = false,
+    /// Accumulate the scatter over frames: the ray-march jitter changes every frame and the previous result is
+    /// reprojected, clamped to the current neighbourhood and blended. Smooths the sampling noise of 64 steps.
+    /// Off by default; history is dropped on resize, camera cuts and when the effect is toggled.
+    temporal: bool = false,
+    /// Weight of the current frame in the temporal blend (0.05 = smooth and laggy, 1.0 = no history).
+    temporal_blend: f32 = 0.1,
 };
 
 /// Exponential/height distance fog resource.
@@ -356,6 +362,23 @@ pub const IblRebuildBudget = enum(u32) {
     sliced = 1,
 };
 
+/// Shadow scalability switches. Every field defaults to the established behaviour.
+pub const ShadowQuality = struct {
+    /// Offset the receiver along its normal before the cascade lookup, by `shadow_normal_bias * 50` shadow texels
+    /// scaled by the surface slope. Removes acne without a large depth bias that would detach contacts.
+    normal_offset: bool = false,
+    /// Give the limited local shadow tiles to the most relevant lights (intensity attenuated by distance to the
+    /// light's range sphere) instead of the first ones submitted.
+    prioritize_local_lights: bool = false,
+    /// Re-render the cascades and the local atlas only when casters, lights or cascade frustums changed.
+    static_cache: bool = false,
+    /// Choose each local light's tile size (256..1024) from its apparent size instead of a fixed 512.
+    adaptive_atlas: bool = false,
+    /// Contact-hardening penumbra from a blocker search for directional lights that set `pcss_enabled`.
+    /// Without it `pcss_enabled` only widens the filter with distance.
+    pcss: bool = false,
+};
+
 /// Quality and cost switches that do not change what the scene means, only how the backend renders it.
 pub const RenderQuality = struct {
     /// Reuse the depth prepass (written for SSAO and contact shadows) as the depth buffer of the lit pass, so
@@ -363,6 +386,7 @@ pub const RenderQuality = struct {
     /// capture suite shows identical silhouettes on the target GPUs.
     reuse_depth_prepass: bool = false,
     ibl_rebuild_budget: IblRebuildBudget = .unlimited,
+    shadows: ShadowQuality = .{},
 };
 
 pub const PostProcessSettings = struct {

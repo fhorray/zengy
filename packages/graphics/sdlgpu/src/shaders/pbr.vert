@@ -9,6 +9,9 @@ layout(std140, set = 1, binding = 0) uniform PbrVertUniforms {
     mat4 normal_matrix;
     mat4 mvp;
     mat4 light_vp[4];
+    vec4 shadow_offset;  // x = offset in shadow texels at grazing angles (0 = off)
+    vec4 cascade_texel;  // world-space size of one shadow texel per cascade
+    vec4 to_sun;         // xyz = direction to the sun
 };
 
 // Position must match bit-for-bit with shadow.vert, because the lit pass depth-tests against the prepass.
@@ -24,8 +27,13 @@ void main() {
     v_world_pos = wp.xyz;
     v_world_normal = normalize(mat3(normal_matrix) * in_normal);
     v_uv = in_uv;
+    // Normal-offset shadow lookup: move the receiver along its normal, most at grazing angles, so the depth bias
+    // can stay small. With shadow_offset.x == 0 the offset is exactly zero.
+    float n_dot_l = clamp(dot(v_world_normal, to_sun.xyz), 0.0, 1.0);
+    float slope = sqrt(max(1.0 - n_dot_l * n_dot_l, 0.0));
     for (int i = 0; i < 4; ++i) {
-        v_light_pos[i] = light_vp[i] * wp;
+        vec3 offset = v_world_normal * (shadow_offset.x * cascade_texel[i] * slope);
+        v_light_pos[i] = light_vp[i] * vec4(wp.xyz + offset, 1.0);
     }
     gl_Position = mvp * vec4(in_pos, 1.0);
 }

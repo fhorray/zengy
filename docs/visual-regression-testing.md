@@ -21,7 +21,9 @@ Both need a GPU and a window (the demo runs a normal visual loop). Outputs go to
 | `<scenario>.diff.png` | Written only on failure: red where the frame differs from the golden |
 
 Environment variables read by the demo: `ZENGY_CAPTURE_DIR` (enables capture mode), `ZENGY_CAPTURE_GOLDEN`
-(default `tests/golden/visual-pbr`), `ZENGY_CAPTURE_UPDATE=1` (write goldens instead of comparing).
+(default `tests/golden/visual-pbr`), `ZENGY_CAPTURE_UPDATE=1` (write goldens instead of comparing),
+`ZENGY_CAPTURE_FILTER=<text>` (run only scenarios whose name contains the text; with `UPDATE=1` this regenerates just
+those goldens, so one golden can change without rewriting the rest).
 
 ## What is checked
 
@@ -38,9 +40,14 @@ Scenarios (`SCENARIOS` in `examples/visual-pbr/main.zig`): gallery, close-up and
 fog / SSAO / shadows / bloom / FXAA on and off, a dusk sky, and a materials pose with an alpha-masked
 double-sided panel and an alpha-blended pane.
 
+Scenarios may also set `max_delta` (largest per-channel difference allowed, to catch ghosts that touch few pixels),
+`stability` (a second frame must match the first) and `shake` (camera moves during warm-up, then settles).
+
 Scenarios with `golden_of` own no golden: they must match another scenario within the normal tolerances. They guard
 switches that may not change the picture: `*_reuse_depth` (`quality.reuse_depth_prepass`) and
-`gallery_dusk_sliced_ibl` (`quality.ibl_rebuild_budget = .sliced`).
+`gallery_dusk_sliced_ibl` (`quality.ibl_rebuild_budget = .sliced`), `*_temporal*` (`fog.volumetric.temporal`),
+`*_shadow_prioritize`, `*_shadow_cache` and `*_shadow_adaptive`. `gallery_normal_offset` and `gallery_pcss` change the
+picture on purpose and own goldens.
 
 ## Reading a failure
 

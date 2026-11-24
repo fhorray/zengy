@@ -452,7 +452,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.render.3d",
-            .version = "0.4.0",
+            .version = "0.5.0",
             .provides_capabilities = &.{"engine.render.3d/1"},
             .required_capabilities = &.{ "engine.graphics.device/1", "engine.camera/1" },
         },

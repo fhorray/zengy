@@ -87,6 +87,21 @@ const Scenario = struct {
     /// Compare against the golden of this other scenario instead of owning one. Switches that must not change
     /// the picture (depth reuse, sliced IBL) are checked this way, with the normal tolerances.
     golden_of: ?[]const u8 = null,
+    /// Volumetric temporal accumulation.
+    temporal: bool = false,
+    /// Move the camera during the warm-up and settle on the exact pose for the last frames, so a wrong
+    /// reprojection leaves ghosts that the golden comparison sees.
+    shake: bool = false,
+    /// Capture a second frame and require it to match the first (frame-to-frame stability under jitter).
+    stability: bool = false,
+    shadow_normal_offset: bool = false,
+    shadow_prioritize: bool = false,
+    shadow_cache: bool = false,
+    shadow_adaptive: bool = false,
+    shadow_pcss: bool = false,
+    /// Largest per-channel difference tolerated against the golden, on top of the pixel-fraction limit. Catches
+    /// small but strong artefacts such as ghosts that touch few pixels.
+    max_delta: u8 = 255,
 };
 
 const SCENARIOS = [_]Scenario{
@@ -111,9 +126,26 @@ const SCENARIOS = [_]Scenario{
     .{ .name = "materials_reuse_depth", .pose = .materials, .reuse_depth = true, .golden_of = "materials_default" },
     .{ .name = "vol_room_reuse_depth", .pose = .vol_room, .reuse_depth = true, .golden_of = "vol_room_default" },
     .{ .name = "gallery_dusk_sliced_ibl", .sky_preset = 2, .sliced_ibl = true, .golden_of = "gallery_dusk" },
+    // Phase 4: temporal volumetric fog. A static camera must converge to the single-frame result, stay stable from
+    // frame to frame, and a moving camera must not leave ghosts once it stops.
+    .{ .name = "vol_room_temporal", .pose = .vol_room, .temporal = true, .stability = true, .max_delta = 16, .golden_of = "vol_room_default" },
+    .{ .name = "gallery_temporal_shake", .temporal = true, .shake = true, .max_delta = 16, .golden_of = "gallery_default" },
+    .{ .name = "gallery_temporal", .temporal = true, .stability = true, .max_delta = 16, .golden_of = "gallery_default" },
+    // Phase 5: shadow scalability. Prioritisation and the cache must not change the picture; adaptive tiles change
+    // it only slightly; normal offset and PCSS change it on purpose and own goldens.
+    .{ .name = "gallery_shadow_prioritize", .shadow_prioritize = true, .golden_of = "gallery_default" },
+    .{ .name = "gallery_shadow_cache", .shadow_cache = true, .golden_of = "gallery_default" },
+    .{ .name = "vol_room_shadow_cache", .pose = .vol_room, .shadow_cache = true, .golden_of = "vol_room_default" },
+    .{ .name = "vol_room_shadow_adaptive", .pose = .vol_room, .shadow_adaptive = true, .golden_of = "vol_room_default" },
+    .{ .name = "gallery_normal_offset", .shadow_normal_offset = true },
+    .{ .name = "gallery_pcss", .shadow_pcss = true },
 };
 
-const CaptureStage = enum { warmup, wait_final, wait_hdr };
+const CaptureStage = enum { warmup, wait_final, wait_stable, wait_hdr };
+/// Warm-up frames at the end of a shake scenario during which the camera holds the exact pose.
+const SHAKE_SETTLE_FRAMES: u32 = 4;
+/// Allowed fraction of pixels that change between two frames of a stability scenario.
+const MAX_FLICKER_FRACTION: f64 = 0.001;
 
 const CaptureRunner = struct {
     allocator: std.mem.Allocator,
@@ -122,6 +154,8 @@ const CaptureRunner = struct {
     golden_dir: []const u8,
     update_goldens: bool,
     scenario: usize = 0,
+    /// Only scenarios whose name contains this text run (`ZENGY_CAPTURE_FILTER`); null runs all.
+    filter: ?[]const u8 = null,
     stage: CaptureStage = .warmup,
     applied: bool = false,
     frames: u32 = 0,
@@ -189,6 +223,9 @@ const CaptureRunner = struct {
         const diff = try capture.compareRgb8(rgb, golden.rgb, PIXEL_THRESHOLD);
         const frac = diff.differingFraction();
         std.debug.print("[capture] {s}: {d:.4}% pixels differ (max delta {d})\n", .{ sc.name, frac * 100.0, diff.max_delta });
+        if (diff.max_delta > sc.max_delta) {
+            self.fail(sc.name, "max channel delta {d} exceeds {d} (localised artefact such as a ghost)", .{ diff.max_delta, sc.max_delta });
+        }
         if (frac > MAX_DIFF_FRACTION) {
             self.fail(sc.name, "{d:.3}% of pixels differ from the golden (limit {d:.3}%)", .{ frac * 100.0, MAX_DIFF_FRACTION * 100.0 });
             const diff_img = try capture.diffImageRgb8(self.allocator, rgb, golden.rgb, PIXEL_THRESHOLD);
@@ -280,6 +317,25 @@ fn applySkyPreset(sky: *render_3d.pbr.SkyEnvironment, sun: *render_3d.pbr.Direct
     }
 }
 
+/// The free-camera controller rebuilds the pose orientation from its own yaw and pitch every frame, so a pose
+/// assigned from outside is lost unless the controller re-reads it. Clearing `initialized` makes it do so.
+fn resetFreeCamera(ctx: *engine.SystemContext, st: *PbrDemoState) void {
+    if (ctx.world.get(st.cam_entity, camera.FreeCamera)) |fc| fc.state.initialized = false;
+}
+
+/// Camera pose of a scenario; `dx`/`dz` shift the eye (and a third of it the target) for the shake scenarios.
+fn scenarioPose(pose: Pose, dx: f32, dz: f32) camera.CameraPose {
+    const base: [2][3]f32 = switch (pose) {
+        .gallery => .{ .{ 0, 2.6, 10.0 }, .{ 0, 2.6, 0 } },
+        .vol_room => .{ .{ 11.2, 2.1, 2.8 }, .{ 15.2, 2.3, -1.2 } },
+        .closeup => .{ .{ 0.5, 2.4, 5.5 }, .{ 0, 2.0, 0 } },
+        .materials => .{ .{ -8.0, 1.9, 10.0 }, .{ -8.0, 1.2, 6.0 } },
+    };
+    const eye = [3]f32{ base[0][0] + dx, base[0][1], base[0][2] + dz };
+    const target = [3]f32{ base[1][0] + dx * 0.3, base[1][1], base[1][2] + dz * 0.3 };
+    return camera.CameraPose.lookAt(eye, target, .{ 0, 1, 0 });
+}
+
 fn applyScenario(
     sc: Scenario,
     cam_pose: *camera.CameraPose,
@@ -288,11 +344,14 @@ fn applyScenario(
     fog: *render_3d.pbr.FogSettings,
     sky: ?*render_3d.pbr.SkyEnvironment,
 ) void {
-    cam_pose.* = switch (sc.pose) {
-        .gallery => camera.CameraPose.lookAt(.{ 0, 2.6, 10.0 }, .{ 0, 2.6, 0 }, .{ 0, 1, 0 }),
-        .vol_room => camera.CameraPose.lookAt(.{ 11.2, 2.1, 2.8 }, .{ 15.2, 2.3, -1.2 }, .{ 0, 1, 0 }),
-        .closeup => camera.CameraPose.lookAt(.{ 0.5, 2.4, 5.5 }, .{ 0, 2.0, 0 }, .{ 0, 1, 0 }),
-        .materials => camera.CameraPose.lookAt(.{ -8.0, 1.9, 10.0 }, .{ -8.0, 1.2, 6.0 }, .{ 0, 1, 0 }),
+    cam_pose.* = scenarioPose(sc.pose, 0, 0);
+    fog.volumetric.temporal = sc.temporal;
+    pp.quality.shadows = .{
+        .normal_offset = sc.shadow_normal_offset,
+        .prioritize_local_lights = sc.shadow_prioritize,
+        .static_cache = sc.shadow_cache,
+        .adaptive_atlas = sc.shadow_adaptive,
+        .pcss = sc.shadow_pcss,
     };
     fog.enabled = sc.fog;
     fog.volumetric.enabled = sc.fog;
@@ -324,15 +383,28 @@ fn stepCapture(
         st.app.quit();
         return;
     }
+    if (cr.filter) |f| {
+        while (cr.scenario < SCENARIOS.len and std.mem.indexOf(u8, SCENARIOS[cr.scenario].name, f) == null) cr.scenario += 1;
+        if (cr.scenario >= SCENARIOS.len) return;
+    }
     const sc = SCENARIOS[cr.scenario];
     switch (cr.stage) {
         .warmup => {
             if (!cr.applied) {
                 applyScenario(sc, cam_pose, pp, sun, fog, ctx.resources.get(render_3d.pbr.SkyEnvironment));
+                resetFreeCamera(ctx, st);
                 cr.applied = true;
                 cr.frames = 0;
             }
             cr.frames += 1;
+            if (sc.shake and cr.frames + SHAKE_SETTLE_FRAMES < WARMUP_FRAMES) {
+                const t: f32 = @floatFromInt(cr.frames);
+                cam_pose.* = scenarioPose(sc.pose, @sin(t * 0.5) * 0.9, @cos(t * 0.31) * 0.6);
+                resetFreeCamera(ctx, st);
+            } else if (sc.shake) {
+                cam_pose.* = scenarioPose(sc.pose, 0, 0);
+                resetFreeCamera(ctx, st);
+            }
             if (cr.frames >= WARMUP_FRAMES) {
                 graphics_sdlgpu.requestCapture(st.app, .final);
                 cr.stage = .wait_final;
@@ -352,6 +424,37 @@ fn stepCapture(
             };
             defer img.deinit(cr.allocator);
             try cr.handleFinal(sc, img);
+            if (sc.stability) {
+                graphics_sdlgpu.requestCapture(st.app, .final);
+                cr.stage = .wait_stable;
+            } else {
+                graphics_sdlgpu.requestCapture(st.app, .hdr);
+                cr.stage = .wait_hdr;
+            }
+            cr.frames = 0;
+        },
+        .wait_stable => {
+            cr.frames += 1;
+            var img = graphics_sdlgpu.takeCapture(st.app) orelse {
+                if (cr.frames > WAIT_LIMIT_FRAMES) {
+                    cr.fail(sc.name, "no second capture after {d} frames", .{WAIT_LIMIT_FRAMES});
+                    cr.scenario += 1;
+                    cr.stage = .warmup;
+                    cr.applied = false;
+                }
+                return;
+            };
+            defer img.deinit(cr.allocator);
+            const second = try capture.displayToRgb8(cr.allocator, img);
+            defer cr.allocator.free(second);
+            if (cr.final_rgb) |first| {
+                const diff = try capture.compareRgb8(first, second, PIXEL_THRESHOLD);
+                const frac = diff.differingFraction();
+                std.debug.print("[capture] {s}: frame-to-frame {d:.4}% pixels differ (max delta {d})\n", .{ sc.name, frac * 100.0, diff.max_delta });
+                if (frac > MAX_FLICKER_FRACTION) {
+                    cr.fail(sc.name, "{d:.3}% of pixels change between consecutive frames (limit {d:.3}%)", .{ frac * 100.0, MAX_FLICKER_FRACTION * 100.0 });
+                }
+            }
             graphics_sdlgpu.requestCapture(st.app, .hdr);
             cr.stage = .wait_hdr;
             cr.frames = 0;
@@ -826,7 +929,7 @@ pub fn main(init: std.process.Init) !void {
         const update = if (init.environ_map.get("ZENGY_CAPTURE_UPDATE")) |v| std.mem.eql(u8, v, "1") else false;
         try std.Io.Dir.cwd().createDirPath(init.io, dir);
         if (update) try std.Io.Dir.cwd().createDirPath(init.io, golden);
-        capture_runner = .{ .allocator = allocator, .io = init.io, .out_dir = dir, .golden_dir = golden, .update_goldens = update };
+        capture_runner = .{ .allocator = allocator, .io = init.io, .out_dir = dir, .golden_dir = golden, .update_goldens = update, .filter = init.environ_map.get("ZENGY_CAPTURE_FILTER") };
     }
 
     const px = window_sdl3.pixelSize(&app);

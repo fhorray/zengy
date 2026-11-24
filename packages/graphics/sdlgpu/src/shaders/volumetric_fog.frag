@@ -26,7 +26,7 @@ layout(std140, set = 3, binding = 0) uniform VolFogParams {
     vec4 point_shadow[4];   // x=first cube-face tile, y=1 when it casts shadows
     mat4 local_vp[16];      // local shadow atlas view-projections (point cube faces and spot tiles)
     vec4 local_rect[16];    // local shadow atlas rect: xy=offset, z=size
-    vec4 cascade_info;      // x=number of cascades rendered this frame (0..4)
+    vec4 cascade_info;      // x=number of cascades rendered this frame (0..4), y=per-frame jitter offset (0 when not temporal)
 };
 
 // RGB = in-scattered light, A = marched distance. The composite pass reads A to upsample depth-aware.
@@ -122,7 +122,8 @@ void main() {
 
     const int STEPS = 64;
     float step_len = max_dist / float(STEPS);
-    float jitter = ign(gl_FragCoord.xy);
+    // The offset walks the golden-ratio sequence frame to frame, so a temporal accumulator sees fresh samples.
+    float jitter = fract(ign(gl_FragCoord.xy) + cascade_info.y);
     // Extinction uses the configured density exactly: the composite pass applies the same T to the scene,
     // so a floor here would darken the scene even when fog density is zero.
     float ext_density = max(cam_pos_density.w, 0.0);

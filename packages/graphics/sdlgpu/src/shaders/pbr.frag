@@ -15,6 +15,7 @@ layout(set = 2, binding = 6) uniform sampler2D u_ssao_tex;
 layout(set = 2, binding = 7) uniform sampler2DShadow u_local_shadow_tex;
 layout(set = 2, binding = 8) uniform sampler2D u_ao_tex;
 layout(set = 2, binding = 9) uniform sampler2D u_emissive_tex;
+layout(set = 2, binding = 10) uniform sampler2D u_shadow_raw; // same depth as u_shadow_tex, read without comparison (PCSS blocker search)
 
 struct GpuPointLight {
     vec4 pos_range;  // xyz=pos, w=range
@@ -43,22 +44,22 @@ struct GpuReflectionProbe {
     vec4 ground_pad; // rgb=ground_tint
 };
 
-layout(std430, set = 2, binding = 10) readonly buffer ClusterLightsBuffer {
+layout(std430, set = 2, binding = 11) readonly buffer ClusterLightsBuffer {
     GpuPointLight c_points[256];
     GpuSpotLight c_spots[256];
     GpuRectLight c_rects[64];
     GpuReflectionProbe c_probes[32];
 };
 
-layout(std430, set = 2, binding = 11) readonly buffer ClusterGridBuffer {
+layout(std430, set = 2, binding = 12) readonly buffer ClusterGridBuffer {
     uvec4 clusters[];
 };
 
-layout(std430, set = 2, binding = 12) readonly buffer ClusterIndicesBuffer {
+layout(std430, set = 2, binding = 13) readonly buffer ClusterIndicesBuffer {
     uint cluster_indices[];
 };
 
-layout(std430, set = 2, binding = 13) readonly buffer LocalShadowBuffer {
+layout(std430, set = 2, binding = 14) readonly buffer LocalShadowBuffer {
     mat4 local_shadow_vp[16];
     vec4 local_atlas_rect[16]; // x, y, w, h in [0,1]
 };
@@ -189,6 +190,27 @@ float sampleCascadePCF(int c_idx, vec3 N, vec3 L, float rot, float view_depth) {
     float pcss_boost = (probe_volumetric.y > 0.5) ? (1.0 + clamp(view_depth / 30.0, 0.0, 1.5)) : 1.0;
     float radius_texels = (2.2 - float(c_idx) * 0.2) * pcss_boost;
     int taps = (c_idx < 2) ? 12 : 8;
+    if (probe_volumetric.y > 1.5) {
+        // PCSS: find blockers around the receiver, then widen the filter with the receiver-blocker distance.
+        // Cascade extents mirror computeCascade on the CPU: half_ext = max(far * 1.25, 12), 1024 texels across.
+        float texel_world = 2.0 * max(cascade_splits[c_idx] * 1.25, 12.0) / 1024.0;
+        float blocker_sum = 0.0;
+        float blocker_n = 0.0;
+        for (int i = 0; i < 12; ++i) {
+            vec2 o = vogelDisk(i, 12, rot) * 6.0 * texel;
+            vec2 suv = clamp(uv + o, q_min + texel, q_max - texel);
+            float r = textureLod(u_shadow_raw, suv, 0.0).r;
+            if (r < proj.z - bias) {
+                blocker_sum += r;
+                blocker_n += 1.0;
+            }
+        }
+        if (blocker_n < 0.5) return 1.0;
+        float depth_gap_m = (proj.z - blocker_sum / blocker_n) * depth_range;
+        // 0.03 is the tangent of the light's apparent half-size; larger values give wider penumbrae.
+        radius_texels = clamp(depth_gap_m * 0.03 / texel_world, 1.0, 14.0);
+        taps = 16;
+    }
     float shadow = 0.0;
     for (int i = 0; i < taps; ++i) {
         vec2 o = vogelDisk(i, taps, rot) * radius_texels * texel;
@@ -247,7 +269,8 @@ float sampleLocalTile(int tile_idx, vec3 world_pos, float bias, float rot) {
     vec2 texel = 1.0 / vec2(textureSize(u_local_shadow_tex, 0));
     float s = 0.0;
     for (int i = 0; i < 6; ++i) {
-        vec2 o = vogelDisk(i, 6, rot) * 1.6 * texel;
+        // Filter radius follows the tile's share of the atlas, so large and small tiles blur the same angle.
+        vec2 o = vogelDisk(i, 6, rot) * 1.6 * (rect.z / 0.25) * texel;
         vec2 cuv = clamp(suv + o, rect.xy + texel, rect.xy + rect.zw - texel);
         s += texture(u_local_shadow_tex, vec3(cuv, proj.z - bias));
     }
