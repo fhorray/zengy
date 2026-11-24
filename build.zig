@@ -350,6 +350,14 @@ pub fn build(b: *std.Build) void {
     render_3d_mod.addImport("camera", camera_mod);
     render_3d_mod.addImport("scene", scene_mod);
 
+    const gizmos_mod = b.addModule("gizmos", .{
+        .root_source_file = b.path("packages/gizmos/src/gizmos.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gizmos_mod.addImport("engine", engine_mod);
+    gizmos_mod.addImport("camera", camera_mod);
+
     // Diagnostic CLI tool (`tools/cli`)
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("tools/cli/main.zig"),
@@ -568,6 +576,7 @@ pub fn build(b: *std.Build) void {
     graphics_sdlgpu_mod.addImport("window_sdl3", window_sdl3_mod);
     graphics_sdlgpu_mod.addImport("text", text_mod);
     graphics_sdlgpu_mod.addImport("render_3d", render_3d_mod);
+    graphics_sdlgpu_mod.addImport("gizmos", gizmos_mod);
     graphics_sdlgpu_mod.addImport("sdl3_c", sdl3_c_mod);
 
     // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
@@ -884,6 +893,7 @@ pub fn build(b: *std.Build) void {
     visual_pbr_mod.addImport("input_sdl3", input_sdl3_mod);
     visual_pbr_mod.addImport("camera", camera_mod);
     visual_pbr_mod.addImport("render_3d", render_3d_mod);
+    visual_pbr_mod.addImport("gizmos", gizmos_mod);
 
     const visual_pbr_exe = b.addExecutable(.{
         .name = "visual-pbr",
@@ -896,6 +906,35 @@ pub fn build(b: *std.Build) void {
     run_visual_pbr.step.dependOn(b.getInstallStep());
     const run_visual_pbr_step = b.step("run-visual-pbr", "Open the Visual PBR, Shadows, AutoExposure & Tonemapping demo");
     run_visual_pbr_step.dependOn(&run_visual_pbr.step);
+
+    // Visual 3D Gizmos Showcase. Run with `zig build run-visual-gizmos`.
+    const visual_gizmos_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-gizmos/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_gizmos_mod.addImport("engine", engine_mod);
+    visual_gizmos_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_gizmos_mod.addImport("graphics", graphics_mod);
+    visual_gizmos_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_gizmos_mod.addImport("input", input_mod);
+    visual_gizmos_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_gizmos_mod.addImport("camera", camera_mod);
+    visual_gizmos_mod.addImport("render_3d", render_3d_mod);
+    visual_gizmos_mod.addImport("gizmos", gizmos_mod);
+
+    const visual_gizmos_exe = b.addExecutable(.{
+        .name = "visual-gizmos",
+        .root_module = visual_gizmos_mod,
+    });
+    b.installArtifact(visual_gizmos_exe);
+
+    const run_visual_gizmos = b.addSystemCommand(&.{"zig-out/bin/visual-gizmos.exe"});
+    run_visual_gizmos.setCwd(b.path("."));
+    run_visual_gizmos.step.dependOn(b.getInstallStep());
+    const run_visual_gizmos_step = b.step("run-visual-gizmos", "Open the Visual 3D Gizmos Showcase");
+    run_visual_gizmos_step.dependOn(&run_visual_gizmos.step);
 
     // Render regression harness: renders the fixed scenarios of `visual-pbr` and compares them with
     // `tests/golden/visual-pbr` (`capture-check`) or rewrites those goldens (`capture-update`).
@@ -1112,6 +1151,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "scene", .mod = scene_mod },
         .{ .name = "camera", .mod = camera_mod },
         .{ .name = "render_3d", .mod = render_3d_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/gizmos/tests/gizmos_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "camera", .mod = camera_mod },
+        .{ .name = "gizmos", .mod = gizmos_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/formats/toml/tests/toml_tests.zig", target, optimize, false, &.{

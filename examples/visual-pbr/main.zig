@@ -28,6 +28,7 @@ const input = @import("input");
 const input_sdl3 = @import("input_sdl3");
 const camera = @import("camera");
 const render_3d = @import("render_3d");
+const gizmos = @import("gizmos");
 
 const testing_sdk = @import("testing_sdk");
 const capture = testing_sdk.render_regression;
@@ -58,6 +59,7 @@ const PbrDemoState = struct {
     hdri_alt: []const [4]f32,
     /// Present only in capture mode (`ZENGY_CAPTURE_DIR`); drives the scenarios instead of the keyboard.
     capture: ?CaptureRunner = null,
+    show_gizmos: bool = false,
 };
 
 /// Failures found by the capture runner; read after the loop to set the process exit status.
@@ -758,6 +760,7 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
     }
     if (keys.justPressed(.key_v)) pp.vignette.enabled = !pp.vignette.enabled;
     if (keys.justPressed(.key_r)) st.rotate_sun = !st.rotate_sun;
+    if (keys.justPressed(.key_z)) st.show_gizmos = !st.show_gizmos;
     if (keys.justPressed(.key_t)) {
         st.in_vol_room = !st.in_vol_room;
         if (st.in_vol_room) {
@@ -788,10 +791,23 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
 
     const h2 = std.fmt.bufPrint(
         &st.hud2,
-        "WASD+RMB=Fly | T=VolRoom | F=Fog({any}) | R=SunCycle({any}) | V=Vignette({any}) | Pos:({d:.1},{d:.1},{d:.1})",
-        .{ fog.enabled, st.rotate_sun, pp.vignette.enabled, cam_pose.position[0], cam_pose.position[1], cam_pose.position[2] },
+        "WASD+RMB=Fly | T=VolRoom | Z=Gizmos({any}) | F=Fog({any}) | R=SunCycle({any}) | Pos:({d:.1},{d:.1},{d:.1})",
+        .{ st.show_gizmos, fog.enabled, st.rotate_sun, cam_pose.position[0], cam_pose.position[1], cam_pose.position[2] },
     ) catch "";
     st.hud2_len = h2.len;
+
+    if (st.show_gizmos) {
+        if (ctx.resources.get(gizmos.GizmoService)) |giz| {
+            giz.axes(.{ 0, 0.05, 0 }, 2.0);
+            giz.grid(.{ 0, -0.36, 0 }, .{ 16, 16 }, .{ 2.0, 2.0 }, .{ 0.35, 0.45, 0.55, 0.45 });
+            giz.cuboid(.{ 14.0, 2.6, 0.0 }, .{ 8.6, 6.0, 8.6 }, .{ 0.2, 0.9, 1.0, 0.75 });
+            giz.sphere(.{ -4.5, 2.5, 3.0 }, 0.35, 16, .{ 0.25, 0.65, 1.0, 1.0 });
+            giz.sphere(.{ 14.2, 2.4, 0.2 }, 0.35, 16, .{ 1.0, 0.2, 0.1, 1.0 });
+            giz.arrow(.{ 11.4, 4.4, 2.2 }, .{ 1.65, -2.04, -1.44 }, .{ 1.0, 0.95, 0.4, 1.0 });
+            giz.arrow(.{ 0, 7.5, 0 }, .{ sun.direction[0] * 3.0, sun.direction[1] * 3.0, sun.direction[2] * 3.0 }, .{ 1.0, 0.85, 0.2, 1.0 });
+            giz.lineXray(.{ 0, 0.05, 0 }, .{ 14.2, 2.4, 0.2 }, .{ 1.0, 0.3, 0.3, 0.9 });
+        }
+    }
 }
 
 fn renderPbrOverlay(ctx: *engine.SystemContext) !void {
@@ -820,6 +836,7 @@ pub fn main(init: std.process.Init) !void {
     try app.registerModule(input_sdl3.module());
     try app.registerModule(camera.module());
     try app.registerModule(render_3d.module());
+    try app.registerModule(gizmos.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
         .title = "Zengy — PBR Lighting, Shadows, Sky, AutoExposure & Tonemapping",

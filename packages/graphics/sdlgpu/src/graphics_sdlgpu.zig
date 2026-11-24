@@ -17,6 +17,7 @@ const graphics = @import("graphics");
 const window_sdl3 = @import("window_sdl3");
 const text_pkg = @import("text");
 const render_3d = @import("render_3d");
+const gizmos = @import("gizmos");
 const c = @import("sdl3_c");
 const shadow_cull = @import("shadow_cull.zig");
 /// Frame capture, statistics and comparison helpers for render regression tests.
@@ -45,6 +46,8 @@ const TEX_VERT_SPV = @embedFile("shaders/textured.vert.spv");
 const TEX_FRAG_SPV = @embedFile("shaders/textured.frag.spv");
 const MESH_VERT_SPV = @embedFile("shaders/mesh_unlit.vert.spv");
 const MESH_FRAG_SPV = @embedFile("shaders/mesh_unlit.frag.spv");
+const GIZMO_VERT_SPV = @embedFile("shaders/gizmo.vert.spv");
+const GIZMO_FRAG_SPV = @embedFile("shaders/gizmo.frag.spv");
 
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
 
@@ -131,6 +134,23 @@ const SdlGpuState = struct {
     meshes: MeshPool,
     queued_meshes: std.ArrayList(QueuedMeshDraw),
     pbr: pbr_backend.PbrGpuState,
+
+    gizmo_vert_shader: *c.SDL_GPUShader,
+    gizmo_frag_shader: *c.SDL_GPUShader,
+    gizmo_pipeline_depth: *c.SDL_GPUGraphicsPipeline,
+    gizmo_pipeline_xray: *c.SDL_GPUGraphicsPipeline,
+    gizmo_tri_pipeline_depth: *c.SDL_GPUGraphicsPipeline,
+    gizmo_tri_pipeline_xray: *c.SDL_GPUGraphicsPipeline,
+    gizmo_vertex_buffer: *c.SDL_GPUBuffer,
+    gizmo_transfer_buffer: *c.SDL_GPUTransferBuffer,
+    gizmo_capacity_bytes: u32,
+    gizmo_view_proj: [16]f32 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 },
+    gizmo_line_width: f32 = 2.0,
+    gizmo_depth_bias: f32 = 0.0,
+    gizmo_depth_verts: std.ArrayList(gizmos.GizmoVertex) = .empty,
+    gizmo_xray_verts: std.ArrayList(gizmos.GizmoVertex) = .empty,
+    gizmo_solid_xray_verts: std.ArrayList(gizmos.GizmoVertex) = .empty,
+    gizmo_quad_verts: std.ArrayList(gizmos.GizmoVertex) = .empty,
 
     default_clear_color: graphics.Color,
     ndc_vertices: std.ArrayList(Vertex2D),
@@ -317,6 +337,68 @@ fn createMeshUnlitPipeline(
         },
     });
     return c.SDL_CreateGPUGraphicsPipeline(device, &info) orelse sdlFail(diag, "SDL_CreateGPUGraphicsPipeline (mesh_unlit) failed");
+}
+
+fn createGizmoPipeline(
+    device: *c.SDL_GPUDevice,
+    diag: *engine.Diagnostics,
+    vert_shader: *c.SDL_GPUShader,
+    frag_shader: *c.SDL_GPUShader,
+    color_format: c.SDL_GPUTextureFormat,
+    depth_format: c.SDL_GPUTextureFormat,
+    depth_test: bool,
+    primitive_type: c.SDL_GPUPrimitiveType,
+) !*c.SDL_GPUGraphicsPipeline {
+    const vb_desc = [_]c.SDL_GPUVertexBufferDescription{.{
+        .slot = 0,
+        .pitch = @sizeOf(gizmos.GizmoVertex),
+        .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
+        .instance_step_rate = 0,
+    }};
+    const attrs = [_]c.SDL_GPUVertexAttribute{
+        .{ .location = 0, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, .offset = 0 },
+        .{ .location = 1, .buffer_slot = 0, .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = 12 },
+    };
+    const targets = [_]c.SDL_GPUColorTargetDescription{.{
+        .format = color_format,
+        .blend_state = std.mem.zeroInit(c.SDL_GPUColorTargetBlendState, .{
+            .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+            .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
+            .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+            .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+            .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
+            .enable_blend = true,
+        }),
+    }};
+    const info = std.mem.zeroInit(c.SDL_GPUGraphicsPipelineCreateInfo, .{
+        .vertex_shader = vert_shader,
+        .fragment_shader = frag_shader,
+        .vertex_input_state = .{
+            .vertex_buffer_descriptions = &vb_desc,
+            .num_vertex_buffers = vb_desc.len,
+            .vertex_attributes = &attrs,
+            .num_vertex_attributes = attrs.len,
+        },
+        .primitive_type = primitive_type,
+        .rasterizer_state = std.mem.zeroInit(c.SDL_GPURasterizerState, .{
+            .fill_mode = c.SDL_GPU_FILLMODE_FILL,
+            .cull_mode = c.SDL_GPU_CULLMODE_NONE,
+            .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE,
+        }),
+        .depth_stencil_state = std.mem.zeroInit(c.SDL_GPUDepthStencilState, .{
+            .enable_depth_test = depth_test,
+            .enable_depth_write = false,
+            .compare_op = c.SDL_GPU_COMPAREOP_LESS_OR_EQUAL,
+        }),
+        .target_info = std.mem.zeroInit(c.SDL_GPUGraphicsPipelineTargetInfo, .{
+            .color_target_descriptions = &targets,
+            .num_color_targets = targets.len,
+            .depth_stencil_format = depth_format,
+            .has_depth_stencil_target = depth_test,
+        }),
+    });
+    return c.SDL_CreateGPUGraphicsPipeline(device, &info) orelse sdlFail(diag, "SDL_CreateGPUGraphicsPipeline (gizmo) failed");
 }
 
 fn ensureDepthTexture(state: *SdlGpuState, w: u32, h: u32) !*c.SDL_GPUTexture {
@@ -749,7 +831,7 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
             },
             .icon => |ic| {
                 const first_v: u32 = @intCast(state.tex_vertices.items.len);
-                if (state.lucide_atlas.makeIconQuad(@intFromEnum(ic.kind), ic.x * dpi_scale, ic.y * dpi_scale, ic.size * dpi_scale, ic.color)) |iq| {
+                if (state.lucide_atlas.makeIconQuad(@backingInt(ic.kind), ic.x * dpi_scale, ic.y * dpi_scale, ic.size * dpi_scale, ic.color)) |iq| {
                     try gpu_resources.appendTexturedQuadVertices(&state.tex_vertices, state.allocator, .{
                         .x = iq.x,
                         .y = iq.y,
@@ -966,7 +1048,108 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
         c.SDL_EndGPURenderPass(pass_3d);
     }
 
-    const color_load_op: c.SDL_GPULoadOp = if (has_3d) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR;
+    // Optional 3D Line Gizmos pass (depth-tested + X-ray overlay, with portable thick-line quad expansion).
+    const giz_depth_n: u32 = @intCast(state.gizmo_depth_verts.items.len);
+    const giz_xray_n: u32 = @intCast(state.gizmo_xray_verts.items.len);
+    const giz_solid_n: u32 = @intCast(state.gizmo_solid_xray_verts.items.len);
+    const has_gizmos = (giz_depth_n > 0 or giz_xray_n > 0 or giz_solid_n > 0);
+    if (has_gizmos) {
+        const use_thick = state.gizmo_line_width > 1.25;
+        var draw_depth_slice: []const gizmos.GizmoVertex = state.gizmo_depth_verts.items;
+        var draw_xray_slice: []const gizmos.GizmoVertex = state.gizmo_xray_verts.items;
+        var draw_vp: [16]f32 = state.gizmo_view_proj;
+
+        if (use_thick) {
+            state.gizmo_quad_verts.clearRetainingCapacity();
+            try appendExpandedGizmoQuads(state.allocator, &state.gizmo_quad_verts, state.gizmo_depth_verts.items, state.gizmo_view_proj, tex_w, tex_h, state.gizmo_line_width, state.gizmo_depth_bias);
+            const depth_quad_len = state.gizmo_quad_verts.items.len;
+            try appendExpandedGizmoQuads(state.allocator, &state.gizmo_quad_verts, state.gizmo_xray_verts.items, state.gizmo_view_proj, tex_w, tex_h, state.gizmo_line_width, 0.0);
+            draw_depth_slice = state.gizmo_quad_verts.items[0..depth_quad_len];
+            draw_xray_slice = state.gizmo_quad_verts.items[depth_quad_len..];
+            draw_vp = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+        }
+
+        const draw_depth_n: u32 = @intCast(draw_depth_slice.len);
+        const draw_xray_n: u32 = @intCast(draw_xray_slice.len);
+        const total_giz_bytes: u32 = @max((draw_depth_n + draw_xray_n + giz_solid_n) * @sizeOf(gizmos.GizmoVertex), 28);
+        try ensureDynamicBuffer(state.device, state.diagnostics, &state.gizmo_vertex_buffer, &state.gizmo_transfer_buffer, &state.gizmo_capacity_bytes, total_giz_bytes);
+
+        const mapped_g = c.SDL_MapGPUTransferBuffer(state.device, state.gizmo_transfer_buffer, true) orelse {
+            return sdlFail(state.diagnostics, "SDL_MapGPUTransferBuffer (gizmos) failed");
+        };
+        const dst_g: [*]u8 = @ptrCast(mapped_g);
+        const depth_bytes = std.mem.sliceAsBytes(draw_depth_slice);
+        const xray_bytes = std.mem.sliceAsBytes(draw_xray_slice);
+        const solid_bytes = std.mem.sliceAsBytes(state.gizmo_solid_xray_verts.items);
+        if (depth_bytes.len > 0) @memcpy(dst_g[0..depth_bytes.len], depth_bytes);
+        if (xray_bytes.len > 0) @memcpy(dst_g[depth_bytes.len..][0..xray_bytes.len], xray_bytes);
+        if (solid_bytes.len > 0) @memcpy(dst_g[depth_bytes.len + xray_bytes.len ..][0..solid_bytes.len], solid_bytes);
+        c.SDL_UnmapGPUTransferBuffer(state.device, state.gizmo_transfer_buffer);
+
+        const gcp = c.SDL_BeginGPUCopyPass(cmd_buf) orelse return sdlFail(state.diagnostics, "SDL_BeginGPUCopyPass (gizmos) failed");
+        c.SDL_UploadToGPUBuffer(gcp, &.{ .transfer_buffer = state.gizmo_transfer_buffer, .offset = 0 }, &.{ .buffer = state.gizmo_vertex_buffer, .offset = 0, .size = total_giz_bytes }, true);
+        c.SDL_EndGPUCopyPass(gcp);
+
+        if (draw_depth_n > 0) {
+            const depth_tex = try ensureDepthTexture(state, tex_w, tex_h);
+            const g_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
+                .texture = target_tex.?,
+                .load_op = @as(c_uint, if (has_3d) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR),
+                .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
+                .store_op = c.SDL_GPU_STOREOP_STORE,
+            });
+            const g_depth = std.mem.zeroInit(c.SDL_GPUDepthStencilTargetInfo, .{
+                .texture = depth_tex,
+                .clear_depth = 1.0,
+                .load_op = @as(c_uint, if (has_3d) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR),
+                .store_op = c.SDL_GPU_STOREOP_STORE,
+                .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
+                .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+            });
+            const g_pass = c.SDL_BeginGPURenderPass(cmd_buf, &g_col, 1, &g_depth) orelse return sdlFail(state.diagnostics, "SDL_BeginGPURenderPass (gizmo depth) failed");
+            c.SDL_SetGPUViewport(g_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(tex_w), .h = @floatFromInt(tex_h), .min_depth = 0, .max_depth = 1 });
+            c.SDL_BindGPUGraphicsPipeline(g_pass, if (use_thick) state.gizmo_tri_pipeline_depth else state.gizmo_pipeline_depth);
+            c.SDL_BindGPUVertexBuffers(g_pass, 0, &.{ .buffer = state.gizmo_vertex_buffer, .offset = 0 }, 1);
+            c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &draw_vp, @sizeOf([16]f32));
+            c.SDL_DrawGPUPrimitives(g_pass, draw_depth_n, 1, 0, 0);
+            c.SDL_EndGPURenderPass(g_pass);
+        }
+        if (draw_xray_n > 0) {
+            const x_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
+                .texture = target_tex.?,
+                .load_op = @as(c_uint, if (has_3d or draw_depth_n > 0) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR),
+                .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
+                .store_op = c.SDL_GPU_STOREOP_STORE,
+            });
+            const x_pass = c.SDL_BeginGPURenderPass(cmd_buf, &x_col, 1, null) orelse return sdlFail(state.diagnostics, "SDL_BeginGPURenderPass (gizmo xray) failed");
+            c.SDL_SetGPUViewport(x_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(tex_w), .h = @floatFromInt(tex_h), .min_depth = 0, .max_depth = 1 });
+            c.SDL_BindGPUGraphicsPipeline(x_pass, if (use_thick) state.gizmo_tri_pipeline_xray else state.gizmo_pipeline_xray);
+            c.SDL_BindGPUVertexBuffers(x_pass, 0, &.{ .buffer = state.gizmo_vertex_buffer, .offset = @intCast(depth_bytes.len) }, 1);
+            c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &draw_vp, @sizeOf([16]f32));
+            c.SDL_DrawGPUPrimitives(x_pass, draw_xray_n, 1, 0, 0);
+            c.SDL_EndGPURenderPass(x_pass);
+        }
+        if (giz_solid_n > 0) {
+            const s_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
+                .texture = target_tex.?,
+                .load_op = @as(c_uint, if (has_3d or draw_depth_n > 0 or draw_xray_n > 0) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR),
+                .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
+                .store_op = c.SDL_GPU_STOREOP_STORE,
+            });
+            const s_pass = c.SDL_BeginGPURenderPass(cmd_buf, &s_col, 1, null) orelse return sdlFail(state.diagnostics, "SDL_BeginGPURenderPass (gizmo solid xray) failed");
+            c.SDL_SetGPUViewport(s_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(tex_w), .h = @floatFromInt(tex_h), .min_depth = 0, .max_depth = 1 });
+            c.SDL_BindGPUGraphicsPipeline(s_pass, state.gizmo_tri_pipeline_xray);
+            c.SDL_BindGPUVertexBuffers(s_pass, 0, &.{ .buffer = state.gizmo_vertex_buffer, .offset = @intCast(depth_bytes.len + xray_bytes.len) }, 1);
+            c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &state.gizmo_view_proj, @sizeOf([16]f32));
+            c.SDL_DrawGPUPrimitives(s_pass, giz_solid_n, 1, 0, 0);
+            c.SDL_EndGPURenderPass(s_pass);
+        }
+        state.gizmo_depth_verts.clearRetainingCapacity();
+        state.gizmo_xray_verts.clearRetainingCapacity();
+        state.gizmo_solid_xray_verts.clearRetainingCapacity();
+    }
+
+    const color_load_op: c.SDL_GPULoadOp = if (has_3d or has_gizmos) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR;
     const color_target = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
         .texture = target_tex.?,
         .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
@@ -1307,6 +1490,30 @@ fn buildModule(raw_app: *anyopaque) !void {
     var pbr_state = try pbr_backend.PbrGpuState.init(app.allocator, device, &app.diagnostics, swapchain_format, depth_format);
     errdefer pbr_state.deinit();
 
+    const gizmo_vert = try createShader(device, &app.diagnostics, c.SDL_GPU_SHADERSTAGE_VERTEX, GIZMO_VERT_SPV, 0, 1);
+    errdefer c.SDL_ReleaseGPUShader(device, gizmo_vert);
+    const gizmo_frag = try createShader(device, &app.diagnostics, c.SDL_GPU_SHADERSTAGE_FRAGMENT, GIZMO_FRAG_SPV, 0, 0);
+    errdefer c.SDL_ReleaseGPUShader(device, gizmo_frag);
+    const gizmo_pipe_depth = try createGizmoPipeline(device, &app.diagnostics, gizmo_vert, gizmo_frag, swapchain_format, depth_format, true, c.SDL_GPU_PRIMITIVETYPE_LINELIST);
+    errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, gizmo_pipe_depth);
+    const gizmo_pipe_xray = try createGizmoPipeline(device, &app.diagnostics, gizmo_vert, gizmo_frag, swapchain_format, depth_format, false, c.SDL_GPU_PRIMITIVETYPE_LINELIST);
+    errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, gizmo_pipe_xray);
+    const gizmo_tri_pipe_depth = try createGizmoPipeline(device, &app.diagnostics, gizmo_vert, gizmo_frag, swapchain_format, depth_format, true, c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST);
+    errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, gizmo_tri_pipe_depth);
+    const gizmo_tri_pipe_xray = try createGizmoPipeline(device, &app.diagnostics, gizmo_vert, gizmo_frag, swapchain_format, depth_format, false, c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST);
+    errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, gizmo_tri_pipe_xray);
+    const gizmo_bytes: u32 = @intCast(INITIAL_VERTEX_CAPACITY * @sizeOf(gizmos.GizmoVertex));
+    const gizmo_vb = c.SDL_CreateGPUBuffer(device, &std.mem.zeroInit(c.SDL_GPUBufferCreateInfo, .{
+        .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX,
+        .size = gizmo_bytes,
+    })) orelse return sdlFail(&app.diagnostics, "SDL_CreateGPUBuffer (gizmo) failed");
+    errdefer c.SDL_ReleaseGPUBuffer(device, gizmo_vb);
+    const gizmo_tb = c.SDL_CreateGPUTransferBuffer(device, &std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo, .{
+        .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size = gizmo_bytes,
+    })) orelse return sdlFail(&app.diagnostics, "SDL_CreateGPUTransferBuffer (gizmo) failed");
+    errdefer c.SDL_ReleaseGPUTransferBuffer(device, gizmo_tb);
+
     try app.resources.insert(SdlGpuState, .{
         .allocator = app.allocator,
         .app = app,
@@ -1342,6 +1549,15 @@ fn buildModule(raw_app: *anyopaque) !void {
         .meshes = MeshPool.init(app.allocator),
         .queued_meshes = .empty,
         .pbr = pbr_state,
+        .gizmo_vert_shader = gizmo_vert,
+        .gizmo_frag_shader = gizmo_frag,
+        .gizmo_pipeline_depth = gizmo_pipe_depth,
+        .gizmo_pipeline_xray = gizmo_pipe_xray,
+        .gizmo_tri_pipeline_depth = gizmo_tri_pipe_depth,
+        .gizmo_tri_pipeline_xray = gizmo_tri_pipe_xray,
+        .gizmo_vertex_buffer = gizmo_vb,
+        .gizmo_transfer_buffer = gizmo_tb,
+        .gizmo_capacity_bytes = gizmo_bytes,
         .default_clear_color = cfg.default_clear_color,
         .ndc_vertices = .empty,
         .queued_quads = .empty,
@@ -1377,11 +1593,89 @@ fn buildModule(raw_app: *anyopaque) !void {
     });
 }
 
+fn appendExpandedGizmoQuads(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(gizmos.GizmoVertex),
+    lines: []const gizmos.GizmoVertex,
+    vp: [16]f32,
+    tex_w: u32,
+    tex_h: u32,
+    line_width: f32,
+    depth_bias: f32,
+) !void {
+    const fw: f32 = @floatFromInt(@max(tex_w, 1));
+    const fh: f32 = @floatFromInt(@max(tex_h, 1));
+    const half_px = line_width * 0.5;
+    var i: usize = 0;
+    while (i + 1 < lines.len) : (i += 2) {
+        const a = lines[i];
+        const b = lines[i + 1];
+        var ca = [4]f32{
+            vp[0] * a.pos[0] + vp[4] * a.pos[1] + vp[8] * a.pos[2] + vp[12],
+            vp[1] * a.pos[0] + vp[5] * a.pos[1] + vp[9] * a.pos[2] + vp[13],
+            vp[2] * a.pos[0] + vp[6] * a.pos[1] + vp[10] * a.pos[2] + vp[14],
+            vp[3] * a.pos[0] + vp[7] * a.pos[1] + vp[11] * a.pos[2] + vp[15],
+        };
+        var cb = [4]f32{
+            vp[0] * b.pos[0] + vp[4] * b.pos[1] + vp[8] * b.pos[2] + vp[12],
+            vp[1] * b.pos[0] + vp[5] * b.pos[1] + vp[9] * b.pos[2] + vp[13],
+            vp[2] * b.pos[0] + vp[6] * b.pos[1] + vp[10] * b.pos[2] + vp[14],
+            vp[3] * b.pos[0] + vp[7] * b.pos[1] + vp[11] * b.pos[2] + vp[15],
+        };
+        const w_min: f32 = 0.05;
+        if (ca[3] <= w_min and cb[3] <= w_min) continue;
+        // Clip line segment to the near w-plane instead of dropping lines that cross behind the camera.
+        if (ca[3] < w_min) {
+            const t = (w_min - ca[3]) / (cb[3] - ca[3]);
+            inline for (0..4) |k| ca[k] = ca[k] + (cb[k] - ca[k]) * t;
+        } else if (cb[3] < w_min) {
+            const t = (w_min - cb[3]) / (ca[3] - cb[3]);
+            inline for (0..4) |k| cb[k] = cb[k] + (ca[k] - cb[k]) * t;
+        }
+        const na = [3]f32{ ca[0] / ca[3], ca[1] / ca[3], ca[2] / ca[3] + depth_bias * 0.002 };
+        const nb = [3]f32{ cb[0] / cb[3], cb[1] / cb[3], cb[2] / cb[3] + depth_bias * 0.002 };
+        const dx_px = (nb[0] - na[0]) * fw * 0.5;
+        const dy_px = (nb[1] - na[1]) * fh * 0.5;
+        const len_px = @sqrt(dx_px * dx_px + dy_px * dy_px);
+        if (len_px < 1e-3) continue;
+        const nx_ndc = (-dy_px / len_px) * (half_px * 2.0 / fw);
+        const ny_ndc = (dx_px / len_px) * (half_px * 2.0 / fh);
+
+        const v0 = gizmos.GizmoVertex{ .pos = .{ na[0] + nx_ndc, na[1] + ny_ndc, na[2] }, .color = a.color };
+        const v1 = gizmos.GizmoVertex{ .pos = .{ na[0] - nx_ndc, na[1] - ny_ndc, na[2] }, .color = a.color };
+        const v2 = gizmos.GizmoVertex{ .pos = .{ nb[0] + nx_ndc, nb[1] + ny_ndc, nb[2] }, .color = b.color };
+        const v3 = gizmos.GizmoVertex{ .pos = .{ nb[0] - nx_ndc, nb[1] - ny_ndc, nb[2] }, .color = b.color };
+        try out.appendSlice(allocator, &.{ v0, v1, v2, v2, v1, v3 });
+    }
+}
+
+fn submitGizmosBackend(
+    raw: *anyopaque,
+    params: gizmos.GizmoSubmitParams,
+    depth_lines: []const gizmos.GizmoVertex,
+    xray_lines: []const gizmos.GizmoVertex,
+    solid_xray_tris: []const gizmos.GizmoVertex,
+) anyerror!void {
+    const state: *SdlGpuState = @ptrCast(@alignCast(raw));
+    state.gizmo_view_proj = params.view_proj;
+    state.gizmo_line_width = params.line_width;
+    state.gizmo_depth_bias = params.depth_bias;
+    state.gizmo_depth_verts.clearRetainingCapacity();
+    state.gizmo_xray_verts.clearRetainingCapacity();
+    state.gizmo_solid_xray_verts.clearRetainingCapacity();
+    try state.gizmo_depth_verts.appendSlice(state.allocator, depth_lines);
+    try state.gizmo_xray_verts.appendSlice(state.allocator, xray_lines);
+    try state.gizmo_solid_xray_verts.appendSlice(state.allocator, solid_xray_tris);
+}
+
 fn startModule(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
-    if (app.resources.get(render_3d.Render3DService)) |r3d| {
-        if (app.resources.get(SdlGpuState)) |state| {
+    if (app.resources.get(SdlGpuState)) |state| {
+        if (app.resources.get(render_3d.Render3DService)) |r3d| {
             r3d.setPbrBackend(state.pbr.vtable());
+        }
+        if (app.resources.get(gizmos.GizmoService)) |giz| {
+            giz.setBackend(.{ .ctx = state, .submitGizmos = submitGizmosBackend });
         }
     }
 }
@@ -1391,11 +1685,26 @@ fn stopModule(raw_app: *anyopaque) void {
     if (app.resources.get(render_3d.Render3DService)) |r3d| {
         r3d.setPbrBackend(null);
     }
+    if (app.resources.get(gizmos.GizmoService)) |giz| {
+        giz.setBackend(null);
+    }
     app.scheduler.render_extract_enabled = false;
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
 
     if (app.resources.get(SdlGpuState)) |state| {
         _ = c.SDL_WaitForGPUIdle(state.device);
+        state.gizmo_depth_verts.deinit(state.allocator);
+        state.gizmo_xray_verts.deinit(state.allocator);
+        state.gizmo_solid_xray_verts.deinit(state.allocator);
+        state.gizmo_quad_verts.deinit(state.allocator);
+        c.SDL_ReleaseGPUTransferBuffer(state.device, state.gizmo_transfer_buffer);
+        c.SDL_ReleaseGPUBuffer(state.device, state.gizmo_vertex_buffer);
+        c.SDL_ReleaseGPUGraphicsPipeline(state.device, state.gizmo_tri_pipeline_xray);
+        c.SDL_ReleaseGPUGraphicsPipeline(state.device, state.gizmo_tri_pipeline_depth);
+        c.SDL_ReleaseGPUGraphicsPipeline(state.device, state.gizmo_pipeline_xray);
+        c.SDL_ReleaseGPUGraphicsPipeline(state.device, state.gizmo_pipeline_depth);
+        c.SDL_ReleaseGPUShader(state.device, state.gizmo_frag_shader);
+        c.SDL_ReleaseGPUShader(state.device, state.gizmo_vert_shader);
         state.pbr.deinit();
         if (state.depth_texture) |dt| c.SDL_ReleaseGPUTexture(state.device, dt);
 

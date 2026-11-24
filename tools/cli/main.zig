@@ -47,6 +47,7 @@ const OFFICIAL_PACKAGES = [_]OfficialPackageInfo{
     .{ .name = "physics-rapier", .entry = "src/physics_rapier.zig", .summary = "Rapier3D (Rust) solver backend (requires cargo/rustc)" },
     .{ .name = "render-2d", .entry = "src/render_2d.zig", .summary = "Sprite, Visibility & 2D batch extraction (uses camera)" },
     .{ .name = "render-3d", .entry = "src/render_3d.zig", .summary = "3D math, MeshRef, glTF 2.0 & frustum culling (uses camera)" },
+    .{ .name = "gizmos", .entry = "src/gizmos.zig", .summary = "Immediate-mode 3D debug & editor gizmos (uses camera)" },
     .{ .name = "camera", .entry = "src/camera.zig", .summary = "Unified 2D/3D Camera, Projection, Viewport, RenderTarget & FreeCamera" },
     .{ .name = "input", .entry = "src/input.zig", .summary = "Bevy-style KeyCode, ButtonInput, Gamepad/D-Pad, mouse motion & scroll" },
     .{ .name = "input-haptics", .entry = "src/haptics.zig", .summary = "Agnostic controller rumble & trigger haptics contract" },
