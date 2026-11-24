@@ -76,6 +76,11 @@ const ComponentPool = struct {
     sparse: std.ArrayList(u32),
     dense_entities: std.ArrayList(EntityHandle),
     dense_bytes: std.array_list.Aligned(u8, .@"64"),
+    /// Opt-in change tracking (`World.enableChangeTracking`): per-dense-slot tick of the last
+    /// add / last mutation. Empty (and unused) while `tracked` is false.
+    tracked: bool = false,
+    added_ticks: std.ArrayList(u64) = .empty,
+    changed_ticks: std.ArrayList(u64) = .empty,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -109,6 +114,33 @@ const ComponentPool = struct {
         self.sparse.deinit(allocator);
         self.dense_entities.deinit(allocator);
         self.dense_bytes.deinit(allocator);
+        self.added_ticks.deinit(allocator);
+        self.changed_ticks.deinit(allocator);
+    }
+
+    /// Starts tracking; components that already exist are stamped with tick 0 (never "new").
+    fn enableTracking(self: *ComponentPool, allocator: std.mem.Allocator) !void {
+        if (self.tracked) return;
+        const n = self.dense_entities.items.len;
+        try self.added_ticks.resize(allocator, n);
+        errdefer self.added_ticks.clearRetainingCapacity();
+        try self.changed_ticks.resize(allocator, n);
+        @memset(self.added_ticks.items, 0);
+        @memset(self.changed_ticks.items, 0);
+        self.tracked = true;
+    }
+
+    /// Pre-allocates room for `extra` more components and for sparse index `max_entity_index`
+    /// so the following `setBytes` calls cannot fail with OutOfMemory.
+    fn reserve(self: *ComponentPool, allocator: std.mem.Allocator, extra: usize, max_entity_index: u32) !void {
+        try self.ensureSparse(allocator, max_entity_index);
+        const total = self.dense_entities.items.len + extra;
+        try self.dense_entities.ensureTotalCapacity(allocator, total);
+        if (self.stride > 0) try self.dense_bytes.ensureTotalCapacity(allocator, total * self.stride);
+        if (self.tracked) {
+            try self.added_ticks.ensureTotalCapacity(allocator, total);
+            try self.changed_ticks.ensureTotalCapacity(allocator, total);
+        }
     }
 
     fn ensureSparse(self: *ComponentPool, allocator: std.mem.Allocator, entity_index: u32) !void {
@@ -143,7 +175,7 @@ const ComponentPool = struct {
         return self.dense_bytes.items[start .. start + self.elem_size];
     }
 
-    fn setBytes(self: *ComponentPool, allocator: std.mem.Allocator, entity: EntityHandle, bytes: []const u8) !void {
+    fn setBytes(self: *ComponentPool, allocator: std.mem.Allocator, entity: EntityHandle, bytes: []const u8, tick: u64) !void {
         if (bytes.len != self.elem_size) return error.ComponentSizeMismatch;
         try self.ensureSparse(allocator, entity.index);
 
@@ -153,9 +185,14 @@ const ComponentPool = struct {
                 const start = @as(usize, existing) * self.stride;
                 @memcpy(self.dense_bytes.items[start .. start + self.elem_size], bytes);
             }
+            if (self.tracked) self.changed_ticks.items[existing] = tick;
             return;
         }
 
+        if (self.tracked) {
+            try self.added_ticks.ensureUnusedCapacity(allocator, 1);
+            try self.changed_ticks.ensureUnusedCapacity(allocator, 1);
+        }
         const new_dense: u32 = @intCast(self.dense_entities.items.len);
         try self.dense_entities.append(allocator, entity);
         errdefer _ = self.dense_entities.pop();
@@ -167,6 +204,10 @@ const ComponentPool = struct {
             @memcpy(self.dense_bytes.items[old_len .. old_len + self.elem_size], bytes);
         }
 
+        if (self.tracked) {
+            self.added_ticks.appendAssumeCapacity(tick);
+            self.changed_ticks.appendAssumeCapacity(tick);
+        }
         self.sparse.items[entity.index] = new_dense;
     }
 
@@ -191,6 +232,10 @@ const ComponentPool = struct {
         }
 
         _ = self.dense_entities.pop();
+        if (self.tracked) {
+            _ = self.added_ticks.swapRemove(dense_idx);
+            _ = self.changed_ticks.swapRemove(dense_idx);
+        }
         if (self.stride > 0) {
             self.dense_bytes.items.len -= self.stride;
         }
@@ -217,6 +262,11 @@ pub const World = struct {
     name_to_type: std.StringHashMapUnmanaged(ComponentTypeId),
     active_queries: u32,
     entity_count: usize,
+    /// Monotonic change-detection clock; see `advanceTick`.
+    tick: u64 = 1,
+    /// Tick after which `.added`/`.changed` query filters match. The scheduler sets this to the
+    /// running system's previous run tick; outside systems it is 0 (everything counts as new).
+    query_since: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, id: WorldId) World {
         return .{
@@ -351,8 +401,41 @@ pub const World = struct {
     /// Stores bytes for `entity` in `pool`, updating membership only after the pool mutation succeeded.
     fn storeBytes(self: *World, entity: EntityHandle, pool: *ComponentPool, bytes: []const u8) !void {
         const was_member = pool.has(entity);
-        try pool.setBytes(self.allocator, entity, bytes);
+        try pool.setBytes(self.allocator, entity, bytes, self.tick);
         if (!was_member) self.markMember(entity.index, pool);
+    }
+
+    /// Enables `.added`/`.changed` filtering for `T` (registering it if needed). Existing
+    /// components are not reported as added. Costs 16 bytes per component of this type.
+    pub fn enableChangeTracking(self: *World, comptime T: type) !void {
+        const tid = try self.registerComponent(T);
+        try self.enableChangeTrackingRaw(tid);
+    }
+
+    /// Type-id variant of `enableChangeTracking` for dynamically registered components.
+    pub fn enableChangeTrackingRaw(self: *World, tid: ComponentTypeId) !void {
+        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        const pool = self.pools.get(tid) orelse return error.ComponentNotRegistered;
+        try pool.enableTracking(self.allocator);
+    }
+
+    /// Advances the change clock. The scheduler calls this around every system run and command
+    /// flush; call it manually when driving the world without a scheduler.
+    pub fn advanceTick(self: *World) void {
+        self.tick += 1;
+    }
+
+    /// Marks `T` on `entity` as changed at the current tick (for writes made through raw pointers
+    /// obtained from `getConst`/queries). No-op for untracked components.
+    pub fn markChanged(self: *World, entity: EntityHandle, comptime T: type) void {
+        if (!self.isAlive(entity)) return;
+        const pool = self.pools.get(comptimeTypeId(T)) orelse return;
+        self.touch(pool, entity);
+    }
+
+    fn touch(self: *World, pool: *ComponentPool, entity: EntityHandle) void {
+        if (!pool.tracked or !pool.has(entity)) return;
+        pool.changed_ticks.items[pool.sparse.items[entity.index]] = self.tick;
     }
 
     pub fn spawn(self: *World) !EntityHandle {
@@ -445,6 +528,7 @@ pub const World = struct {
         if (!self.isAlive(entity)) return null;
         const pool = self.pools.get(comptimeTypeId(T)) orelse return null;
         const bytes = pool.getBytes(entity) orelse return null;
+        self.touch(pool, entity); // mutable access counts as a change; use getConst to read
         return @ptrCast(@alignCast(bytes.ptr));
     }
 
@@ -458,6 +542,7 @@ pub const World = struct {
     pub fn getRaw(self: *World, entity: EntityHandle, tid: ComponentTypeId) ?[]u8 {
         if (!self.isAlive(entity)) return null;
         const pool = self.pools.get(tid) orelse return null;
+        self.touch(pool, entity);
         return pool.getBytes(entity);
     }
 
@@ -498,6 +583,12 @@ pub fn Query(comptime spec: anytype) type {
     const read_types = if (@hasField(@TypeOf(spec), "read")) spec.read else .{};
     // `.without = .{T, ...}` excludes entities that currently hold any listed component.
     const without_types = if (@hasField(@TypeOf(spec), "without")) spec.without else .{};
+    // `.added` / `.changed` keep only entities whose component was added / modified since the
+    // query's `since` tick (requires `World.enableChangeTracking`). `.optional` terms are read
+    // through `Row.optional`.
+    const added_types = if (@hasField(@TypeOf(spec), "added")) spec.added else .{};
+    const changed_types = if (@hasField(@TypeOf(spec), "changed")) spec.changed else .{};
+    const optional_types = if (@hasField(@TypeOf(spec), "optional")) spec.optional else .{};
     const total_terms = write_types.len + read_types.len;
 
     return struct {
@@ -539,6 +630,24 @@ pub fn Query(comptime spec: anytype) type {
                 @compileError("Component type not present in Query spec");
             }
 
+            /// Returns the optional component `T` of this row's entity, or null when absent.
+            pub fn optional(self: Row, comptime T: type) ?*const T {
+                inline for (optional_types, 0..) |OT, idx| {
+                    if (OT == T) {
+                        const pool = self.query_ptr.optional_pools[idx] orelse return null;
+                        const bytes = pool.getBytesConst(self.entity) orelse return null;
+                        if (@sizeOf(T) == 0) {
+                            const Zst = struct {
+                                var dummy: T = undefined;
+                            };
+                            return &Zst.dummy;
+                        }
+                        return @ptrCast(@alignCast(bytes.ptr));
+                    }
+                }
+                @compileError("Component type not declared as optional in Query spec");
+            }
+
             pub fn write(self: Row, comptime T: type) *T {
                 inline for (write_types, 0..) |WT, idx| {
                     if (WT == T) {
@@ -549,6 +658,7 @@ pub fn Query(comptime spec: anytype) type {
                             return &Zst.dummy;
                         }
                         const pool = self.query_ptr.write_pools[idx].?;
+                        if (pool.tracked) pool.changed_ticks.items[self.w_dense[idx]] = self.query_ptr.world.tick;
                         const start = @as(usize, self.w_dense[idx]) * pool.stride;
                         return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
                     }
@@ -563,6 +673,11 @@ pub fn Query(comptime spec: anytype) type {
         read_pools: [read_types.len]?*ComponentPool,
         /// Pools of excluded types; null when the type is not registered (nothing to exclude).
         without_pools: [without_types.len]?*ComponentPool,
+        added_pools: [added_types.len]?*ComponentPool,
+        changed_pools: [changed_types.len]?*ComponentPool,
+        optional_pools: [optional_types.len]?*ComponentPool,
+        /// Change-detection threshold copied from `World.query_since` at creation.
+        since: u64,
         cursor: usize,
 
         pub fn init(world: *World) !Self {
@@ -595,6 +710,29 @@ pub fn Query(comptime spec: anytype) type {
                 x_pools[idx] = world.pools.get(World.comptimeTypeId(T));
             }
 
+            var ad_pools: [added_types.len]?*ComponentPool = @splat(null);
+            var ch_pools: [changed_types.len]?*ComponentPool = @splat(null);
+            var op_pools: [optional_types.len]?*ComponentPool = @splat(null);
+            inline for (added_types, 0..) |T, idx| {
+                if (world.pools.get(World.comptimeTypeId(T))) |pool| {
+                    if (!pool.tracked) return error.ChangeTrackingNotEnabled;
+                    ad_pools[idx] = pool;
+                } else {
+                    missing = true;
+                }
+            }
+            inline for (changed_types, 0..) |T, idx| {
+                if (world.pools.get(World.comptimeTypeId(T))) |pool| {
+                    if (!pool.tracked) return error.ChangeTrackingNotEnabled;
+                    ch_pools[idx] = pool;
+                } else {
+                    missing = true;
+                }
+            }
+            inline for (optional_types, 0..) |T, idx| {
+                op_pools[idx] = world.pools.get(World.comptimeTypeId(T));
+            }
+
             world.active_queries += 1;
             return .{
                 .world = world,
@@ -602,8 +740,28 @@ pub fn Query(comptime spec: anytype) type {
                 .write_pools = w_pools,
                 .read_pools = r_pools,
                 .without_pools = x_pools,
+                .added_pools = ad_pools,
+                .changed_pools = ch_pools,
+                .optional_pools = op_pools,
+                .since = world.query_since,
                 .cursor = 0,
             };
+        }
+
+        fn addedMatches(self: *const Self, idx: usize, entity: EntityHandle) bool {
+            const pool = self.added_pools[idx] orelse return false;
+            if (entity.index >= pool.sparse.items.len) return false;
+            const d = pool.sparse.items[entity.index];
+            if (d == ABSENT_INDEX or pool.dense_entities.items[d].generation != entity.generation) return false;
+            return pool.added_ticks.items[d] > self.since;
+        }
+
+        fn changedMatches(self: *const Self, idx: usize, entity: EntityHandle) bool {
+            const pool = self.changed_pools[idx] orelse return false;
+            if (entity.index >= pool.sparse.items.len) return false;
+            const d = pool.sparse.items[entity.index];
+            if (d == ABSENT_INDEX or pool.dense_entities.items[d].generation != entity.generation) return false;
+            return pool.changed_ticks.items[d] > self.since;
         }
 
         pub fn deinit(self: *Self) void {
@@ -629,6 +787,15 @@ pub fn Query(comptime spec: anytype) type {
                     if (self.without_pools[idx]) |pool| {
                         if (pool.has(entity)) matches = false;
                     }
+                }
+                if (!matches) continue;
+
+                inline for (0..added_types.len) |idx| {
+                    if (!self.addedMatches(idx, entity)) matches = false;
+                }
+                if (!matches) continue;
+                inline for (0..changed_types.len) |idx| {
+                    if (!self.changedMatches(idx, entity)) matches = false;
                 }
                 if (!matches) continue;
 

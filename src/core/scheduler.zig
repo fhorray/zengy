@@ -89,6 +89,8 @@ const StoredSystem = struct {
     after: []const []const u8,
     exclusive: bool,
     thread_affinity: ThreadAffinity,
+    /// World tick at which this system last ran; drives `.added`/`.changed` query filters.
+    last_run_tick: u64 = 0,
 };
 
 /// Errors returned when adding systems, resolving stage schedules, or stepping frames.
@@ -362,11 +364,23 @@ pub const Scheduler = struct {
         {
             errdefer ctx.commands.clear();
             const systems = self.stages[s_idx].items;
+            // Outside systems, queries see every change.
+            defer ctx.world.query_since = 0;
             for (self.execution_order[s_idx].items) |sys_idx| {
-                try systems[sys_idx].run(ctx);
+                const sys = &systems[sys_idx];
+                // Each system gets its own tick so it sees changes made by others since it last
+                // ran, but not its own writes from that run.
+                ctx.world.advanceTick();
+                ctx.world.query_since = sys.last_run_tick;
+                const run_tick = ctx.world.tick;
+                try sys.run(ctx);
+                sys.last_run_tick = run_tick;
             }
         }
+        // Give out-of-system writes and the command flush fresh ticks of their own.
+        ctx.world.advanceTick();
         try ctx.commands.apply(ctx.world, ctx.events);
+        ctx.world.advanceTick();
     }
 
     /// Executes exactly one `.fixed_update` tick deterministically (no accumulator)

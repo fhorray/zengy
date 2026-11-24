@@ -779,3 +779,82 @@ test "App.initialize rolls back systems and stops every built module when start 
     try testing.expectEqual(@as(u32, 2), lifecycle_stops); // both A and the failed-start B
     for (app.scheduler.stages) |stage| try testing.expectEqual(@as(usize, 0), stage.items.len);
 }
+
+const Health = struct { hp: i32 = 10 };
+const Shield = struct { v: i32 = 1 };
+var seen_added: u32 = 0;
+var seen_changed: u32 = 0;
+var seen_shield_sum: i32 = 0;
+
+fn observeAdded(ctx: *engine.SystemContext) !void {
+    var q = try ctx.query(.{ .read = .{Health}, .added = .{Health} });
+    defer q.deinit();
+    while (q.next()) |_| seen_added += 1;
+}
+fn observeChanged(ctx: *engine.SystemContext) !void {
+    var q = try ctx.query(.{ .read = .{Health}, .changed = .{Health}, .optional = .{Shield} });
+    defer q.deinit();
+    while (q.next()) |row| {
+        seen_changed += 1;
+        if (row.optional(Shield)) |sh| seen_shield_sum += sh.v;
+    }
+}
+
+test "Query .added/.changed/.optional with per-system change ticks" {
+    seen_added = 0;
+    seen_changed = 0;
+    seen_shield_sum = 0;
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.world.enableChangeTracking(Health);
+    _ = try app.registerComponent(Shield);
+    try app.addSystem(.{ .name = "obs.added", .stage = .update, .run = observeAdded });
+    try app.addSystem(.{ .name = "obs.changed", .stage = .update, .run = observeChanged });
+
+    const a = try app.world.spawn();
+    const b = try app.world.spawn();
+    try app.world.set(a, Health, .{});
+    try app.world.set(b, Health, .{});
+    try app.world.set(a, Shield, .{ .v = 5 });
+
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 2), seen_added);
+    try testing.expectEqual(@as(u32, 2), seen_changed); // adds count as changes
+    try testing.expectEqual(@as(i32, 5), seen_shield_sum);
+
+    // Nothing touched: neither filter fires.
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 2), seen_added);
+    try testing.expectEqual(@as(u32, 2), seen_changed);
+
+    // Mutable access marks only that entity changed; reads via getConst do not.
+    _ = app.world.getConst(b, Health);
+    app.world.get(a, Health).?.hp = 3;
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 2), seen_added);
+    try testing.expectEqual(@as(u32, 3), seen_changed);
+
+    // Overwriting through set() counts; removal + re-add counts as added.
+    try app.world.set(b, Health, .{ .hp = 1 });
+    try testing.expect(try app.world.remove(a, Health));
+    try app.world.set(a, Health, .{});
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 3), seen_added);
+    try testing.expectEqual(@as(u32, 5), seen_changed);
+}
+
+test "Query change filters require enableChangeTracking; pre-existing components are not new" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    const e = try world.spawn();
+    try world.set(e, Health, .{});
+    try testing.expectError(error.ChangeTrackingNotEnabled, world.query(.{ .read = .{Health}, .changed = .{Health} }));
+    try testing.expectEqual(@as(u32, 0), world.active_queries);
+
+    try world.enableChangeTracking(Health);
+    world.advanceTick();
+    world.query_since = world.tick - 1;
+    var q = try world.query(.{ .read = .{Health}, .added = .{Health} });
+    defer q.deinit();
+    try testing.expect(q.next() == null);
+}
