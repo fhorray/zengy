@@ -518,9 +518,14 @@ pub const ComboboxHandles = struct {
     trigger: ui_core.UiNodeId,
     popup: ui_core.UiNodeId,
     search_input: ui_core.UiNodeId,
-    option_nodes: [32]?ui_core.UiNodeId = @splat(null),
+    option_nodes: [ComboboxHandles.max_options]?ui_core.UiNodeId = @splat(null),
+
     option_count: usize = 0,
     selected_idx: usize = 0,
+
+    /// Maximum number of options a combobox can hold; `comboboxEx` returns `error.TooManyOptions`
+    /// beyond it instead of silently dropping the rest.
+    pub const max_options: usize = 32;
 };
 
 /// Configuration options for `comboboxEx`.
@@ -554,6 +559,7 @@ pub fn comboboxEx(
     tag: []const u8,
     level: theme.SurfaceLevel,
 ) !ComboboxHandles {
+    if (options.len > ComboboxHandles.max_options) return error.TooManyOptions;
     const initial = if (selected_idx < options.len) options[selected_idx] else "Select...";
     const trig_idx = try tree.createNode(parent, .{
         .id = "",
@@ -655,7 +661,7 @@ pub fn comboboxEx(
         .search_input = search_id,
         .selected_idx = selected_idx,
     };
-    const count = @min(options.len, 32);
+    const count = options.len;
     handles.option_count = count;
     for (0..count) |i| {
         const opt_idx = try tree.createNode(list_idx, .{

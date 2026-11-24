@@ -1348,7 +1348,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.ui.widgets",
-            .version = "0.1.1",
+            .version = "0.2.0",
             .provides_capabilities = &.{"engine.ui.widgets/1"},
             .required_capabilities = &.{"engine.ui.tree/1"},
         },

@@ -123,7 +123,7 @@ const save_btn = try ui_plume.controls.button.button(tree, mgr, &th, parent_idx,
 - **TextInput & Textarea**: Single-line (`inputs.textInput`) and multiline (`inputs.textarea`) inputs with caret rendering, text clipping/scrolling, and full `TextEditState` shortcuts.
 - **Slider & RangeSlider**: Continuous slider (`inputs.slider`) and dual-thumb `[min, max]` range slider (`inputs.rangeSlider`), with arrow-key nudging when focused.
 - **NumberInput & Vec3Input**: Drag-to-scrub numeric fields + click/double-click inline editing (`inputs.numberInput`, `inputs.vec3Input`).
-- **Combobox**: Searchable dropdown combining a text filter with a selectable list (`inputs.combobox`).
+- **Combobox**: Searchable dropdown combining a text filter with a selectable list (`inputs.combobox`). Holds up to `ComboboxHandles.max_options` (32) options; more returns `error.TooManyOptions` instead of being dropped silently.
 - **KeybindInput**: Captures keyboard shortcuts + modifiers (`Ctrl`, `Shift`, `Alt`) (`inputs.keybindInput`).
 
 ```zig

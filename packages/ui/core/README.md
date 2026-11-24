@@ -15,4 +15,5 @@ See [ADR-0001: Layered UI Architecture](../../../docs/adr/0001-layered-ui-archit
 
 - **Retained `UiTree` IR**: Decoupled from any markup parser or scripting runtime (`Frontend -> UiTree -> layoutTree() -> paint() -> GraphicsDeviceService`).
 - **Layout & Interaction**: Flex-like `column`/`row` layout (`grow`, `percent`, `absolute`), overflow clipping & scrollbars, spatial `hitTest()`, `Tab` focus tracking, caret/placeholder/selection rendering, and `ui.action` event emission.
+- **Stable node identity**: destroyed slots are reused with a bumped generation, and `clear()` keeps old `UiNodeId`s invalid; text editing (`handleTextInput`/`handleBackspace`/`handleDelete`/`moveTextCursor`) works on whole UTF-8 code points and rejects invalid UTF-8 (`utf8Floor`/`utf8Prev`/`utf8Next` helpers). Caret blinking advances by `frame_dt_s`, not by frame count.
 - **Backend-Neutral Output**: Emits standard `graphics.DrawCommand` lists, running identically in headless tests and GPU-backed windows.

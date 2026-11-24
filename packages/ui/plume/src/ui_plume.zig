@@ -73,7 +73,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.ui.plume",
-            .version = "0.2.0",
+            .version = "0.3.0",
             .provides_capabilities = &.{"engine.ui.theme/1"},
             .required_capabilities = &.{ "engine.ui.tree/1", "engine.ui.widgets/1" },
         },
