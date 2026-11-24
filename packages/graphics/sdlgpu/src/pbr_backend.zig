@@ -8,6 +8,7 @@ const render_3d = @import("render_3d");
 const gpu_resources = @import("gpu_resources.zig");
 const volumetric_lights = @import("volumetric_lights.zig");
 const shadow_cull = @import("shadow_cull.zig");
+const capture = @import("capture.zig");
 const c = @import("sdl3_c");
 
 const pbr = render_3d.pbr;
@@ -205,6 +206,14 @@ const PostFxParams = extern struct {
 };
 
 /// One entry of the lit-pass submission order, with the sort keys computed once per frame.
+/// A GPU-to-CPU readback that has been recorded but whose submission has not completed yet.
+const PendingCapture = struct {
+    transfer: *c.SDL_GPUTransferBuffer,
+    width: u32,
+    height: u32,
+    format: c.SDL_GPUTextureFormat,
+};
+
 const DrawOrderEntry = struct {
     index: u32,
     depth: f32,
@@ -331,6 +340,16 @@ pub const PbrGpuState = struct {
     bloom_sizes: [BLOOM_MIPS][2]u32 = @splat(.{ 0, 0 }),
 
     queued_draws: std.ArrayList(QueuedPbrDraw) = .empty,
+    /// Format of the swapchain, needed to read a final-frame capture back correctly.
+    swapchain_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_INVALID,
+    /// Pending request for the next frame, consumed by `renderFrame`.
+    capture_request: ?capture.Target = null,
+    /// Offscreen copy of the final frame (without the 2D overlay); only allocated while captures are used.
+    capture_final_tex: ?*c.SDL_GPUTexture = null,
+    capture_final_w: u32 = 0,
+    capture_final_h: u32 = 0,
+    capture_pending: ?PendingCapture = null,
+    capture_result: ?capture.Image = null,
     /// Reused across frames so cluster construction does not allocate in steady state.
     cluster_scratch: cluster.ClusterScratch = .{},
     /// Lit-pass submission order, rebuilt every frame; reused to avoid per-frame allocation.
@@ -563,6 +582,7 @@ pub const PbrGpuState = struct {
             .allocator = allocator,
             .device = device,
             .diag = diag,
+            .swapchain_format = swapchain_format,
             .pbr_pipeline = pbr_pipe,
             .pbr_double_sided_pipeline = pbr_ds_pipe,
             .pbr_blend_pipeline = pbr_blend_pipe,
@@ -603,6 +623,9 @@ pub const PbrGpuState = struct {
     pub fn deinit(self: *PbrGpuState) void {
         self.queued_draws.deinit(self.allocator);
         self.cluster_scratch.deinit(self.allocator);
+        if (self.capture_pending) |p| c.SDL_ReleaseGPUTransferBuffer(self.device, p.transfer);
+        if (self.capture_result) |*img| img.deinit(self.allocator);
+        if (self.capture_final_tex) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         self.draw_order.deinit(self.allocator);
         self.shadow_casters.deinit(self.allocator);
         self.dir_lights_copy.deinit(self.allocator);
@@ -1660,10 +1683,12 @@ pub const PbrGpuState = struct {
             break :blk self.bloom_textures[0].?;
         } else self.black_texture;
 
-        // 6. PostFX Composite + Tonemap -> Swapchain
-        {
+        // 6. PostFX Composite + Tonemap -> Swapchain (and, when a final capture is pending, an offscreen copy)
+        const capture_final = self.capture_request != null and self.capture_request.? == .final;
+        if (capture_final) try self.ensureCaptureFinal(tex_w, tex_h);
+        for (0..(if (capture_final) @as(usize, 2) else 1)) |post_pass_index| {
             const out_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
-                .texture = target_tex,
+                .texture = if (post_pass_index == 0) target_tex else self.capture_final_tex.?,
                 .load_op = c.SDL_GPU_LOADOP_DONT_CARE,
                 .store_op = c.SDL_GPU_STOREOP_STORE,
             });
@@ -1687,6 +1712,108 @@ pub const PbrGpuState = struct {
             c.SDL_DrawGPUPrimitives(pf_pass, 3, 1, 0, 0);
             c.SDL_EndGPURenderPass(pf_pass);
         }
+
+        if (self.capture_request) |target| {
+            self.capture_request = null;
+            switch (target) {
+                .final => try self.enqueueCapture(cmd_buf, self.capture_final_tex.?, tex_w, tex_h, self.swapchain_format),
+                .hdr => try self.enqueueCapture(cmd_buf, hdr_tex, tex_w, tex_h, c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT),
+                .ssao => if (self.ssao_blur_texture) |t| try self.enqueueCapture(cmd_buf, t, tex_w, tex_h, c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM),
+            }
+        }
+    }
+
+    /// Asks the next rendered frame to read back `target`. The image is available from `takeCapture` after
+    /// that frame has been submitted and `finishCapture` has run.
+    pub fn requestCapture(self: *PbrGpuState, target: capture.Target) void {
+        self.capture_request = target;
+    }
+
+    /// Moves the finished capture out of the backend. The caller owns the image.
+    pub fn takeCapture(self: *PbrGpuState) ?capture.Image {
+        const img = self.capture_result orelse return null;
+        self.capture_result = null;
+        return img;
+    }
+
+    fn ensureCaptureFinal(self: *PbrGpuState, w: u32, h: u32) !void {
+        if (self.capture_final_tex != null and self.capture_final_w == w and self.capture_final_h == h) return;
+        const tex = c.SDL_CreateGPUTexture(self.device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = self.swapchain_format,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = w,
+            .height = h,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+        })) orelse return error.SdlGpuFailure;
+        if (self.capture_final_tex) |old| c.SDL_ReleaseGPUTexture(self.device, old);
+        self.capture_final_tex = tex;
+        self.capture_final_w = w;
+        self.capture_final_h = h;
+    }
+
+    fn bytesPerPixel(format: c.SDL_GPUTextureFormat) ?u32 {
+        if (format == c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT) return 8;
+        if (format == c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM or format == c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB or
+            format == c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM or format == c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB) return 4;
+        return null;
+    }
+
+    /// Records a texture-to-transfer-buffer copy in `cmd_buf`. The data is only valid after the command
+    /// buffer has been submitted and the GPU is idle, which `finishCapture` waits for.
+    fn enqueueCapture(self: *PbrGpuState, cmd_buf: *c.SDL_GPUCommandBuffer, src: *c.SDL_GPUTexture, w: u32, h: u32, format: c.SDL_GPUTextureFormat) !void {
+        const bpp = bytesPerPixel(format) orelse return error.UnsupportedCaptureFormat;
+        if (self.capture_pending) |old| c.SDL_ReleaseGPUTransferBuffer(self.device, old.transfer);
+        self.capture_pending = null;
+        const tb = c.SDL_CreateGPUTransferBuffer(self.device, &std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo, .{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD,
+            .size = w * h * bpp,
+        })) orelse return error.SdlGpuFailure;
+        const cp = c.SDL_BeginGPUCopyPass(cmd_buf) orelse {
+            c.SDL_ReleaseGPUTransferBuffer(self.device, tb);
+            return error.SdlGpuFailure;
+        };
+        c.SDL_DownloadFromGPUTexture(
+            cp,
+            &.{ .texture = src, .mip_level = 0, .layer = 0, .x = 0, .y = 0, .z = 0, .w = w, .h = h, .d = 1 },
+            &.{ .transfer_buffer = tb, .offset = 0, .pixels_per_row = w, .rows_per_layer = h },
+        );
+        c.SDL_EndGPUCopyPass(cp);
+        self.capture_pending = .{ .transfer = tb, .width = w, .height = h, .format = format };
+    }
+
+    /// Completes a recorded capture: waits for the GPU, converts the pixels to float RGBA and stores them.
+    /// Call after the frame's command buffer has been submitted. A no-op when nothing is pending.
+    pub fn finishCapture(self: *PbrGpuState) void {
+        const p = self.capture_pending orelse return;
+        self.capture_pending = null;
+        defer c.SDL_ReleaseGPUTransferBuffer(self.device, p.transfer);
+        if (!c.SDL_WaitForGPUIdle(self.device)) return;
+        const ptr = c.SDL_MapGPUTransferBuffer(self.device, p.transfer, false) orelse return;
+        defer c.SDL_UnmapGPUTransferBuffer(self.device, p.transfer);
+
+        const px: usize = @as(usize, p.width) * p.height;
+        const rgba = self.allocator.alloc(f32, px * 4) catch return;
+        const bytes: [*]const u8 = @ptrCast(ptr);
+        if (p.format == c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT) {
+            const halves: [*]const f16 = @ptrCast(@alignCast(ptr));
+            for (0..px * 4) |i| rgba[i] = @floatCast(halves[i]);
+        } else {
+            const bgra = p.format == c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM or p.format == c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB;
+            for (0..px) |i| {
+                const b0: f32 = @floatFromInt(bytes[i * 4 + 0]);
+                const b1: f32 = @floatFromInt(bytes[i * 4 + 1]);
+                const b2: f32 = @floatFromInt(bytes[i * 4 + 2]);
+                const b3: f32 = @floatFromInt(bytes[i * 4 + 3]);
+                rgba[i * 4 + 0] = (if (bgra) b2 else b0) / 255.0;
+                rgba[i * 4 + 1] = b1 / 255.0;
+                rgba[i * 4 + 2] = (if (bgra) b0 else b2) / 255.0;
+                rgba[i * 4 + 3] = b3 / 255.0;
+            }
+        }
+        if (self.capture_result) |*old| old.deinit(self.allocator);
+        self.capture_result = .{ .width = p.width, .height = p.height, .rgba = rgba };
     }
 
     fn updateEnvIbl(self: *PbrGpuState, sun_dir: [3]f32, sun_col: [3]f32, sun_int: f32) !void {

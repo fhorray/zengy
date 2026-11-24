@@ -19,6 +19,8 @@ const text_pkg = @import("text");
 const render_3d = @import("render_3d");
 const c = @import("sdl3_c");
 const shadow_cull = @import("shadow_cull.zig");
+/// Frame capture, statistics and comparison helpers for render regression tests.
+pub const capture = @import("capture.zig");
 pub const gpu_resources = @import("gpu_resources.zig");
 pub const pbr_backend = @import("pbr_backend.zig");
 
@@ -1043,6 +1045,20 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
         state.graphics_svc.setDeviceAvailable(false);
         return sdlFail(state.diagnostics, "SDL_SubmitGPUCommandBuffer failed");
     }
+    // A capture recorded in this frame can only be read once the submission has finished.
+    state.pbr.finishCapture();
+}
+
+/// Asks the next PBR frame to read back `target` (`final`, `hdr`, or `ssao`). `final` excludes the 2D overlay.
+pub fn requestCapture(app: *engine.App, target: capture.Target) void {
+    const state = app.resources.get(SdlGpuState) orelse return;
+    state.pbr.requestCapture(target);
+}
+
+/// Takes the capture produced by `requestCapture`, if the frame has completed. The caller owns the image.
+pub fn takeCapture(app: *engine.App) ?capture.Image {
+    const state = app.resources.get(SdlGpuState) orelse return null;
+    return state.pbr.takeCapture();
 }
 
 const BACKEND_VTABLE = graphics.BackendVTable{

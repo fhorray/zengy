@@ -896,6 +896,25 @@ pub fn build(b: *std.Build) void {
     const run_visual_pbr_step = b.step("run-visual-pbr", "Open the Visual PBR, Shadows, AutoExposure & Tonemapping demo");
     run_visual_pbr_step.dependOn(&run_visual_pbr.step);
 
+    // Render regression harness: renders the fixed scenarios of `visual-pbr` and compares them with
+    // `tests/golden/visual-pbr` (`capture-check`) or rewrites those goldens (`capture-update`).
+    // Needs a GPU and a window; see docs/roadmap/visual-risk-plan.md.
+    const capture_exe_path = b.fmt("zig-out/bin/visual-pbr{s}", .{target.result.exeFileExt()});
+    const capture_check = b.addSystemCommand(&.{capture_exe_path});
+    capture_check.setCwd(b.path("."));
+    capture_check.setEnvironmentVariable("ZENGY_CAPTURE_DIR", "zig-out/capture");
+    capture_check.step.dependOn(b.getInstallStep());
+    const capture_check_step = b.step("capture-check", "Render the visual-pbr scenarios and compare them with the golden images");
+    capture_check_step.dependOn(&capture_check.step);
+
+    const capture_update = b.addSystemCommand(&.{capture_exe_path});
+    capture_update.setCwd(b.path("."));
+    capture_update.setEnvironmentVariable("ZENGY_CAPTURE_DIR", "zig-out/capture");
+    capture_update.setEnvironmentVariable("ZENGY_CAPTURE_UPDATE", "1");
+    capture_update.step.dependOn(b.getInstallStep());
+    const capture_update_step = b.step("capture-update", "Re-render the visual-pbr scenarios and overwrite the golden images");
+    capture_update_step.dependOn(&capture_update.step);
+
     // Manifesto-driven visual runtime (`tools/runtime/main.zig`): reads game.toml in CWD.
     const runtime_mod = b.createModule(.{
         .root_source_file = b.path("tools/runtime/main.zig"),
@@ -1135,6 +1154,7 @@ pub fn build(b: *std.Build) void {
     // Pure volumetric light ranking; no SDL or engine imports, so it runs headless.
     addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/volumetric_lights.zig", target, optimize, false, &.{}, null);
     addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/shadow_cull.zig", target, optimize, false, &.{}, null);
+    addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/capture.zig", target, optimize, false, &.{}, null);
 
     addModuleTest(b, test_step, "packages/render/text/tests/text_tests.zig", target, optimize, false, &.{
         .{ .name = "text", .mod = text_mod },
