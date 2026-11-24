@@ -41,7 +41,7 @@ jobs:
 
   macos:
     name: Build & Test macOS arm64 (${{ matrix.optimize }})
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
