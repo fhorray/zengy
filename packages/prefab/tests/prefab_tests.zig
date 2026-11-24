@@ -264,3 +264,194 @@ test "TOML authoring files load through the JSON bridge" {
     defer toml_format.TomlService.freeTable(testing.allocator, bad);
     try testing.expectError(error.UnsupportedTomlValue, toml_format.tableToJsonValue(arena.allocator(), bad));
 }
+
+fn makeStatsTypes(types: *engine.TypeRegistry) !engine.ComponentSchema {
+    return types.registerSchema("game", "Stats", 1, .blittable, &.{.{ .name = "hp", .field_type = .i32_t }});
+}
+
+fn addStatsEntity(pf: *prefab.Prefab, schema: engine.ComponentSchema, id: []const u8, parent: ?[]const u8, hp: i32) !void {
+    try pf.addEntity(id, parent);
+    var b: [4]u8 = undefined;
+    try engine.TypeRegistry.setField(schema, &b, "hp", .{ .i32_t = hp });
+    try pf.addComponent(id, schema, &b);
+}
+
+fn hpOf(world: *engine.World, schema: engine.ComponentSchema, e: engine.EntityHandle) !i32 {
+    const raw = world.getRaw(e, engine.World.dynamicTypeId("game.Stats")).?;
+    return (try engine.TypeRegistry.getField(schema, raw, "hp")).i32_t;
+}
+
+test "nested prefabs expand under an anchor, apply nested overrides, and reject cycles and depth" {
+    var types = engine.TypeRegistry.init(testing.allocator);
+    defer types.deinit();
+    const stats = try makeStatsTypes(&types);
+
+    var lib = prefab.PrefabLibrary.init(testing.allocator);
+    defer lib.deinit();
+    var weapon = prefab.Prefab.init(testing.allocator);
+    try addStatsEntity(&weapon, stats, "blade", null, 10);
+    try addStatsEntity(&weapon, stats, "gem", "blade", 1);
+    try lib.put("weapon", weapon);
+
+    var guard = prefab.Prefab.init(testing.allocator);
+    defer guard.deinit();
+    try addStatsEntity(&guard, stats, "body", null, 100);
+    // The nested weapon's blade gets 99 HP; the gem keeps its authored 1.
+    try guard.addNested("hand", "body", "weapon", &.{.{ .local_id = "blade", .stable_id = stats.stable_id, .field = "hp", .value = .{ .i32_t = 99 } }});
+
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    Linked.reset();
+    var inst = try prefab.instantiate(testing.allocator, &world, &types, &guard, .{ .resolver = lib.resolver(), .link = Linked.link });
+    defer inst.deinit();
+
+    // body, hand (anchor) + blade, gem from the nested prefab: 4 entities, top-level first.
+    try testing.expectEqual(@as(usize, 4), inst.handles.len);
+    try testing.expectEqual(@as(usize, 4), world.entity_count);
+    try testing.expectEqual(@as(i32, 100), try hpOf(&world, stats, inst.find(&guard, "body").?));
+    try testing.expectEqual(@as(i32, 99), try hpOf(&world, stats, inst.handles[2])); // blade
+    try testing.expectEqual(@as(i32, 1), try hpOf(&world, stats, inst.handles[3])); // gem
+    // hierarchy: hand -> body, blade -> hand, gem -> blade
+    try testing.expectEqual(@as(usize, 3), Linked.count);
+    try testing.expect(Linked.has(inst.handles[1], inst.handles[0]));
+    try testing.expect(Linked.has(inst.handles[2], inst.handles[1]));
+    try testing.expect(Linked.has(inst.handles[3], inst.handles[2]));
+
+    // Without a resolver, nesting cannot be satisfied.
+    try testing.expectError(error.UnknownPrefab, prefab.instantiate(testing.allocator, &world, &types, &guard, .{}));
+    try testing.expectEqual(@as(usize, 4), world.entity_count); // nothing leaked from the failed call
+
+    // Cycle: a -> b -> a.
+    var pa = prefab.Prefab.init(testing.allocator);
+    try pa.addNested("n", null, "b", &.{});
+    try lib.put("a", pa);
+    var pb = prefab.Prefab.init(testing.allocator);
+    try pb.addNested("n", null, "a", &.{});
+    try lib.put("b", pb);
+    try testing.expectError(error.NestedPrefabCycle, prefab.instantiate(testing.allocator, &world, &types, lib.get("a").?, .{ .resolver = lib.resolver() }));
+
+    // Override naming a nonexistent nested entity is rejected.
+    var bad = prefab.Prefab.init(testing.allocator);
+    defer bad.deinit();
+    try bad.addNested("h", null, "weapon", &.{.{ .local_id = "nope", .stable_id = stats.stable_id, .field = "hp", .value = .{ .i32_t = 1 } }});
+    try testing.expectError(error.UnknownOverrideTarget, prefab.instantiate(testing.allocator, &world, &types, &bad, .{ .resolver = lib.resolver() }));
+}
+
+const Linked = struct {
+    var pairs: [16]struct { c: engine.EntityHandle, p: engine.EntityHandle } = undefined;
+    var count: usize = 0;
+    fn reset() void {
+        count = 0;
+    }
+    fn link(_: ?*anyopaque, _: *engine.World, child: engine.EntityHandle, parent: engine.EntityHandle) anyerror!void {
+        pairs[count] = .{ .c = child, .p = parent };
+        count += 1;
+    }
+    fn has(c: engine.EntityHandle, p: engine.EntityHandle) bool {
+        for (pairs[0..count]) |x| {
+            if (std.meta.eql(x.c, c) and std.meta.eql(x.p, p)) return true;
+        }
+        return false;
+    }
+};
+
+test "cooked binary round-trips prefabs (nested + overrides) and rejects corruption" {
+    var types = engine.TypeRegistry.init(testing.allocator);
+    defer types.deinit();
+    const stats = try makeStatsTypes(&types);
+
+    var pf = prefab.Prefab.init(testing.allocator);
+    defer pf.deinit();
+    try addStatsEntity(&pf, stats, "body", null, 100);
+    try pf.addNested("hand", "body", "weapon", &.{
+        .{ .local_id = "blade", .stable_id = stats.stable_id, .field = "hp", .value = .{ .i32_t = 99 } },
+        .{ .local_id = "blade", .stable_id = stats.stable_id, .field = "pos", .value = .{ .vec3_t = .{ 1, 2, 3 } } },
+    });
+
+    const bytes = try prefab.cooked.cook(testing.allocator, &pf);
+    defer testing.allocator.free(bytes);
+    var back = try prefab.cooked.load(testing.allocator, bytes);
+    defer back.deinit();
+
+    try testing.expectEqual(@as(usize, 2), back.entities.items.len);
+    try testing.expectEqualStrings("hand", back.entities.items[1].local_id);
+    try testing.expectEqualStrings("body", back.entities.items[1].parent.?);
+    const n = back.entities.items[1].nested.?;
+    try testing.expectEqualStrings("weapon", n.prefab_name);
+    try testing.expectEqual(@as(usize, 2), n.overrides.len);
+    try testing.expectEqual(@as(i32, 99), n.overrides[0].value.i32_t);
+    try testing.expectEqual([3]f32{ 1, 2, 3 }, n.overrides[1].value.vec3_t);
+    // Re-cooking the loaded prefab is byte-identical (stable format).
+    const bytes2 = try prefab.cooked.cook(testing.allocator, &back);
+    defer testing.allocator.free(bytes2);
+    try testing.expectEqualSlices(u8, bytes, bytes2);
+
+    // Any single flipped bit is caught by the checksum.
+    const mutated = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(mutated);
+    for (0..mutated.len) |i| {
+        mutated[i] ^= 0x10;
+        try testing.expectError(error.CorruptPrefab, prefab.cooked.load(testing.allocator, mutated));
+        mutated[i] ^= 0x10;
+    }
+    // Truncation and garbage never read out of bounds.
+    for (0..bytes.len) |len| {
+        if (prefab.cooked.load(testing.allocator, bytes[0..len])) |p| {
+            var pp = p;
+            pp.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+    try testing.expectError(error.CorruptPrefab, prefab.cooked.load(testing.allocator, "not a prefab at all, definitely"));
+}
+
+test "streaming: budgeted commit, duplicate/cancel handling, atomic failure, unload" {
+    var types = engine.TypeRegistry.init(testing.allocator);
+    defer types.deinit();
+    const stats = try makeStatsTypes(&types);
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+
+    var cell = prefab.Prefab.init(testing.allocator);
+    defer cell.deinit();
+    try addStatsEntity(&cell, stats, "a", null, 1);
+    try addStatsEntity(&cell, stats, "b", "a", 2);
+    try addStatsEntity(&cell, stats, "c", "a", 3);
+
+    var st = prefab.streaming.CellStreamer.init(testing.allocator);
+    defer st.deinit();
+
+    // Prepare off to the side (no world access), then queue three cells.
+    try st.request("north", try prefab.prepare(testing.allocator, &types, &cell, .{}), .{});
+    try st.request("south", try prefab.prepare(testing.allocator, &types, &cell, .{}), .{});
+    try st.request("east", try prefab.prepare(testing.allocator, &types, &cell, .{}), .{});
+    try testing.expectError(error.CellAlreadyQueued, st.request("north", try prefab.prepare(testing.allocator, &types, &cell, .{}), .{}));
+    try testing.expect(st.cancel("east"));
+    try testing.expect(!st.cancel("east"));
+
+    // Budget of 4 entities: "north" (3) loads, "south" (3) would exceed it and waits.
+    try testing.expectEqual(@as(usize, 3), try st.update(&world, 4));
+    try testing.expect(st.isLoaded("north") and st.isQueued("south"));
+    try testing.expectEqual(@as(usize, 3), world.entity_count);
+    // A budget smaller than any cell still makes progress (one cell per call).
+    try testing.expectEqual(@as(usize, 3), try st.update(&world, 1));
+    try testing.expectEqual(@as(usize, 6), world.entity_count);
+    try testing.expectEqual(@as(usize, 0), try st.update(&world, 100));
+    try testing.expectError(error.CellAlreadyLoaded, st.request("north", try prefab.prepare(testing.allocator, &types, &cell, .{}), .{}));
+
+    // Unloading removes exactly that cell's entities.
+    try testing.expect(st.unload(&world, "north"));
+    try testing.expect(!st.unload(&world, "north"));
+    try testing.expectEqual(@as(usize, 3), world.entity_count);
+
+    // A failing commit (link error) is atomic and does not wedge the queue.
+    const failing = struct {
+        fn link(_: ?*anyopaque, _: *engine.World, _: engine.EntityHandle, _: engine.EntityHandle) anyerror!void {
+            return error.LinkFailed;
+        }
+    }.link;
+    try st.request("bad", try prefab.prepare(testing.allocator, &types, &cell, .{}), .{ .link = failing });
+    try testing.expectError(error.LinkFailed, st.update(&world, 100));
+    try testing.expectEqual(@as(usize, 3), world.entity_count);
+    try testing.expect(!st.isQueued("bad") and !st.isLoaded("bad"));
+}
