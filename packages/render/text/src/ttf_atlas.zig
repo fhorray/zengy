@@ -38,6 +38,47 @@ extern fn zengy_ttf_bake_codepoints(
     out_chars: [*]ZengyBakedChar,
 ) c_int;
 
+extern fn zengy_ttf_bake_extra(
+    ttf_data: [*]const u8,
+    pixel_height: f32,
+    out_alpha: [*]u8,
+    pw: c_int,
+    ph: c_int,
+    start_y: c_int,
+    codepoints: [*]const c_int,
+    count: c_int,
+    out_chars: [*]ZengyBakedChar,
+) c_int;
+
+/// Code points baked beyond ASCII, sorted ascending: Latin-1 Supplement, Latin Extended-A,
+/// common punctuation and currency, Greek, and Cyrillic. Code points the font lacks fall back to `?`.
+pub const extra_codepoints: [extra_count]c_int = blk: {
+    @setEvalBranchQuota(10_000);
+    var out: [extra_count]c_int = undefined;
+    var n: usize = 0;
+    // Ascending ranges only: `glyph` binary-searches this table.
+    for (0xA0..0x180) |c| {
+        out[n] = @intCast(c);
+        n += 1;
+    }
+    for (0x391..0x3CA) |c| {
+        out[n] = @intCast(c);
+        n += 1;
+    }
+    for (0x400..0x460) |c| {
+        out[n] = @intCast(c);
+        n += 1;
+    }
+    for ([_]c_int{ 0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2026, 0x20AC, 0x2122 }) |c| {
+        out[n] = c;
+        n += 1;
+    }
+    std.debug.assert(n == extra_count);
+    for (1..n) |i| std.debug.assert(out[i - 1] < out[i]);
+    break :blk out;
+};
+const extra_count: usize = (0x180 - 0xA0) + 10 + (0x3CA - 0x391) + (0x460 - 0x400);
+
 /// Embedded Fira Sans Regular TTF bytes (SIL Open Font License 1.1).
 pub const FIRA_SANS_REGULAR: []const u8 = @embedFile("FiraSans-Regular.ttf");
 
@@ -55,12 +96,31 @@ pub const TtfAtlas = struct {
     baked_px_h: f32,
     ascent_px: f32,
     chars: [95]ZengyBakedChar,
+    /// Glyphs for `extra_codepoints` (same order); `xadvance < 0` marks a missing glyph.
+    extra: [extra_count]ZengyBakedChar,
     rgba_pixels: []u8,
 
-    /// Bakes `ttf_bytes` at `baked_px_h` into a `512x512` white RGBA8 texture.
+    /// Returns the glyph drawn for `cp`: the baked glyph, or `?` when the code point is not in the
+    /// atlas (outside ASCII and the extra ranges, missing from the font, or out of atlas space).
+    pub fn glyph(self: *const TtfAtlas, cp: u21) *const ZengyBakedChar {
+        if (cp >= 32 and cp <= 126) return &self.chars[cp - 32];
+        const key: c_int = @intCast(cp);
+        const idx = std.sort.binarySearch(c_int, &extra_codepoints, key, struct {
+            fn order(k: c_int, item: c_int) std.math.Order {
+                return std.math.order(k, item);
+            }
+        }.order);
+        if (idx) |i| {
+            if (self.extra[i].xadvance >= 0) return &self.extra[i];
+        }
+        return &self.chars['?' - 32];
+    }
+
+    /// Bakes `ttf_bytes` at `baked_px_h` into a `1024x1024` white RGBA8 texture (ASCII on top,
+    /// extended glyphs below).
     pub fn bake(allocator: std.mem.Allocator, ttf_bytes: []const u8, baked_px_h: f32) !TtfAtlas {
-        const w: u32 = 512;
-        const h: u32 = 512;
+        const w: u32 = 1024;
+        const h: u32 = 1024;
         const alpha_buf = try allocator.alloc(u8, w * h);
         defer allocator.free(alpha_buf);
         @memset(alpha_buf, 0);
@@ -79,6 +139,22 @@ pub const TtfAtlas = struct {
             return error.FontBakeFailed;
         }
 
+        // The extended glyphs go below the last row used by the ASCII bake.
+        var ascii_bottom: u32 = 0;
+        for (chars) |c| ascii_bottom = @max(ascii_bottom, c.y1);
+        var extra: [extra_count]ZengyBakedChar = undefined;
+        _ = zengy_ttf_bake_extra(
+            ttf_bytes.ptr,
+            baked_px_h,
+            alpha_buf.ptr,
+            @intCast(w),
+            @intCast(h),
+            @intCast(ascii_bottom + 3),
+            &extra_codepoints,
+            @intCast(extra_count),
+            &extra,
+        );
+
         const rgba = try allocator.alloc(u8, w * h * 4);
         for (alpha_buf, 0..) |a, i| {
             const base = i * 4;
@@ -95,6 +171,7 @@ pub const TtfAtlas = struct {
             .baked_px_h = baked_px_h,
             .ascent_px = ascent_px,
             .chars = chars,
+            .extra = extra,
             .rgba_pixels = rgba,
         };
     }
@@ -118,7 +195,7 @@ pub const TtfAtlas = struct {
                 cur_w = 0;
                 lines += 1;
             } else {
-                cur_w += self.chars[text_pkg.atlasChar(cp) - 32].xadvance * s;
+                cur_w += self.glyph(cp).xadvance * s;
             }
         }
         if (cur_w > max_w) max_w = cur_w;
@@ -151,7 +228,7 @@ pub const TtfAtlas = struct {
                 pen_y += target_px_h * line_spacing;
                 continue;
             }
-            const bc = self.chars[text_pkg.atlasChar(cp) - 32];
+            const bc = self.glyph(cp).*;
             if (cp != ' ') {
                 const gw = @as(f32, @floatFromInt(bc.x1 - bc.x0)) * s;
                 const gh = @as(f32, @floatFromInt(bc.y1 - bc.y0)) * s;

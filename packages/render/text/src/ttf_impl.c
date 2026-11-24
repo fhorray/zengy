@@ -101,3 +101,63 @@ int zengy_ttf_bake_codepoints(
     }
     return 1;
 }
+
+/* Packs `count` extra codepoints below row `start_y` of an already partially filled alpha bitmap.
+ * Unlike zengy_ttf_bake_codepoints this keeps the true horizontal advance and the trimmed-box
+ * offsets (xoff/yoff already include the trim). Codepoints the font lacks, or that no longer fit,
+ * get xadvance = -1 so callers can fall back to another glyph. Returns the number baked. */
+int zengy_ttf_bake_extra(
+    const unsigned char *ttf_data,
+    float pixel_height,
+    unsigned char *out_alpha,
+    int pw,
+    int ph,
+    int start_y,
+    const int *codepoints,
+    int count,
+    ZengyBakedChar *out_chars
+) {
+    stbtt_fontinfo info;
+    for (int i = 0; i < count; ++i) {
+        out_chars[i].x0 = out_chars[i].y0 = out_chars[i].x1 = out_chars[i].y1 = 0;
+        out_chars[i].xoff = out_chars[i].yoff = 0.0f;
+        out_chars[i].xadvance = -1.0f;
+    }
+    if (!stbtt_InitFont(&info, ttf_data, 0)) return 0;
+    float scale = stbtt_ScaleForPixelHeight(&info, pixel_height);
+    int x = 1, y = start_y, row_h = 0, baked = 0;
+    for (int i = 0; i < count; ++i) {
+        int glyph = stbtt_FindGlyphIndex(&info, codepoints[i]);
+        if (glyph == 0) continue;
+        int adv = 0, lsb = 0;
+        stbtt_GetGlyphHMetrics(&info, glyph, &adv, &lsb);
+        int gw = 0, gh = 0, xoff = 0, yoff = 0;
+        unsigned char *bmp = stbtt_GetGlyphBitmap(&info, scale, scale, glyph, &gw, &gh, &xoff, &yoff);
+        if (x + gw + 2 > pw) {
+            x = 1;
+            y += row_h + 2;
+            row_h = 0;
+        }
+        if (y + gh + 2 > ph) {
+            if (bmp) stbtt_FreeBitmap(bmp, NULL);
+            break;
+        }
+        if (bmp) {
+            for (int r = 0; r < gh; ++r)
+                for (int c = 0; c < gw; ++c)
+                    out_alpha[(y + r) * pw + (x + c)] = bmp[r * gw + c];
+            stbtt_FreeBitmap(bmp, NULL);
+        }
+        out_chars[i].x0 = (unsigned short)x;
+        out_chars[i].y0 = (unsigned short)y;
+        out_chars[i].x1 = (unsigned short)(x + gw);
+        out_chars[i].y1 = (unsigned short)(y + gh);
+        out_chars[i].xoff = (float)xoff;
+        out_chars[i].yoff = (float)yoff;
+        out_chars[i].xadvance = (float)adv * scale;
+        x += gw + 2;
+        if (gh > row_h) row_h = gh;
+        baked++;
+    }
+    return baked;
+}
