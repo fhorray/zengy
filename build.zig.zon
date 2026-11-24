@@ -25,6 +25,10 @@
             .hash = "N-V-__8AAB5_KwAQEFMrn0mf8KV6LqWrZSQm_1DyEETmejhB",
             .lazy = true,
         },
+        .zaudio = .{
+            .url = "https://github.com/zig-gamedev/zaudio/archive/refs/heads/main.tar.gz",
+            .hash = "zaudio-0.11.0-dev-_M-91hV9QQDDAxcE4rPrEU90b3yiP25XYL1215u9M4sj",
+        },
     },
     .paths = .{
         "build.zig",

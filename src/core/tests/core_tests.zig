@@ -1585,3 +1585,60 @@ test "AppConfig.enable_parallel configures and tears down parallel scheduler aut
     try app.tick(1.0 / 60.0);
     try testing.expectEqual(@as(u32, 2), app.world.getConst(e, Counter).?.n);
 }
+
+test "Time, Stopwatch, Timer, and Scheduler run_if conditions" {
+    var sw = engine.Stopwatch{};
+    sw.tick(0.25);
+    sw.paused = true;
+    sw.tick(1.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), sw.elapsed_s, 1e-6);
+    sw.reset();
+    try testing.expectApproxEqAbs(@as(f32, 0.0), sw.elapsed_s, 1e-6);
+
+    var once = engine.Timer.init(0.5, .once);
+    once.tick(0.3);
+    try testing.expect(!once.finished());
+    try testing.expect(!once.justFinished());
+    try testing.expectApproxEqAbs(@as(f32, 0.6), once.fraction(), 1e-5);
+    once.tick(0.3);
+    try testing.expect(once.finished());
+    try testing.expect(once.justFinished());
+    once.tick(0.1);
+    try testing.expect(!once.justFinished());
+
+    var rep = engine.Timer.init(0.25, .repeating);
+    rep.tick(0.6);
+    try testing.expect(rep.justFinished());
+    try testing.expectEqual(@as(u32, 2), rep.timesFinishedThisTick());
+    try testing.expectApproxEqAbs(@as(f32, 0.1), rep.elapsed_s, 1e-5);
+
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    const Gate = struct { allow: bool = false, hits: u32 = 0 };
+    try app.resources.insert(Gate, .{});
+
+    const cond = struct {
+        fn check(ctx: *const engine.SystemContext) bool {
+            const g = ctx.resources.getConst(Gate) orelse return false;
+            return g.allow;
+        }
+    }.check;
+    const sys = struct {
+        fn run(ctx: *engine.SystemContext) !void {
+            ctx.resources.get(Gate).?.hits += 1;
+        }
+    }.run;
+    try app.addSystem(.{ .name = "gated", .run = sys, .run_if = cond });
+
+    try app.tick(0.5);
+    try testing.expectEqual(@as(u32, 0), app.resources.getConst(Gate).?.hits);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), app.resources.getConst(engine.Time).?.elapsed_s, 1e-5);
+
+    app.resources.get(Gate).?.allow = true;
+    app.resources.get(engine.Time).?.paused = true;
+    try app.tick(0.25);
+    try testing.expectEqual(@as(u32, 1), app.resources.getConst(Gate).?.hits);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), app.resources.getConst(engine.Time).?.delta_s, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), app.resources.getConst(engine.Time).?.elapsed_s, 1e-5);
+}

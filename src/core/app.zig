@@ -23,6 +23,7 @@ const service_mod = @import("service_registry.zig");
 const module_mod = @import("module_registry.zig");
 const reflection_mod = @import("reflection.zig");
 const diagnostics_mod = @import("diagnostics.zig");
+const time_mod = @import("time.zig");
 const abi_mod = @import("abi.zig");
 
 /// Explicit lifecycle state machine for an `App` instance.
@@ -199,6 +200,12 @@ pub const App = struct {
             self.scheduler.setParallel(pio.io());
         }
 
+        if (!self.resources.contains(time_mod.Time)) {
+            try self.resources.insert(time_mod.Time, .{
+                .fixed_delta_s = @floatCast(self.scheduler.fixed_dt),
+            });
+        }
+
         try self.scheduler.buildAll();
 
         var ctx = self.makeSystemContext(0.0);
@@ -218,6 +225,9 @@ pub const App = struct {
         }
         if (self.state != .running) return error.InvalidAppState;
 
+        if (self.resources.get(time_mod.Time)) |t| {
+            t.advance(@floatCast(frame_dt), @floatCast(self.scheduler.fixed_dt));
+        }
         var ctx = self.makeSystemContext(@floatCast(frame_dt));
         _ = try self.scheduler.stepFrame(frame_dt, &ctx);
         self.diagnostics.frame_count += 1;
@@ -236,6 +246,9 @@ pub const App = struct {
         }
         if (self.state != .running) return error.InvalidAppState;
 
+        if (self.resources.get(time_mod.Time)) |t| {
+            t.advance(@floatCast(self.scheduler.fixed_dt), @floatCast(self.scheduler.fixed_dt));
+        }
         var ctx = self.makeSystemContext(@floatCast(self.scheduler.fixed_dt));
         try self.scheduler.stepFixedTick(&ctx);
         self.diagnostics.frame_count += 1;

@@ -26,6 +26,7 @@ pub const service_registry = @import("core/service_registry.zig");
 pub const module_registry = @import("core/module_registry.zig");
 pub const reflection = @import("core/reflection.zig");
 pub const diagnostics = @import("core/diagnostics.zig");
+pub const time = @import("core/time.zig");
 pub const abi = @import("core/abi.zig");
 
 pub const App = app.App;
@@ -41,6 +42,11 @@ pub const ComponentTypeId = world.ComponentTypeId;
 pub const Stage = scheduler.Stage;
 pub const SystemContext = scheduler.SystemContext;
 pub const SystemDescriptor = scheduler.SystemDescriptor;
+pub const RunConditionFn = scheduler.RunConditionFn;
+pub const Time = time.Time;
+pub const Timer = time.Timer;
+pub const TimerMode = time.TimerMode;
+pub const Stopwatch = time.Stopwatch;
 
 pub const CommandBuffer = commands.CommandBuffer;
 pub const EventBus = events.EventBus;

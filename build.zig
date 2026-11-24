@@ -317,6 +317,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     camera_mod.addImport("engine", engine_mod);
+
+    const state_mod = b.addModule("state", .{
+        .root_source_file = b.path("packages/state/src/state.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    state_mod.addImport("engine", engine_mod);
+
+    const audio_mod = b.addModule("audio", .{
+        .root_source_file = b.path("packages/audio/core/src/audio.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audio_mod.addImport("engine", engine_mod);
+
+    default_plugins_mod.addImport("camera", camera_mod);
+    default_plugins_mod.addImport("input", input_mod);
+    default_plugins_mod.addImport("input_haptics", input_haptics_mod);
+    default_plugins_mod.addImport("state", state_mod);
+    default_plugins_mod.addImport("audio", audio_mod);
     camera_mod.addImport("graphics", graphics_mod);
     camera_mod.addImport("input", input_mod);
     camera_mod.addImport("scene", scene_mod);
@@ -447,6 +467,33 @@ pub fn build(b: *std.Build) void {
     input_sdl3_mod.addImport("input", input_mod);
     input_sdl3_mod.addImport("input_haptics", input_haptics_mod);
     input_sdl3_mod.addImport("sdl3_c", sdl3_c_mod);
+
+    const audio_sdl3_mod = b.addModule("audio_sdl3", .{
+        .root_source_file = b.path("packages/audio/sdl3/src/audio_sdl3.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    audio_sdl3_mod.addImport("engine", engine_mod);
+    audio_sdl3_mod.addImport("audio", audio_mod);
+    audio_sdl3_mod.addImport("sdl3_c", sdl3_c_mod);
+
+    const zaudio_dep = b.dependency("zaudio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zaudio_pkg_mod = zaudio_dep.module("root");
+    const miniaudio_lib = zaudio_dep.artifact("miniaudio");
+
+    const audio_zaudio_mod = b.addModule("audio_zaudio", .{
+        .root_source_file = b.path("packages/audio/zaudio/src/audio_zaudio.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audio_zaudio_mod.addImport("engine", engine_mod);
+    audio_zaudio_mod.addImport("audio", audio_mod);
+    audio_zaudio_mod.addImport("zaudio", zaudio_pkg_mod);
+    audio_zaudio_mod.linkLibrary(miniaudio_lib);
 
     // Visual hello (D1): native SDL3 window, input and DPI. Run with `zig build run-visual-hello`.
     const visual_hello_mod = b.createModule(.{
@@ -789,6 +836,37 @@ pub fn build(b: *std.Build) void {
     const run_visual_gamepad_step = b.step("run-visual-gamepad", "Open the Visual PS5 DualSense & Haptics demo");
     run_visual_gamepad_step.dependOn(&run_visual_gamepad.step);
 
+    // Visual Audio, State & Time demo. Run with `zig build run-visual-audio`.
+    const visual_audio_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-audio/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_audio_mod.addImport("engine", engine_mod);
+    visual_audio_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_audio_mod.addImport("graphics", graphics_mod);
+    visual_audio_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_audio_mod.addImport("input", input_mod);
+    visual_audio_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_audio_mod.addImport("camera", camera_mod);
+    visual_audio_mod.addImport("render_3d", render_3d_mod);
+    visual_audio_mod.addImport("state", state_mod);
+    visual_audio_mod.addImport("audio", audio_mod);
+    visual_audio_mod.addImport("audio_zaudio", audio_zaudio_mod);
+
+    const visual_audio_exe = b.addExecutable(.{
+        .name = "visual-audio",
+        .root_module = visual_audio_mod,
+    });
+    b.installArtifact(visual_audio_exe);
+
+    const run_visual_audio = b.addSystemCommand(&.{"zig-out/bin/visual-audio.exe"});
+    run_visual_audio.setCwd(b.path("."));
+    run_visual_audio.step.dependOn(b.getInstallStep());
+    const run_visual_audio_step = b.step("run-visual-audio", "Open the Visual Audio, State & Time demo");
+    run_visual_audio_step.dependOn(&run_visual_audio.step);
+
     // Manifesto-driven visual runtime (`tools/runtime/main.zig`): reads game.toml in CWD.
     const runtime_mod = b.createModule(.{
         .root_source_file = b.path("tools/runtime/main.zig"),
@@ -1060,5 +1138,19 @@ pub fn build(b: *std.Build) void {
     addModuleTest(b, test_step, "packages/input/haptics/tests/haptics_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "input_haptics", .mod = input_haptics_mod },
+    }, null);
+    addModuleTest(b, test_step, "packages/state/tests/state_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "state", .mod = state_mod },
+    }, null);
+    addModuleTest(b, test_step, "packages/audio/core/tests/audio_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "audio", .mod = audio_mod },
+    }, null);
+    addModuleTest(b, test_step, "packages/audio/zaudio/tests/zaudio_tests.zig", target, optimize, true, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "audio", .mod = audio_mod },
+        .{ .name = "zaudio", .mod = zaudio_pkg_mod },
+        .{ .name = "audio_zaudio", .mod = audio_zaudio_mod },
     }, null);
 }

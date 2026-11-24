@@ -77,11 +77,15 @@ pub const SystemContext = struct {
 /// Signature implemented by all ECS system callbacks.
 pub const SystemFn = *const fn (ctx: *SystemContext) anyerror!void;
 
+/// Optional predicate gating whether a system executes on a given frame/tick.
+pub const RunConditionFn = *const fn (ctx: *const SystemContext) bool;
+
 /// Registration metadata controlling stage placement, ordering constraints, and access hints.
 pub const SystemDescriptor = struct {
     name: []const u8,
     stage: Stage = .update,
     run: SystemFn,
+    run_if: ?RunConditionFn = null,
     reads: []const []const u8 = &.{},
     writes: []const []const u8 = &.{},
     before: []const []const u8 = &.{},
@@ -94,6 +98,7 @@ const StoredSystem = struct {
     name: []const u8,
     stage: Stage,
     run: SystemFn,
+    run_if: ?RunConditionFn,
     reads: []const []const u8,
     writes: []const []const u8,
     before: []const []const u8,
@@ -213,6 +218,7 @@ pub const Scheduler = struct {
             .name = name_copy,
             .stage = desc.stage,
             .run = desc.run,
+            .run_if = desc.run_if,
             .reads = reads_copy,
             .writes = writes_copy,
             .before = before_copy,
@@ -476,6 +482,9 @@ pub const Scheduler = struct {
 
     /// Runs one system serially with its own change-detection tick.
     fn runOne(ctx: *SystemContext, sys: *StoredSystem) !void {
+        if (sys.run_if) |cond| {
+            if (!cond(ctx)) return;
+        }
         // Each system gets its own tick so it sees changes made by others since it last ran,
         // but not its own writes from that run.
         ctx.world.advanceTick();
@@ -528,10 +537,17 @@ pub const Scheduler = struct {
         defer self.allocator.free(errs);
         const ticks = try self.allocator.alloc(u64, n);
         defer self.allocator.free(ticks);
+        const active = try self.allocator.alloc(bool, n);
+        defer self.allocator.free(active);
 
         var made: usize = 0;
         defer for (bufs[0..made]) |*bf| bf.deinit();
         for (idxs, 0..) |sys_idx, k| {
+            active[k] = if (systems[sys_idx].run_if) |cond| cond(ctx) else true;
+            if (!active[k]) {
+                errs[k] = null;
+                continue;
+            }
             ctx.world.advanceTick();
             ticks[k] = ctx.world.tick;
             bufs[k] = commands_mod.CommandBuffer.init(self.allocator);
@@ -545,7 +561,10 @@ pub const Scheduler = struct {
 
         @atomicStore(bool, &ctx.world.parallel_phase, true, .release);
         var group: std.Io.Group = .init;
-        for (idxs, 0..) |sys_idx, k| group.async(io, runTask, .{ systems[sys_idx].run, &ctxs[k], &errs[k] });
+        for (idxs, 0..) |sys_idx, k| {
+            if (!active[k]) continue;
+            group.async(io, runTask, .{ systems[sys_idx].run, &ctxs[k], &errs[k] });
+        }
         const awaited = group.await(io);
         @atomicStore(bool, &ctx.world.parallel_phase, false, .release);
         awaited catch return error.Canceled;
@@ -554,8 +573,9 @@ pub const Scheduler = struct {
         // merged in schedule order, so results never depend on thread timing.
         for (errs) |e| if (e) |err| return err;
         for (idxs, 0..) |sys_idx, k| {
+            if (!active[k]) continue;
             systems[sys_idx].last_run_tick = ticks[k];
-            try ctx.commands.append(&bufs[k]);
+            try ctx.commands.append(&ctxs[k].commands.*);
         }
     }
 

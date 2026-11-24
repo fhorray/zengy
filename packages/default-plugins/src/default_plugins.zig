@@ -14,6 +14,11 @@ const scene = @import("scene");
 const scripting_host = @import("scripting_host");
 const toml_format = @import("toml_format");
 const json_format = @import("json_format");
+const camera = @import("camera");
+const input = @import("input");
+const input_haptics = @import("input_haptics");
+const state = @import("state");
+const audio = @import("audio");
 
 /// Registers the standard suite of optional engine modules on `app`.
 pub fn registerDefaultModules(app: *engine.App) !void {
@@ -25,4 +30,9 @@ pub fn registerDefaultModules(app: *engine.App) !void {
     try app.registerModule(scripting_host.module());
     try app.registerModule(toml_format.module());
     try app.registerModule(json_format.module());
+    try app.registerModule(camera.module());
+    try app.registerModule(input.module());
+    try app.registerModule(input_haptics.module());
+    try app.registerModule(state.module());
+    try app.registerModule(audio.module());
 }
