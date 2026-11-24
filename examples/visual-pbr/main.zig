@@ -115,7 +115,10 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
 
     if (keys.justPressed(.key_x)) pp.auto_exposure.enabled = !pp.auto_exposure.enabled;
     if (keys.justPressed(.key_b)) pp.bloom.enabled = !pp.bloom.enabled;
-    if (keys.justPressed(.key_f)) fog.enabled = !fog.enabled;
+    if (keys.justPressed(.key_f)) {
+        fog.enabled = !fog.enabled;
+        fog.volumetric.enabled = fog.enabled;
+    }
     if (keys.justPressed(.key_g)) sun.shadows_enabled = !sun.shadows_enabled;
     if (keys.justPressed(.key_o)) pp.ssao.enabled = !pp.ssao.enabled;
     if (keys.justPressed(.key_n)) {
@@ -262,6 +265,17 @@ pub fn main(init: std.process.Init) !void {
         .sky_tint = .{ 0.14, 0.38, 0.85 },
         .horizon_tint = .{ 0.52, 0.70, 0.92 },
         .ground_albedo = .{ 0.14, 0.14, 0.16 },
+    });
+    try app.resources.insert(render_3d.pbr.FogSettings, .{
+        .enabled = true,
+        .density = 0.012,
+        .start_distance = 4.0,
+        .volumetric = .{
+            .enabled = true,
+            .anisotropy = 0.68,
+            .scattering = 0.35,
+            .max_distance = 75.0,
+        },
     });
     const sun_e = try app.world.spawn();
     try app.world.set(sun_e, render_3d.pbr.DirectionalLight, .{

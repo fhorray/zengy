@@ -26,6 +26,7 @@ const BLOOM_UP_SPV = @embedFile("shaders/bloom_upsample.frag.spv");
 const POSTFX_FRAG_SPV = @embedFile("shaders/postfx.frag.spv");
 const SSAO_FRAG_SPV = @embedFile("shaders/ssao.frag.spv");
 const SSAO_BLUR_SPV = @embedFile("shaders/ssao_blur.frag.spv");
+const VOL_FOG_SPV = @embedFile("shaders/volumetric_fog.frag.spv");
 
 const SHADOW_W: u32 = 2048;
 const SHADOW_H: u32 = 2048;
@@ -72,6 +73,20 @@ const SsaoParams = extern struct {
     params: [4]f32,
     sun_view_dir: [4]f32,
     contact_params: [4]f32,
+};
+
+const VolFogParams = extern struct {
+    inv_view_proj: [16]f32,
+    light_vp: [4][16]f32,
+    cam_pos_density: [4]f32,
+    sun_dir_int: [4]f32,
+    sun_col_aniso: [4]f32,
+    fog_col_scat: [4]f32,
+    cascade_splits: [4]f32,
+    cam_fwd_maxd: [4]f32,
+    spot_pos_range: [4]f32,
+    spot_dir_cos: [4]f32,
+    spot_col_on: [4]f32,
 };
 
 const GpuPointLight = extern struct {
@@ -167,6 +182,7 @@ pub const PbrGpuState = struct {
     shadow_pipeline: *c.SDL_GPUGraphicsPipeline,
     ssao_pipeline: *c.SDL_GPUGraphicsPipeline,
     ssao_blur_pipeline: *c.SDL_GPUGraphicsPipeline,
+    volumetric_pipeline: *c.SDL_GPUGraphicsPipeline,
     bloom_down_pipeline: *c.SDL_GPUGraphicsPipeline,
     bloom_up_pipeline: *c.SDL_GPUGraphicsPipeline,
     postfx_pipeline: *c.SDL_GPUGraphicsPipeline,
@@ -255,6 +271,11 @@ pub const PbrGpuState = struct {
         defer c.SDL_ReleaseGPUShader(device, ssao_blur_fs);
         const ssao_blur_pipe = try createFullscreenPipeline(device, sky_vs, ssao_blur_fs, ao_format, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, ssao_blur_pipe);
+
+        const vol_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, VOL_FOG_SPV, 2, 1);
+        defer c.SDL_ReleaseGPUShader(device, vol_fs);
+        const vol_pipe = try createFullscreenPipeline(device, sky_vs, vol_fs, hdr_format, true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, vol_pipe);
 
         const bd_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, BLOOM_DOWN_SPV, 1, 1);
         defer c.SDL_ReleaseGPUShader(device, bd_fs);
@@ -398,6 +419,7 @@ pub const PbrGpuState = struct {
             .shadow_pipeline = sh_pipe,
             .ssao_pipeline = ssao_pipe,
             .ssao_blur_pipeline = ssao_blur_pipe,
+            .volumetric_pipeline = vol_pipe,
             .bloom_down_pipeline = bd_pipe,
             .bloom_up_pipeline = bu_pipe,
             .postfx_pipeline = pf_pipe,
@@ -456,6 +478,7 @@ pub const PbrGpuState = struct {
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.postfx_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.bloom_up_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.bloom_down_pipeline);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.volumetric_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.ssao_blur_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.ssao_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.shadow_pipeline);
@@ -988,7 +1011,7 @@ pub const PbrGpuState = struct {
                 .texture = depth_tex,
                 .clear_depth = 1.0,
                 .load_op = c.SDL_GPU_LOADOP_CLEAR,
-                .store_op = c.SDL_GPU_STOREOP_DONT_CARE,
+                .store_op = c.SDL_GPU_STOREOP_STORE,
                 .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
                 .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
             });
@@ -1099,6 +1122,52 @@ pub const PbrGpuState = struct {
                 c.SDL_DrawGPUIndexedPrimitives(pbr_pass, gm.index_count, 1, 0, 0, 0);
             }
             c.SDL_EndGPURenderPass(pbr_pass);
+        }
+
+        // 3.5 Volumetric Fog & God Rays (additive ray-marched scattering into HDR target)
+        if (self.frame_data.fog.enabled and self.frame_data.fog.volumetric.enabled) {
+            const vf_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
+                .texture = hdr_tex,
+                .load_op = c.SDL_GPU_LOADOP_LOAD,
+                .store_op = c.SDL_GPU_STOREOP_STORE,
+            });
+            const vf_pass = c.SDL_BeginGPURenderPass(cmd_buf, &vf_col, 1, null) orelse return error.SdlGpuFailure;
+            c.SDL_SetGPUViewport(vf_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(tex_w), .h = @floatFromInt(tex_h), .min_depth = 0, .max_depth = 1 });
+            c.SDL_BindGPUGraphicsPipeline(vf_pass, self.volumetric_pipeline);
+
+            const has_dir_vf = self.frame_data.directional_lights.len > 0;
+            const vf_sun_dir: [3]f32 = if (has_dir_vf)
+                .{ -self.frame_data.directional_lights[0].direction[0], -self.frame_data.directional_lights[0].direction[1], -self.frame_data.directional_lights[0].direction[2] }
+            else
+                .{ 0.4, 0.8, 0.45 };
+            const vf_sun_col: [3]f32 = if (has_dir_vf) self.frame_data.directional_lights[0].color else .{ 1, 1, 1 };
+            const vf_sun_int: f32 = if (has_dir_vf) self.frame_data.directional_lights[0].illuminance_lux / 2500.0 else 0.0;
+
+            const has_spot_vf = self.frame_data.spot_lights.len > 0;
+            const vf_spot = if (has_spot_vf) self.frame_data.spot_lights[0] else undefined;
+            const vf_spot_sc: f32 = if (has_spot_vf) vf_spot.intensity_lumens / 100.0 else 0.0;
+
+            const vfp = VolFogParams{
+                .inv_view_proj = invertMat4(self.frame_data.view_proj),
+                .light_vp = .{ light_vps[0].m, light_vps[1].m, light_vps[2].m, light_vps[3].m },
+                .cam_pos_density = .{ self.frame_data.camera_position[0], self.frame_data.camera_position[1], self.frame_data.camera_position[2], self.frame_data.fog.density },
+                .sun_dir_int = .{ vf_sun_dir[0], vf_sun_dir[1], vf_sun_dir[2], vf_sun_int },
+                .sun_col_aniso = .{ vf_sun_col[0], vf_sun_col[1], vf_sun_col[2], self.frame_data.fog.volumetric.anisotropy },
+                .fog_col_scat = .{ self.frame_data.fog.color[0], self.frame_data.fog.color[1], self.frame_data.fog.color[2], self.frame_data.fog.volumetric.scattering },
+                .cascade_splits = cascade_splits,
+                .cam_fwd_maxd = .{ self.frame_data.camera_forward[0], self.frame_data.camera_forward[1], self.frame_data.camera_forward[2], self.frame_data.fog.volumetric.max_distance },
+                .spot_pos_range = if (has_spot_vf) .{ vf_spot.position[0], vf_spot.position[1], vf_spot.position[2], vf_spot.range } else .{ 0, 0, 0, 1 },
+                .spot_dir_cos = if (has_spot_vf) .{ vf_spot.direction[0], vf_spot.direction[1], vf_spot.direction[2], @cos(vf_spot.outer_angle_rad) } else .{ 0, -1, 0, 0.8 },
+                .spot_col_on = if (has_spot_vf) .{ vf_spot.color[0] * vf_spot_sc, vf_spot.color[1] * vf_spot_sc, vf_spot.color[2] * vf_spot_sc, 1.0 } else .{ 0, 0, 0, 0.0 },
+            };
+            const vf_samplers = [_]c.SDL_GPUTextureSamplerBinding{
+                .{ .texture = depth_tex, .sampler = nearest_sampler },
+                .{ .texture = self.shadow_texture, .sampler = self.shadow_sampler },
+            };
+            c.SDL_BindGPUFragmentSamplers(vf_pass, 0, &vf_samplers, vf_samplers.len);
+            c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &vfp, @sizeOf(VolFogParams));
+            c.SDL_DrawGPUPrimitives(vf_pass, 3, 1, 0, 0);
+            c.SDL_EndGPURenderPass(vf_pass);
         }
 
         // 4. Compute Auto-Exposure (Histogram -> EV100 Adaptation)
