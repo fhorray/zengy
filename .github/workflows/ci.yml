@@ -60,3 +60,80 @@ jobs:
           zig build run-cli -Doptimize=${{ matrix.optimize }}
           zig build run-cli -Dcli-cmd=packages -Doptimize=${{ matrix.optimize }}
           zig build run-cli -Dcli-cmd=test-scenario -Doptimize=${{ matrix.optimize }}
+
+  sanitize:
+    name: ThreadSanitizer (parallel scheduler)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Run scheduler tests under TSan
+        # -fsanitize-thread applies per module: instrument both the tests and the engine.
+        run: >
+          zig test -OReleaseSafe --test-filter "parallel"
+          --dep engine -fsanitize-thread -Mroot=src/core/tests/core_tests.zig
+          -fsanitize-thread -Mengine=src/engine.zig
+
+  bench:
+    name: Benchmark regression guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Run benchmarks
+        run: zig build run-bench -Doptimize=ReleaseFast 2>&1 | tee bench.txt
+      - name: Check thresholds
+        run: sh tools/ci/check_bench.sh bench.txt
+
+  gpu-smoke:
+    name: Native visual demos (SDL3 + lavapipe, headless)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install SDL3 build dependencies and a software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake pkg-config mesa-vulkan-drivers libvulkan-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
+            libxtst-dev libxrender-dev libxinerama-dev libxkbcommon-dev libwayland-dev libdrm-dev \
+            libgbm-dev libgl1-mesa-dev libegl1-mesa-dev libasound2-dev libpulse-dev libudev-dev \
+            libdbus-1-dev libdecor-0-dev
+      - name: Cache SDL3
+        id: sdl
+        uses: actions/cache@v4
+        with:
+          path: /opt/sdl3
+          key: sdl3-3.4.20-ubuntu-24.04
+      - name: Build SDL3 3.4.20
+        if: steps.sdl.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL /tmp/SDL
+          cmake -S /tmp/SDL -B /tmp/SDL/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX=/opt/sdl3
+          cmake --build /tmp/SDL/build -j4
+          cmake --install /tmp/SDL/build
+      - name: Build all native targets
+        # zig build finds SDL3 through its library search paths (not pkg-config), so point it at the prefix.
+        run: zig build --search-prefix /opt/sdl3 --summary all -Doptimize=ReleaseSafe
+      - name: Run each visual demo for 8s and check for leaks, panics, and errors
+        run: |
+          export LD_LIBRARY_PATH=/opt/sdl3/lib
+          export VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n 1)
+          export SDL_VIDEODRIVER=offscreen
+          status=0
+          for demo in visual-gpu visual-2d visual-plume visual-ui visual-playground visual-3d visual-python visual-hello; do
+            timeout 8 ./zig-out/bin/$demo > /tmp/$demo.log 2>&1 || true
+            if grep -qiE 'leak|panic|error' /tmp/$demo.log; then
+              echo "::error::$demo reported problems"; cat /tmp/$demo.log; status=1
+            else
+              echo "ok $demo"
+            fi
+          done
+          exit $status

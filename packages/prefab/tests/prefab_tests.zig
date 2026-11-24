@@ -455,3 +455,51 @@ test "streaming: budgeted commit, duplicate/cancel handling, atomic failure, unl
     try testing.expectEqual(@as(usize, 3), world.entity_count);
     try testing.expect(!st.isQueued("bad") and !st.isLoaded("bad"));
 }
+
+test "fuzz: the cooked loader never crashes or reads out of bounds on mutated or random input" {
+    var types = engine.TypeRegistry.init(testing.allocator);
+    defer types.deinit();
+    const stats = try makeStatsTypes(&types);
+    var pf = prefab.Prefab.init(testing.allocator);
+    defer pf.deinit();
+    try addStatsEntity(&pf, stats, "a", null, 1);
+    try addStatsEntity(&pf, stats, "b", "a", 2);
+    try pf.addNested("n", "a", "other", &.{.{ .local_id = "x", .stable_id = stats.stable_id, .field = "hp", .value = .{ .vec3_t = .{ 1, 2, 3 } } }});
+    const good = try prefab.cooked.cook(testing.allocator, &pf);
+    defer testing.allocator.free(good);
+
+    const iterations: u64 = blk: {
+        const raw = std.testing.environ.getAlloc(testing.allocator, "ZENGY_FUZZ_ITER") catch break :blk 2000;
+        defer testing.allocator.free(raw);
+        break :blk std.fmt.parseInt(u64, raw, 10) catch 2000;
+    };
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rng = prng.random();
+    const buf = try testing.allocator.alloc(u8, good.len + 64);
+    defer testing.allocator.free(buf);
+
+    for (0..iterations) |_| {
+        // Mutate a valid file in a few places, then *repair the checksum* so the structural
+        // parser (not just the CRC) is exercised.
+        const len = good.len;
+        @memcpy(buf[0..len], good);
+        const flips = rng.intRangeAtMost(usize, 1, 4);
+        for (0..flips) |_| buf[rng.uintLessThan(usize, len - 4)] = rng.int(u8);
+        const crc = std.hash.Crc32.hash(buf[0 .. len - 4]);
+        std.mem.writeInt(u32, buf[len - 4 ..][0..4], crc, .little);
+        if (prefab.cooked.load(testing.allocator, buf[0..len])) |loaded| {
+            var l = loaded;
+            l.deinit();
+        } else |_| {}
+
+        // Pure noise of random length with a valid CRC trailer.
+        const n = rng.intRangeAtMost(usize, 8, buf.len);
+        rng.bytes(buf[0..n]);
+        @memcpy(buf[0..4], "ZPFB");
+        std.mem.writeInt(u32, buf[n - 4 ..][0..4], std.hash.Crc32.hash(buf[0 .. n - 4]), .little);
+        if (prefab.cooked.load(testing.allocator, buf[0..n])) |loaded| {
+            var l = loaded;
+            l.deinit();
+        } else |_| {}
+    }
+}

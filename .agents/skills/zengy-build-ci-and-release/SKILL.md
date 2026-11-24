@@ -38,6 +38,8 @@ zig build cli -Doptimize=ReleaseSafe
 1. **CI (`.github/workflows/ci.yml`)**:
    - Triggers on push/PR to `main` and `staging`.
    - Runs `ubuntu-24.04` (`Debug` + `ReleaseSafe`), Windows x64 cross-compile from `ubuntu-24.04`, and `macos-15` (`Debug` + `ReleaseSafe`).
+   - Extra jobs: `sanitize` (ThreadSanitizer over the parallel-scheduler tests; `-fsanitize-thread` must be passed per module), `bench` (`zig build run-bench` + `tools/ci/check_bench.sh` threshold guard), and `gpu-smoke` (builds SDL3 3.4.20 from source, then runs every native visual demo for 8 s under lavapipe with `SDL_VIDEODRIVER=offscreen`; `zig build` finds SDL3 via `--search-prefix`, not pkg-config).
+   - `.github/workflows/fuzz.yml` runs the property/fuzz tests nightly at scale (`ZENGY_FUZZ_STEPS`, `ZENGY_FUZZ_ITER`, `ZENGY_FUZZ_SEED`).
    - Note: `macos-14` is retired by GitHub Actions — always keep macOS jobs on `macos-15` (or newer).
 2. **Release (`.github/workflows/release.yml`)**:
    - Triggers on `v*` tags (e.g., `git tag v0.1.7 && git push origin v0.1.7`) or `workflow_dispatch`.

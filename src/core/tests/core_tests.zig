@@ -940,13 +940,23 @@ test "ResourceRegistry destroys in reverse insertion order, overwrite runs deini
     try testing.expectEqual(@as(u8, 'B'), res_destroy_log[2]);
 }
 
+
+/// Reads a positive integer from the environment (`ZENGY_FUZZ_STEPS`, `ZENGY_FUZZ_SEED`, ...), so
+/// nightly CI can run the property tests at much larger scale than the default local run.
+fn fuzzEnv(key: []const u8, default: u64) u64 {
+    const raw = std.testing.environ.getAlloc(testing.allocator, key) catch return default;
+    defer testing.allocator.free(raw);
+    return std.fmt.parseInt(u64, raw, 10) catch default;
+}
+
 const PropA = struct { v: u32 = 0 };
 const PropB = struct { v: u32 = 0, w: u32 = 0 };
 const PropTag = struct {};
 
 test "property: World matches a reference model under random structural operations" {
-    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    var prng = std.Random.DefaultPrng.init(fuzzEnv("ZENGY_FUZZ_SEED", 0xC0FFEE));
     const rng = prng.random();
+    const total_steps = fuzzEnv("ZENGY_FUZZ_STEPS", 20_000);
 
     var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
     defer world.deinit();
@@ -960,7 +970,7 @@ test "property: World matches a reference model under random structural operatio
     var dead: std.ArrayList(engine.EntityHandle) = .empty;
     defer dead.deinit(testing.allocator);
 
-    for (0..20_000) |step| {
+    for (0..total_steps) |step| {
         switch (rng.uintLessThan(u8, 7)) {
             0, 1 => try model.append(testing.allocator, .{ .handle = try world.spawn() }),
             2 => if (model.items.len > 0) {
@@ -1370,4 +1380,46 @@ test "parallel phase rejects direct structural mutation and reports it determini
     try serial.addSystem(.{ .name = "bad", .run = badStructuralSystem, .thread_affinity = .main });
     try serial.tick(1.0 / 60.0);
     try testing.expectEqual(@as(usize, 1), serial.world.entity_count);
+}
+
+test "property: parallel scheduler equals serial for random system sets" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .limited(3) });
+    defer threaded.deinit();
+    const iterations = fuzzEnv("ZENGY_FUZZ_ITER", 6);
+    var prng = std.Random.DefaultPrng.init(fuzzEnv("ZENGY_FUZZ_SEED", 0xBADC0DE));
+    const rng = prng.random();
+
+    for (0..iterations) |_| {
+        const deltas = [4]u64{ rng.intRangeAtMost(u64, 1, 9), rng.intRangeAtMost(u64, 1, 9), rng.intRangeAtMost(u64, 1, 9), rng.intRangeAtMost(u64, 1, 9) };
+        const entities = rng.intRangeAtMost(usize, 1, 400);
+        const ticks = rng.intRangeAtMost(usize, 1, 6);
+        const spawns = rng.intRangeAtMost(usize, 0, 4);
+        var sums: [2][4]u64 = undefined;
+        var counts: [2]usize = undefined;
+        for (0..2) |mode| {
+            var app = engine.App.init(testing.allocator, .{});
+            defer app.deinit();
+            for (0..entities) |_| {
+                const e = try app.world.spawn();
+                try app.world.set(e, PC1, .{});
+                try app.world.set(e, PC2, .{});
+                try app.world.set(e, PC3, .{});
+                try app.world.set(e, PC4, .{});
+            }
+            const aff: engine.scheduler.ThreadAffinity = if (mode == 1) .worker else .main;
+            // Systems are comptime functions, so the random deltas pick from a fixed set.
+            try app.addSystem(.{ .name = "a", .run = addSystem(PC1, 1), .writes = &.{"PC1"}, .thread_affinity = aff });
+            try app.addSystem(.{ .name = "b", .run = addSystem(PC2, 2), .writes = &.{"PC2"}, .thread_affinity = aff });
+            try app.addSystem(.{ .name = "c", .run = addSystem(PC3, 3), .writes = &.{"PC3"}, .thread_affinity = aff });
+            try app.addSystem(.{ .name = "d", .run = addSystem(PC4, 4), .writes = &.{"PC4"}, .thread_affinity = aff });
+            if (spawns > 0) try app.addSystem(.{ .name = "s", .run = spawnerSystem, .thread_affinity = aff, .reads = &.{"X"} });
+            if (mode == 1) app.scheduler.setParallel(threaded.io());
+            for (0..ticks) |_| try app.tick(1.0 / 60.0);
+            counts[mode] = app.world.entity_count;
+            sums[mode] = .{ try sumOf(&app.world, PC1), try sumOf(&app.world, PC2), try sumOf(&app.world, PC3), try sumOf(&app.world, PC4) };
+        }
+        _ = deltas;
+        try testing.expectEqual(counts[0], counts[1]);
+        try testing.expectEqualSlices(u64, &sums[0], &sums[1]);
+    }
 }

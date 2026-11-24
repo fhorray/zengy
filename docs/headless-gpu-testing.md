@@ -4,7 +4,7 @@ Useful in containers and CI to smoke-test `graphics-sdlgpu`, `window-sdl3`, and 
 
 1. Install SDL3 3.4.x (Ubuntu 24.04 has no `libsdl3-dev`): build `libsdl-org/SDL` at tag `release-3.4.20`
    with CMake and install it to `/usr/local` (needs the X11/Wayland/ALSA/Vulkan `-dev` packages).
-2. Build natively: `zig build` (links the system SDL3).
+2. Build natively: `zig build` (links SDL3 from the default search paths). `zig build` does not use pkg-config; for a private install prefix pass `--search-prefix /opt/sdl3` and set `LD_LIBRARY_PATH=/opt/sdl3/lib` when running.
 3. Run with a software Vulkan driver (lavapipe/llvmpipe) and SDL's offscreen video driver:
 
 ```sh

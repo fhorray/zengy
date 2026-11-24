@@ -1,0 +1,32 @@
+name: Nightly fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "ECS random operations per property test"
+        default: "5000000"
+      iterations:
+        description: "Iterations for loader/scheduler fuzz tests"
+        default: "300000"
+
+jobs:
+  fuzz:
+    name: Property & fuzz tests at scale
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Run property and fuzz tests (ReleaseSafe)
+        env:
+          ZENGY_FUZZ_STEPS: ${{ github.event.inputs.steps || '5000000' }}
+          ZENGY_FUZZ_ITER: ${{ github.event.inputs.iterations || '300000' }}
+          ZENGY_FUZZ_SEED: ${{ github.run_id }}
+        run: |
+          echo "seed=$ZENGY_FUZZ_SEED steps=$ZENGY_FUZZ_STEPS iter=$ZENGY_FUZZ_ITER"
+          zig build test -Doptimize=ReleaseSafe --summary all
