@@ -78,6 +78,8 @@ const SsaoParams = extern struct {
 const VolFogParams = extern struct {
     inv_view_proj: [16]f32,
     light_vp: [4][16]f32,
+    spot_shadow_vp: [16]f32,
+    spot_atlas_rect: [4]f32,
     cam_pos_density: [4]f32,
     sun_dir_int: [4]f32,
     sun_col_aniso: [4]f32,
@@ -87,6 +89,8 @@ const VolFogParams = extern struct {
     spot_pos_range: [4]f32,
     spot_dir_cos: [4]f32,
     spot_col_on: [4]f32,
+    point_pos: [4][4]f32,
+    point_col: [4][4]f32,
 };
 
 const GpuPointLight = extern struct {
@@ -272,7 +276,7 @@ pub const PbrGpuState = struct {
         const ssao_blur_pipe = try createFullscreenPipeline(device, sky_vs, ssao_blur_fs, ao_format, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, ssao_blur_pipe);
 
-        const vol_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, VOL_FOG_SPV, 2, 1);
+        const vol_fs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, VOL_FOG_SPV, 3, 1);
         defer c.SDL_ReleaseGPUShader(device, vol_fs);
         const vol_pipe = try createFullscreenPipeline(device, sky_vs, vol_fs, hdr_format, true);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, vol_pipe);
@@ -1146,23 +1150,44 @@ pub const PbrGpuState = struct {
             const has_spot_vf = self.frame_data.spot_lights.len > 0;
             const vf_spot = if (has_spot_vf) self.frame_data.spot_lights[0] else undefined;
             const vf_spot_sc: f32 = if (has_spot_vf) vf_spot.intensity_lumens / 100.0 else 0.0;
+            const vf_spot_tile: i32 = if (has_spot_vf) @intFromFloat(cl_lights.spots[0].shadow_params[0]) else -1;
+            const vf_spot_vp = if (vf_spot_tile >= 0) local_sh_data.shadow_vp[@intCast(vf_spot_tile)] else math3d.Mat4.identity().m;
+            const vf_spot_rect: [4]f32 = if (vf_spot_tile >= 0)
+                .{ local_sh_data.atlas_rect[@intCast(vf_spot_tile)][0], local_sh_data.atlas_rect[@intCast(vf_spot_tile)][1], local_sh_data.atlas_rect[@intCast(vf_spot_tile)][2], 1.0 }
+            else
+                .{ 0, 0, 0.25, 0.0 };
+
+            var vf_pt_pos: [4][4]f32 = @splat(.{ 0, 0, 0, 1 });
+            var vf_pt_col: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
+            const vf_pn = @min(self.frame_data.point_lights.len, 4);
+            for (0..vf_pn) |i| {
+                const pl = self.frame_data.point_lights[i];
+                const sc = pl.intensity_lumens / 100.0;
+                vf_pt_pos[i] = .{ pl.position[0], pl.position[1], pl.position[2], pl.range };
+                vf_pt_col[i] = .{ pl.color[0] * sc, pl.color[1] * sc, pl.color[2] * sc, 1.0 };
+            }
 
             const vfp = VolFogParams{
                 .inv_view_proj = invertMat4(self.frame_data.view_proj),
                 .light_vp = .{ light_vps[0].m, light_vps[1].m, light_vps[2].m, light_vps[3].m },
+                .spot_shadow_vp = vf_spot_vp,
+                .spot_atlas_rect = vf_spot_rect,
                 .cam_pos_density = .{ self.frame_data.camera_position[0], self.frame_data.camera_position[1], self.frame_data.camera_position[2], self.frame_data.fog.density },
                 .sun_dir_int = .{ vf_sun_dir[0], vf_sun_dir[1], vf_sun_dir[2], vf_sun_int },
                 .sun_col_aniso = .{ vf_sun_col[0], vf_sun_col[1], vf_sun_col[2], self.frame_data.fog.volumetric.anisotropy },
                 .fog_col_scat = .{ self.frame_data.fog.color[0], self.frame_data.fog.color[1], self.frame_data.fog.color[2], self.frame_data.fog.volumetric.scattering },
-                .cascade_splits = cascade_splits,
+                .cascade_splits = if (shadows_enabled > 0.5) cascade_splits else .{ -1.0, -1.0, -1.0, -1.0 },
                 .cam_fwd_maxd = .{ self.frame_data.camera_forward[0], self.frame_data.camera_forward[1], self.frame_data.camera_forward[2], self.frame_data.fog.volumetric.max_distance },
                 .spot_pos_range = if (has_spot_vf) .{ vf_spot.position[0], vf_spot.position[1], vf_spot.position[2], vf_spot.range } else .{ 0, 0, 0, 1 },
                 .spot_dir_cos = if (has_spot_vf) .{ vf_spot.direction[0], vf_spot.direction[1], vf_spot.direction[2], @cos(vf_spot.outer_angle_rad) } else .{ 0, -1, 0, 0.8 },
                 .spot_col_on = if (has_spot_vf) .{ vf_spot.color[0] * vf_spot_sc, vf_spot.color[1] * vf_spot_sc, vf_spot.color[2] * vf_spot_sc, 1.0 } else .{ 0, 0, 0, 0.0 },
+                .point_pos = vf_pt_pos,
+                .point_col = vf_pt_col,
             };
             const vf_samplers = [_]c.SDL_GPUTextureSamplerBinding{
                 .{ .texture = depth_tex, .sampler = nearest_sampler },
                 .{ .texture = self.shadow_texture, .sampler = self.shadow_sampler },
+                .{ .texture = self.local_shadow_texture, .sampler = self.shadow_sampler },
             };
             c.SDL_BindGPUFragmentSamplers(vf_pass, 0, &vf_samplers, vf_samplers.len);
             c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &vfp, @sizeOf(VolFogParams));

@@ -431,15 +431,14 @@ void main() {
 
     if (camera_pos_fog.w > 0.5) {
         float d = max(length(camera_pos_fog.xyz - v_world_pos) - fog_color_start.w, 0.0);
-        float fog_f = 1.0 - exp(-d * ambient_sky.w);
-        vec3 fog_c = fog_color_start.rgb;
-        if (probe_volumetric.z > 0.5 && dir_light_dir.w > 0.0) {
-            float cos_a = dot(-V, normalize(dir_light_dir.xyz));
-            float g = 0.6;
-            float phase = (1.0 - g * g) / (4.0 * PI * pow(max(1.0 + g * g - 2.0 * g * cos_a, 0.01), 1.5));
-            fog_c += dir_light_col.rgb * dir_light_dir.w * phase * probe_volumetric.w;
+        if (probe_volumetric.z > 0.5) {
+            // When ray-marched volumetric fog is active, only apply gentle distance extinction
+            // so shadowed rooms stay dark instead of being washed out by unshadowed fog color.
+            color *= exp(-d * ambient_sky.w * 0.35);
+        } else {
+            float fog_f = 1.0 - exp(-d * ambient_sky.w);
+            color = mix(color, fog_color_start.rgb, clamp(fog_f, 0.0, 1.0));
         }
-        color = mix(color, fog_c, clamp(fog_f, 0.0, 1.0));
     }
 
     frag_color = vec4(color, albedo_a.a);

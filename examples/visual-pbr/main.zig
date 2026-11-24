@@ -39,6 +39,7 @@ const PbrDemoState = struct {
     hud1_len: usize = 0,
     hud2: [180]u8 = @splat(0),
     hud2_len: usize = 0,
+    in_vol_room: bool = false,
 };
 
 fn createUvSphere(allocator: std.mem.Allocator, radius: f32, stacks: u32, slices: u32) !render_3d.gltf.MeshData {
@@ -127,7 +128,7 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
             switch (st.sky_preset) {
                 0 => {
                     sky.kind = .hdri;
-                    sun.illuminance_lux = 8500.0;
+                    sun.illuminance_lux = 24000.0;
                     sun.color = .{ 1.0, 0.96, 0.90 };
                 },
                 1 => {
@@ -135,7 +136,7 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
                     sky.sky_tint = .{ 0.14, 0.38, 0.85 };
                     sky.horizon_tint = .{ 0.52, 0.70, 0.92 };
                     sky.ground_albedo = .{ 0.14, 0.14, 0.16 };
-                    sun.illuminance_lux = 8500.0;
+                    sun.illuminance_lux = 24000.0;
                     sun.color = .{ 1.0, 0.96, 0.90 };
                 },
                 2 => {
@@ -159,10 +160,19 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
     }
     if (keys.justPressed(.key_v)) pp.vignette.enabled = !pp.vignette.enabled;
     if (keys.justPressed(.key_r)) st.rotate_sun = !st.rotate_sun;
+    if (keys.justPressed(.key_t)) {
+        st.in_vol_room = !st.in_vol_room;
+        if (st.in_vol_room) {
+            cam_pose.* = camera.CameraPose.lookAt(.{ 11.2, 2.1, 2.8 }, .{ 15.2, 2.3, -1.2 }, .{ 0, 1, 0 });
+        } else {
+            cam_pose.* = camera.CameraPose.lookAt(.{ 0, 2.6, 10.0 }, .{ 0, 2.6, 0 }, .{ 0, 1, 0 });
+        }
+    }
 
     if (st.rotate_sun) {
-        st.sun_angle += ctx.dt * 0.35;
-        sun.direction = .{ -@cos(st.sun_angle) * 0.6, -@max(@sin(st.sun_angle), 0.05), -0.45 };
+        st.sun_angle += ctx.dt * 0.65;
+        const elev = 0.35 + 0.55 * (0.5 + 0.5 * @sin(st.sun_angle * 0.7));
+        sun.direction = .{ -@cos(st.sun_angle) * 0.65, -elev, -@sin(st.sun_angle) * 0.55 - 0.15 };
     }
 
     const sky_label: []const u8 = switch (st.sky_preset) {
@@ -181,7 +191,7 @@ fn updatePbrDemo(ctx: *engine.SystemContext) !void {
 
     const h2 = std.fmt.bufPrint(
         &st.hud2,
-        "WASD+RMB=Fly | Q/E=Alt | F=Fog({any}) | R=SunCycle({any}) | V=Vignette({any}) | Pos:({d:.1},{d:.1},{d:.1})",
+        "WASD+RMB=Fly | T=VolRoom | F=Fog({any}) | R=SunCycle({any}) | V=Vignette({any}) | Pos:({d:.1},{d:.1},{d:.1})",
         .{ fog.enabled, st.rotate_sun, pp.vignette.enabled, cam_pose.position[0], cam_pose.position[1], cam_pose.position[2] },
     ) catch "";
     st.hud2_len = h2.len;
@@ -262,25 +272,30 @@ pub fn main(init: std.process.Init) !void {
         .hdri_pixels = hdri.pixels,
         .hdri_width = hdri.width,
         .hdri_height = hdri.height,
+        .hdri_exposure_ev = -0.6,
         .sky_tint = .{ 0.14, 0.38, 0.85 },
         .horizon_tint = .{ 0.52, 0.70, 0.92 },
         .ground_albedo = .{ 0.14, 0.14, 0.16 },
     });
+    try app.resources.insert(render_3d.pbr.AmbientLight, .{
+        .color = .{ 0.55, 0.68, 0.88 },
+        .brightness = 0.04,
+    });
     try app.resources.insert(render_3d.pbr.FogSettings, .{
         .enabled = true,
-        .density = 0.012,
+        .density = 0.014,
         .start_distance = 4.0,
         .volumetric = .{
             .enabled = true,
             .anisotropy = 0.68,
-            .scattering = 0.35,
+            .scattering = 0.22,
             .max_distance = 75.0,
         },
     });
     const sun_e = try app.world.spawn();
     try app.world.set(sun_e, render_3d.pbr.DirectionalLight, .{
         .color = .{ 1.0, 0.96, 0.90 },
-        .illuminance_lux = 8500.0,
+        .illuminance_lux = 24000.0,
         .direction = .{ -0.45, -0.75, -0.45 },
         .shadows_enabled = true,
         .pcss_enabled = true,
@@ -325,38 +340,38 @@ pub fn main(init: std.process.Init) !void {
         try app.world.set(ce, render_3d.MeshRef, .{ .mesh_asset = @bitCast(gpu_cube), .material_handle = col_mat });
     }
 
-    // Shadowed SpotLight aimed into the alcove.
+    // Shadowed SpotLight aimed across the dark volumetric room.
     const spot_e = try app.world.spawn();
-    try app.world.set(spot_e, render_3d.Transform3D, .{ .position = .{ 7.5, 5.2, 2.5 } });
+    try app.world.set(spot_e, render_3d.Transform3D, .{ .position = .{ 11.4, 4.4, 2.2 } });
     try app.world.set(spot_e, render_3d.pbr.SpotLight, .{
-        .color = .{ 1.0, 0.88, 0.68 },
-        .intensity_lumens = 3500.0,
-        .direction = .{ 0.6, -0.6, -0.4 },
-        .range = 20.0,
-        .inner_angle_rad = 0.3,
-        .outer_angle_rad = 0.65,
+        .color = .{ 0.92, 0.96, 1.0 },
+        .intensity_lumens = 1200.0,
+        .direction = .{ 0.55, -0.68, -0.48 },
+        .range = 16.0,
+        .inner_angle_rad = 0.22,
+        .outer_angle_rad = 0.52,
         .shadows_enabled = true,
     });
 
-    // Local ReflectionProbe covering the full shaded alcove interior with smooth exterior fade.
+    // Dark ReflectionProbe covering the enclosed volumetric room so the interior stays dark.
     const probe_e = try app.world.spawn();
-    try app.world.set(probe_e, render_3d.Transform3D, .{ .position = .{ 11.5, 2.2, 0.0 } });
+    try app.world.set(probe_e, render_3d.Transform3D, .{ .position = .{ 14.0, 2.6, 0.0 } });
     try app.world.set(probe_e, render_3d.pbr.ReflectionProbe, .{
-        .half_extents = .{ 5.8, 3.6, 5.2 },
-        .blend_distance = 2.4,
-        .intensity = 0.85,
-        .sky_tint = .{ 0.22, 0.25, 0.30 },
-        .ground_tint = .{ 0.10, 0.10, 0.11 },
+        .half_extents = .{ 4.3, 3.0, 4.3 },
+        .blend_distance = 0.6,
+        .intensity = 0.96,
+        .sky_tint = .{ 0.008, 0.008, 0.012 },
+        .ground_tint = .{ 0.004, 0.004, 0.006 },
     });
 
-    // Two colored PointLights near the dark alcove and metallic grid.
+    // Two colored PointLights: blue near metallic grid, red inside the dark volumetric room.
     const pl1 = try app.world.spawn();
     try app.world.set(pl1, render_3d.Transform3D, .{ .position = .{ -4.5, 2.5, 3.0 } });
-    try app.world.set(pl1, render_3d.pbr.PointLight, .{ .color = .{ 0.25, 0.65, 1.0 }, .intensity_lumens = 2500.0, .range = 16.0 });
+    try app.world.set(pl1, render_3d.pbr.PointLight, .{ .color = .{ 0.25, 0.65, 1.0 }, .intensity_lumens = 2500.0, .range = 16.0, .shadows_enabled = true });
 
     const pl2 = try app.world.spawn();
-    try app.world.set(pl2, render_3d.Transform3D, .{ .position = .{ 9.5, 2.5, -0.5 } });
-    try app.world.set(pl2, render_3d.pbr.PointLight, .{ .color = .{ 1.0, 0.45, 0.20 }, .intensity_lumens = 2500.0, .range = 16.0, .shadows_enabled = true });
+    try app.world.set(pl2, render_3d.Transform3D, .{ .position = .{ 14.2, 2.4, 0.2 } });
+    try app.world.set(pl2, render_3d.pbr.PointLight, .{ .color = .{ 1.0, 0.12, 0.06 }, .intensity_lumens = 320.0, .range = 9.0, .shadows_enabled = true });
 
     // Procedural architectural tile floor texture (256x256).
     var floor_pixels: [256 * 256 * 4]u8 = undefined;
@@ -426,12 +441,26 @@ pub fn main(init: std.process.Init) !void {
     try app.world.set(beacon, render_3d.Transform3D, .{ .position = .{ -5.5, 1.5, 0.0 }, .scale = .{ 0.7, 2.8, 0.7 } });
     try app.world.set(beacon, render_3d.MeshRef, .{ .mesh_asset = @bitCast(gpu_cube), .material_handle = em_mat });
 
-    // Shaded alcove structure on the right (fly inside to test Auto Exposure darkening -> brightening!).
+    // Enclosed dark volumetric room on the right (press T to jump inside) with a grated skylight window.
     const wall_mat = try mats.add(.{ .base_color = .{ 0.22, 0.23, 0.26, 1.0 }, .metallic = 0.0, .roughness = 0.9 });
     const alcove_parts = [_]struct { pos: [3]f32, scale: [3]f32 }{
-        .{ .pos = .{ 11.5, 2.2, -3.5 }, .scale = .{ 7.0, 5.0, 0.5 } },
-        .{ .pos = .{ 15.0, 2.2, 0.0 }, .scale = .{ 0.5, 5.0, 7.0 } },
-        .{ .pos = .{ 11.5, 4.7, 0.0 }, .scale = .{ 7.5, 0.5, 7.5 } },
+        // Back (-Z), Front (+Z), Right (+X), and Left (-X with small doorway at z=2.6..4.0) walls
+        .{ .pos = .{ 14.0, 2.5, -4.0 }, .scale = .{ 8.5, 5.5, 0.5 } },
+        .{ .pos = .{ 14.0, 2.5, 4.0 }, .scale = .{ 8.5, 5.5, 0.5 } },
+        .{ .pos = .{ 18.0, 2.5, 0.0 }, .scale = .{ 0.5, 5.5, 8.5 } },
+        .{ .pos = .{ 10.0, 2.5, -0.9 }, .scale = .{ 0.5, 5.5, 6.2 } },
+        .{ .pos = .{ 10.0, 3.8, 3.1 }, .scale = .{ 0.5, 2.9, 2.2 } },
+        // Solid roof sections around the skylight opening (opening at x=14.6..17.4, z=-1.0..2.2)
+        .{ .pos = .{ 12.3, 5.2, 0.0 }, .scale = .{ 4.8, 0.5, 8.5 } },
+        .{ .pos = .{ 16.0, 5.2, -2.5 }, .scale = .{ 4.0, 0.5, 3.2 } },
+        .{ .pos = .{ 16.0, 5.2, 3.1 }, .scale = .{ 4.0, 0.5, 2.0 } },
+        .{ .pos = .{ 17.7, 5.2, 0.6 }, .scale = .{ 0.8, 0.5, 3.6 } },
+        // Grated window bars across the skylight opening
+        .{ .pos = .{ 15.5, 5.2, 0.6 }, .scale = .{ 0.24, 0.5, 3.4 } },
+        .{ .pos = .{ 16.5, 5.2, 0.6 }, .scale = .{ 0.24, 0.5, 3.4 } },
+        .{ .pos = .{ 16.0, 5.2, -0.1 }, .scale = .{ 3.2, 0.5, 0.24 } },
+        .{ .pos = .{ 16.0, 5.2, 0.7 }, .scale = .{ 3.2, 0.5, 0.24 } },
+        .{ .pos = .{ 16.0, 5.2, 1.5 }, .scale = .{ 3.2, 0.5, 0.24 } },
     };
     for (alcove_parts) |ap| {
         const we = try app.world.spawn();
