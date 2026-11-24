@@ -1,0 +1,10 @@
+name=gallery_dusk
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=0.4066
+p50_luma=0.1450
+p95_luma=1.5871
+speckle=0
+contrast=166.00

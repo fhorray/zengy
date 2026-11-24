@@ -1,0 +1,10 @@
+name=gallery_shadows_off
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=1.5239
+p50_luma=0.9743
+p95_luma=4.6800
+speckle=0
+contrast=145.00

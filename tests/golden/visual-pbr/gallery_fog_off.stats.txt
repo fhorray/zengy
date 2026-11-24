@@ -1,0 +1,10 @@
+name=gallery_fog_off
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=1.0971
+p50_luma=0.3838
+p95_luma=3.6850
+speckle=0
+contrast=194.00

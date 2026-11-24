@@ -1,0 +1,10 @@
+name=closeup_fog_off
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=0.7444
+p50_luma=0.2376
+p95_luma=5.3516
+speckle=0
+contrast=203.00

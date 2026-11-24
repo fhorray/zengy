@@ -1,0 +1,10 @@
+name=materials_fog_off
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=0.9600
+p50_luma=0.4733
+p95_luma=1.3525
+speckle=0
+contrast=174.00

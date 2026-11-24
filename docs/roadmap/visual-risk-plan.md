@@ -105,3 +105,17 @@ reviewed.
 4. Shader changes: recompile SPIR-V with glslang, keep derivative-dependent calls (`texture`, `dFdx`)
    out of non-uniform control flow (use `textureLod`/`texelFetch`).
 5. Run `zig build test` in Debug and ReleaseSafe plus the capture suite before merging.
+
+## Status
+
+- **Phase 0 - done.** Harness in `docs/visual-regression-testing.md`. Acceptance verified: the FXAA derivative
+  bug (taps read with implicit derivatives inside a branch) was reintroduced on purpose and failed 12 checks
+  (image diff in 9 scenarios, speckle count in 5), while `gallery_aa_off` stayed clean. Two runs on the same
+  machine differ by at most 1/255. Deviations from the plan: it runs on the real GPU, not lavapipe, so goldens
+  are machine-specific; the capture goes through a dedicated API (`requestCapture`/`takeCapture`) and the
+  comparator lives in `capture.zig` instead of a CLI command; `zig build capture-check` / `capture-update`
+  replace a separate runner.
+- **Phase 1 - done.** 14 scenarios and their goldens in `tests/golden/visual-pbr` (8.6 MB, zlib PNG). The
+  statistics checks (NaN/Inf, speckle, contrast, mean luminance) run in every capture. Not done: frame/pass
+  time trends (see limits in the harness doc), and the capture suite is not part of `zig build test` because it
+  needs a GPU and a window.
