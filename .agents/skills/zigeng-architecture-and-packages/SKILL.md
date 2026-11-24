@@ -22,7 +22,7 @@ Related packages are grouped under category subdirectories in `packages/`, while
 - `window`: `window` (`packages/window/core`), `window-sdl3` (`packages/window/sdl3`)
 - `graphics`: `graphics` (`packages/graphics/core`), `graphics-sdlgpu` (`packages/graphics/sdlgpu`)
 - `render`: `render-2d` (`packages/render/2d`), `render-3d` (`packages/render/3d`), `text` (`packages/render/text`)
-- `ui`: `ui-core` (`packages/ui/core`), `ui-markup` (`packages/ui/markup`), `ui-novaui` (`packages/ui/novaui`), `ui-immediate` (`packages/ui/immediate`)
+- `ui`: `ui-core` (`packages/ui/core`), `ui-markup` (`packages/ui/markup`)
 - `scripting`: `scripting-host` (`packages/scripting/host`), `scripting-lua` (`packages/scripting/lua`), `scripting-python` (`packages/scripting/python`)
 - `formats` / `tooling`: `formats/toml`, `formats/json`, `tooling/file-watcher`
 - Flat: `assets`, `scene`, `editor-shell`, `testing`, `default-plugins`, `sdl3`

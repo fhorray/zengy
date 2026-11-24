@@ -4,7 +4,7 @@
 //! decoupled from any HTML/CSS parser or scripting runtime.
 //!
 //! Pipeline:
-//! `Frontend (Zig / HTML-like / NovaUI) -> UiTree -> layoutTree() -> paint() -> GraphicsDeviceService`
+//! `Frontend (Zig / HTML-like) -> UiTree -> layoutTree() -> paint() -> GraphicsDeviceService`
 //!
 //! Supports flex-like `column`/`row` layout, spatial `hitTest()`, focus tracking,
 //! `ui.action` event emission, and deterministic `DrawCommand` generation.

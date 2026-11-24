@@ -15,7 +15,7 @@ const scripting_host = @import("scripting_host");
 const scripting_python = @import("scripting_python");
 
 const PYTHON_SOURCE =
-    \\import engine
+    \\import zigeng
     \\import math
     \\
     \\t = 0.0
@@ -30,7 +30,7 @@ const PYTHON_SOURCE =
     \\        r = 0.25 + 0.12 * i
     \\        g = 0.85 - 0.10 * i
     \\        b = 0.95
-    \\        engine.draw_rect(x, y, 56.0, 56.0, r, g, b, 0.9)
+    \\        zigeng.draw_rect(x, y, 56.0, 56.0, r, g, b, 0.9)
     \\
 ;
 

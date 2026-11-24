@@ -4,8 +4,8 @@
 // - `engine`: Minimal headless core SDK module (`src/engine.zig`)
 // - `headless-ecs`: Phase 1 standalone 1000-entity simulation (`zig build run-headless`)
 // - `c_plugin`: Phase 3 pure C11 shared library plugin (`examples/c-plugin/plugin.c`)
-// - Optional packages: `window`, `graphics`, `ui_core`, `ui_markup`, `ui_novaui`,
-//   `ui_immediate`, `scripting_host`, `assets`, `scene`, `editor_shell`, `render_3d`
+// - Optional packages: `window`, `graphics`, `ui_core`, `ui_markup`,
+//   `scripting_host`, `assets`, `scene`, `editor_shell`, `render_3d`
 // - `engine-cli`: Diagnostic CLI (`zig build run-cli`)
 // - `test`: Per-module test suites organized inside each module's `tests/` directory
 
@@ -96,22 +96,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ui_markup_mod.addImport("ui_core", ui_core_mod);
-
-    const ui_novaui_mod = b.addModule("ui_novaui", .{
-        .root_source_file = b.path("packages/ui/novaui/src/novaui.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ui_novaui_mod.addImport("ui_core", ui_core_mod);
-
-    const ui_immediate_mod = b.addModule("ui_immediate", .{
-        .root_source_file = b.path("packages/ui/immediate/src/ui_immediate.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ui_immediate_mod.addImport("engine", engine_mod);
-    ui_immediate_mod.addImport("window", window_mod);
-    ui_immediate_mod.addImport("graphics", graphics_mod);
 
     const scripting_host_mod = b.addModule("scripting_host", .{
         .root_source_file = b.path("packages/scripting/host/src/scripting_host.zig"),
@@ -305,6 +289,24 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("assets", assets_mod);
     cli_mod.addImport("testing_sdk", testing_sdk_mod);
     cli_mod.addImport("toml_format", toml_format_mod);
+    cli_mod.addAnonymousImport("py_zigeng_init_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zigeng/__init__.pyi"),
+    });
+    cli_mod.addAnonymousImport("py_zigeng_input_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zigeng/input.pyi"),
+    });
+    cli_mod.addAnonymousImport("py_zigeng_key_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zigeng/Key.pyi"),
+    });
+    cli_mod.addAnonymousImport("py_zigeng_init_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zigeng/__init__.pyi"),
+    });
+    cli_mod.addAnonymousImport("py_zigeng_input_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zigeng/input.pyi"),
+    });
+    cli_mod.addAnonymousImport("py_zigeng_key_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zigeng/Key.pyi"),
+    });
 
     const cli_exe = b.addExecutable(.{
         .name = "zigeng",
@@ -337,7 +339,6 @@ pub fn build(b: *std.Build) void {
     playground_mod.addImport("graphics", graphics_mod);
     playground_mod.addImport("ui_core", ui_core_mod);
     playground_mod.addImport("ui_markup", ui_markup_mod);
-    playground_mod.addImport("ui_novaui", ui_novaui_mod);
     playground_mod.addImport("scripting_host", scripting_host_mod);
     playground_mod.addImport("assets", assets_mod);
     playground_mod.addImport("scene", scene_mod);
@@ -725,14 +726,6 @@ pub fn build(b: *std.Build) void {
     addModuleTest(b, test_step, "packages/ui/markup/tests/ui_frontends_tests.zig", target, optimize, false, &.{
         .{ .name = "ui_core", .mod = ui_core_mod },
         .{ .name = "ui_markup", .mod = ui_markup_mod },
-        .{ .name = "ui_novaui", .mod = ui_novaui_mod },
-    }, null);
-
-    addModuleTest(b, test_step, "packages/ui/immediate/tests/ui_immediate_tests.zig", target, optimize, false, &.{
-        .{ .name = "engine", .mod = engine_mod },
-        .{ .name = "window", .mod = window_mod },
-        .{ .name = "graphics", .mod = graphics_mod },
-        .{ .name = "ui_immediate", .mod = ui_immediate_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/scripting/host/tests/scripting_host_tests.zig", target, optimize, false, &.{

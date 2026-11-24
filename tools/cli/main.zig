@@ -5,6 +5,8 @@
 //! - `packages`: prints resolved topological module order and registered providers.
 //! - `test-scenario`: runs a deterministic TOML scenario and outputs a structured JSON report.
 //! - `list-official`: lists all official packages available from `fhorray/zigeng`.
+//! - `new <name>`: scaffolds a game.toml + starter Python script + IDE typings project.
+//! - `typings`: writes Python `.pyi` stubs (`typings/`) and `pyrightconfig.json` in CWD.
 //! - `add <pkg>`: downloads an official package from GitHub into `./packages/<pkg>/`
 //!   (and any required `third_party/` dependency such as `pocketpy` or `sdl3`).
 //!
@@ -47,8 +49,6 @@ const OFFICIAL_PACKAGES = [_]OfficialPackageInfo{
     .{ .name = "text", .entry = "src/text.zig", .summary = "Embedded 8x8 ASCII bitmap font atlas" },
     .{ .name = "ui-core", .entry = "src/ui_core.zig", .summary = "Retained UiTree, flex layout & hit testing" },
     .{ .name = "ui-markup", .entry = "src/ui_markup.zig", .summary = "HTML-like UI markup parser" },
-    .{ .name = "ui-novaui", .entry = "src/novaui.zig", .summary = "NovaUI DSL frontend" },
-    .{ .name = "ui-immediate", .entry = "src/ui_immediate.zig", .summary = "Immediate-mode UI backend" },
     .{ .name = "scripting-host", .entry = "src/scripting_host.zig", .summary = "Language-agnostic scripting host & bridge" },
     .{ .name = "scripting-lua", .entry = "src/scripting_lua.zig", .summary = "Embedded Lua 5.4 runtime" },
     .{ .name = "scripting-python", .entry = "src/scripting_python.zig", .summary = "Embedded PocketPy (Python) runtime" },
@@ -74,8 +74,6 @@ fn packageDir(name: []const u8) []const u8 {
         .{ "physics-rapier", "physics/rapier" },
         .{ "ui-core", "ui/core" },
         .{ "ui-markup", "ui/markup" },
-        .{ "ui-novaui", "ui/novaui" },
-        .{ "ui-immediate", "ui/immediate" },
         .{ "window", "window/core" },
         .{ "window-sdl3", "window/sdl3" },
         .{ "graphics", "graphics/core" },
@@ -158,8 +156,69 @@ fn writeFileRelative(io: std.Io, path: []const u8, content: []const u8) !void {
     try file.writeStreamingAll(io, content);
 }
 
+const PY_ZIGENG_INIT_PYI = @embedFile("py_zigeng_init_pyi");
+const PY_ZIGENG_INPUT_PYI = @embedFile("py_zigeng_input_pyi");
+const PY_ZIGENG_KEY_PYI = @embedFile("py_zigeng_key_pyi");
+
+const PYRIGHT_CONFIG_JSON =
+    \\{
+    \\  "include": ["scripts"],
+    \\  "extraPaths": ["typings"]
+    \\}
+    \\
+;
+
+const STARTER_MAIN_PY =
+    \\import zigeng
+    \\from zigeng import Key
+    \\
+    \\x = 600.0
+    \\y = 320.0
+    \\
+    \\
+    \\def start():
+    \\    zigeng.log("zigeng game started!")
+    \\
+    \\
+    \\def update(dt):
+    \\    global x, y
+    \\    speed = 300.0 * float(dt)
+    \\    if zigeng.input.is_key_down(Key.A) or zigeng.input.is_key_down(Key.LEFT):
+    \\        x -= speed
+    \\    if zigeng.input.is_key_down(Key.D) or zigeng.input.is_key_down(Key.RIGHT):
+    \\        x += speed
+    \\    if zigeng.input.is_key_down(Key.W) or zigeng.input.is_key_down(Key.UP):
+    \\        y -= speed
+    \\    if zigeng.input.is_key_down(Key.S) or zigeng.input.is_key_down(Key.DOWN):
+    \\        y += speed
+    \\    zigeng.draw_rect(x, y, 64.0, 64.0, 0.25, 0.75, 1.0, 1.0)
+    \\
+;
+
+fn writePythonTypings(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8) !void {
+    const typings_zigeng_dir = try std.fmt.allocPrint(allocator, "{s}/typings/zigeng", .{base_dir});
+    defer allocator.free(typings_zigeng_dir);
+    try std.Io.Dir.cwd().createDirPath(io, typings_zigeng_dir);
+
+    const files = [_]struct { rel: []const u8, content: []const u8 }{
+        .{ .rel = "typings/zigeng/__init__.pyi", .content = PY_ZIGENG_INIT_PYI },
+        .{ .rel = "typings/zigeng/input.pyi", .content = PY_ZIGENG_INPUT_PYI },
+        .{ .rel = "typings/zigeng/Key.pyi", .content = PY_ZIGENG_KEY_PYI },
+        .{ .rel = "pyrightconfig.json", .content = PYRIGHT_CONFIG_JSON },
+    };
+    for (files) |f| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, f.rel });
+        defer allocator.free(path);
+        try writeFileRelative(io, path, f.content);
+    }
+}
+
 fn scaffoldProject(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, name);
+
+    const scripts_dir = try std.fmt.allocPrint(allocator, "{s}/scripts", .{name});
+    defer allocator.free(scripts_dir);
+    try std.Io.Dir.cwd().createDirPath(io, scripts_dir);
 
     const toml_path = try std.fmt.allocPrint(allocator, "{s}/game.toml", .{name});
     defer allocator.free(toml_path);
@@ -169,13 +228,20 @@ fn scaffoldProject(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !
         \\width = 1280
         \\height = 720
         \\mode = "2d"
+        \\entry_script = "scripts/main.py"
         \\plugins = []
         \\
     , .{name});
     defer allocator.free(toml_src);
     try writeFileRelative(io, toml_path, toml_src);
 
-    std.debug.print("Created zigeng project '{s}/':\n  cd {s}\n  zigeng run\n", .{ name, name });
+    const main_py_path = try std.fmt.allocPrint(allocator, "{s}/scripts/main.py", .{name});
+    defer allocator.free(main_py_path);
+    try writeFileRelative(io, main_py_path, STARTER_MAIN_PY);
+
+    try writePythonTypings(allocator, io, name);
+
+    std.debug.print("Created zigeng project '{s}/' (with scripts/main.py + Python typings):\n  cd {s}\n  zigeng run\n", .{ name, name });
 }
 
 fn runShell(allocator: std.mem.Allocator, io: std.Io, shell_cmd: []const u8) !void {
@@ -505,6 +571,12 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         try scaffoldProject(allocator, init.io, proj_name);
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "typings")) {
+        try writePythonTypings(allocator, init.io, ".");
+        std.debug.print("Generated Python typings in ./typings/ and ./pyrightconfig.json.\n", .{});
         return;
     }
 

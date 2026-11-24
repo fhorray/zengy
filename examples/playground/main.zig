@@ -2,7 +2,7 @@
 //!
 //! End-to-end sandbox composing the minimal headless core with optional packages:
 //! - `official.window` & `official.graphics` (surface, input, draw commands, present)
-//! - `official.ui.core` + `official.ui.markup` + `community.ui.novaui` (retained UI IR)
+//! - `official.ui.core` + `official.ui.markup` (retained UI IR)
 //! - `official.script.host` (runtime bridge + isolated event posting)
 //! - `official.assets` (importer priority + caching)
 //! - `official.scene` (2D transform hierarchy + snapshot)
@@ -18,7 +18,6 @@ const window = @import("window");
 const graphics = @import("graphics");
 const ui_core = @import("ui_core");
 const ui_markup = @import("ui_markup");
-const ui_novaui = @import("ui_novaui");
 const scripting_host = @import("scripting_host");
 const assets = @import("assets");
 const scene = @import("scene");
@@ -91,16 +90,6 @@ pub fn main() !void {
     , ui_tree);
     ui_tree.layoutTree(1280, 720);
 
-    // Also prove NovaUI DSL parses cleanly into a separate UiTree IR.
-    var nova_tree = ui_core.UiTree.init(allocator);
-    defer nova_tree.deinit();
-    try ui_novaui.parseIntoTree(allocator,
-        \\Panel id="playground.hud" {
-        \\  Label id="title" text="ZigEng Playground"
-        \\  Button id="spawn_btn" text="Spawn Entity" action="playground.spawn"
-        \\}
-    , &nova_tree);
-
     // 5. Load an asset via AssetService.
     const asset_svc = app.resources.get(assets.AssetService).?;
     try asset_svc.registerImporter(.{
@@ -144,7 +133,7 @@ pub fn main() !void {
     std.debug.print(
         "Playground OK:\n" ++
             "  Frames: {d}, Entities: {d}\n" ++
-            "  UI nodes (markup/nova): {d}/{d}, Presented frames: {d}\n" ++
+            "  UI nodes (markup): {d}, Presented frames: {d}\n" ++
             "  2D child world pos: ({d:.1}, {d:.1})\n" ++
             "  3D extracted meshes: {d}\n" ++
             "  Editor panels: {d}\n" ++
@@ -154,7 +143,6 @@ pub fn main() !void {
             app.diagnostics.frame_count,
             app.world.entity_count,
             ui_tree.nodeCount(),
-            nova_tree.nodeCount(),
             gfx.presentedFrames(rt).?,
             child_t.world_x,
             child_t.world_y,

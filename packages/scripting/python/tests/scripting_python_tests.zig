@@ -45,11 +45,11 @@ test "PocketPy and Lua coexist in one App, spawn entities, and exchange events" 
     );
 
     const py_mod = try host.loadScript(1, "b.py",
-        \\import engine
+        \\import zigeng
         \\def run(arg):
-        \\    engine.log("python: " + arg)
-        \\    engine.spawn_entity()
-        \\    engine.post_event("py.event", arg)
+        \\    zigeng.log("python: " + arg)
+        \\    zigeng.spawn_entity()
+        \\    zigeng.post_event("py.event", arg)
         \\def fail(arg):
         \\    raise ValueError("intentional python error")
     );
@@ -82,9 +82,9 @@ test "PocketPy engine.draw_rect populates ScriptDrawQueue" {
 
     const rt: u16 = 0;
     const mod = try host.loadScript(rt, "draw_test.py",
-        \\import engine
+        \\import zigeng
         \\def draw(arg):
-        \\    engine.draw_rect(10, 20, 100, 50, 0.2, 0.4, 0.8, 1.0)
+        \\    zigeng.draw_rect(10, 20, 100, 50, 0.2, 0.4, 0.8, 1.0)
     );
     try testing.expect(host.invokeScript(mod, "draw", "").ok);
 
@@ -92,4 +92,46 @@ test "PocketPy engine.draw_rect populates ScriptDrawQueue" {
     try testing.expectEqual(@as(usize, 1), q.rects.items.len);
     try testing.expectEqual(@as(f32, 10.0), q.rects.items[0].x);
     try testing.expectEqual(@as(f32, 100.0), q.rects.items[0].width);
+}
+
+test "import zigeng, submodules (input, Key), is_alive, and 0-arg hooks work" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(scripting_host.module());
+    try app.registerModule(scripting_python.module());
+    try app.initialize();
+
+    const h_entry = try app.services.getService("engine.script.host", 1);
+    const host: *scripting_host.ScriptingHost = @ptrCast(@alignCast(@constCast(h_entry.api_ptr)));
+
+    const mod = try host.loadScript(0, "zigeng_api_test.py",
+        \\import zigeng
+        \\from zigeng import Key, input
+        \\
+        \\started = False
+        \\
+        \\def start():
+        \\    global started
+        \\    started = True
+        \\    zigeng.log("started via zigeng", "warn")
+        \\    ent = zigeng.spawn_entity()
+        \\    if not zigeng.is_alive(ent):
+        \\        raise RuntimeError("entity should be alive")
+        \\    if Key.W != 26 or Key.A != 4 or Key.SPACE != 44:
+        \\        raise RuntimeError("unexpected scancodes")
+        \\    if input.is_key_down(Key.W):
+        \\        raise RuntimeError("key should not be down")
+        \\    zigeng.draw_rect(1, 2, 3, 4)
+        \\
+        \\def check(arg):
+        \\    if not started:
+        \\        raise RuntimeError("start() did not run")
+    );
+    try testing.expect(host.invokeScript(mod, "start", "").ok);
+    try testing.expect(host.invokeScript(mod, "check", "").ok);
+
+    const q = app.resources.get(scripting_host.ScriptDrawQueue).?;
+    try testing.expectEqual(@as(usize, 1), q.rects.items.len);
+    try testing.expect(app.diagnostics.count() >= 1);
 }

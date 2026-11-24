@@ -8,9 +8,9 @@
 //!   No system Python is required on the build or target machine.
 //! - Each `ScriptingHost` runtime owns one PocketPy VM (`py_switchvm`, indices 1..15).
 //!   Scripts of one runtime never see the globals of another.
-//! - `engine.log`, `engine.spawn_entity` and `engine.post_event` are bound into a per-VM
-//!   `engine` module. The `ScriptEngineBridge` pointer is stored in that module, so the
-//!   native callbacks need no globals.
+//! - `zigeng` (with submodules `zigeng.input` and `zigeng.Key`) is bound per-VM.
+//!   The `ScriptEngineBridge` pointer is stored in the module dict, so native callbacks
+//!   need no globals.
 //! - Errors are returned as `ScriptResult` from `py_formatexc()`; they never abort the host.
 
 const std = @import("std");
@@ -42,9 +42,9 @@ fn releaseVmIndex(idx: c_int) void {
     g_vm_in_use[@intCast(idx)] = false;
 }
 
-/// Reads the bridge pointer stored in the current VM's `engine` module.
-fn bridgeFromEngineModule() ?*scripting_host.ScriptEngineBridge {
-    const mod = c.py_getmodule("engine");
+/// Reads the bridge pointer stored in the current VM's `zigeng` module.
+fn bridgeFromModule() ?*scripting_host.ScriptEngineBridge {
+    const mod = c.py_getmodule("zigeng");
     if (mod == null) return null;
     const item = c.py_getdict(mod, c.py_name("__bridge"));
     if (item == null) return null;
@@ -53,40 +53,70 @@ fn bridgeFromEngineModule() ?*scripting_host.ScriptEngineBridge {
     return @ptrFromInt(raw);
 }
 
+fn parseLogLevel(sv: []const u8) engine.LogLevel {
+    if (std.mem.eql(u8, sv, "debug")) return .debug;
+    if (std.mem.eql(u8, sv, "warn") or std.mem.eql(u8, sv, "warning")) return .warn;
+    if (std.mem.eql(u8, sv, "err") or std.mem.eql(u8, sv, "error")) return .err;
+    return .info;
+}
+
 fn engineLog(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
-    if (argc != 1) return c.py_exception(c.tp_TypeError, "engine.log() expects 1 argument");
+    if (argc < 1 or argc > 2) return c.py_exception(c.tp_TypeError, "log(msg, level='info') expects 1 or 2 arguments");
     if (!c.py_checkstr(&argv[0])) return false;
-    const bridge = bridgeFromEngineModule() orelse return false;
+    const bridge = bridgeFromModule() orelse return false;
     var n: c_int = 0;
     const p = c.py_tostrn(&argv[0], &n);
-    bridge.log(.info, p[0..@intCast(n)]) catch {};
+    var level: engine.LogLevel = .info;
+    if (argc == 2) {
+        if (!c.py_checkstr(&argv[1])) return false;
+        var ln: c_int = 0;
+        const lp = c.py_tostrn(&argv[1], &ln);
+        level = parseLogLevel(lp[0..@intCast(ln)]);
+    }
+    bridge.log(level, p[0..@intCast(n)]) catch {};
     c.py_newnone(c.py_retval());
     return true;
 }
 
 fn engineSpawnEntity(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
     _ = argv;
-    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.spawn_entity() takes no arguments");
-    const bridge = bridgeFromEngineModule() orelse return false;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "spawn_entity() takes no arguments");
+    const bridge = bridgeFromModule() orelse return false;
     const handle = bridge.spawnEntity() catch 0;
     c.py_newint(c.py_retval(), @intCast(handle));
     return true;
 }
 
+fn engineIsAlive(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
+    if (argc != 1) return c.py_exception(c.tp_TypeError, "is_alive(entity) expects 1 argument");
+    if (!c.py_checkint(&argv[0])) return false;
+    const raw = c.py_toint(&argv[0]);
+    const bridge = bridgeFromModule() orelse return false;
+    const alive = if (raw >= 0) bridge.isEntityAlive(@intCast(raw)) else false;
+    c.py_newbool(c.py_retval(), alive);
+    return true;
+}
+
 fn enginePostEvent(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
-    if (argc < 1 or argc > 2) return c.py_exception(c.tp_TypeError, "engine.post_event(name, payload='') expects 1 or 2 arguments");
+    if (argc < 1 or argc > 3) return c.py_exception(c.tp_TypeError, "post_event(name, payload='', entity=0) expects 1..3 arguments");
     if (!c.py_checkstr(&argv[0])) return false;
     var name_len: c_int = 0;
     const name_ptr = c.py_tostrn(&argv[0], &name_len);
     var payload: []const u8 = "";
-    if (argc == 2) {
+    if (argc >= 2) {
         if (!c.py_checkstr(&argv[1])) return false;
         var payload_len: c_int = 0;
         const payload_ptr = c.py_tostrn(&argv[1], &payload_len);
         payload = payload_ptr[0..@intCast(payload_len)];
     }
-    const bridge = bridgeFromEngineModule() orelse return false;
-    bridge.postEvent(name_ptr[0..@intCast(name_len)], payload, 0) catch {};
+    var entity_handle: u64 = 0;
+    if (argc == 3) {
+        if (!c.py_checkint(&argv[2])) return false;
+        const raw_ent = c.py_toint(&argv[2]);
+        if (raw_ent > 0) entity_handle = @intCast(raw_ent);
+    }
+    const bridge = bridgeFromModule() orelse return false;
+    bridge.postEvent(name_ptr[0..@intCast(name_len)], payload, entity_handle) catch {};
     c.py_newnone(c.py_retval());
     return true;
 }
@@ -98,7 +128,7 @@ fn pyNumberArg(val: c.py_Ref) ?f32 {
 }
 
 fn engineDrawRect(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
-    if (argc < 4 or argc > 8) return c.py_exception(c.tp_TypeError, "engine.draw_rect(x, y, w, h, r=1, g=1, b=1, a=1) expects 4..8 args");
+    if (argc < 4 or argc > 8) return c.py_exception(c.tp_TypeError, "draw_rect(x, y, w, h, r=1, g=1, b=1, a=1) expects 4..8 args");
     const x = pyNumberArg(&argv[0]) orelse return false;
     const y = pyNumberArg(&argv[1]) orelse return false;
     const w = pyNumberArg(&argv[2]) orelse return false;
@@ -108,17 +138,26 @@ fn engineDrawRect(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
     const b: f32 = if (argc >= 7) (pyNumberArg(&argv[6]) orelse return false) else 1.0;
     const a: f32 = if (argc >= 8) (pyNumberArg(&argv[7]) orelse return false) else 1.0;
 
-    const bridge = bridgeFromEngineModule() orelse return false;
+    const bridge = bridgeFromModule() orelse return false;
     bridge.drawRect(.{ .x = x, .y = y, .width = w, .height = h, .r = r, .g = g, .b = b, .a = a }) catch {};
     c.py_newnone(c.py_retval());
     return true;
 }
 
+fn engineClearDrawQueue(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
+    _ = argv;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "clear_draw_queue() takes no arguments");
+    const bridge = bridgeFromModule() orelse return false;
+    bridge.clearDrawQueue();
+    c.py_newnone(c.py_retval());
+    return true;
+}
+
 fn engineIsKeyDown(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
-    if (argc != 1) return c.py_exception(c.tp_TypeError, "engine.is_key_down(scancode) expects 1 argument");
+    if (argc != 1) return c.py_exception(c.tp_TypeError, "is_key_down(scancode) expects 1 argument");
     if (!c.py_checkint(&argv[0])) return false;
     const raw = c.py_toint(&argv[0]);
-    const bridge = bridgeFromEngineModule() orelse return false;
+    const bridge = bridgeFromModule() orelse return false;
     const down = if (raw >= 0 and raw < 256) bridge.isKeyDown(@intCast(raw)) else false;
     c.py_newbool(c.py_retval(), down);
     return true;
@@ -126,32 +165,32 @@ fn engineIsKeyDown(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
 
 fn engineMouseX(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
     _ = argv;
-    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.mouse_x() takes no arguments");
-    const bridge = bridgeFromEngineModule() orelse return false;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "mouse_x() takes no arguments");
+    const bridge = bridgeFromModule() orelse return false;
     c.py_newfloat(c.py_retval(), bridge.mouseX());
     return true;
 }
 
 fn engineMouseY(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
     _ = argv;
-    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.mouse_y() takes no arguments");
-    const bridge = bridgeFromEngineModule() orelse return false;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "mouse_y() takes no arguments");
+    const bridge = bridgeFromModule() orelse return false;
     c.py_newfloat(c.py_retval(), bridge.mouseY());
     return true;
 }
 
 fn engineIsMouseDown(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
     _ = argv;
-    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.is_mouse_down() takes no arguments");
-    const bridge = bridgeFromEngineModule() orelse return false;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "is_mouse_down() takes no arguments");
+    const bridge = bridgeFromModule() orelse return false;
     c.py_newbool(c.py_retval(), bridge.isMouseDown());
     return true;
 }
 
 fn engineWasMouseClicked(argc: c_int, argv: c.py_StackRef) callconv(.c) bool {
     _ = argv;
-    if (argc != 0) return c.py_exception(c.tp_TypeError, "engine.was_mouse_clicked() takes no arguments");
-    const bridge = bridgeFromEngineModule() orelse return false;
+    if (argc != 0) return c.py_exception(c.tp_TypeError, "was_mouse_clicked() takes no arguments");
+    const bridge = bridgeFromModule() orelse return false;
     c.py_newbool(c.py_retval(), bridge.wasMouseClicked());
     return true;
 }
@@ -181,6 +220,71 @@ fn captureError(st: *PythonRuntimeState) []const u8 {
     return st.last_error[0..n];
 }
 
+fn setIntConst(mod: c.py_Ref, name: [:0]const u8, val: i64) void {
+    var tv: c.py_TValue = undefined;
+    c.py_newint(&tv, val);
+    c.py_setdict(mod, c.py_name(name.ptr), &tv);
+}
+
+fn populateKeyModule(key_mod: c.py_Ref) void {
+    const key_table = [_]struct { name: [:0]const u8, code: i64 }{
+        .{ .name = "A", .code = 4 },
+        .{ .name = "B", .code = 5 },
+        .{ .name = "C", .code = 6 },
+        .{ .name = "D", .code = 7 },
+        .{ .name = "E", .code = 8 },
+        .{ .name = "F", .code = 9 },
+        .{ .name = "G", .code = 10 },
+        .{ .name = "H", .code = 11 },
+        .{ .name = "I", .code = 12 },
+        .{ .name = "J", .code = 13 },
+        .{ .name = "K", .code = 14 },
+        .{ .name = "L", .code = 15 },
+        .{ .name = "M", .code = 16 },
+        .{ .name = "N", .code = 17 },
+        .{ .name = "O", .code = 18 },
+        .{ .name = "P", .code = 19 },
+        .{ .name = "Q", .code = 20 },
+        .{ .name = "R", .code = 21 },
+        .{ .name = "S", .code = 22 },
+        .{ .name = "T", .code = 23 },
+        .{ .name = "U", .code = 24 },
+        .{ .name = "V", .code = 25 },
+        .{ .name = "W", .code = 26 },
+        .{ .name = "X", .code = 27 },
+        .{ .name = "Y", .code = 28 },
+        .{ .name = "Z", .code = 29 },
+        .{ .name = "NUM_1", .code = 30 },
+        .{ .name = "NUM_2", .code = 31 },
+        .{ .name = "NUM_3", .code = 32 },
+        .{ .name = "NUM_4", .code = 33 },
+        .{ .name = "NUM_5", .code = 34 },
+        .{ .name = "NUM_6", .code = 35 },
+        .{ .name = "NUM_7", .code = 36 },
+        .{ .name = "NUM_8", .code = 37 },
+        .{ .name = "NUM_9", .code = 38 },
+        .{ .name = "NUM_0", .code = 39 },
+        .{ .name = "RETURN", .code = 40 },
+        .{ .name = "ESCAPE", .code = 41 },
+        .{ .name = "BACKSPACE", .code = 42 },
+        .{ .name = "TAB", .code = 43 },
+        .{ .name = "SPACE", .code = 44 },
+        .{ .name = "RIGHT", .code = 79 },
+        .{ .name = "LEFT", .code = 80 },
+        .{ .name = "DOWN", .code = 81 },
+        .{ .name = "UP", .code = 82 },
+        .{ .name = "LCTRL", .code = 224 },
+        .{ .name = "LSHIFT", .code = 225 },
+        .{ .name = "LALT", .code = 226 },
+        .{ .name = "RCTRL", .code = 228 },
+        .{ .name = "RSHIFT", .code = 229 },
+        .{ .name = "RALT", .code = 230 },
+    };
+    for (key_table) |k| {
+        setIntConst(key_mod, k.name, k.code);
+    }
+}
+
 fn createPythonRuntime(allocator: std.mem.Allocator, bridge: *scripting_host.ScriptEngineBridge) !*anyopaque {
     if (!g_initialized) {
         c.py_initialize();
@@ -191,20 +295,28 @@ fn createPythonRuntime(allocator: std.mem.Allocator, bridge: *scripting_host.Scr
     errdefer releaseVmIndex(idx);
     c.py_switchvm(idx);
 
-    // Per-VM `engine` module: the bridge pointer is kept in its dict, not in a global.
-    const mod = c.py_newmodule("engine");
-    var bridge_val: c.py_TValue = undefined;
-    c.py_newint(&bridge_val, @intCast(@intFromPtr(bridge)));
-    c.py_setdict(mod, c.py_name("__bridge"), &bridge_val);
-    c.py_bindfunc(mod, "log", engineLog);
-    c.py_bindfunc(mod, "spawn_entity", engineSpawnEntity);
-    c.py_bindfunc(mod, "post_event", enginePostEvent);
-    c.py_bindfunc(mod, "draw_rect", engineDrawRect);
-    c.py_bindfunc(mod, "is_key_down", engineIsKeyDown);
-    c.py_bindfunc(mod, "mouse_x", engineMouseX);
-    c.py_bindfunc(mod, "mouse_y", engineMouseY);
-    c.py_bindfunc(mod, "is_mouse_down", engineIsMouseDown);
-    c.py_bindfunc(mod, "was_mouse_clicked", engineWasMouseClicked);
+    // Per-VM `zigeng` package (`zigeng`, `zigeng.input`, `zigeng.Key`).
+    // The bridge pointer lives in the module dict, avoiding process-wide globals.
+    const input_mod = c.py_newmodule("zigeng.input");
+    c.py_bindfunc(input_mod, "is_key_down", engineIsKeyDown);
+    c.py_bindfunc(input_mod, "mouse_x", engineMouseX);
+    c.py_bindfunc(input_mod, "mouse_y", engineMouseY);
+    c.py_bindfunc(input_mod, "is_mouse_down", engineIsMouseDown);
+    c.py_bindfunc(input_mod, "was_mouse_clicked", engineWasMouseClicked);
+
+    const key_mod = c.py_newmodule("zigeng.Key");
+    populateKeyModule(key_mod);
+
+    const zigeng_mod = c.py_newmodule("zigeng");
+    setIntConst(zigeng_mod, "__bridge", @intCast(@intFromPtr(bridge)));
+    c.py_bindfunc(zigeng_mod, "log", engineLog);
+    c.py_bindfunc(zigeng_mod, "spawn_entity", engineSpawnEntity);
+    c.py_bindfunc(zigeng_mod, "is_alive", engineIsAlive);
+    c.py_bindfunc(zigeng_mod, "post_event", enginePostEvent);
+    c.py_bindfunc(zigeng_mod, "draw_rect", engineDrawRect);
+    c.py_bindfunc(zigeng_mod, "clear_draw_queue", engineClearDrawQueue);
+    c.py_setdict(zigeng_mod, c.py_name("input"), input_mod);
+    c.py_setdict(zigeng_mod, c.py_name("Key"), key_mod);
 
     const st = try allocator.create(PythonRuntimeState);
     st.* = .{
@@ -267,6 +379,13 @@ fn invokePythonScript(raw: *anyopaque, script_id: u64, fn_name: []const u8, arg:
 
     if (!c.py_call(fn_ref, 1, arg_slot)) {
         const err_msg = captureError(st);
+        // Allow zero-argument lifecycle hooks like `def start():` / `def destroy():`.
+        if (arg.len == 0 and std.mem.indexOf(u8, err_msg, "takes 0 positional arguments") != null) {
+            if (c.py_call(fn_ref, 0, null)) {
+                return .{ .ok = true };
+            }
+            return .{ .ok = false, .error_message = captureError(st) };
+        }
         return .{ .ok = false, .error_message = err_msg };
     }
     return .{ .ok = true };

@@ -11,7 +11,7 @@ Related packages are grouped by category; the public package name used by `zigen
 | Category | Directories |
 |---|---|
 | `physics/` | `core` (contract), `jolt`, `rapier` |
-| `ui/` | `core`, `markup`, `novaui`, `immediate` |
+| `ui/` | `core`, `markup` |
 | `window/` | `core`, `sdl3` |
 | `graphics/` | `core`, `sdlgpu` |
 | `scripting/` | `host`, `lua`, `python` |
@@ -31,8 +31,6 @@ Related packages are grouped by category; the public package name used by `zigen
 | [`render/2d/`](render/2d/src/render_2d.zig) | `official.render.2d` | `engine.render.2d/1` | `Camera2D`, `Sprite`, `Visibility`, and `.render_extract` 2D batch extraction. |
 | [`ui/core/`](ui/core/src/ui_core.zig) | `official.ui.core` | `engine.ui.tree/1` | Syntax-agnostic retained `UiTree`, flex layout, O(1) ID index, focus, and hit testing. |
 | [`ui/markup/`](ui/markup/src/ui_markup.zig) | `official.ui.markup` | — | Official HTML-like markup parser compiling into `UiTree` IR. |
-| [`ui/novaui/`](ui/novaui/src/novaui.zig) | `community.ui.novaui` | — | Alternative community DSL (`NovaUI`) compiling into the same `UiTree` IR. |
-| [`ui/immediate/`](ui/immediate/src/ui_immediate.zig) | `community.ui.immediate` | `engine.ui.backend.immediate/1` | Immediate-mode UI backend consuming `window`/`input`/`graphics` without `ui-core`. |
 | [`scripting/host/`](scripting/host/src/scripting_host.zig) | `official.script.host` | `engine.script.host/1` | Language-agnostic Scripting Host Protocol (SHP) and handle-based `ScriptEngineBridge`. |
 | [`scripting/lua/`](scripting/lua/src/scripting_lua.zig) | `official.script.lua` | `engine.script.runtime.lua/1` | Real embedded **Lua 5.5** VM (`zlua`) registered with `ScriptingHost`. |
 | [`scripting/python/`](scripting/python/src/scripting_python.zig) | `official.script.python` | `engine.script.runtime.python/1` | **PocketPy v2.2.0** (Python subset, vendored in `packages/scripting/python/third_party/pocketpy`) runtime, one VM per `ScriptingHost` runtime, registered with `ScriptingHost`. |

@@ -28,14 +28,10 @@ All packages under `packages/` are optional `engine.Module` implementations that
   - `tree.hitTest(x, y)` and `tree.handlePointerClick(x, y, &app.events)` (sets focus + emits `ui.action`)
   - `tree.paint(allocator, &out_cmds)` (generates `graphics.DrawCommand` list)
 
-## 4. UI Frontends & Alternative Backends
+## 4. UI Markup Frontend
 
 - **HTML-like Markup (`official.ui.markup` — `packages/ui/markup/src/ui_markup.zig`):**
-  `ui_markup.parseIntoTree(allocator, html_src, &ui_tree)`
-- **Community NovaUI DSL (`community.ui.novaui` — `packages/ui/novaui/src/novaui.zig`):**
-  `ui_novaui.parseIntoTree(allocator, nova_src, &ui_tree)` — produces the exact same `UiTree` IR.
-- **Immediate-Mode UI Backend (`community.ui.immediate` — `packages/ui/immediate/src/ui_immediate.zig`):**
-  Provides `engine.ui.backend.immediate/1` (`ImmediateUiService`). Consumes `window`, `input`, and `graphics` directly **without** `official.ui.core`.
+  `ui_markup.parseIntoTree(allocator, html_src, &ui_tree)` — compiles declarative markup into `UiTree` IR.
 
 ## 5. Scripting Host Protocol (`official.script.host` — `packages/scripting/host/src/scripting_host.zig`)
 
