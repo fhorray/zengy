@@ -32,7 +32,7 @@ Welcome to the `zengy` documentation. This engine is built around a **minimal he
 Requires **Zig `0.17.1`**:
 
 ```bash
-# Run all 68 test steps (Debug / ReleaseSafe)
+# Run all 76 test steps (Debug / ReleaseSafe)
 zig build test --summary all
 zig build test -Doptimize=ReleaseSafe --summary all
 
@@ -57,4 +57,6 @@ zig build run-visual-python
 zig build run-visual-3d
 zig build run-visual-camera
 zig build run-visual-gamepad
+zig build run-visual-audio
+zig build run-visual-pbr
 ```

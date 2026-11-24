@@ -22,7 +22,7 @@ test "EditorShell panels, schema-driven inspector, and undo/redo" {
     try app.initialize();
 
     const shell = app.resources.get(editor_shell.EditorShellService).?;
-    try testing.expectEqual(@as(usize, 3), shell.panelCount());
+    try testing.expectEqual(@as(usize, 5), shell.panelCount());
 
     const schema = try app.types.registerSchema("game", "Health", 1, .blittable, &.{
         .{ .name = "hp", .field_type = .f32_t },

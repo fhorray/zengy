@@ -1,0 +1,11 @@
+name=gallery_default
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=1.4337
+p50_luma=0.7943
+p95_luma=4.6525
+speckle=0
+contrast=147.00
+hf_energy=2.3910

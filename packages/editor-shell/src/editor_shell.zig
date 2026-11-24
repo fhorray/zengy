@@ -144,6 +144,8 @@ fn buildModule(raw_app: *anyopaque) !void {
     try svc.registerPanel(.{ .id = "editor.hierarchy", .title = "Hierarchy" });
     try svc.registerPanel(.{ .id = "editor.inspector", .title = "Inspector" });
     try svc.registerPanel(.{ .id = "editor.console", .title = "Console" });
+    try svc.registerPanel(.{ .id = "editor.profiler", .title = "Profiler" });
+    try svc.registerPanel(.{ .id = "editor.remote", .title = "Remote Inspector" });
 
     try app.services.register(.{
         .capability = "engine.tools.editor_shell",

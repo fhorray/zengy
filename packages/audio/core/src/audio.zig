@@ -55,7 +55,14 @@ pub const AudioPlayer = struct {
     settings: PlaybackSettings = .{},
     position: [3]f32 = .{ 0, 0, 0 },
     auto_play: bool = true,
+    /// Consecutive failed start attempts; `auto_play` is cleared once retries are exhausted.
+    failed_starts: u8 = 0,
     active_playback: ?AudioPlaybackHandle = null,
+    applied_source: AudioSourceHandle = .invalid,
+    applied_volume: f32 = -1.0,
+    applied_paused: bool = false,
+    applied_speed: f32 = -1.0,
+    applied_pan: f32 = -2.0,
 };
 
 /// ECS component marking the active listener position and right vector for spatial audio.
@@ -90,6 +97,16 @@ const PlaybackSlot = struct {
     alive: bool = false,
     backend_id: u64 = 0,
     source: AudioSourceHandle = .invalid,
+    /// Per-voice volume before the service master volume is applied; re-applied when the master changes.
+    base_volume: f32 = 1.0,
+    /// `true` when the voice belongs to an `AudioPlayer` component (lifecycle managed by the ECS system).
+    component_owned: bool = false,
+};
+
+/// Link from a live `AudioPlayer` component to the playback it started, used to release orphaned voices.
+const ComponentVoice = struct {
+    entity: engine.EntityHandle,
+    playback: AudioPlaybackHandle,
 };
 
 /// Resource & service (`engine.audio/1`) managing audio sources and active playbacks.
@@ -98,7 +115,13 @@ pub const AudioService = struct {
     backend: ?AudioBackendVTable = null,
     sources: std.ArrayList(SourceSlot) = .empty,
     playbacks: std.ArrayList(PlaybackSlot) = .empty,
+    /// Global output gain applied to every live voice. Write it through `setMasterVolume` so live voices update.
     master_volume: f32 = 1.0,
+    /// Voices started by `AudioPlayer` components; the system releases a voice once its owner is gone.
+    component_voices: std.ArrayList(ComponentVoice) = .empty,
+    /// Indices of playback slots that are not alive, so `play` reuses one in O(1) instead of scanning.
+    /// Invariant: a slot is listed here if and only if it is not alive.
+    free_playbacks: std.ArrayList(u32) = .empty,
 
     /// Initializes an empty `AudioService`.
     pub fn init(allocator: std.mem.Allocator) AudioService {
@@ -117,19 +140,24 @@ pub const AudioService = struct {
         }
         self.playbacks.deinit(self.allocator);
         self.sources.deinit(self.allocator);
+        self.component_voices.deinit(self.allocator);
+        self.free_playbacks.deinit(self.allocator);
         self.playbacks = .empty;
         self.sources = .empty;
+        self.component_voices = .empty;
+        self.free_playbacks = .empty;
         self.backend = null;
     }
 
     /// Registers or clears the active hardware/software audio backend.
     pub fn setBackend(self: *AudioService, backend: ?AudioBackendVTable) void {
         if (self.backend) |old_be| {
-            for (self.playbacks.items) |*pb| {
+            for (self.playbacks.items, 0..) |*pb, idx| {
                 if (pb.alive) {
                     old_be.stop(old_be.ctx, pb.backend_id);
                     pb.alive = false;
                     pb.generation +%= 1;
+                    self.pushFreePlayback(idx);
                 }
             }
             for (self.sources.items) |*src| {
@@ -187,11 +215,12 @@ pub const AudioService = struct {
         if (!slot.alive or slot.generation != handle.generation) return false;
 
         if (self.backend) |be| {
-            for (self.playbacks.items) |*pb| {
+            for (self.playbacks.items, 0..) |*pb, idx| {
                 if (pb.alive and std.meta.eql(pb.source, handle)) {
                     be.stop(be.ctx, pb.backend_id);
                     pb.alive = false;
                     pb.generation +%= 1;
+                    self.pushFreePlayback(idx);
                 }
             }
             be.unloadSource(be.ctx, slot.backend_id);
@@ -202,7 +231,12 @@ pub const AudioService = struct {
     }
 
     /// Starts playing `source` with `settings` and returns a generational `AudioPlaybackHandle`.
+    /// Manually started voices that finish are reclaimed by `collectFinished`.
     pub fn play(self: *AudioService, source: AudioSourceHandle, settings: PlaybackSettings) !AudioPlaybackHandle {
+        return self.playInternal(source, settings, false);
+    }
+
+    fn playInternal(self: *AudioService, source: AudioSourceHandle, settings: PlaybackSettings, component_owned: bool) !AudioPlaybackHandle {
         const be = self.backend orelse return error.MissingAudioBackend;
         if (source.index >= self.sources.items.len) return error.InvalidAudioSource;
         const src_slot = &self.sources.items[source.index];
@@ -213,14 +247,15 @@ pub const AudioService = struct {
         const backend_id = try be.play(be.ctx, src_slot.backend_id, scaled);
         errdefer be.stop(be.ctx, backend_id);
 
-        for (self.playbacks.items, 0..) |*slot, i| {
-            if (!slot.alive) {
-                if (slot.generation == 0) slot.generation = 1;
-                slot.alive = true;
-                slot.backend_id = backend_id;
-                slot.source = source;
-                return .{ .index = @intCast(i), .generation = slot.generation };
-            }
+        if (self.free_playbacks.pop()) |idx| {
+            const slot = &self.playbacks.items[idx];
+            if (slot.generation == 0) slot.generation = 1;
+            slot.alive = true;
+            slot.backend_id = backend_id;
+            slot.source = source;
+            slot.base_volume = settings.volume;
+            slot.component_owned = component_owned;
+            return .{ .index = idx, .generation = slot.generation };
         }
 
         const idx: u32 = @intCast(self.playbacks.items.len);
@@ -229,8 +264,38 @@ pub const AudioService = struct {
             .alive = true,
             .backend_id = backend_id,
             .source = source,
+            .base_volume = settings.volume,
+            .component_owned = component_owned,
         });
         return .{ .index = idx, .generation = 1 };
+    }
+
+    /// Releases every finished manual playback so fire-and-forget SFX do not accumulate backend voices.
+    /// Component-owned voices are skipped; the `AudioPlayer` system releases them by their play mode.
+    /// Returns the number of playbacks released.
+    pub fn collectFinished(self: *AudioService) usize {
+        const be = self.backend orelse return 0;
+        var released: usize = 0;
+        for (self.playbacks.items, 0..) |*slot, idx| {
+            if (!slot.alive or slot.component_owned) continue;
+            if (!be.isFinished(be.ctx, slot.backend_id)) continue;
+            be.stop(be.ctx, slot.backend_id);
+            slot.alive = false;
+            slot.generation +%= 1;
+            self.pushFreePlayback(idx);
+            released += 1;
+        }
+        return released;
+    }
+
+    /// Sets the global output gain and re-applies it to every live voice.
+    pub fn setMasterVolume(self: *AudioService, volume: f32) void {
+        self.master_volume = @max(volume, 0.0);
+        const be = self.backend orelse return;
+        for (self.playbacks.items) |*slot| {
+            if (!slot.alive) continue;
+            be.setVolume(be.ctx, slot.backend_id, std.math.clamp(slot.base_volume * self.master_volume, 0.0, 4.0));
+        }
     }
 
     fn resolvePlayback(self: *const AudioService, handle: AudioPlaybackHandle) ?*const PlaybackSlot {
@@ -248,11 +313,20 @@ pub const AudioService = struct {
         if (self.backend) |be| be.stop(be.ctx, slot.backend_id);
         slot.alive = false;
         slot.generation +%= 1;
+        self.pushFreePlayback(handle.index);
     }
 
-    /// Updates playback volume (clamped >= 0).
+    /// Records a released playback slot for reuse. If the append fails, the slot is simply not reused.
+    fn pushFreePlayback(self: *AudioService, index: usize) void {
+        self.free_playbacks.append(self.allocator, @intCast(index)) catch {};
+    }
+
+    /// Updates playback volume (clamped >= 0). The master volume is applied on top of `volume`.
     pub fn setVolume(self: *AudioService, handle: AudioPlaybackHandle, volume: f32) void {
         const slot = self.resolvePlayback(handle) orelse return;
+        // Store the un-mastered volume so `setMasterVolume` can recompute the effective gain later.
+        const mutable: *PlaybackSlot = &self.playbacks.items[handle.index];
+        mutable.base_volume = volume;
         if (self.backend) |be| {
             be.setVolume(be.ctx, slot.backend_id, std.math.clamp(volume * self.master_volume, 0.0, 4.0));
         }
@@ -308,6 +382,25 @@ fn audioUpdateSystem(ctx: *engine.SystemContext) !void {
     const svc = ctx.resources.get(AudioService) orelse return;
     if (svc.backend == null) return;
 
+    // Release voices whose owning entity was despawned or lost its AudioPlayer (or whose playback already ended).
+    {
+        var i: usize = 0;
+        while (i < svc.component_voices.items.len) {
+            const cv = svc.component_voices.items[i];
+            const owner_active = if (ctx.world.getConst(cv.entity, AudioPlayer)) |ap|
+                ap.active_playback != null and std.meta.eql(ap.active_playback.?, cv.playback)
+            else
+                false;
+            if (owner_active) {
+                i += 1;
+                continue;
+            }
+            // `stop` is a no-op for handles that already ended, so this is safe for finished voices too.
+            svc.stop(cv.playback);
+            _ = svc.component_voices.swapRemove(i);
+        }
+    }
+
     var listener_pos: ?[3]f32 = null;
     var listener_right: [3]f32 = .{ 1, 0, 0 };
     var listener_gain: f32 = 1.0;
@@ -331,14 +424,46 @@ fn audioUpdateSystem(ctx: *engine.SystemContext) !void {
         else
             .{ .gain = 1.0, .pan = 0.0 };
         const spatial_scale = spatial.gain * listener_gain;
+        // Non-spatial voices must be centered explicitly, otherwise a previous spatial pan would persist.
+        const target_pan: f32 = if (p.settings.spatial) spatial.pan else 0.0;
 
+        if (p.active_playback) |pb| {
+            if (p.source != p.applied_source) {
+                svc.stop(pb);
+                p.active_playback = null;
+            }
+        }
+
+        const eff_vol = p.settings.volume * spatial_scale;
         if (p.active_playback == null and p.auto_play) {
             var eff = p.settings;
-            eff.volume *= spatial_scale;
-            if (svc.play(p.source, eff)) |pb| {
+            eff.volume = eff_vol;
+            if (svc.playInternal(p.source, eff, true)) |pb| {
+                // Track the voice before publishing it on the component, so an allocation failure cannot leak it.
+                svc.component_voices.append(svc.allocator, .{ .entity = row.entity, .playback = pb }) catch |err| {
+                    svc.stop(pb);
+                    return err;
+                };
                 p.active_playback = pb;
-                if (p.settings.spatial) svc.setPan(pb, spatial.pan);
-            } else |_| {}
+                p.applied_source = p.source;
+                p.applied_volume = eff_vol;
+                p.applied_paused = p.settings.paused;
+                p.applied_speed = p.settings.speed;
+                p.applied_pan = target_pan;
+                svc.setPan(pb, target_pan);
+                p.failed_starts = 0;
+            } else |err| {
+                // Permanent errors never succeed on retry; recoverable ones get a bounded number of attempts.
+                // Without a limit, a bad source would log and retry every frame.
+                const permanent = err == error.InvalidAudioSource or err == error.MissingAudioBackend;
+                p.failed_starts +|= 1;
+                if (permanent or p.failed_starts >= AUDIO_START_RETRY_LIMIT) {
+                    p.auto_play = false;
+                    std.log.warn("audio: giving up on AudioPlayer after {d} failed start(s): {s}", .{ p.failed_starts, @errorName(err) });
+                } else {
+                    std.log.warn("audio: start attempt {d}/{d} failed: {s}", .{ p.failed_starts, AUDIO_START_RETRY_LIMIT, @errorName(err) });
+                }
+            }
             continue;
         }
 
@@ -346,6 +471,7 @@ fn audioUpdateSystem(ctx: *engine.SystemContext) !void {
             if (svc.isFinished(pb)) {
                 svc.stop(pb);
                 p.active_playback = null;
+                p.applied_source = .invalid;
                 switch (p.settings.mode) {
                     .once => p.auto_play = false,
                     .loop => {},
@@ -353,16 +479,33 @@ fn audioUpdateSystem(ctx: *engine.SystemContext) !void {
                     .remove_component => try ctx.commands.remove(row.entity, AudioPlayer),
                 }
             } else {
-                svc.setVolume(pb, p.settings.volume * spatial_scale);
-                svc.setPaused(pb, p.settings.paused);
-                svc.setSpeed(pb, p.settings.speed);
-                if (p.settings.spatial) svc.setPan(pb, spatial.pan);
+                if (@abs(eff_vol - p.applied_volume) > 1e-4) {
+                    svc.setVolume(pb, eff_vol);
+                    p.applied_volume = eff_vol;
+                }
+                if (p.settings.paused != p.applied_paused) {
+                    svc.setPaused(pb, p.settings.paused);
+                    p.applied_paused = p.settings.paused;
+                }
+                if (@abs(p.settings.speed - p.applied_speed) > 1e-4) {
+                    svc.setSpeed(pb, p.settings.speed);
+                    p.applied_speed = p.settings.speed;
+                }
+                if (@abs(target_pan - p.applied_pan) > 1e-3) {
+                    svc.setPan(pb, target_pan);
+                    p.applied_pan = target_pan;
+                }
             }
         }
     }
+
+    _ = svc.collectFinished();
 }
 
 const MODULE_OWNER_ID: u64 = 2035;
+
+/// Start attempts a recoverable failure gets before an `AudioPlayer` stops trying.
+const AUDIO_START_RETRY_LIMIT: u8 = 3;
 
 fn buildAudioModule(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
@@ -401,7 +544,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.audio",
-            .version = "0.1.0",
+            .version = "0.2.0",
             .provides_capabilities = &.{"engine.audio/1"},
         },
         .build = buildAudioModule,

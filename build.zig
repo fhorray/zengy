@@ -350,6 +350,57 @@ pub fn build(b: *std.Build) void {
     render_3d_mod.addImport("camera", camera_mod);
     render_3d_mod.addImport("scene", scene_mod);
 
+    const gizmos_mod = b.addModule("gizmos", .{
+        .root_source_file = b.path("packages/gizmos/src/gizmos.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gizmos_mod.addImport("engine", engine_mod);
+    gizmos_mod.addImport("camera", camera_mod);
+
+    const shapes_mod = b.addModule("shapes", .{
+        .root_source_file = b.path("packages/shapes/src/shapes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shapes_mod.addImport("engine", engine_mod);
+    shapes_mod.addImport("render_3d", render_3d_mod);
+
+    const dev_tools_mod = b.addModule("dev_tools", .{
+        .root_source_file = b.path("packages/dev-tools/src/dev_tools.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dev_tools_mod.addImport("engine", engine_mod);
+
+    const picking_mod = b.addModule("picking", .{
+        .root_source_file = b.path("packages/picking/src/picking.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    picking_mod.addImport("engine", engine_mod);
+    picking_mod.addImport("camera", camera_mod);
+    picking_mod.addImport("input", input_mod);
+    picking_mod.addImport("render_3d", render_3d_mod);
+
+    const remote_mod = b.addModule("remote", .{
+        .root_source_file = b.path("packages/remote/src/remote.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const log_mod = b.addModule("log", .{
+        .root_source_file = b.path("packages/log/src/log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    log_mod.addImport("engine", engine_mod);
+
+    remote_mod.addImport("engine", engine_mod);
+    remote_mod.addImport("dev_tools", dev_tools_mod);
+    remote_mod.addImport("editor_shell", editor_shell_mod);
+    remote_mod.addImport("picking", picking_mod);
+    remote_mod.addImport("log", log_mod);
+
     // Diagnostic CLI tool (`tools/cli`)
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("tools/cli/main.zig"),
@@ -567,6 +618,9 @@ pub fn build(b: *std.Build) void {
     graphics_sdlgpu_mod.addImport("graphics", graphics_mod);
     graphics_sdlgpu_mod.addImport("window_sdl3", window_sdl3_mod);
     graphics_sdlgpu_mod.addImport("text", text_mod);
+    graphics_sdlgpu_mod.addImport("render_3d", render_3d_mod);
+    graphics_sdlgpu_mod.addImport("gizmos", gizmos_mod);
+    graphics_sdlgpu_mod.addImport("dev_tools", dev_tools_mod);
     graphics_sdlgpu_mod.addImport("sdl3_c", sdl3_c_mod);
 
     // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
@@ -867,6 +921,120 @@ pub fn build(b: *std.Build) void {
     const run_visual_audio_step = b.step("run-visual-audio", "Open the Visual Audio, State & Time demo");
     run_visual_audio_step.dependOn(&run_visual_audio.step);
 
+    // Visual PBR, Shadows, Sky, AutoExposure & Tonemapping demo. Run with `zig build run-visual-pbr`.
+    const visual_pbr_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-pbr/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_pbr_mod.addImport("engine", engine_mod);
+    visual_pbr_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_pbr_mod.addImport("graphics", graphics_mod);
+    visual_pbr_mod.addImport("testing_sdk", testing_sdk_mod);
+    visual_pbr_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_pbr_mod.addImport("input", input_mod);
+    visual_pbr_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_pbr_mod.addImport("camera", camera_mod);
+    visual_pbr_mod.addImport("render_3d", render_3d_mod);
+    visual_pbr_mod.addImport("gizmos", gizmos_mod);
+
+    const visual_pbr_exe = b.addExecutable(.{
+        .name = "visual-pbr",
+        .root_module = visual_pbr_mod,
+    });
+    b.installArtifact(visual_pbr_exe);
+
+    const run_visual_pbr = b.addSystemCommand(&.{"zig-out/bin/visual-pbr.exe"});
+    run_visual_pbr.setCwd(b.path("."));
+    run_visual_pbr.step.dependOn(b.getInstallStep());
+    const run_visual_pbr_step = b.step("run-visual-pbr", "Open the Visual PBR, Shadows, AutoExposure & Tonemapping demo");
+    run_visual_pbr_step.dependOn(&run_visual_pbr.step);
+
+    // Visual 3D Gizmos Showcase. Run with `zig build run-visual-gizmos`.
+    const visual_gizmos_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-gizmos/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_gizmos_mod.addImport("engine", engine_mod);
+    visual_gizmos_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_gizmos_mod.addImport("graphics", graphics_mod);
+    visual_gizmos_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_gizmos_mod.addImport("input", input_mod);
+    visual_gizmos_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_gizmos_mod.addImport("camera", camera_mod);
+    visual_gizmos_mod.addImport("render_3d", render_3d_mod);
+    visual_gizmos_mod.addImport("gizmos", gizmos_mod);
+
+    const visual_gizmos_exe = b.addExecutable(.{
+        .name = "visual-gizmos",
+        .root_module = visual_gizmos_mod,
+    });
+    b.installArtifact(visual_gizmos_exe);
+
+    const run_visual_gizmos = b.addSystemCommand(&.{"zig-out/bin/visual-gizmos.exe"});
+    run_visual_gizmos.setCwd(b.path("."));
+    run_visual_gizmos.step.dependOn(b.getInstallStep());
+    const run_visual_gizmos_step = b.step("run-visual-gizmos", "Open the Visual 3D Gizmos Showcase");
+    run_visual_gizmos_step.dependOn(&run_visual_gizmos.step);
+
+    // Visual Shapes + Picking + Profiler + Remote Inspector Showcase. Run with `zig build run-visual-inspector`.
+    const visual_inspector_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-inspector/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_inspector_mod.addImport("engine", engine_mod);
+    visual_inspector_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_inspector_mod.addImport("graphics", graphics_mod);
+    visual_inspector_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_inspector_mod.addImport("input", input_mod);
+    visual_inspector_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_inspector_mod.addImport("ui_core", ui_core_mod);
+    visual_inspector_mod.addImport("camera", camera_mod);
+    visual_inspector_mod.addImport("render_3d", render_3d_mod);
+    visual_inspector_mod.addImport("gizmos", gizmos_mod);
+    visual_inspector_mod.addImport("shapes", shapes_mod);
+    visual_inspector_mod.addImport("dev_tools", dev_tools_mod);
+    visual_inspector_mod.addImport("editor_shell", editor_shell_mod);
+    visual_inspector_mod.addImport("picking", picking_mod);
+    visual_inspector_mod.addImport("log", log_mod);
+    visual_inspector_mod.addImport("remote", remote_mod);
+
+    const visual_inspector_exe = b.addExecutable(.{
+        .name = "visual-inspector",
+        .root_module = visual_inspector_mod,
+    });
+    b.installArtifact(visual_inspector_exe);
+
+    const run_visual_inspector = b.addSystemCommand(&.{"zig-out/bin/visual-inspector.exe"});
+    run_visual_inspector.setCwd(b.path("."));
+    run_visual_inspector.step.dependOn(b.getInstallStep());
+    const run_visual_inspector_step = b.step("run-visual-inspector", "Open the Visual Shapes, Picking & Profiler Showcase");
+    run_visual_inspector_step.dependOn(&run_visual_inspector.step);
+
+    // Render regression harness: renders the fixed scenarios of `visual-pbr` and compares them with
+    // `tests/golden/visual-pbr` (`capture-check`) or rewrites those goldens (`capture-update`).
+    // Needs a GPU and a window; see docs/roadmap/visual-risk-plan.md.
+    const capture_exe_path = b.fmt("zig-out/bin/visual-pbr{s}", .{target.result.exeFileExt()});
+    const capture_check = b.addSystemCommand(&.{capture_exe_path});
+    capture_check.setCwd(b.path("."));
+    capture_check.setEnvironmentVariable("ZENGY_CAPTURE_DIR", "zig-out/capture");
+    capture_check.step.dependOn(b.getInstallStep());
+    const capture_check_step = b.step("capture-check", "Render the visual-pbr scenarios and compare them with the golden images");
+    capture_check_step.dependOn(&capture_check.step);
+
+    const capture_update = b.addSystemCommand(&.{capture_exe_path});
+    capture_update.setCwd(b.path("."));
+    capture_update.setEnvironmentVariable("ZENGY_CAPTURE_DIR", "zig-out/capture");
+    capture_update.setEnvironmentVariable("ZENGY_CAPTURE_UPDATE", "1");
+    capture_update.step.dependOn(b.getInstallStep());
+    const capture_update_step = b.step("capture-update", "Re-render the visual-pbr scenarios and overwrite the golden images");
+    capture_update_step.dependOn(&capture_update.step);
+
     // Manifesto-driven visual runtime (`tools/runtime/main.zig`): reads game.toml in CWD.
     const runtime_mod = b.createModule(.{
         .root_source_file = b.path("tools/runtime/main.zig"),
@@ -963,6 +1131,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(plugin_path_tests).step);
+
+    // The render regression suite needs a GPU and a window, so it joins `zig build test` only on request.
+    const capture_in_test = b.option(bool, "capture", "Also run the GPU render regression suite (capture-check) as part of `zig build test`") orelse false;
+    if (capture_in_test) test_step.dependOn(capture_check_step);
 
     const hook_tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1061,6 +1233,49 @@ pub fn build(b: *std.Build) void {
         .{ .name = "render_3d", .mod = render_3d_mod },
     }, null);
 
+    addModuleTest(b, test_step, "packages/gizmos/tests/gizmos_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "camera", .mod = camera_mod },
+        .{ .name = "gizmos", .mod = gizmos_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/shapes/tests/shapes_tests.zig", target, optimize, false, &.{
+        .{ .name = "shapes", .mod = shapes_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/dev-tools/tests/dev_tools_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "dev_tools", .mod = dev_tools_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/picking/tests/picking_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "input", .mod = input_mod },
+        .{ .name = "scene", .mod = scene_mod },
+        .{ .name = "camera", .mod = camera_mod },
+        .{ .name = "render_3d", .mod = render_3d_mod },
+        .{ .name = "picking", .mod = picking_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/remote/tests/remote_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "dev_tools", .mod = dev_tools_mod },
+        .{ .name = "editor_shell", .mod = editor_shell_mod },
+        .{ .name = "picking", .mod = picking_mod },
+        .{ .name = "log", .mod = log_mod },
+        .{ .name = "remote", .mod = remote_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/log/tests/log_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "log", .mod = log_mod },
+    }, null);
+
     addModuleTest(b, test_step, "packages/formats/toml/tests/toml_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "toml_format", .mod = toml_format_mod },
@@ -1101,6 +1316,14 @@ pub fn build(b: *std.Build) void {
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "gpu_resources", .mod = gpu_resources_mod },
+    }, null);
+
+    // Pure volumetric light ranking; no SDL or engine imports, so it runs headless.
+    addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/volumetric_lights.zig", target, optimize, false, &.{}, null);
+    addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/shadow_cull.zig", target, optimize, false, &.{}, null);
+    addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/shadow_plan.zig", target, optimize, false, &.{}, null);
+    addModuleTest(b, test_step, "packages/testing/src/render_regression.zig", target, optimize, false, &.{
+        .{ .name = "graphics", .mod = graphics_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/render/text/tests/text_tests.zig", target, optimize, false, &.{

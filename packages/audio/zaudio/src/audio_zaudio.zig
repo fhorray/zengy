@@ -33,11 +33,13 @@ const ZaudioState = struct {
     ma_engine: ?*zaudio.Engine = null,
     next_source_id: u64 = 1,
     next_playback_id: u64 = 1,
-    sources: std.ArrayList(SourceEntry) = .empty,
-    playbacks: std.ArrayList(PlaybackEntry) = .empty,
+    // Keyed by backend id: every per-voice call (volume, pan, finished, stop) is O(1) instead of a scan.
+    sources: std.AutoHashMapUnmanaged(u64, SourceEntry) = .empty,
+    playbacks: std.AutoHashMapUnmanaged(u64, PlaybackEntry) = .empty,
 
     fn deinit(self: *ZaudioState) void {
-        for (self.playbacks.items) |pb| {
+        var pb_it = self.playbacks.valueIterator();
+        while (pb_it.next()) |pb| {
             pb.sound.stop() catch {};
             pb.sound.destroy();
             pb.decoder.destroy();
@@ -45,7 +47,8 @@ const ZaudioState = struct {
         self.playbacks.deinit(self.allocator);
         self.playbacks = .empty;
 
-        for (self.sources.items) |src| {
+        var src_it = self.sources.valueIterator();
+        while (src_it.next()) |src| {
             self.allocator.free(src.bytes);
         }
         self.sources.deinit(self.allocator);
@@ -62,17 +65,11 @@ const ZaudioState = struct {
     }
 
     fn findSource(self: *const ZaudioState, id: u64) ?SourceEntry {
-        for (self.sources.items) |src| {
-            if (src.id == id) return src;
-        }
-        return null;
+        return self.sources.get(id);
     }
 
     fn findPlaybackMut(self: *ZaudioState, id: u64) ?*PlaybackEntry {
-        for (self.playbacks.items) |*pb| {
-            if (pb.id == id) return pb;
-        }
-        return null;
+        return self.playbacks.getPtr(id);
     }
 
     fn loadBytes(raw: *anyopaque, bytes: []const u8, format: audio.AudioFormat) anyerror!u64 {
@@ -92,19 +89,13 @@ const ZaudioState = struct {
         errdefer self.allocator.free(copy);
         const id = self.next_source_id;
         self.next_source_id += 1;
-        try self.sources.append(self.allocator, .{ .id = id, .bytes = copy });
+        try self.sources.put(self.allocator, id, .{ .id = id, .bytes = copy });
         return id;
     }
 
     fn unloadSource(raw: *anyopaque, backend_source_id: u64) void {
         const self: *ZaudioState = @ptrCast(@alignCast(raw));
-        for (self.sources.items, 0..) |src, i| {
-            if (src.id == backend_source_id) {
-                self.allocator.free(src.bytes);
-                _ = self.sources.swapRemove(i);
-                return;
-            }
-        }
+        if (self.sources.fetchRemove(backend_source_id)) |kv| self.allocator.free(kv.value.bytes);
     }
 
     fn play(raw: *anyopaque, backend_source_id: u64, settings: audio.PlaybackSettings) anyerror!u64 {
@@ -131,7 +122,7 @@ const ZaudioState = struct {
 
         const id = self.next_playback_id;
         self.next_playback_id += 1;
-        try self.playbacks.append(self.allocator, .{
+        try self.playbacks.put(self.allocator, id, .{
             .id = id,
             .decoder = decoder,
             .sound = sound,
@@ -142,14 +133,10 @@ const ZaudioState = struct {
 
     fn stop(raw: *anyopaque, backend_playback_id: u64) void {
         const self: *ZaudioState = @ptrCast(@alignCast(raw));
-        for (self.playbacks.items, 0..) |pb, i| {
-            if (pb.id == backend_playback_id) {
-                pb.sound.stop() catch {};
-                pb.sound.destroy();
-                pb.decoder.destroy();
-                _ = self.playbacks.swapRemove(i);
-                return;
-            }
+        if (self.playbacks.fetchRemove(backend_playback_id)) |kv| {
+            kv.value.sound.stop() catch {};
+            kv.value.sound.destroy();
+            kv.value.decoder.destroy();
         }
     }
 

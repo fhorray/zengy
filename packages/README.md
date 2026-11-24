@@ -17,7 +17,7 @@ Related packages are grouped by category; the public package name used by `zengy
 | `scripting/` | `host`, `lua`, `python` |
 | `render/` | `2d`, `3d`, `text` |
 | `formats/`, `tooling/` | format adapters and file watcher |
-| flat | `assets`, `scene`, `prefab`, `editor-shell`, `testing`, `default-plugins`, `sdl3` (third-party SDK) |
+| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `editor-shell`, `testing`, `default-plugins`, `sdl3` (third-party SDK) |
 
 ## Package Catalog
 
@@ -43,6 +43,12 @@ Related packages are grouped by category; the public package name used by `zengy
 | [`prefab/`](prefab/src/prefab.zig) | `official.prefab` | `engine.prefab/1` | Portable `Prefab` entity trees (stable type ids, versioned encoded components), field overrides, atomic batch `instantiate`, and a `PrefabLibrary` resource. |
 | [`editor-shell/`](editor-shell/src/editor_shell.zig) | `official.tools.editor_shell` | `engine.tools.editor_shell/1` | Optional dockable panel registry, schema-driven inspector, and transactional undo/redo. |
 | [`render/3d/`](render/3d/src/render_3d.zig) | `official.render.3d` | `engine.render.3d/1` | 3D transform/mesh components (`Transform3D`, `MeshRef`) and `.render_extract` draw extraction (powered by `official.camera`). |
+| [`gizmos/`](gizmos/src/gizmos.zig) | `official.gizmos` | `engine.gizmos/1` | Immediate-mode 3D debug & editor gizmos (`line`, `ray`, `arrow`, `cuboid`, `axes`, `circle`, `sphere`, `grid`) with depth-tested and X-ray layers. |
+| [`shapes/`](shapes/src/shapes.zig) | `official.shapes` | `engine.shapes/1` | Procedural 3D mesh primitives (`Plane`, `Cuboid`, `Sphere`, `Capsule`, `Cylinder`, `Torus`, `Cone`) with UVs and tangents. |
+| [`dev-tools/`](dev-tools/src/dev_tools.zig) | `official.dev_tools` | `engine.dev_tools.profiler/1` | Per-pass frame profiler (`Shadow`, `SSAO`, `Volumetric`, `Forward+`, `Bloom`, `PostFX`) and rolling FPS metrics. |
+| [`picking/`](picking/src/picking.zig) | `official.picking` | `engine.picking/1`, `engine.input_focus/1` | Unified UI/2D/3D pointer picking (`PointerEnter`, `PointerLeave`, `PointerDown`, `PointerUp`, `PointerDrag`) and `InputFocus`. |
+| [`remote/`](remote/src/remote.zig) | `official.remote` | `engine.remote/1` | JSON-RPC 2.0 remote inspector for live ECS inspection, field mutation, and profiler telemetry. |
+| [`log/`](log/src/log.zig) | `official.log` | `engine.log/1` | Configurable subsystem log filtering, ANSI console sink, `std.log` bridge, and pluggable `LogSinkVTable`. |
 | [`formats/toml/`](formats/toml/src/toml_format.zig) | `official.format.toml` | `engine.format.toml/1` | TOML v1.1.0 adapter over `z-toml` for manifests and test scenarios. |
 | [`formats/json/`](formats/json/src/json_format.zig) | `official.format.json` | `engine.format.json/1` | Dual JSON adapter (`std.json` for small configs, `yyjson` C11 for high-volume payloads). |
 | [`tooling/file-watcher/`](tooling/file-watcher/src/file_watcher.zig) | `official.tooling.file_watcher` | `engine.tooling.file_watcher/1` | Filesystem watching adapter over `lookout` for hot reload. |

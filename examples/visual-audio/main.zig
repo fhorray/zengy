@@ -88,16 +88,15 @@ fn loadSampleOrBeep(svc: *audio.AudioService, allocator: std.mem.Allocator, io: 
     };
 }
 
-fn quatRight(q: [4]f32) [3]f32 {
-    const x = q[0];
-    const y = q[1];
-    const z = q[2];
-    const w = q[3];
-    return .{
-        1.0 - 2.0 * (y * y + z * z),
-        2.0 * (x * y + w * z),
-        2.0 * (x * z - w * y),
-    };
+fn poseRight(pose: camera.CameraPose) [3]f32 {
+    const f = pose.forward;
+    const u = pose.up;
+    const cx = f[1] * u[2] - f[2] * u[1];
+    const cy = f[2] * u[0] - f[0] * u[2];
+    const cz = f[0] * u[1] - f[1] * u[0];
+    const len = @sqrt(cx * cx + cy * cy + cz * cz);
+    if (len < 1e-6) return .{ 1, 0, 0 };
+    return .{ cx / len, cy / len, cz / len };
 }
 
 fn updateSharedControls(ctx: *engine.SystemContext) !void {
@@ -118,10 +117,10 @@ fn updateSharedControls(ctx: *engine.SystemContext) !void {
     }
 
     if (keys.pressed(.arrow_up)) {
-        svc.master_volume = std.math.clamp(svc.master_volume + 0.8 * time.raw_delta_s, 0.0, 1.5);
+        svc.setMasterVolume(std.math.clamp(svc.master_volume + 0.8 * time.raw_delta_s, 0.0, 1.5));
     }
     if (keys.pressed(.arrow_down)) {
-        svc.master_volume = std.math.clamp(svc.master_volume - 0.8 * time.raw_delta_s, 0.0, 1.5);
+        svc.setMasterVolume(std.math.clamp(svc.master_volume - 0.8 * time.raw_delta_s, 0.0, 1.5));
     }
 
     const triggers = [_]struct { key: input.KeyCode, idx: usize, label: []const u8 }{
@@ -165,7 +164,7 @@ fn updatePlayingOnly(ctx: *engine.SystemContext) !void {
 
     // Sync SpatialListener with camera pose so flying away/around shifts distance + L/R pan!
     listener.position = cam_pose.position;
-    listener.right = quatRight(cam_pose.rotation);
+    listener.right = poseRight(cam_pose.*);
 
     t.rotation_euler[1] += 1.2 * time.delta_s;
     st.pulse_timer.tick(time.delta_s);

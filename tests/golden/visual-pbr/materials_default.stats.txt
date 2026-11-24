@@ -1,0 +1,10 @@
+name=materials_default
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=0.8561
+p50_luma=0.9142
+p95_luma=1.4011
+speckle=0
+contrast=97.00
