@@ -159,6 +159,8 @@ pub const WidgetBinding = struct {
 pub const WidgetManager = struct {
     allocator: std.mem.Allocator,
     bindings: std.ArrayList(WidgetBinding) = .empty,
+    /// Node id -> index into `bindings` so `attach`/`findByNode` are O(1) instead of O(n).
+    node_index: std.AutoHashMapUnmanaged(ui_core.UiNodeId, u32) = .empty,
     event_queue: events.WidgetEventQueue,
     undo_history: text_edit.UndoHistory = .{},
     last_edit_consumed_undo: bool = false,
@@ -177,6 +179,7 @@ pub const WidgetManager = struct {
             if (b.tag.len > 0) self.allocator.free(b.tag);
         }
         self.bindings.deinit(self.allocator);
+        self.node_index.deinit(self.allocator);
         self.event_queue.deinit();
     }
 
@@ -186,6 +189,7 @@ pub const WidgetManager = struct {
             if (b.tag.len > 0) self.allocator.free(b.tag);
         }
         self.bindings.clearRetainingCapacity();
+        self.node_index.clearRetainingCapacity();
         self.event_queue.clear();
     }
 
@@ -195,28 +199,28 @@ pub const WidgetManager = struct {
         errdefer if (tag_copy.len > 0) self.allocator.free(tag_copy);
 
         // Replace existing binding on the same node if present.
-        for (self.bindings.items, 0..) |*b, i| {
-            if (std.meta.eql(b.node, node)) {
-                if (b.tag.len > 0) self.allocator.free(b.tag);
-                b.* = .{ .node = node, .tag = tag_copy, .behavior = behavior };
-                return i;
-            }
+        if (self.node_index.get(node)) |i| {
+            const b = &self.bindings.items[i];
+            if (b.tag.len > 0) self.allocator.free(b.tag);
+            b.* = .{ .node = node, .tag = tag_copy, .behavior = behavior };
+            return i;
         }
         const idx = self.bindings.items.len;
+        // Reserve the index entry first so a failed append cannot leave a dangling map entry.
+        try self.node_index.ensureUnusedCapacity(self.allocator, 1);
         try self.bindings.append(self.allocator, .{
             .node = node,
             .tag = tag_copy,
             .behavior = behavior,
         });
+        self.node_index.putAssumeCapacity(node, @intCast(idx));
         return idx;
     }
 
     /// Finds the mutable binding for `node`, if any.
     pub fn findByNode(self: *WidgetManager, node: ui_core.UiNodeId) ?*WidgetBinding {
-        for (self.bindings.items) |*b| {
-            if (std.meta.eql(b.node, node)) return b;
-        }
-        return null;
+        const i = self.node_index.get(node) orelse return null;
+        return &self.bindings.items[i];
     }
 
     /// Finds the mutable binding by `tag`, if any.

@@ -124,3 +124,25 @@ test "WidgetManager headless button, fast-click checkbox, radio group, and slide
     }
     try testing.expectEqual(@as(i32, 5), mgr.findByNode(ni_id).?.behavior.number_input.value.i32);
 }
+
+test "WidgetManager node index: attach replaces in place, finds in O(1), and survives clear" {
+    var mgr = ui_widgets.WidgetManager.init(testing.allocator);
+    defer mgr.deinit();
+
+    const n = 2000;
+    for (0..n) |i| {
+        const id: ui_core.UiNodeId = .{ .index = @intCast(i), .generation = 1 };
+        const slot = try mgr.attach(id, "w", .{ .button = .{} });
+        try testing.expectEqual(i, slot);
+    }
+    const mid: ui_core.UiNodeId = .{ .index = 1234, .generation = 1 };
+    try testing.expectEqual(@as(usize, 1234), try mgr.attach(mid, "replaced", .{ .button = .{} }));
+    try testing.expectEqual(@as(usize, n), mgr.bindings.items.len);
+    try testing.expectEqualStrings("replaced", mgr.findByNode(mid).?.tag);
+    // Same index, different generation is a different (stale) node.
+    try testing.expect(mgr.findByNode(.{ .index = 1234, .generation = 2 }) == null);
+
+    mgr.clear();
+    try testing.expect(mgr.findByNode(mid) == null);
+    try testing.expectEqual(@as(usize, 0), try mgr.attach(mid, "", .{ .button = .{} }));
+}
