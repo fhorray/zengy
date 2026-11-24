@@ -387,8 +387,8 @@ fn ensureDynamicBuffer(
     var new_cap = cap_bytes.*;
     while (new_cap < needed_bytes) : (new_cap *= 2) {}
 
-    _ = c.SDL_WaitForGPUIdle(device);
-
+    // No idle wait: SDL_ReleaseGPU* defers destruction until in-flight command buffers finish,
+    // and the previous contents are re-uploaded from the CPU every frame.
     const new_vb = c.SDL_CreateGPUBuffer(device, &std.mem.zeroInit(c.SDL_GPUBufferCreateInfo, .{
         .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX,
         .size = new_cap,
@@ -515,8 +515,12 @@ fn onResizeSurface(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, wid
     for (state.offscreen_targets.items) |*ot| {
         if (std.meta.eql(ot.handle, handle)) {
             if (ot.width == width and ot.height == height) return;
-            const new_tex = createOffscreenColorTexture(state.device, state.diagnostics, state.swapchain_format, width, height) catch return;
-            _ = c.SDL_WaitForGPUIdle(state.device);
+            // The callback cannot return an error: log it and keep the previous (still valid) texture.
+            const new_tex = createOffscreenColorTexture(state.device, state.diagnostics, state.swapchain_format, width, height) catch {
+                state.diagnostics.log(.err, "graphics-sdlgpu", "offscreen resize failed; keeping previous target size") catch {};
+                return;
+            };
+            // Deferred release: SDL keeps the old texture alive until in-flight work completes.
             c.SDL_ReleaseGPUTexture(state.device, ot.texture);
             ot.texture = new_tex;
             ot.width = width;
@@ -530,7 +534,6 @@ fn onDestroySurface(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle) vo
     const state: *SdlGpuState = @ptrCast(@alignCast(raw_ctx));
     for (state.offscreen_targets.items, 0..) |ot, i| {
         if (std.meta.eql(ot.handle, handle)) {
-            _ = c.SDL_WaitForGPUIdle(state.device);
             c.SDL_ReleaseGPUTexture(state.device, ot.texture);
             _ = state.offscreen_targets.swapRemove(i);
             return;
@@ -1043,7 +1046,6 @@ pub fn createTextureRgba8(app: *engine.App, width: u32, height: u32, pixels: []c
 pub fn destroyTexture(app: *engine.App, handle: GpuTextureHandle) void {
     const state = app.resources.get(SdlGpuState) orelse return;
     if (state.textures.remove(handle)) |tex| {
-        _ = c.SDL_WaitForGPUIdle(state.device);
         c.SDL_ReleaseGPUTexture(state.device, tex);
     }
 }
@@ -1076,7 +1078,6 @@ pub fn createMesh3D(app: *engine.App, vertex_bytes: []const u8, indices: []const
 pub fn destroyMesh3D(app: *engine.App, handle: GpuMeshHandle) void {
     const state = app.resources.get(SdlGpuState) orelse return;
     if (state.meshes.remove(handle)) |m| {
-        _ = c.SDL_WaitForGPUIdle(state.device);
         c.SDL_ReleaseGPUBuffer(state.device, m.index_buffer);
         c.SDL_ReleaseGPUBuffer(state.device, m.vertex_buffer);
     }
@@ -1375,7 +1376,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = PROVIDER_ID,
-            .version = "0.1.0",
+            .version = "0.1.1",
             .provides_capabilities = &.{"engine.graphics.device/1"},
             .required_capabilities = &.{"engine.window/1"},
         },
