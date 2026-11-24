@@ -317,3 +317,25 @@ test "CaptureService alpha blending and text glyph rasterization" {
     const txt_px = cap.readPixel(2, 2).?;
     try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, txt_px);
 }
+
+test "CaptureService golden hash determinism with clip_push and rounded rects" {
+    const cmds = [_]graphics.DrawCommand{
+        .{ .clear = .{ .r = 0.08, .g = 0.09, .b = 0.12, .a = 1.0 } },
+        .{ .clip_push = .{ .x = 8, .y = 8, .width = 48, .height = 48 } },
+        .{ .rect = .{ .x = 4, .y = 4, .width = 56, .height = 56, .color = .{ .r = 0.25, .g = 0.65, .b = 0.98, .a = 1.0 } } },
+        .{ .clip_pop = {} },
+    };
+
+    var cap1 = try testing_sdk.CaptureService.init(testing.allocator, 64, 64);
+    defer cap1.deinit();
+    cap1.rasterize(&cmds);
+
+    var cap2 = try testing_sdk.CaptureService.init(testing.allocator, 64, 64);
+    defer cap2.deinit();
+    cap2.rasterize(&cmds);
+
+    try testing.expectEqual(cap1.computeHash(), cap2.computeHash());
+    // Outside clip region (0, 0) must remain clear color, inside (32, 32) must be filled.
+    try testing.expect(cap1.readPixel(0, 0).?[0] < 30);
+    try testing.expect(cap1.readPixel(32, 32).?[2] > 200);
+}

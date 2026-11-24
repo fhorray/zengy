@@ -8,6 +8,8 @@ const testing = std.testing;
 const engine = @import("engine");
 const window = @import("window");
 const graphics = @import("graphics");
+const scene = @import("scene");
+const camera = @import("camera");
 const render_3d = @import("render_3d");
 
 test "Render3DService extracts meshes during render_extract when camera is active" {
@@ -16,10 +18,12 @@ test "Render3DService extracts meshes during render_extract when camera is activ
 
     try app.registerModule(window.module());
     try app.registerModule(graphics.module());
+    try app.registerModule(camera.module());
     try app.registerModule(render_3d.module());
 
     const cam = try app.world.spawn();
-    try app.world.set(cam, render_3d.Camera3D, .{ .fov_deg = 75.0, .active = true });
+    try app.world.set(cam, camera.Camera, .{});
+    try app.world.set(cam, camera.Projection, .{ .perspective = .{ .fov_rad = 75.0 * (std.math.pi / 180.0) } });
 
     const mesh1 = try app.world.spawn();
     try app.world.set(mesh1, render_3d.Transform3D, .{ .position = .{ 1, 2, 3 } });
@@ -45,14 +49,13 @@ test "Render3D frustum culling culls meshes behind Camera3D" {
 
     try app.registerModule(window.module());
     try app.registerModule(graphics.module());
+    try app.registerModule(camera.module());
     try app.registerModule(render_3d.module());
 
     const cam = try app.world.spawn();
-    try app.world.set(cam, render_3d.Camera3D, .{
-        .position = .{ 0, 0, 5 },
-        .target = .{ 0, 0, 0 },
-        .active = true,
-    });
+    try app.world.set(cam, camera.Camera, .{});
+    try app.world.set(cam, camera.Projection, .{ .perspective = .{} });
+    try app.world.set(cam, camera.CameraPose, camera.CameraPose.lookAt(.{ 0, 0, 5 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }));
 
     const visible_e = try app.world.spawn();
     try app.world.set(visible_e, render_3d.Transform3D, .{ .position = .{ 0, 0, 0 } });
@@ -116,22 +119,17 @@ test "Render3D selects highest-priority Camera3D and applies bounds_offset durin
 
     try app.registerModule(window.module());
     try app.registerModule(graphics.module());
+    try app.registerModule(camera.module());
     try app.registerModule(render_3d.module());
 
     const low_cam = try app.world.spawn();
-    try app.world.set(low_cam, render_3d.Camera3D, .{
-        .position = .{ 0, 0, 500 },
-        .target = .{ 0, 0, 490 },
-        .priority = 1,
-        .active = true,
-    });
+    try app.world.set(low_cam, camera.Camera, .{ .order = 1 });
+    try app.world.set(low_cam, camera.Projection, .{ .perspective = .{} });
+    try app.world.set(low_cam, camera.CameraPose, camera.CameraPose.lookAt(.{ 0, 0, 500 }, .{ 0, 0, 490 }, .{ 0, 1, 0 }));
     const high_cam = try app.world.spawn();
-    try app.world.set(high_cam, render_3d.Camera3D, .{
-        .position = .{ 0, 0, 5 },
-        .target = .{ 0, 0, 0 },
-        .priority = 10,
-        .active = true,
-    });
+    try app.world.set(high_cam, camera.Camera, .{ .order = 10 });
+    try app.world.set(high_cam, camera.Projection, .{ .perspective = .{} });
+    try app.world.set(high_cam, camera.CameraPose, camera.CameraPose.lookAt(.{ 0, 0, 5 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }));
 
     // Pivot is behind the camera (+20), but bounds_offset places sphere at origin (0,0,0) -> visible!
     const offset_mesh = try app.world.spawn();
@@ -149,4 +147,40 @@ test "Render3D selects highest-priority Camera3D and applies bounds_offset durin
     try testing.expectEqual(@as(usize, 2), r3d.active_cameras);
     try testing.expectEqual(@as(usize, 1), r3d.drawCount());
     try testing.expectEqual(@as(usize, 0), r3d.culled_count);
+}
+
+test "Render3D extracts hierarchical LocalTransform3D / GlobalTransform3D meshes" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(window.module());
+    try app.registerModule(graphics.module());
+    try app.registerModule(scene.module());
+    try app.registerModule(camera.module());
+    try app.registerModule(render_3d.module());
+    try app.initialize();
+
+    const cam = try app.world.spawn();
+    try app.world.set(cam, camera.Camera, .{});
+    try app.world.set(cam, camera.Projection, .{ .perspective = .{} });
+    try app.world.set(cam, camera.CameraPose, camera.CameraPose.lookAt(.{ 0, 0, 10 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }));
+
+    const parent = try app.world.spawn();
+    try app.world.set(parent, scene.incremental.LocalTransform3D, .{ .translation = .{ 2, 0, 0 } });
+    try app.world.set(parent, scene.incremental.GlobalTransform3D, .{});
+
+    const child = try app.world.spawn();
+    try app.world.set(child, scene.incremental.LocalTransform3D, .{ .translation = .{ 1, 3, -2 } });
+    try app.world.set(child, scene.incremental.GlobalTransform3D, .{});
+    try app.world.set(child, render_3d.MeshRef, .{ .mesh_asset = 77, .bounds_radius = 1.0 });
+    try scene.graph.reparent(&app.world, child, parent, .{});
+
+    try app.tick(1.0 / 60.0);
+
+    const r3d = app.resources.get(render_3d.Render3DService).?;
+    try testing.expectEqual(@as(usize, 1), r3d.drawCount());
+    const draw = r3d.extracted_draws.items[0];
+    try testing.expectApproxEqAbs(@as(f32, 3.0), draw.position[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), draw.position[1], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, -2.0), draw.position[2], 1e-4);
 }

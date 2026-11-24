@@ -23,22 +23,27 @@ pub const FieldType = enum {
     vec2_t,
     vec3_t,
     vec4_t,
+    enum_u32_t,
+    entity_ref_t,
+    asset_ref_t,
+    fixed_str64_t,
 
     pub fn byteSize(self: FieldType) usize {
         return switch (self) {
             .bool_t => 1,
-            .i32_t, .u32_t, .f32_t => 4,
-            .i64_t, .u64_t, .f64_t, .vec2_t => 8,
+            .i32_t, .u32_t, .f32_t, .enum_u32_t => 4,
+            .i64_t, .u64_t, .f64_t, .vec2_t, .entity_ref_t, .asset_ref_t => 8,
             .vec3_t => 12,
             .vec4_t => 16,
+            .fixed_str64_t => 64,
         };
     }
 
     pub fn alignment(self: FieldType) usize {
         return switch (self) {
-            .bool_t => 1,
-            .i32_t, .u32_t, .f32_t, .vec2_t, .vec3_t, .vec4_t => 4,
-            .i64_t, .u64_t, .f64_t => 8,
+            .bool_t, .fixed_str64_t => 1,
+            .i32_t, .u32_t, .f32_t, .vec2_t, .vec3_t, .vec4_t, .enum_u32_t, .entity_ref_t => 4,
+            .i64_t, .u64_t, .f64_t, .asset_ref_t => 8,
         };
     }
 };
@@ -54,6 +59,10 @@ pub const FieldValue = union(FieldType) {
     vec2_t: [2]f32,
     vec3_t: [3]f32,
     vec4_t: [4]f32,
+    enum_u32_t: u32,
+    entity_ref_t: world_mod.EntityHandle,
+    asset_ref_t: u64,
+    fixed_str64_t: [64]u8,
 };
 
 pub const StoragePolicy = enum {
@@ -280,12 +289,20 @@ pub const TypeRegistry = struct {
             const slot = bytes[f.offset .. f.offset + f.field_type.byteSize()];
             switch (f.field_type) {
                 .bool_t => out.appendAssumeCapacity(if (slot[0] != 0) 1 else 0),
-                .i32_t, .u32_t, .f32_t => out.appendSliceAssumeCapacity(&toLe(u32, slot)),
-                .i64_t, .u64_t, .f64_t => out.appendSliceAssumeCapacity(&toLe(u64, slot)),
+                .i32_t, .u32_t, .f32_t, .enum_u32_t => out.appendSliceAssumeCapacity(&toLe(u32, slot)),
+                .i64_t, .u64_t, .f64_t, .asset_ref_t => out.appendSliceAssumeCapacity(&toLe(u64, slot)),
+                .entity_ref_t => {
+                    const eh = std.mem.bytesToValue(world_mod.EntityHandle, slot[0..@sizeOf(world_mod.EntityHandle)]);
+                    var buf: [8]u8 = undefined;
+                    std.mem.writeInt(u32, buf[0..4], eh.index, .little);
+                    std.mem.writeInt(u32, buf[4..8], eh.generation, .little);
+                    out.appendSliceAssumeCapacity(&buf);
+                },
                 .vec2_t, .vec3_t, .vec4_t => {
                     var i: usize = 0;
                     while (i < slot.len) : (i += 4) out.appendSliceAssumeCapacity(&toLe(u32, slot[i..][0..4]));
                 },
+                .fixed_str64_t => out.appendSliceAssumeCapacity(slot),
             }
         }
     }
@@ -331,12 +348,20 @@ pub const TypeRegistry = struct {
             const src = payload[cursor .. cursor + sz];
             switch (f.field_type) {
                 .bool_t => dst[0] = if (src[0] != 0) 1 else 0,
-                .i32_t, .u32_t, .f32_t => fromLe(u32, dst, src),
-                .i64_t, .u64_t, .f64_t => fromLe(u64, dst, src),
+                .i32_t, .u32_t, .f32_t, .enum_u32_t => fromLe(u32, dst, src),
+                .i64_t, .u64_t, .f64_t, .asset_ref_t => fromLe(u64, dst, src),
+                .entity_ref_t => {
+                    const eh = world_mod.EntityHandle{
+                        .index = std.mem.readInt(u32, src[0..4], .little),
+                        .generation = std.mem.readInt(u32, src[4..8], .little),
+                    };
+                    @memcpy(dst, std.mem.asBytes(&eh));
+                },
                 .vec2_t, .vec3_t, .vec4_t => {
                     var i: usize = 0;
                     while (i < sz) : (i += 4) fromLe(u32, dst[i..][0..4], src[i..][0..4]);
                 },
+                .fixed_str64_t => @memcpy(dst, src),
             }
             cursor += sz;
         }
@@ -386,6 +411,10 @@ pub const TypeRegistry = struct {
                 .vec2_t => |v| @memcpy(slot, std.mem.asBytes(&v)),
                 .vec3_t => |v| @memcpy(slot, std.mem.asBytes(&v)),
                 .vec4_t => |v| @memcpy(slot, std.mem.asBytes(&v)),
+                .enum_u32_t => |v| @memcpy(slot, std.mem.asBytes(&v)),
+                .entity_ref_t => |v| @memcpy(slot, std.mem.asBytes(&v)),
+                .asset_ref_t => |v| @memcpy(slot, std.mem.asBytes(&v)),
+                .fixed_str64_t => |v| @memcpy(slot, &v),
             }
             return;
         }
@@ -408,8 +437,145 @@ pub const TypeRegistry = struct {
                 .vec2_t => .{ .vec2_t = std.mem.bytesToValue([2]f32, slot[0..8]) },
                 .vec3_t => .{ .vec3_t = std.mem.bytesToValue([3]f32, slot[0..12]) },
                 .vec4_t => .{ .vec4_t = std.mem.bytesToValue([4]f32, slot[0..16]) },
+                .enum_u32_t => .{ .enum_u32_t = std.mem.bytesToValue(u32, slot[0..4]) },
+                .entity_ref_t => .{ .entity_ref_t = std.mem.bytesToValue(world_mod.EntityHandle, slot[0..8]) },
+                .asset_ref_t => .{ .asset_ref_t = std.mem.bytesToValue(u64, slot[0..8]) },
+                .fixed_str64_t => .{ .fixed_str64_t = slot[0..64].* },
             };
         }
         return error.FieldNotFound;
+    }
+
+    pub const WorldDeserializeOptions = struct {
+        unknown_policy: enum { error_on_unknown, skip_unknown } = .error_on_unknown,
+    };
+
+    const world_magic = "ZENGYWLD";
+    const world_format_version: u32 = 1;
+
+    /// Serializes all alive entities and their reflected components from `world` into a
+    /// portable, endian-independent binary stream.
+    pub fn serializeWorld(self: *const TypeRegistry, allocator: std.mem.Allocator, world: *const world_mod.World, out: *std.ArrayList(u8)) !void {
+        var alive_entities: std.ArrayList(world_mod.EntityHandle) = .empty;
+        defer alive_entities.deinit(allocator);
+
+        for (world.generations.items, 0..) |gen, idx| {
+            const h = world_mod.EntityHandle{ .index = @intCast(idx), .generation = gen };
+            if (world.isAlive(h)) {
+                try alive_entities.append(allocator, h);
+            }
+        }
+
+        var latest_schemas: std.ArrayList(ComponentSchema) = .empty;
+        defer latest_schemas.deinit(allocator);
+        var st_it = self.latest_version.iterator();
+        while (st_it.next()) |kv| {
+            if (self.getVersion(kv.key_ptr.*, kv.value_ptr.*)) |s| {
+                try latest_schemas.append(allocator, s);
+            }
+        }
+
+        try out.appendSlice(allocator, world_magic);
+        var hdr: [8]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], world_format_version, .little);
+        std.mem.writeInt(u32, hdr[4..8], @intCast(alive_entities.items.len), .little);
+        try out.appendSlice(allocator, &hdr);
+
+        for (alive_entities.items) |h| {
+            var ehdr: [12]u8 = undefined;
+            std.mem.writeInt(u32, ehdr[0..4], h.index, .little);
+            std.mem.writeInt(u32, ehdr[4..8], h.generation, .little);
+
+            const count_pos = out.items.len + 8;
+            std.mem.writeInt(u32, ehdr[8..12], 0, .little);
+            try out.appendSlice(allocator, &ehdr);
+
+            var comp_count: u32 = 0;
+            for (latest_schemas.items) |schema| {
+                const pool = world.pools.get(schema.component_type_id) orelse continue;
+                const bytes = pool.getBytesConst(h) orelse continue;
+                try encodeComponent(allocator, schema, bytes, out);
+                comp_count += 1;
+            }
+            std.mem.writeInt(u32, out.items[count_pos..][0..4], comp_count, .little);
+        }
+    }
+
+    /// Deserializes a stream produced by `serializeWorld` into `world`, spawning entities,
+    /// upgrading older component versions via registered migrations, and remapping `entity_ref_t`
+    /// handles to the newly spawned entities. Returns the number of spawned entities.
+    pub fn deserializeWorld(
+        self: *const TypeRegistry,
+        allocator: std.mem.Allocator,
+        world: *world_mod.World,
+        data: []const u8,
+        opts: WorldDeserializeOptions,
+    ) !usize {
+        if (data.len < 16) return error.PayloadTruncated;
+        if (!std.mem.eql(u8, data[0..8], world_magic)) return error.InvalidWorldHeader;
+        const fmt_ver = std.mem.readInt(u32, data[8..12], .little);
+        if (fmt_ver != world_format_version) return error.UnsupportedWorldVersion;
+        const entity_count: usize = std.mem.readInt(u32, data[12..16], .little);
+
+        var cursor: usize = 16;
+        var remap: std.AutoHashMapUnmanaged(u64, world_mod.EntityHandle) = .empty;
+        defer remap.deinit(allocator);
+
+        // Pass 1: allocate entities and record old -> new handle mapping.
+        var scan_cursor = cursor;
+        for (0..entity_count) |_| {
+            if (scan_cursor + 12 > data.len) return error.PayloadTruncated;
+            const old_idx = std.mem.readInt(u32, data[scan_cursor..][0..4], .little);
+            const old_gen = std.mem.readInt(u32, data[scan_cursor + 4 ..][0..4], .little);
+            const comp_count: usize = std.mem.readInt(u32, data[scan_cursor + 8 ..][0..4], .little);
+            scan_cursor += 12;
+            const new_h = try world.spawn();
+            const key = (@as(u64, old_gen) << 32) | old_idx;
+            try remap.put(allocator, key, new_h);
+            for (0..comp_count) |_| {
+                if (scan_cursor + header_size > data.len) return error.PayloadTruncated;
+                const plen: usize = std.mem.readInt(u32, data[scan_cursor + 20 ..][0..4], .little);
+                if (scan_cursor + header_size + plen > data.len) return error.PayloadTruncated;
+                scan_cursor += header_size + plen;
+            }
+        }
+
+        // Pass 2: decode components, remap `entity_ref_t`, and store into `world`.
+        for (0..entity_count) |_| {
+            const old_idx = std.mem.readInt(u32, data[cursor..][0..4], .little);
+            const old_gen = std.mem.readInt(u32, data[cursor + 4 ..][0..4], .little);
+            const comp_count: usize = std.mem.readInt(u32, data[cursor + 8 ..][0..4], .little);
+            cursor += 12;
+            const key = (@as(u64, old_gen) << 32) | old_idx;
+            const target_h = remap.get(key).?;
+
+            for (0..comp_count) |_| {
+                const decoded = self.decodeComponent(allocator, data[cursor..]) catch |err| switch (err) {
+                    error.UnknownSchema => {
+                        if (opts.unknown_policy == .skip_unknown) {
+                            const plen: usize = std.mem.readInt(u32, data[cursor + 20 ..][0..4], .little);
+                            cursor += header_size + plen;
+                            continue;
+                        }
+                        return err;
+                    },
+                    else => return err,
+                };
+                defer allocator.free(decoded.bytes);
+                cursor += decoded.consumed;
+
+                for (decoded.schema.fields) |f| {
+                    if (f.field_type == .entity_ref_t) {
+                        const slot = decoded.bytes[f.offset .. f.offset + 8];
+                        const old_ref = std.mem.bytesToValue(world_mod.EntityHandle, slot[0..8]);
+                        const ref_key = (@as(u64, old_ref.generation) << 32) | old_ref.index;
+                        const new_ref = remap.get(ref_key) orelse world_mod.EntityHandle.invalid;
+                        @memcpy(slot, std.mem.asBytes(&new_ref));
+                    }
+                }
+                try world.setRaw(target_h, decoded.schema.component_type_id, decoded.bytes);
+            }
+        }
+        return entity_count;
     }
 };

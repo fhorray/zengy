@@ -1,0 +1,17 @@
+=== Zengy Benchmark Suite ===
+1. World spawn+set (10k entities): 0.920 ms (91 ns/entity)
+2. Query iter (10k x 100 = 1M updates): 1.952 ms (1 ns/update)
+3. EventBus post+drain (10k events): 0.456 ms (45 ns/event)
+4. UiTree layout+paint (1k nodes x 10): 0.406 ms (0.041 ms/frame)
+5. Scene2D propagate (1k entities x 10 frames): 0.274 ms (0.027 ms/frame)
+7. Despawn (8 registered types, 50000 entities): 11.4 ns/entity
+7. Despawn (100 registered types, 50000 entities): 10.9 ns/entity
+7. Despawn (400 registered types, 50000 entities): 16.6 ns/entity
+8. Scene2D propagate (chain depth 8000): 0.241 ms
+9. CommandBuffer.apply (10000 spawn+2set): 124.6 ns/entity
+9. Tracked write iterate (10000 entities): 2.2 ns/entity
+10. Incremental propagate (10101 nodes): first 1.283 ms, idle 0.016 ms, 1 dirty subtree (101 nodes) 0.026 ms
+11. Parallel scheduler (4 systems x 100k entities): serial 5.94 ms/frame, parallel 1.69 ms/frame (3.52x)
+6. JSON (~5 KB, 4 KB): std.json=0.123 ms vs yyjson=0.044 ms
+6. JSON (~500 KB, 468 KB): std.json=5.125 ms vs yyjson=0.913 ms
+6. JSON (~5 MB, 4687 KB): std.json=46.484 ms vs yyjson=8.986 ms

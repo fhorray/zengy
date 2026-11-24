@@ -74,6 +74,18 @@ pub fn fieldValueFromJson(ft: FieldType, v: Value) !FieldValue {
         .vec2_t => .{ .vec2_t = try vecOf(2, v) },
         .vec3_t => .{ .vec3_t = try vecOf(3, v) },
         .vec4_t => .{ .vec4_t = try vecOf(4, v) },
+        .enum_u32_t => .{ .enum_u32_t = try intInRange(u32, v) },
+        .entity_ref_t => return error.InvalidFieldValue,
+        .asset_ref_t => .{ .asset_ref_t = try intInRange(u64, v) },
+        .fixed_str64_t => switch (v) {
+            .string => |s| blk: {
+                var buf: [64]u8 = @splat(0);
+                const n = @min(s.len, 64);
+                @memcpy(buf[0..n], s[0..n]);
+                break :blk .{ .fixed_str64_t = buf };
+            },
+            else => error.InvalidFieldValue,
+        },
     };
 }
 

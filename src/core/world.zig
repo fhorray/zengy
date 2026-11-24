@@ -191,7 +191,7 @@ const ComponentPool = struct {
         return self.dense_bytes.items[start .. start + self.elem_size];
     }
 
-    fn getBytesConst(self: *const ComponentPool, entity: EntityHandle) ?[]const u8 {
+    pub fn getBytesConst(self: *const ComponentPool, entity: EntityHandle) ?[]const u8 {
         if (!self.has(entity)) return null;
         const dense_idx = self.sparse.items[entity.index];
         if (self.stride == 0) return &.{};

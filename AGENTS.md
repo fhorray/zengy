@@ -7,6 +7,7 @@
 - **Strict unidirectional dependency**: `src/core/` (`@import("engine")`) **never** imports anything from `packages/`, SDL, GPU drivers, UI, or scripting VMs.
 - **Capabilities before implementations**: Core defines `App`, `World`, `Scheduler`, `EventBus`, `ResourceRegistry`, `ServiceRegistry`, and `ModuleGraph`. Contracts (`window`, `graphics`, `physics`, `scripting-host`, `ui-core`) define interfaces/vtables; providers (`window-sdl3`, `graphics-sdlgpu`, `physics-jolt`, `physics-rapier`, `scripting-lua`, `scripting-python`) implement them without leaking backend internals.
 - **Agnostic & community-extensible by design**: Every new feature must be designed as an open, extensible contract (capability/vtable, service/resource registry, or C ABI hook) rather than a closed monolith—just like `scripting-host` lets the community plug in any scripting language or `ui-core`/`ui-widgets` lets them build custom UI frontends—so third-party packages can extend, replace, and compose features without modifying core or official providers.
+- **Reference ecosystem (`zig-gamedev`)**: When implementing specific Zig gamedev systems, math, audio, physics, or native bindings, consult [`zig-gamedev`](https://github.com/zig-gamedev) packages as a reference before reinventing low-level bindings, while wrapping any chosen dependency behind `zengy`'s agnostic capability contracts.
 - **Headless-first**: All core simulation and tests must run deterministically without a window or GPU.
 
 ## Code & Documentation Style

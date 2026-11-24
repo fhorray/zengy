@@ -22,6 +22,7 @@ const scripting_host = @import("scripting_host");
 const assets = @import("assets");
 const scene = @import("scene");
 const editor_shell = @import("editor_shell");
+const camera = @import("camera");
 const render_3d = @import("render_3d");
 
 fn playgroundTextImporter(allocator: std.mem.Allocator, _: []const u8, raw: []const u8) !assets.AssetArtifact {
@@ -48,6 +49,7 @@ pub fn main() !void {
     defer app.deinit();
 
     // 1. Register optional modules in arbitrary order (ModuleRegistry resolves topologically).
+    try app.registerModule(camera.module());
     try app.registerModule(render_3d.module());
     try app.registerModule(editor_shell.module());
     try app.registerModule(ui_core.module());
@@ -108,7 +110,9 @@ pub fn main() !void {
     try app.world.set(child_2d, scene.Parent, .{ .entity = root_2d });
 
     const cam = try app.world.spawn();
-    try app.world.set(cam, render_3d.Camera3D, .{ .fov_deg = 60.0, .active = true });
+    try app.world.set(cam, camera.Camera, .{});
+    try app.world.set(cam, camera.Projection, .{ .perspective = .{ .fov_rad = std.math.pi / 3.0 } });
+    try app.world.set(cam, camera.CameraPose, .{});
     const cube = try app.world.spawn();
     try app.world.set(cube, render_3d.Transform3D, .{ .position = .{ 0, 1, -5 } });
     try app.world.set(cube, render_3d.MeshRef, .{ .mesh_asset = @bitCast(config_asset), .material_id = 1 });

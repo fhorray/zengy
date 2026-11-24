@@ -15,6 +15,7 @@ const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
 const graphics_sdlgpu = @import("graphics_sdlgpu");
 const scene = @import("scene");
+const camera = @import("camera");
 const render_2d = @import("render_2d");
 const ui_core = @import("ui_core");
 const ui_markup = @import("ui_markup");
@@ -125,13 +126,13 @@ fn updatePlaygroundSystem(ctx: *engine.SystemContext) !void {
         }
     }
 
-    // Camera2D pan with WASD (scancodes: A=4, D=7, S=22, W=26) or Arrow keys (Right=79, Left=80, Down=81, Up=82).
-    if (ctx.world.get(st.camera_entity, render_2d.Camera2D)) |cam| {
+    // Pan camera with WASD (scancodes: A=4, D=7, S=22, W=26) or Arrow keys (Right=79, Left=80, Down=81, Up=82).
+    if (ctx.world.get(st.camera_entity, camera.CameraPose)) |pose| {
         const pan_speed: f32 = 260.0 * ctx.dt;
-        if (st.input.isKeyDown(4) or st.input.isKeyDown(80)) cam.x -= pan_speed;
-        if (st.input.isKeyDown(7) or st.input.isKeyDown(79)) cam.x += pan_speed;
-        if (st.input.isKeyDown(26) or st.input.isKeyDown(82)) cam.y -= pan_speed;
-        if (st.input.isKeyDown(22) or st.input.isKeyDown(81)) cam.y += pan_speed;
+        if (st.input.isKeyDown(4) or st.input.isKeyDown(80)) pose.position[0] -= pan_speed;
+        if (st.input.isKeyDown(7) or st.input.isKeyDown(79)) pose.position[0] += pan_speed;
+        if (st.input.isKeyDown(26) or st.input.isKeyDown(82)) pose.position[1] -= pan_speed;
+        if (st.input.isKeyDown(22) or st.input.isKeyDown(81)) pose.position[1] += pan_speed;
     }
 
     // Animate all spawned sprites (scoped so active_queries == 0 before any spawn).
@@ -158,10 +159,13 @@ fn updatePlaygroundSystem(ctx: *engine.SystemContext) !void {
     if (st.input.wasMouseClicked(.left)) {
         const hit = st.tree.handlePointerClick(st.input.mouse_x, st.input.mouse_y, ctx.events);
         if (hit == null) {
-            const cam: render_2d.Camera2D = if (ctx.world.getConst(st.camera_entity, render_2d.Camera2D)) |c| c.* else .{};
-            const zoom = if (cam.zoom > 0.001) cam.zoom else 0.001;
-            const wx = (st.input.mouse_x - log_w * 0.5) / zoom + cam.x;
-            const wy = (st.input.mouse_y - log_h * 0.5) / zoom + cam.y;
+            const pose: camera.CameraPose = if (ctx.world.getConst(st.camera_entity, camera.CameraPose)) |p| p.* else .{};
+            const zoom: f32 = if (ctx.world.getConst(st.camera_entity, camera.Projection)) |pr|
+                (if (pr.* == .orthographic and pr.orthographic.scale > 0.001) 1.0 / pr.orthographic.scale else 1.0)
+            else
+                1.0;
+            const wx = (st.input.mouse_x - log_w * 0.5) / zoom + pose.position[0];
+            const wy = (st.input.mouse_y - log_h * 0.5) / zoom + pose.position[1];
             try spawnPlaygroundSprite(st, wx, wy);
         }
     }
@@ -223,6 +227,7 @@ pub fn main() !void {
     try app.registerModule(window_sdl3.module());
     try app.registerModule(graphics_sdlgpu.module());
     try app.registerModule(scene.module());
+    try app.registerModule(camera.module());
     try app.registerModule(render_2d.module());
     try app.registerModule(ui_core.module());
 
@@ -294,7 +299,9 @@ pub fn main() !void {
     const sprite_tex = try graphics_sdlgpu.createTextureRgba8(&app, 32, 32, &tex_pixels);
 
     const cam_e = try app.world.spawn();
-    try app.world.set(cam_e, render_2d.Camera2D, .{ .x = 0.0, .y = 0.0, .zoom = 1.0, .active = true });
+    try app.world.set(cam_e, camera.Camera, .{});
+    try app.world.set(cam_e, camera.CameraPose, .{ .position = .{ 0.0, 0.0, 0.0 } });
+    try app.world.set(cam_e, camera.Projection, .{ .orthographic = .{ .scale = 1.0 } });
 
     const px = window_sdl3.pixelSize(&app);
     const px_w: u32 = if (px) |p| p.width else 1280;

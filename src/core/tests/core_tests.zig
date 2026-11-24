@@ -1487,3 +1487,74 @@ test "soak: long churn keeps entity slots, pools, and logs bounded (and leaks no
         try testing.expectEqual(@as(usize, 64), pool.dense_entities.items.len);
     }
 }
+
+test "TypeRegistry serializeWorld and deserializeWorld remap EntityRef and preserve enum/asset/fixed_str64" {
+    var reg = engine.reflection.TypeRegistry.init(testing.allocator);
+    defer reg.deinit();
+
+    const schema = try reg.registerSchema("game", "NodeMeta", 1, .blittable, &.{
+        .{ .name = "kind", .field_type = .enum_u32_t },
+        .{ .name = "target", .field_type = .entity_ref_t },
+        .{ .name = "asset_id", .field_type = .asset_ref_t },
+        .{ .name = "label", .field_type = .fixed_str64_t },
+    });
+
+    var src_world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer src_world.deinit();
+    _ = try src_world.registerDynamicComponent("game.NodeMeta", schema.byte_size);
+
+    const dummy = try src_world.spawn();
+    const target_e = try src_world.spawn();
+    const owner_e = try src_world.spawn();
+    _ = try src_world.despawn(dummy); // shift indices so dst_world spawns at different indices
+
+    const owner_bytes = try testing.allocator.alloc(u8, schema.byte_size);
+    defer testing.allocator.free(owner_bytes);
+    @memset(owner_bytes, 0);
+    var lbl: [64]u8 = @splat(0);
+    @memcpy(lbl[0..6], "Player");
+    try engine.reflection.TypeRegistry.setField(schema, owner_bytes, "kind", .{ .enum_u32_t = 2 });
+    try engine.reflection.TypeRegistry.setField(schema, owner_bytes, "target", .{ .entity_ref_t = target_e });
+    try engine.reflection.TypeRegistry.setField(schema, owner_bytes, "asset_id", .{ .asset_ref_t = 0xDEADBEEF_CAFEBABE });
+    try engine.reflection.TypeRegistry.setField(schema, owner_bytes, "label", .{ .fixed_str64_t = lbl });
+    try src_world.setRaw(owner_e, schema.component_type_id, owner_bytes);
+
+    const target_bytes = try testing.allocator.alloc(u8, schema.byte_size);
+    defer testing.allocator.free(target_bytes);
+    @memset(target_bytes, 0);
+    try engine.reflection.TypeRegistry.setField(schema, target_bytes, "kind", .{ .enum_u32_t = 1 });
+    try engine.reflection.TypeRegistry.setField(schema, target_bytes, "target", .{ .entity_ref_t = engine.EntityHandle.invalid });
+    try engine.reflection.TypeRegistry.setField(schema, target_bytes, "asset_id", .{ .asset_ref_t = 42 });
+    try src_world.setRaw(target_e, schema.component_type_id, target_bytes);
+
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(testing.allocator);
+    try reg.serializeWorld(testing.allocator, &src_world, &blob);
+
+    var dst_world = engine.World.init(testing.allocator, .{ .index = 2, .generation = 1 });
+    defer dst_world.deinit();
+    _ = try dst_world.registerDynamicComponent("game.NodeMeta", schema.byte_size);
+
+    const spawned = try reg.deserializeWorld(testing.allocator, &dst_world, blob.items, .{});
+    try testing.expectEqual(@as(usize, 2), spawned);
+
+    var found_owner = false;
+    for (dst_world.generations.items, 0..) |gen, idx| {
+        const h = engine.EntityHandle{ .index = @intCast(idx), .generation = gen };
+        if (!dst_world.isAlive(h)) continue;
+        const raw = dst_world.getRaw(h, schema.component_type_id) orelse continue;
+        const kind = (try engine.reflection.TypeRegistry.getField(schema, raw, "kind")).enum_u32_t;
+        if (kind == 2) {
+            found_owner = true;
+            const asset_id = (try engine.reflection.TypeRegistry.getField(schema, raw, "asset_id")).asset_ref_t;
+            const label = (try engine.reflection.TypeRegistry.getField(schema, raw, "label")).fixed_str64_t;
+            const remapped_target = (try engine.reflection.TypeRegistry.getField(schema, raw, "target")).entity_ref_t;
+            try testing.expectEqual(@as(u64, 0xDEADBEEF_CAFEBABE), asset_id);
+            try testing.expectEqualStrings("Player", label[0..6]);
+            try testing.expect(dst_world.isAlive(remapped_target));
+            const tgt_raw = dst_world.getRaw(remapped_target, schema.component_type_id).?;
+            try testing.expectEqual(@as(u32, 1), (try engine.reflection.TypeRegistry.getField(schema, tgt_raw, "kind")).enum_u32_t);
+        }
+    }
+    try testing.expect(found_owner);
+}

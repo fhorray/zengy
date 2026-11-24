@@ -177,6 +177,8 @@ pub const PhysicsService = struct {
     live_bodies: std.AutoHashMapUnmanaged(u64, engine.EntityHandle) = .empty,
     /// Bumped whenever the backend is replaced; invalidates `PhysicsBodyHandle`s from the old one.
     backend_epoch: u32 = 0,
+    skipped_static_count: usize = 0,
+    skipped_unchanged_dynamic: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) PhysicsService {
         return .{
@@ -343,6 +345,7 @@ pub fn physicsSyncInSystem(ctx: *engine.SystemContext) !void {
     const svc = ctx.resources.get(PhysicsService) orelse return;
     if (!svc.hasBackend()) return;
     try reapOrphanBodies(ctx, svc);
+    svc.skipped_static_count = 0;
 
     var q = try ctx.query(.{ .read = .{ RigidBody, PhysicsTransform } });
     defer q.deinit();
@@ -362,8 +365,13 @@ pub fn physicsSyncInSystem(ctx: *engine.SystemContext) !void {
             // Backends take only a position at creation; push the full pose so rotation is honored.
             svc.setBodyTransform(body_id, xf.pos, xf.rot_euler);
             try ctx.commands.set(row.entity, PhysicsBodyHandle, .{ .id = body_id, .epoch = svc.backend_epoch });
+        } else if (rb.body_type == .static) {
+            // Static bodies never move or receive external forces once created.
+            svc.skipped_static_count += 1;
+            continue;
         } else if (rb.body_type == .kinematic) {
             svc.setBodyTransform(body_id, xf.pos, xf.rot_euler);
+            continue;
         }
         if (ctx.world.getConst(row.entity, ExternalForce)) |cef| {
             // Skip the backend call for zero force: it is a no-op that would still cost a lookup
@@ -390,6 +398,7 @@ pub fn physicsStepSystem(ctx: *engine.SystemContext) !void {
 pub fn physicsSyncOutSystem(ctx: *engine.SystemContext) !void {
     const svc = ctx.resources.get(PhysicsService) orelse return;
     if (!svc.hasBackend()) return;
+    svc.skipped_unchanged_dynamic = 0;
 
     var q = try ctx.query(.{ .write = .{PhysicsTransform}, .read = .{ RigidBody, PhysicsBodyHandle } });
     defer q.deinit();
@@ -399,13 +408,18 @@ pub fn physicsSyncOutSystem(ctx: *engine.SystemContext) !void {
         const bh = row.read(PhysicsBodyHandle);
         if (bh.id == 0 or bh.id == PhysicsBodyHandle.failed_id or bh.epoch != svc.backend_epoch) continue;
         if (svc.getBodyTransform(bh.id)) |xf| {
-            const pt = row.write(PhysicsTransform);
-            pt.pos = xf.pos;
-            pt.rot_euler = xf.rot_euler;
+            const pt_const = ctx.world.getConst(row.entity, PhysicsTransform).?;
+            if (!std.meta.eql(pt_const.pos, xf.pos) or !std.meta.eql(pt_const.rot_euler, xf.rot_euler)) {
+                const pt = row.write(PhysicsTransform);
+                pt.pos = xf.pos;
+                pt.rot_euler = xf.rot_euler;
+            } else {
+                svc.skipped_unchanged_dynamic += 1;
+            }
         }
         if (ctx.world.get(row.entity, Velocity)) |vel| {
             if (svc.getBodyVelocity(bh.id)) |bv| {
-                vel.* = bv;
+                if (!std.meta.eql(vel.*, bv)) vel.* = bv;
             }
         }
     }

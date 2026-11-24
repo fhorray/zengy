@@ -9,6 +9,8 @@
 
 const std = @import("std");
 const engine = @import("engine");
+const camera = @import("camera");
+const scene = @import("scene");
 pub const math3d = @import("math3d.zig");
 pub const gltf = @import("gltf.zig");
 
@@ -27,29 +29,6 @@ pub const Transform3D = struct {
         const rx = math3d.Mat4.rotationX(self.rotation_euler[0]);
         const s = math3d.Mat4.scale(self.scale[0], self.scale[1], self.scale[2]);
         return math3d.Mat4.mul(t, math3d.Mat4.mul(ry, math3d.Mat4.mul(rx, s)));
-    }
-};
-
-/// 3D perspective camera component.
-pub const Camera3D = struct {
-    position: [3]f32 = .{ 0, 2.0, 6.0 },
-    target: [3]f32 = .{ 0, 0, 0 },
-    up: [3]f32 = .{ 0, 1, 0 },
-    fov_deg: f32 = 60.0,
-    near: f32 = 0.1,
-    far: f32 = 1000.0,
-    aspect: f32 = 16.0 / 9.0,
-    active: bool = true,
-    priority: i32 = 0,
-
-    pub fn viewProjMatrix(self: Camera3D, aspect_override: ?f32) math3d.Mat4 {
-        const eye = math3d.Vec3{ .x = self.position[0], .y = self.position[1], .z = self.position[2] };
-        const tgt = math3d.Vec3{ .x = self.target[0], .y = self.target[1], .z = self.target[2] };
-        const up_v = math3d.Vec3{ .x = self.up[0], .y = self.up[1], .z = self.up[2] };
-        const view = math3d.Mat4.lookAt(eye, tgt, up_v);
-        const fov_rad = self.fov_deg * (std.math.pi / 180.0);
-        const proj = math3d.Mat4.perspective(fov_rad, aspect_override orelse self.aspect, self.near, self.far);
-        return math3d.Mat4.mul(proj, view);
     }
 };
 
@@ -114,50 +93,52 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
     svc.active_cameras = 0;
     svc.culled_count = 0;
 
-    var active_cam: ?Camera3D = null;
-    var active_cam_entity_idx: u32 = std.math.maxInt(u32);
-    {
-        var cam_q = try ctx.query(.{ .read = .{Camera3D} });
-        defer cam_q.deinit();
-        while (cam_q.next()) |row| {
-            const c = row.read(Camera3D);
-            if (c.active) {
-                svc.active_cameras += 1;
-                if (active_cam == null or
-                    c.priority > active_cam.?.priority or
-                    (c.priority == active_cam.?.priority and row.entity.index < active_cam_entity_idx))
-                {
-                    active_cam = c.*;
-                    active_cam_entity_idx = row.entity.index;
-                }
-            }
-        }
-    }
+    const cam_svc = ctx.resources.get(camera.CameraService) orelse return;
+    const active = cam_svc.sortedActiveCameras();
+    svc.active_cameras = active.len;
+    if (active.len == 0) return;
 
-    const cam = active_cam orelse return;
-    const vp = cam.viewProjMatrix(svc.viewport_aspect);
+    // Pick highest-order active camera from `official.camera`.
+    const primary = active[active.len - 1];
+    const vp = math3d.Mat4{ .m = primary.computed.clip_from_world };
     svc.view_proj = vp;
-    const frustum = math3d.Frustum.fromViewProj(vp);
+    const frustum = primary.computed.frustum;
 
-    var mesh_q = try ctx.query(.{ .read = .{ Transform3D, MeshRef } });
+    var mesh_q = try ctx.query(.{
+        .read = .{MeshRef},
+        .optional = .{ scene.incremental.GlobalTransform3D, Transform3D },
+    });
     defer mesh_q.deinit();
     while (mesh_q.next()) |row| {
-        const t = row.read(Transform3D);
         const m = row.read(MeshRef);
-        const model = t.toModelMatrix();
+        var model: math3d.Mat4 = undefined;
+        var pos: [3]f32 = .{ 0, 0, 0 };
+        var max_scale: f32 = 1.0;
+
+        if (row.optional(scene.incremental.GlobalTransform3D)) |gt| {
+            model = .{ .m = gt.m };
+            pos = .{ gt.m[12], gt.m[13], gt.m[14] };
+            const sx = @sqrt(gt.m[0] * gt.m[0] + gt.m[1] * gt.m[1] + gt.m[2] * gt.m[2]);
+            const sy = @sqrt(gt.m[4] * gt.m[4] + gt.m[5] * gt.m[5] + gt.m[6] * gt.m[6]);
+            const sz = @sqrt(gt.m[8] * gt.m[8] + gt.m[9] * gt.m[9] + gt.m[10] * gt.m[10]);
+            max_scale = @max(sx, @max(sy, sz));
+        } else if (row.optional(Transform3D)) |t| {
+            model = t.toModelMatrix();
+            pos = t.position;
+            max_scale = @max(@abs(t.scale[0]), @max(@abs(t.scale[1]), @abs(t.scale[2])));
+        } else continue;
 
         if (m.bounds_radius > 0.0) {
-            const max_scale = @max(@abs(t.scale[0]), @max(@abs(t.scale[1]), @abs(t.scale[2])));
             const world_radius = m.bounds_radius * max_scale;
             const ox = m.bounds_offset[0];
             const oy = m.bounds_offset[1];
             const oz = m.bounds_offset[2];
-            const center = math3d.Vec3{
-                .x = model.m[0] * ox + model.m[4] * oy + model.m[8] * oz + model.m[12],
-                .y = model.m[1] * ox + model.m[5] * oy + model.m[9] * oz + model.m[13],
-                .z = model.m[2] * ox + model.m[6] * oy + model.m[10] * oz + model.m[14],
+            const center = [3]f32{
+                model.m[0] * ox + model.m[4] * oy + model.m[8] * oz + model.m[12],
+                model.m[1] * ox + model.m[5] * oy + model.m[9] * oz + model.m[13],
+                model.m[2] * ox + model.m[6] * oy + model.m[10] * oz + model.m[14],
             };
-            if (!frustum.intersectsSphere(center, world_radius)) {
+            if (!frustum.containsSphere(center, world_radius)) {
                 svc.culled_count += 1;
                 continue;
             }
@@ -165,7 +146,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
         const mvp = math3d.Mat4.mul(vp, model);
         try svc.extracted_draws.append(svc.allocator, .{
             .entity = row.entity,
-            .position = t.position,
+            .position = pos,
             .model_matrix = model,
             .mvp_matrix = mvp,
             .color = m.color,
@@ -181,7 +162,6 @@ fn buildModule(raw_app: *anyopaque) !void {
     const svc = app.resources.get(Render3DService).?;
 
     _ = try app.registerComponent(Transform3D);
-    _ = try app.registerComponent(Camera3D);
     _ = try app.registerComponent(MeshRef);
     try app.addSystem(.{
         .name = "render3d.extract",
@@ -210,9 +190,9 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.render.3d",
-            .version = "0.1.0",
+            .version = "0.2.0",
             .provides_capabilities = &.{"engine.render.3d/1"},
-            .required_capabilities = &.{"engine.graphics.device/1"},
+            .required_capabilities = &.{ "engine.graphics.device/1", "engine.camera/1" },
         },
         .build = buildModule,
         .stop = stopModule,

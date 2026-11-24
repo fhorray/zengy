@@ -12,6 +12,7 @@ const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
 const graphics_sdlgpu = @import("graphics_sdlgpu");
+const camera = @import("camera");
 const render_3d = @import("render_3d");
 
 const Demo3DState = struct {
@@ -32,12 +33,12 @@ fn update3DSystem(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(Demo3DState) orelse return;
     st.elapsed += ctx.dt;
 
-    if (ctx.world.get(st.cam_entity, render_3d.Camera3D)) |cam| {
+    if (ctx.world.get(st.cam_entity, camera.CameraPose)) |pose| {
         const speed: f32 = 4.5 * ctx.dt;
-        if (st.input.isKeyDown(4) or st.input.isKeyDown(80)) cam.position[0] -= speed; // A / Left
-        if (st.input.isKeyDown(7) or st.input.isKeyDown(79)) cam.position[0] += speed; // D / Right
-        if (st.input.isKeyDown(26) or st.input.isKeyDown(82)) cam.position[2] -= speed; // W / Up
-        if (st.input.isKeyDown(22) or st.input.isKeyDown(81)) cam.position[2] += speed; // S / Down
+        if (st.input.isKeyDown(4) or st.input.isKeyDown(80)) pose.position[0] -= speed; // A / Left
+        if (st.input.isKeyDown(7) or st.input.isKeyDown(79)) pose.position[0] += speed; // D / Right
+        if (st.input.isKeyDown(26) or st.input.isKeyDown(82)) pose.position[2] -= speed; // W / Up
+        if (st.input.isKeyDown(22) or st.input.isKeyDown(81)) pose.position[2] += speed; // S / Down
     }
 
     if (ctx.world.get(st.center_cube, render_3d.Transform3D)) |t| {
@@ -56,9 +57,12 @@ fn render3DSystem(ctx: *engine.SystemContext) !void {
     const r3d = ctx.resources.get(render_3d.Render3DService) orelse return;
 
     const px = window_sdl3.pixelSize(st.app);
-    const px_w: f32 = if (px) |p| @floatFromInt(p.width) else 1280.0;
-    const px_h: f32 = if (px) |p| @floatFromInt(p.height) else 720.0;
-    r3d.setViewportSize(px_w, px_h);
+    const px_w: u32 = if (px) |p| p.width else 1280;
+    const px_h: u32 = if (px) |p| p.height else 720;
+    if (ctx.resources.get(camera.CameraService)) |cam_svc| {
+        cam_svc.setPrimaryTargetSize(px_w, px_h);
+    }
+    r3d.setViewportSize(@floatFromInt(px_w), @floatFromInt(px_h));
 
     try st.gfx.beginFrame(st.rt);
     try st.gfx.submitDrawCommands(st.rt, &.{
@@ -92,6 +96,7 @@ pub fn main() !void {
 
     try app.registerModule(window_sdl3.module());
     try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(camera.module());
     try app.registerModule(render_3d.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
@@ -134,12 +139,9 @@ pub fn main() !void {
     const checker_tex = try graphics_sdlgpu.createTextureRgba8(&app, 32, 32, &tex_pixels);
 
     const cam_e = try app.world.spawn();
-    try app.world.set(cam_e, render_3d.Camera3D, .{
-        .position = .{ 0.0, 2.2, 6.5 },
-        .target = .{ 0.0, 0.0, 0.0 },
-        .fov_deg = 60.0,
-        .active = true,
-    });
+    try app.world.set(cam_e, camera.Camera, .{});
+    try app.world.set(cam_e, camera.Projection, .{ .perspective = .{ .fov_rad = std.math.pi / 3.0 } });
+    try app.world.set(cam_e, camera.CameraPose, camera.CameraPose.lookAt(.{ 0.0, 2.2, 6.5 }, .{ 0.0, 0.0, 0.0 }, .{ 0.0, 1.0, 0.0 }));
 
     const center_cube = try app.world.spawn();
     try app.world.set(center_cube, render_3d.Transform3D, .{ .position = .{ 0, 0.2, 0 } });

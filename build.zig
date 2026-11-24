@@ -296,12 +296,39 @@ pub fn build(b: *std.Build) void {
     default_plugins_mod.addImport("toml_format", toml_format_mod);
     default_plugins_mod.addImport("json_format", json_format_mod);
 
+    const input_mod = b.addModule("input", .{
+        .root_source_file = b.path("packages/input/core/src/input.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    input_mod.addImport("engine", engine_mod);
+    input_mod.addImport("window", window_mod);
+
+    const input_haptics_mod = b.addModule("input_haptics", .{
+        .root_source_file = b.path("packages/input/haptics/src/haptics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    input_haptics_mod.addImport("engine", engine_mod);
+
+    const camera_mod = b.addModule("camera", .{
+        .root_source_file = b.path("packages/camera/src/camera.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    camera_mod.addImport("engine", engine_mod);
+    camera_mod.addImport("graphics", graphics_mod);
+    camera_mod.addImport("input", input_mod);
+    camera_mod.addImport("scene", scene_mod);
+
     const render_3d_mod = b.addModule("render_3d", .{
         .root_source_file = b.path("packages/render/3d/src/render_3d.zig"),
         .target = target,
         .optimize = optimize,
     });
     render_3d_mod.addImport("engine", engine_mod);
+    render_3d_mod.addImport("camera", camera_mod);
+    render_3d_mod.addImport("scene", scene_mod);
 
     // Diagnostic CLI tool (`tools/cli`)
     const cli_mod = b.createModule(.{
@@ -371,6 +398,7 @@ pub fn build(b: *std.Build) void {
     playground_mod.addImport("assets", assets_mod);
     playground_mod.addImport("scene", scene_mod);
     playground_mod.addImport("editor_shell", editor_shell_mod);
+    playground_mod.addImport("camera", camera_mod);
     playground_mod.addImport("render_3d", render_3d_mod);
 
     const playground_exe = b.addExecutable(.{
@@ -408,6 +436,17 @@ pub fn build(b: *std.Build) void {
     window_sdl3_mod.addImport("engine", engine_mod);
     window_sdl3_mod.addImport("window", window_mod);
     window_sdl3_mod.addImport("sdl3_c", sdl3_c_mod);
+
+    const input_sdl3_mod = b.addModule("input_sdl3", .{
+        .root_source_file = b.path("packages/input/sdl3/src/input_sdl3.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    input_sdl3_mod.addImport("engine", engine_mod);
+    input_sdl3_mod.addImport("input", input_mod);
+    input_sdl3_mod.addImport("input_haptics", input_haptics_mod);
+    input_sdl3_mod.addImport("sdl3_c", sdl3_c_mod);
 
     // Visual hello (D1): native SDL3 window, input and DPI. Run with `zig build run-visual-hello`.
     const visual_hello_mod = b.createModule(.{
@@ -462,6 +501,7 @@ pub fn build(b: *std.Build) void {
     render_2d_mod.addImport("engine", engine_mod);
     render_2d_mod.addImport("graphics", graphics_mod);
     render_2d_mod.addImport("scene", scene_mod);
+    render_2d_mod.addImport("camera", camera_mod);
 
     const gpu_resources_mod = b.addModule("gpu_resources", .{
         .root_source_file = b.path("packages/graphics/sdlgpu/src/gpu_resources.zig"),
@@ -520,6 +560,7 @@ pub fn build(b: *std.Build) void {
     visual_2d_mod.addImport("graphics", graphics_mod);
     visual_2d_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
     visual_2d_mod.addImport("scene", scene_mod);
+    visual_2d_mod.addImport("camera", camera_mod);
     visual_2d_mod.addImport("render_2d", render_2d_mod);
 
     const visual_2d_exe = b.addExecutable(.{
@@ -602,6 +643,7 @@ pub fn build(b: *std.Build) void {
     visual_pg_mod.addImport("graphics", graphics_mod);
     visual_pg_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
     visual_pg_mod.addImport("scene", scene_mod);
+    visual_pg_mod.addImport("camera", camera_mod);
     visual_pg_mod.addImport("render_2d", render_2d_mod);
     visual_pg_mod.addImport("ui_core", ui_core_mod);
     visual_pg_mod.addImport("ui_markup", ui_markup_mod);
@@ -656,6 +698,7 @@ pub fn build(b: *std.Build) void {
     visual_3d_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_3d_mod.addImport("graphics", graphics_mod);
     visual_3d_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_3d_mod.addImport("camera", camera_mod);
     visual_3d_mod.addImport("render_3d", render_3d_mod);
 
     const visual_3d_exe = b.addExecutable(.{
@@ -669,6 +712,82 @@ pub fn build(b: *std.Build) void {
     run_visual_3d.step.dependOn(b.getInstallStep());
     const run_visual_3d_step = b.step("run-visual-3d", "Open the Phase E 3D Foundation demo");
     run_visual_3d_step.dependOn(&run_visual_3d.step);
+
+    // Headless Camera & Projection example. Run with `zig build run-camera`.
+    const camera_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/camera/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    camera_example_mod.addImport("engine", engine_mod);
+    camera_example_mod.addImport("camera", camera_mod);
+
+    const camera_example_exe = b.addExecutable(.{
+        .name = "camera-example",
+        .root_module = camera_example_mod,
+    });
+    b.installArtifact(camera_example_exe);
+
+    const run_camera = b.addRunArtifact(camera_example_exe);
+    const run_camera_step = b.step("run-camera", "Run the headless Camera & Projection example");
+    run_camera_step.dependOn(&run_camera.step);
+
+    // Visual Camera & Bevy-style Input demo. Run with `zig build run-visual-camera`.
+    const visual_camera_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-camera/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_camera_mod.addImport("engine", engine_mod);
+    visual_camera_mod.addImport("window", window_mod);
+    visual_camera_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_camera_mod.addImport("graphics", graphics_mod);
+    visual_camera_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_camera_mod.addImport("input", input_mod);
+    visual_camera_mod.addImport("camera", camera_mod);
+    visual_camera_mod.addImport("render_3d", render_3d_mod);
+
+    const visual_camera_exe = b.addExecutable(.{
+        .name = "visual-camera",
+        .root_module = visual_camera_mod,
+    });
+    b.installArtifact(visual_camera_exe);
+
+    const run_visual_camera = b.addSystemCommand(&.{"zig-out/bin/visual-camera.exe"});
+    run_visual_camera.setCwd(b.path("."));
+    run_visual_camera.step.dependOn(b.getInstallStep());
+    const run_visual_camera_step = b.step("run-visual-camera", "Open the Visual Camera & Input demo");
+    run_visual_camera_step.dependOn(&run_visual_camera.step);
+
+    // Visual PS5 DualSense / Gamepad & Haptics demo. Run with `zig build run-visual-gamepad`.
+    const visual_gamepad_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-gamepad/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_gamepad_mod.addImport("engine", engine_mod);
+    visual_gamepad_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_gamepad_mod.addImport("graphics", graphics_mod);
+    visual_gamepad_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_gamepad_mod.addImport("input", input_mod);
+    visual_gamepad_mod.addImport("input_haptics", input_haptics_mod);
+    visual_gamepad_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_gamepad_mod.addImport("camera", camera_mod);
+    visual_gamepad_mod.addImport("render_3d", render_3d_mod);
+
+    const visual_gamepad_exe = b.addExecutable(.{
+        .name = "visual-gamepad",
+        .root_module = visual_gamepad_mod,
+    });
+    b.installArtifact(visual_gamepad_exe);
+
+    const run_visual_gamepad = b.addSystemCommand(&.{"zig-out/bin/visual-gamepad.exe"});
+    run_visual_gamepad.setCwd(b.path("."));
+    run_visual_gamepad.step.dependOn(b.getInstallStep());
+    const run_visual_gamepad_step = b.step("run-visual-gamepad", "Open the Visual PS5 DualSense & Haptics demo");
+    run_visual_gamepad_step.dependOn(&run_visual_gamepad.step);
 
     // Manifesto-driven visual runtime (`tools/runtime/main.zig`): reads game.toml in CWD.
     const runtime_mod = b.createModule(.{
@@ -859,6 +978,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "scene", .mod = scene_mod },
+        .{ .name = "camera", .mod = camera_mod },
         .{ .name = "render_3d", .mod = render_3d_mod },
     }, null);
 
@@ -913,11 +1034,31 @@ pub fn build(b: *std.Build) void {
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "scene", .mod = scene_mod },
+        .{ .name = "camera", .mod = camera_mod },
         .{ .name = "render_2d", .mod = render_2d_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/physics/core/tests/physics_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "physics", .mod = physics_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/camera/tests/camera_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "input", .mod = input_mod },
+        .{ .name = "scene", .mod = scene_mod },
+        .{ .name = "camera", .mod = camera_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/input/core/tests/input_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "input", .mod = input_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/input/haptics/tests/haptics_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "input_haptics", .mod = input_haptics_mod },
     }, null);
 }

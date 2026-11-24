@@ -48,6 +48,13 @@ fn putValue(out: *std.ArrayList(u8), a: std.mem.Allocator, v: FieldValue) !void 
         .vec2_t => |x| for (x) |f| try putU32(out, a, @bitCast(f)),
         .vec3_t => |x| for (x) |f| try putU32(out, a, @bitCast(f)),
         .vec4_t => |x| for (x) |f| try putU32(out, a, @bitCast(f)),
+        .enum_u32_t => |x| try putU32(out, a, x),
+        .entity_ref_t => |x| {
+            try putU32(out, a, x.index);
+            try putU32(out, a, x.generation);
+        },
+        .asset_ref_t => |x| try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u64, x))),
+        .fixed_str64_t => |x| try out.appendSlice(a, &x),
     }
 }
 
@@ -134,6 +141,10 @@ fn readValue(r: *Reader) !FieldValue {
         .vec2_t => .{ .vec2_t = .{ @bitCast(try r.u32_()), @bitCast(try r.u32_()) } },
         .vec3_t => .{ .vec3_t = .{ @bitCast(try r.u32_()), @bitCast(try r.u32_()), @bitCast(try r.u32_()) } },
         .vec4_t => .{ .vec4_t = .{ @bitCast(try r.u32_()), @bitCast(try r.u32_()), @bitCast(try r.u32_()), @bitCast(try r.u32_()) } },
+        .enum_u32_t => .{ .enum_u32_t = try r.u32_() },
+        .entity_ref_t => .{ .entity_ref_t = .{ .index = try r.u32_(), .generation = try r.u32_() } },
+        .asset_ref_t => .{ .asset_ref_t = try r.u64_() },
+        .fixed_str64_t => .{ .fixed_str64_t = (try r.take(64))[0..64].* },
     };
 }
 
