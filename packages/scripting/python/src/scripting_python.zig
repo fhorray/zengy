@@ -8,7 +8,7 @@
 //!   No system Python is required on the build or target machine.
 //! - Each `ScriptingHost` runtime owns one PocketPy VM (`py_switchvm`, indices 1..15).
 //!   Scripts of one runtime never see the globals of another.
-//! - `zigeng` (with submodules `zigeng.input` and `zigeng.Key`) is bound per-VM.
+//! - `zengy` (with submodules `zengy.input` and `zengy.Key`) is bound per-VM.
 //!   The `ScriptEngineBridge` pointer is stored in the module dict, so native callbacks
 //!   need no globals.
 //! - Errors are returned as `ScriptResult` from `py_formatexc()`; they never abort the host.
@@ -42,9 +42,9 @@ fn releaseVmIndex(idx: c_int) void {
     g_vm_in_use[@intCast(idx)] = false;
 }
 
-/// Reads the bridge pointer stored in the current VM's `zigeng` module.
+/// Reads the bridge pointer stored in the current VM's `zengy` module.
 fn bridgeFromModule() ?*scripting_host.ScriptEngineBridge {
-    const mod = c.py_getmodule("zigeng");
+    const mod = c.py_getmodule("zengy");
     if (mod == null) return null;
     const item = c.py_getdict(mod, c.py_name("__bridge"));
     if (item == null) return null;
@@ -199,7 +199,7 @@ const PythonRuntimeState = struct {
     allocator: std.mem.Allocator,
     vm_index: c_int,
     bridge: *scripting_host.ScriptEngineBridge,
-    /// script id -> owned module name inside this VM (`zigeng_script_<id>`).
+    /// script id -> owned module name inside this VM (`zengy_script_<id>`).
     modules: std.AutoHashMapUnmanaged(u64, [:0]u8),
     next_mod_id: u64,
     /// Storage for the last error message returned in `ScriptResult`.
@@ -295,28 +295,28 @@ fn createPythonRuntime(allocator: std.mem.Allocator, bridge: *scripting_host.Scr
     errdefer releaseVmIndex(idx);
     c.py_switchvm(idx);
 
-    // Per-VM `zigeng` package (`zigeng`, `zigeng.input`, `zigeng.Key`).
+    // Per-VM `zengy` package (`zengy`, `zengy.input`, `zengy.Key`).
     // The bridge pointer lives in the module dict, avoiding process-wide globals.
-    const input_mod = c.py_newmodule("zigeng.input");
+    const input_mod = c.py_newmodule("zengy.input");
     c.py_bindfunc(input_mod, "is_key_down", engineIsKeyDown);
     c.py_bindfunc(input_mod, "mouse_x", engineMouseX);
     c.py_bindfunc(input_mod, "mouse_y", engineMouseY);
     c.py_bindfunc(input_mod, "is_mouse_down", engineIsMouseDown);
     c.py_bindfunc(input_mod, "was_mouse_clicked", engineWasMouseClicked);
 
-    const key_mod = c.py_newmodule("zigeng.Key");
+    const key_mod = c.py_newmodule("zengy.Key");
     populateKeyModule(key_mod);
 
-    const zigeng_mod = c.py_newmodule("zigeng");
-    setIntConst(zigeng_mod, "__bridge", @intCast(@intFromPtr(bridge)));
-    c.py_bindfunc(zigeng_mod, "log", engineLog);
-    c.py_bindfunc(zigeng_mod, "spawn_entity", engineSpawnEntity);
-    c.py_bindfunc(zigeng_mod, "is_alive", engineIsAlive);
-    c.py_bindfunc(zigeng_mod, "post_event", enginePostEvent);
-    c.py_bindfunc(zigeng_mod, "draw_rect", engineDrawRect);
-    c.py_bindfunc(zigeng_mod, "clear_draw_queue", engineClearDrawQueue);
-    c.py_setdict(zigeng_mod, c.py_name("input"), input_mod);
-    c.py_setdict(zigeng_mod, c.py_name("Key"), key_mod);
+    const zengy_mod = c.py_newmodule("zengy");
+    setIntConst(zengy_mod, "__bridge", @intCast(@intFromPtr(bridge)));
+    c.py_bindfunc(zengy_mod, "log", engineLog);
+    c.py_bindfunc(zengy_mod, "spawn_entity", engineSpawnEntity);
+    c.py_bindfunc(zengy_mod, "is_alive", engineIsAlive);
+    c.py_bindfunc(zengy_mod, "post_event", enginePostEvent);
+    c.py_bindfunc(zengy_mod, "draw_rect", engineDrawRect);
+    c.py_bindfunc(zengy_mod, "clear_draw_queue", engineClearDrawQueue);
+    c.py_setdict(zengy_mod, c.py_name("input"), input_mod);
+    c.py_setdict(zengy_mod, c.py_name("Key"), key_mod);
 
     const st = try allocator.create(PythonRuntimeState);
     st.* = .{
@@ -334,7 +334,7 @@ fn loadPythonScript(raw: *anyopaque, source_name: []const u8, source: []const u8
     c.py_switchvm(st.vm_index);
 
     const id = st.next_mod_id;
-    const mod_name = try std.fmt.allocPrintSentinel(st.allocator, "zigeng_script_{d}", .{id}, 0);
+    const mod_name = try std.fmt.allocPrintSentinel(st.allocator, "zengy_script_{d}", .{id}, 0);
     errdefer st.allocator.free(mod_name);
 
     const src_z = try std.fmt.allocPrintSentinel(st.allocator, "{s}", .{source}, 0);

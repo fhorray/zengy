@@ -1,6 +1,6 @@
 //! Optional Rapier3D Physics Backend Package (`official.physics.rapier`).
 //!
-//! Wraps `zigeng_rapier_ffi` (compiled from Rust via `cargo build --release`
+//! Wraps `zengy_rapier_ffi` (compiled from Rust via `cargo build --release`
 //! on the user's machine) and implements `physics.PhysicsBackendVTable`.
 
 const std = @import("std");

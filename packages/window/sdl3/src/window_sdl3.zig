@@ -24,7 +24,7 @@ pub const PROVIDER_ID = "official.window.sdl3";
 
 /// Optional resource inserted before `app.initialize()` to customise the main window.
 pub const WindowConfig = struct {
-    title: []const u8 = "ZigEng",
+    title: []const u8 = "Zengy",
     width: u32 = 1280,
     height: u32 = 720,
     resizable: bool = true,

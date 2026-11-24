@@ -1,6 +1,6 @@
-# Agnostic Physics Roadmap (`zigeng`)
+# Agnostic Physics Roadmap (`zengy`)
 
-This document outlines how the `zigeng` physics subsystem will be implemented using an **ECS-first + Plugin** developer experience backed by a **pluggable `PhysicsBackendVTable`** (matching the pattern already used in `packages/graphics/core/`).
+This document outlines how the `zengy` physics subsystem will be implemented using an **ECS-first + Plugin** developer experience backed by a **pluggable `PhysicsBackendVTable`** (matching the pattern already used in `packages/graphics/core/`).
 
 ## 1. Architecture Principles
 
@@ -74,4 +74,4 @@ To ensure swapping `physics-simple` for `physics-box2d` or `physics-jolt` does n
   - `packages/physics/jolt` (full 3D: meshes, capsules, character controller).
 - **Phase P4 (Scripting & CLI):**
   - Bindings in `scripting-host` / `scripting-python` / `scripting-lua` (`add_force`, `apply_impulse`, `raycast`, `on_collision` callbacks).
-  - CLI catalog integration (`zigeng add physics`, `zigeng add physics-simple`) and `plugins = ["physics"]` in `game.toml`.
+  - CLI catalog integration (`zengy add physics`, `zengy add physics-simple`) and `plugins = ["physics"]` in `game.toml`.

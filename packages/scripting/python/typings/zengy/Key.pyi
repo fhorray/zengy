@@ -1,4 +1,4 @@
-"""SDL3 USB HID scancode constants for `zigeng.input.is_key_down`."""
+"""SDL3 USB HID scancode constants for `zengy.input.is_key_down`."""
 
 A: int
 B: int

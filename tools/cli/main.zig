@@ -4,7 +4,7 @@
 //! - `doctor`: validates ABI version, module graph resolution, and service count.
 //! - `packages`: prints resolved topological module order and registered providers.
 //! - `test-scenario`: runs a deterministic TOML scenario and outputs a structured JSON report.
-//! - `list-official`: lists all official packages available from `fhorray/zigeng`.
+//! - `list-official`: lists all official packages available from `fhorray/zengy`.
 //! - `new <name>`: scaffolds a game.toml + starter Python script + IDE typings project.
 //! - `typings`: writes Python `.pyi` stubs (`typings/`) and `pyrightconfig.json` in CWD.
 //! - `add <pkg>`: downloads an official package from GitHub into `./packages/<pkg>/`
@@ -156,9 +156,9 @@ fn writeFileRelative(io: std.Io, path: []const u8, content: []const u8) !void {
     try file.writeStreamingAll(io, content);
 }
 
-const PY_ZIGENG_INIT_PYI = @embedFile("py_zigeng_init_pyi");
-const PY_ZIGENG_INPUT_PYI = @embedFile("py_zigeng_input_pyi");
-const PY_ZIGENG_KEY_PYI = @embedFile("py_zigeng_key_pyi");
+const PY_ZENGY_INIT_PYI = @embedFile("py_zengy_init_pyi");
+const PY_ZENGY_INPUT_PYI = @embedFile("py_zengy_input_pyi");
+const PY_ZENGY_KEY_PYI = @embedFile("py_zengy_key_pyi");
 
 const PYRIGHT_CONFIG_JSON =
     \\{
@@ -169,41 +169,41 @@ const PYRIGHT_CONFIG_JSON =
 ;
 
 const STARTER_MAIN_PY =
-    \\import zigeng
-    \\from zigeng import Key
+    \\import zengy
+    \\from zengy import Key
     \\
     \\x = 600.0
     \\y = 320.0
     \\
     \\
     \\def start():
-    \\    zigeng.log("zigeng game started!")
+    \\    zengy.log("zengy game started!")
     \\
     \\
     \\def update(dt):
     \\    global x, y
     \\    speed = 300.0 * float(dt)
-    \\    if zigeng.input.is_key_down(Key.A) or zigeng.input.is_key_down(Key.LEFT):
+    \\    if zengy.input.is_key_down(Key.A) or zengy.input.is_key_down(Key.LEFT):
     \\        x -= speed
-    \\    if zigeng.input.is_key_down(Key.D) or zigeng.input.is_key_down(Key.RIGHT):
+    \\    if zengy.input.is_key_down(Key.D) or zengy.input.is_key_down(Key.RIGHT):
     \\        x += speed
-    \\    if zigeng.input.is_key_down(Key.W) or zigeng.input.is_key_down(Key.UP):
+    \\    if zengy.input.is_key_down(Key.W) or zengy.input.is_key_down(Key.UP):
     \\        y -= speed
-    \\    if zigeng.input.is_key_down(Key.S) or zigeng.input.is_key_down(Key.DOWN):
+    \\    if zengy.input.is_key_down(Key.S) or zengy.input.is_key_down(Key.DOWN):
     \\        y += speed
-    \\    zigeng.draw_rect(x, y, 64.0, 64.0, 0.25, 0.75, 1.0, 1.0)
+    \\    zengy.draw_rect(x, y, 64.0, 64.0, 0.25, 0.75, 1.0, 1.0)
     \\
 ;
 
 fn writePythonTypings(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8) !void {
-    const typings_zigeng_dir = try std.fmt.allocPrint(allocator, "{s}/typings/zigeng", .{base_dir});
-    defer allocator.free(typings_zigeng_dir);
-    try std.Io.Dir.cwd().createDirPath(io, typings_zigeng_dir);
+    const typings_zengy_dir = try std.fmt.allocPrint(allocator, "{s}/typings/zengy", .{base_dir});
+    defer allocator.free(typings_zengy_dir);
+    try std.Io.Dir.cwd().createDirPath(io, typings_zengy_dir);
 
     const files = [_]struct { rel: []const u8, content: []const u8 }{
-        .{ .rel = "typings/zigeng/__init__.pyi", .content = PY_ZIGENG_INIT_PYI },
-        .{ .rel = "typings/zigeng/input.pyi", .content = PY_ZIGENG_INPUT_PYI },
-        .{ .rel = "typings/zigeng/Key.pyi", .content = PY_ZIGENG_KEY_PYI },
+        .{ .rel = "typings/zengy/__init__.pyi", .content = PY_ZENGY_INIT_PYI },
+        .{ .rel = "typings/zengy/input.pyi", .content = PY_ZENGY_INPUT_PYI },
+        .{ .rel = "typings/zengy/Key.pyi", .content = PY_ZENGY_KEY_PYI },
         .{ .rel = "pyrightconfig.json", .content = PYRIGHT_CONFIG_JSON },
     };
     for (files) |f| {
@@ -241,7 +241,7 @@ fn scaffoldProject(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !
 
     try writePythonTypings(allocator, io, name);
 
-    std.debug.print("Created zigeng project '{s}/' (with scripts/main.py + Python typings):\n  cd {s}\n  zigeng run\n", .{ name, name });
+    std.debug.print("Created zengy project '{s}/' (with scripts/main.py + Python typings):\n  cd {s}\n  zengy run\n", .{ name, name });
 }
 
 fn runShell(allocator: std.mem.Allocator, io: std.Io, shell_cmd: []const u8) !void {
@@ -300,41 +300,41 @@ fn cwdFileExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-/// Runs the install flow declared by `<dir>/zigeng.toml` (if any) inside the user's project:
+/// Runs the install flow declared by `<dir>/zengy.toml` (if any) inside the user's project:
 /// `zig fetch --save` for each dependency of this platform, then a marker-delimited hook block
-/// in `build.zig` (inserted after `// zigeng:install-hooks`). Packages without a manifest are skipped.
-/// Projects without `build.zig.zon` (plain `game.toml` projects) skip this: `zigeng-runtime` ships
+/// in `build.zig` (inserted after `// zengy:install-hooks`). Packages without a manifest are skipped.
+/// Projects without `build.zig.zon` (plain `game.toml` projects) skip this: `zengy-runtime` ships
 /// its runtime libraries.
 fn provisionPackageDir(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const manifest_path = try std.fmt.allocPrint(arena, "{s}/zigeng.toml", .{dir});
+    const manifest_path = try std.fmt.allocPrint(arena, "{s}/zengy.toml", .{dir});
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, arena, .limited(256 * 1024)) catch return;
 
     const manifest = pkg_manifest.parse(arena, bytes) catch |err| {
-        std.debug.print("[zigeng] Invalid {s}: {s}. Skipping package provisioning.\n", .{ manifest_path, @errorName(err) });
+        std.debug.print("[zengy] Invalid {s}: {s}. Skipping package provisioning.\n", .{ manifest_path, @errorName(err) });
         return error.InvalidPackageManifest;
     };
     if (manifest.dependencies.len == 0 and manifest.installs.len == 0) return;
     const pkg_name = if (manifest.name.len != 0) manifest.name else std.fs.path.basename(dir);
 
     if (!cwdFileExists(io, "build.zig.zon")) {
-        std.debug.print("[zigeng] '{s}': no build.zig.zon here (game.toml project); runtime libraries come with zigeng-runtime.\n", .{pkg_name});
+        std.debug.print("[zengy] '{s}': no build.zig.zon here (game.toml project); runtime libraries come with zengy-runtime.\n", .{pkg_name});
         return;
     }
 
     for (manifest.dependencies) |d| {
         if (!pkg_manifest.platformMatches(d.platforms, pkg_manifest.host_platform)) continue;
-        std.debug.print("[zigeng] Fetching '{s}' for '{s}' (hash verified by zig)...\n", .{ d.name, pkg_name });
+        std.debug.print("[zengy] Fetching '{s}' for '{s}' (hash verified by zig)...\n", .{ d.name, pkg_name });
         const save_flag = try std.fmt.allocPrint(arena, "--save={s}", .{d.name});
         try runArgv(allocator, io, &.{ "zig", "fetch", save_flag, d.url });
     }
 
     if (manifest.installs.len == 0) return;
     if (!cwdFileExists(io, "build.zig")) {
-        std.debug.print("[zigeng] '{s}': no build.zig found; cannot install runtime files.\n", .{pkg_name});
+        std.debug.print("[zengy] '{s}': no build.zig found; cannot install runtime files.\n", .{pkg_name});
         return;
     }
     const block = try pkg_manifest.renderBlock(arena, pkg_name, manifest);
@@ -342,7 +342,7 @@ fn provisionPackageDir(allocator: std.mem.Allocator, io: std.Io, dir: []const u8
     const updated = pkg_manifest.applyBlock(arena, build_src, pkg_name, block) catch |err| switch (err) {
         error.NoAnchor => {
             std.debug.print(
-                "[zigeng] build.zig has no '{s}' anchor. Add that line inside build() after `const target = ...`, then re-run, or paste this block manually:\n\n{s}\n",
+                "[zengy] build.zig has no '{s}' anchor. Add that line inside build() after `const target = ...`, then re-run, or paste this block manually:\n\n{s}\n",
                 .{ pkg_manifest.ANCHOR, block },
             );
             return;
@@ -351,12 +351,12 @@ fn provisionPackageDir(allocator: std.mem.Allocator, io: std.Io, dir: []const u8
     };
     if (!std.mem.eql(u8, build_src, updated)) {
         try writeFileRelative(io, "build.zig", updated);
-        std.debug.print("[zigeng] Updated build.zig hooks for '{s}' (zig-out/bin install of runtime files).\n", .{pkg_name});
+        std.debug.print("[zengy] Updated build.zig hooks for '{s}' (zig-out/bin install of runtime files).\n", .{pkg_name});
     }
 }
 
 /// Runs `argv` inside `cwd` without a shell (no quoting or path-separator pitfalls) and echoes its output.
-/// Optional local zigeng checkout (`--fork=<path>` or `ZIGENG_FORK`) forwarded to plugin builds.
+/// Optional local zengy checkout (`--fork=<path>` or `ZENGY_FORK`) forwarded to plugin builds.
 var g_fork_path: ?[]const u8 = null;
 
 fn runArgvIn(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: []const u8) !void {
@@ -375,10 +375,10 @@ fn isPluginLib(name: []const u8) bool {
     return std.mem.endsWith(u8, name, ".dll") or std.mem.endsWith(u8, name, ".so") or std.mem.endsWith(u8, name, ".dylib");
 }
 
-/// Copies shared libraries found under `src_dir` into `./.zigeng/plugins/` (created on demand).
+/// Copies shared libraries found under `src_dir` into `./.zengy/plugins/` (created on demand).
 fn copyPluginLibs(allocator: std.mem.Allocator, io: std.Io, src_dir: []const u8, recursive: bool) !void {
-    try std.Io.Dir.cwd().createDirPath(io, ".zigeng/plugins");
-    var plugins = try std.Io.Dir.cwd().openDir(io, ".zigeng/plugins", .{});
+    try std.Io.Dir.cwd().createDirPath(io, ".zengy/plugins");
+    var plugins = try std.Io.Dir.cwd().openDir(io, ".zengy/plugins", .{});
     defer plugins.close(io);
     var src = std.Io.Dir.cwd().openDir(io, src_dir, .{ .iterate = true }) catch return error.PluginBuildOutputMissing;
     defer src.close(io);
@@ -390,11 +390,11 @@ fn copyPluginLibs(allocator: std.mem.Allocator, io: std.Io, src_dir: []const u8,
         if (entry.kind != .file or !isPluginLib(entry.basename)) continue;
         if (!recursive and std.mem.indexOfAny(u8, entry.path, "/\\") != null) continue;
         try entry.dir.copyFile(entry.basename, plugins, entry.basename, io, .{});
-        std.debug.print("[zigeng] Copied {s} -> .zigeng/plugins/\n", .{entry.basename});
+        std.debug.print("[zengy] Copied {s} -> .zengy/plugins/\n", .{entry.basename});
         copied += 1;
     }
     if (copied == 0) {
-        std.debug.print("[zigeng] No shared library (.dll/.so/.dylib) found under '{s}'.\n", .{src_dir});
+        std.debug.print("[zengy] No shared library (.dll/.so/.dylib) found under '{s}'.\n", .{src_dir});
         return error.PluginBuildOutputMissing;
     }
 }
@@ -406,19 +406,19 @@ fn compileAndInstallPluginDir(allocator: std.mem.Allocator, io: std.Io, dir_path
     if (has_cargo) {
         const cargo_ok = hasCommand(allocator, io, if (builtin.os.tag == .windows) "where cargo >nul 2>nul && where rustc >nul 2>nul" else "command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1");
         if (!cargo_ok) {
-            std.debug.print("[zigeng] Error: plugin '{s}' requires Rust ('cargo' and 'rustc' not found in PATH).\n", .{label});
-            std.debug.print("[zigeng] Install Rust from https://rustup.rs and run the command again.\n", .{});
+            std.debug.print("[zengy] Error: plugin '{s}' requires Rust ('cargo' and 'rustc' not found in PATH).\n", .{label});
+            std.debug.print("[zengy] Install Rust from https://rustup.rs and run the command again.\n", .{});
             return error.MissingRustToolchain;
         }
-        std.debug.print("[zigeng] Building Rust dependency for '{s}' (cargo build --release)...\n", .{label});
+        std.debug.print("[zengy] Building Rust dependency for '{s}' (cargo build --release)...\n", .{label});
         try runArgvIn(allocator, io, &.{ "cargo", "build", "--release" }, dir_path);
     }
 
     if (has_zig) {
-        std.debug.print("[zigeng] Building plugin '{s}' locally with zig...\n", .{label});
+        std.debug.print("[zengy] Building plugin '{s}' locally with zig...\n", .{label});
         if (g_fork_path) |fork| {
-            // Local zigeng checkout overrides the pinned `zigeng` dependency of the plugin
-            // (`zig build --fork`); used when developing inside the zigeng repository.
+            // Local zengy checkout overrides the pinned `zengy` dependency of the plugin
+            // (`zig build --fork`); used when developing inside the zengy repository.
             const abs_fork = try std.Io.Dir.cwd().realPathFileAlloc(io, fork, allocator);
             defer allocator.free(abs_fork);
             const fork_arg = try std.fmt.allocPrint(allocator, "--fork={s}", .{abs_fork});
@@ -435,25 +435,25 @@ fn compileAndInstallPluginDir(allocator: std.mem.Allocator, io: std.Io, dir_path
         defer allocator.free(out_dir);
         try copyPluginLibs(allocator, io, out_dir, false);
     } else {
-        std.debug.print("[zigeng] Error: plugin '{s}' has neither build.zig nor Cargo.toml.\n", .{label});
+        std.debug.print("[zengy] Error: plugin '{s}' has neither build.zig nor Cargo.toml.\n", .{label});
         return error.InvalidPluginDirectory;
     }
 
-    std.debug.print("[zigeng] Installed compiled plugin '{s}' into .zigeng/plugins/\n", .{label});
+    std.debug.print("[zengy] Installed compiled plugin '{s}' into .zengy/plugins/\n", .{label});
 }
 
-/// Community/local package flow: compile it when it has build files, then run its `zigeng.toml` install flow.
-/// A package that only declares a `zigeng.toml` (nothing to compile) is valid.
+/// Community/local package flow: compile it when it has build files, then run its `zengy.toml` install flow.
+/// A package that only declares a `zengy.toml` (nothing to compile) is valid.
 fn installPluginDirAndProvision(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, label: []const u8) !void {
     const has_build = fileExists(allocator, io, dir_path, "build.zig") or fileExists(allocator, io, dir_path, "Cargo.toml");
-    const has_manifest = fileExists(allocator, io, dir_path, "zigeng.toml");
+    const has_manifest = fileExists(allocator, io, dir_path, "zengy.toml");
     if (has_build or !has_manifest) try compileAndInstallPluginDir(allocator, io, dir_path, label);
     try provisionPackageDir(allocator, io, dir_path);
 }
 
 fn installPluginSpec(allocator: std.mem.Allocator, io: std.Io, spec: []const u8) !void {
     if (std.mem.eql(u8, spec, "scene") or std.mem.eql(u8, spec, "physics")) {
-        std.debug.print("[zigeng] '{s}' is a built-in engine contract.\n", .{spec});
+        std.debug.print("[zengy] '{s}' is a built-in engine contract.\n", .{spec});
         return;
     }
 
@@ -483,7 +483,7 @@ fn installPluginSpec(allocator: std.mem.Allocator, io: std.Io, spec: []const u8)
         var repo_name = if (last_slash + 1 < repo_part.len) repo_part[last_slash + 1 ..] else "plugin";
         if (std.mem.endsWith(u8, repo_name, ".git")) repo_name = repo_name[0 .. repo_name.len - 4];
 
-        const cache_dir = try std.fmt.allocPrint(allocator, ".zigeng/cache/{s}", .{repo_name});
+        const cache_dir = try std.fmt.allocPrint(allocator, ".zengy/cache/{s}", .{repo_name});
         defer allocator.free(cache_dir);
 
         const branch_flag = if (tag) |t|
@@ -495,13 +495,13 @@ fn installPluginSpec(allocator: std.mem.Allocator, io: std.Io, spec: []const u8)
         const clone_cmd = if (builtin.os.tag == .windows)
             try std.fmt.allocPrint(
                 allocator,
-                "mkdir .zigeng\\cache 2>nul & if not exist \"{s}\" (git clone --depth 1 {s}\"{s}\" \"{s}\") else (git -C \"{s}\" pull --ff-only)",
+                "mkdir .zengy\\cache 2>nul & if not exist \"{s}\" (git clone --depth 1 {s}\"{s}\" \"{s}\") else (git -C \"{s}\" pull --ff-only)",
                 .{ cache_dir, branch_flag, clone_url, cache_dir, cache_dir },
             )
         else
             try std.fmt.allocPrint(
                 allocator,
-                "mkdir -p .zigeng/cache && if [ ! -d \"{s}\" ]; then git clone --depth 1 {s}\"{s}\" \"{s}\"; else git -C \"{s}\" pull --ff-only || true; fi",
+                "mkdir -p .zengy/cache && if [ ! -d \"{s}\" ]; then git clone --depth 1 {s}\"{s}\" \"{s}\"; else git -C \"{s}\" pull --ff-only || true; fi",
                 .{ cache_dir, branch_flag, clone_url, cache_dir, cache_dir },
             );
         defer allocator.free(clone_cmd);
@@ -520,7 +520,7 @@ fn installPluginSpec(allocator: std.mem.Allocator, io: std.Io, spec: []const u8)
 
 fn installFromGameToml(allocator: std.mem.Allocator, io: std.Io) !void {
     const manifest_bytes = std.Io.Dir.cwd().readFileAlloc(io, "game.toml", allocator, .limited(4 * 1024 * 1024)) catch |err| {
-        std.debug.print("[zigeng] Could not read 'game.toml' in current directory: {}\n", .{err});
+        std.debug.print("[zengy] Could not read 'game.toml' in current directory: {}\n", .{err});
         return err;
     };
     defer allocator.free(manifest_bytes);
@@ -529,19 +529,19 @@ fn installFromGameToml(allocator: std.mem.Allocator, io: std.Io) !void {
     defer manifest.deinit(allocator);
 
     if (manifest.plugins.len == 0) {
-        std.debug.print("[zigeng] No plugins listed in game.toml.\n", .{});
+        std.debug.print("[zengy] No plugins listed in game.toml.\n", .{});
         return;
     }
 
-    std.debug.print("[zigeng] Installing {d} plugin(s) from game.toml...\n", .{manifest.plugins.len});
+    std.debug.print("[zengy] Installing {d} plugin(s) from game.toml...\n", .{manifest.plugins.len});
     for (manifest.plugins) |p| {
         try installPluginSpec(allocator, io, p);
     }
-    std.debug.print("[zigeng] All plugins installed.\n", .{});
+    std.debug.print("[zengy] All plugins installed.\n", .{});
 }
 
 fn runProject(allocator: std.mem.Allocator, io: std.Io, args_it: anytype) !void {
-    const runtime_bin = if (builtin.os.tag == .windows) "zigeng-runtime.exe" else "zigeng-runtime";
+    const runtime_bin = if (builtin.os.tag == .windows) "zengy-runtime.exe" else "zengy-runtime";
     var argv_list: std.ArrayList([]const u8) = .empty;
     defer argv_list.deinit(allocator);
     try argv_list.append(allocator, runtime_bin);
@@ -567,7 +567,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "new")) {
         const proj_name = args_it.next() orelse {
-            std.debug.print("Usage: zigeng new <project-name>\n", .{});
+            std.debug.print("Usage: zengy new <project-name>\n", .{});
             return;
         };
         try scaffoldProject(allocator, init.io, proj_name);
@@ -586,7 +586,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, cmd, "install") or std.mem.eql(u8, cmd, "i")) {
-        g_fork_path = init.environ_map.get("ZIGENG_FORK");
+        g_fork_path = init.environ_map.get("ZENGY_FORK");
         while (args_it.next()) |a| {
             if (std.mem.startsWith(u8, a, "--fork=")) g_fork_path = a["--fork=".len..];
         }
@@ -595,7 +595,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, cmd, "list-official")) {
-        std.debug.print("Official zigeng packages (install with: zigeng add <name>):\n", .{});
+        std.debug.print("Official zengy packages (install with: zengy add <name>):\n", .{});
         for (OFFICIAL_PACKAGES) |pkg| {
             std.debug.print("  - {s:<18} {s}\n", .{ pkg.name, pkg.summary });
         }
@@ -603,7 +603,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, cmd, "add")) {
-        g_fork_path = init.environ_map.get("ZIGENG_FORK");
+        g_fork_path = init.environ_map.get("ZENGY_FORK");
         var pkg_spec: ?[]const u8 = null;
         while (args_it.next()) |a| {
             if (std.mem.startsWith(u8, a, "--fork=")) {
@@ -613,7 +613,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const spec = pkg_spec orelse {
-            std.debug.print("Usage: zigeng add [--fork=<zigeng-checkout>] <package | owner/repo[@tag] | github-url | ./local-path>\n", .{});
+            std.debug.print("Usage: zengy add [--fork=<zengy-checkout>] <package | owner/repo[@tag] | github-url | ./local-path>\n", .{});
             return;
         };
         try installPluginSpec(allocator, init.io, spec);
@@ -688,7 +688,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "doctor")) {
         std.debug.print(
-            "zigeng doctor:\n  ABI version: {d}.{d}\n  App state: {s}\n  Modules resolved: {d}\n  Services registered: {d}\n  Status: OK\n",
+            "zengy doctor:\n  ABI version: {d}.{d}\n  App state: {s}\n  Modules resolved: {d}\n  Services registered: {d}\n  Status: OK\n",
             .{
                 engine.abi.ABI_MAJOR,
                 engine.abi.ABI_MINOR,

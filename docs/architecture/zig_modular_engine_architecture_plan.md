@@ -567,10 +567,10 @@ Python publishes `game.damage`; Lua receives it and applies a change via `Comman
 
 ## 9. Packages, Manifests, and CLI
 
-- `zigeng new <name>`: scaffolds a minimal, agnostic core project (`game.toml`).
-- `zigeng add <spec>`: installs official packages or compiles external GitHub/local plugins locally via `zig` (and `cargo` when `Cargo.toml` is present).
-- `zigeng install` (`zigeng i`): installs all plugins declared in `game.toml`.
-- `zigeng run [--headless --ticks N]`: runs the project visually or headlessly via `zigeng-runtime`.
+- `zengy new <name>`: scaffolds a minimal, agnostic core project (`game.toml`).
+- `zengy add <spec>`: installs official packages or compiles external GitHub/local plugins locally via `zig` (and `cargo` when `Cargo.toml` is present).
+- `zengy install` (`zengy i`): installs all plugins declared in `game.toml`.
+- `zengy run [--headless --ticks N]`: runs the project visually or headlessly via `zengy-runtime`.
 
 ---
 
@@ -581,7 +581,7 @@ Python publishes `game.damage`; Lua receives it and applies a change via `Comman
 - **Phase 4:** Reflection & dynamic schemas.
 - **Phases 5–6:** `window`, `graphics`, `ui-core`, `window-sdl3`, `graphics-sdlgpu`.
 - **Phases 7–9:** `scripting-host`, `scripting-lua`, `scripting-python`, `ui-markup`, `ui-novaui`.
-- **Phases 10–13:** `scene`, `assets`, `render-2d`, `render-3d`, `physics` + external pluggable backends (`physics-jolt`, `physics-rapier`), `zigeng` CLI, and `zigeng-runtime`.
+- **Phases 10–13:** `scene`, `assets`, `render-2d`, `render-3d`, `physics` + external pluggable backends (`physics-jolt`, `physics-rapier`), `zengy` CLI, and `zengy-runtime`.
 
 ---
 

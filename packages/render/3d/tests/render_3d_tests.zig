@@ -109,3 +109,44 @@ test "gltf.loadGltfFromMemory parses embedded base64 glTF 2.0 triangle" {
     try testing.expectEqual(@as(f32, 1.0), mesh.vertices[0].y);
     try testing.expect(mesh.bounds_radius > 1.0);
 }
+
+test "Render3D selects highest-priority Camera3D and applies bounds_offset during culling" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+
+    try app.registerModule(window.module());
+    try app.registerModule(graphics.module());
+    try app.registerModule(render_3d.module());
+
+    const low_cam = try app.world.spawn();
+    try app.world.set(low_cam, render_3d.Camera3D, .{
+        .position = .{ 0, 0, 500 },
+        .target = .{ 0, 0, 490 },
+        .priority = 1,
+        .active = true,
+    });
+    const high_cam = try app.world.spawn();
+    try app.world.set(high_cam, render_3d.Camera3D, .{
+        .position = .{ 0, 0, 5 },
+        .target = .{ 0, 0, 0 },
+        .priority = 10,
+        .active = true,
+    });
+
+    // Pivot is behind the camera (+20), but bounds_offset places sphere at origin (0,0,0) -> visible!
+    const offset_mesh = try app.world.spawn();
+    try app.world.set(offset_mesh, render_3d.Transform3D, .{ .position = .{ 0, 0, 20 } });
+    try app.world.set(offset_mesh, render_3d.MeshRef, .{
+        .mesh_asset = 1,
+        .bounds_radius = 1.0,
+        .bounds_offset = .{ 0, 0, -20 },
+    });
+
+    try app.initialize();
+    try app.tick(1.0 / 60.0);
+
+    const r3d = app.resources.get(render_3d.Render3DService).?;
+    try testing.expectEqual(@as(usize, 2), r3d.active_cameras);
+    try testing.expectEqual(@as(usize, 1), r3d.drawCount());
+    try testing.expectEqual(@as(usize, 0), r3d.culled_count);
+}

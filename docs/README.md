@@ -1,6 +1,6 @@
-# Zig Modular Engine (`zigeng`) Documentation
+# Zig Modular Engine (`zengy`) Documentation
 
-Welcome to the `zigeng` documentation. This engine is built around a **minimal headless Zig core** (`src/core/`) with zero mandatory dependencies on windowing, GPUs, UI, or scripting VMs. Every higher-level feature is an optional package composed through capabilities and services.
+Welcome to the `zengy` documentation. This engine is built around a **minimal headless Zig core** (`src/core/`) with zero mandatory dependencies on windowing, GPUs, UI, or scripting VMs. Every higher-level feature is an optional package composed through capabilities and services.
 
 ## Documentation Index
 

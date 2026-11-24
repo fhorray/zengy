@@ -4,7 +4,7 @@
 // (`cd packages/physics/jolt && zig build`), so the engine and visual demos never depend on it.
 //
 // Outputs:
-// - `zigeng_physics_jolt` shared library (installed to zig-out/lib)
+// - `zengy_physics_jolt` shared library (installed to zig-out/lib)
 // - `zig build test` runs the Jolt backend tests
 
 const std = @import("std");
@@ -13,9 +13,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zigeng = b.dependency("zigeng", .{ .target = target, .optimize = optimize });
-    const engine_mod = zigeng.module("engine");
-    const physics_mod = zigeng.module("physics");
+    const zengy = b.dependency("zengy", .{ .target = target, .optimize = optimize });
+    const engine_mod = zengy.module("engine");
+    const physics_mod = zengy.module("physics");
 
     const jolt_dep = b.dependency("jolt", .{});
 
@@ -205,7 +205,7 @@ pub fn build(b: *std.Build) void {
     jolt_plugin_mod.addImport("physics_jolt", physics_jolt_mod);
 
     const jolt_plugin_lib = b.addLibrary(.{
-        .name = "zigeng_physics_jolt",
+        .name = "zengy_physics_jolt",
         .linkage = .dynamic,
         .root_module = jolt_plugin_mod,
     });

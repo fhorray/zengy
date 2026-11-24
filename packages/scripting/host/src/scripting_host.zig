@@ -220,6 +220,15 @@ pub const ScriptingHost = struct {
         return idx;
     }
 
+    pub fn findRuntimeByLanguage(self: *const ScriptingHost, language_id: []const u8) ?u16 {
+        for (self.runtimes.items, 0..) |rt, i| {
+            if (rt.active and std.mem.eql(u8, rt.descriptor.language_id, language_id)) {
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
     pub fn loadScript(self: *ScriptingHost, runtime_idx: u16, source_name: []const u8, source: []const u8) !ScriptModuleHandle {
         if (runtime_idx >= self.runtimes.items.len or !self.runtimes.items[runtime_idx].active) {
             return error.InvalidRuntime;
@@ -332,14 +341,8 @@ fn buildModule(raw_app: *anyopaque) !void {
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
-    if (app.resources.get(ScriptingHost)) |host| {
-        host.deinit();
-        _ = app.resources.remove(ScriptingHost);
-    }
-    if (app.resources.get(ScriptDrawQueue)) |q| {
-        q.deinit();
-        _ = app.resources.remove(ScriptDrawQueue);
-    }
+    _ = app.resources.remove(ScriptingHost);
+    _ = app.resources.remove(ScriptDrawQueue);
     _ = app.resources.remove(ScriptInputState);
 }
 

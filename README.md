@@ -1,6 +1,6 @@
-# Zig Modular Engine (`zigeng`)
+# Zig Modular Engine (`zengy`)
 
-**`zigeng` is a headless-first, modular 2D/3D engine written in Zig.**  
+**`zengy` is a headless-first, modular 2D/3D engine written in Zig.**  
 Start with a tiny, fast simulation core—then plug in only the capabilities your game, tool, or server actually needs.
 
 ---
@@ -9,7 +9,7 @@ Start with a tiny, fast simulation core—then plug in only the capabilities you
 
 Most game engines force every project to carry a window manager, GPU driver, UI toolkit, and scripting runtime—even when you just want to run a dedicated server, a simulation, or automated tests.
 
-`zigeng` flips that model:
+`zengy` flips that model:
 
 1. **The Core is 100% Headless (`engine`)**  
    Out of the box, you get an Entity Component System (ECS), a deterministic frame/fixed-timestep loop, events, resources, and diagnostics—with **zero** dependencies on SDL, GPUs, UI, or scripting languages.
@@ -30,7 +30,7 @@ Requires **Zig `0.17.1`**:
 
 ```bash
 git clone https://github.com/fhorray/zigeng.git
-cd zigeng
+cd zengy
 
 # Verify everything works
 zig build test
@@ -48,7 +48,7 @@ zig build run-visual-python      # Optional PocketPy (Python) script drawing on 
 
 ---
 
-## Your First `zigeng` App
+## Your First `zengy` App
 
 A minimal headless simulation takes only a few lines of Zig:
 
@@ -102,22 +102,22 @@ When you are ready to add graphics, simply register the optional modules you wan
 | **UI & Text** | `ui-core`, `ui-markup`, `text` | Retained flex layout, HTML-like markup, clickable buttons, textboxes |
 | **Scripting** | `scripting-host` + `scripting-lua` or `scripting-python` | Bring your own language, or opt into Lua 5.4 / PocketPy (Python) |
 | **C / Native Plugins** | `include/engine_extension.h` | Load `.dll` / `.so` / `.dylib` plugins dynamically at runtime |
-| **Automated Testing** | `testing` + `zigeng` CLI | Deterministic TOML scenarios & offscreen framebuffer capture |
+| **Automated Testing** | `testing` + `zengy` CLI | Deterministic TOML scenarios & offscreen framebuffer capture |
 
-### Zero-Boilerplate Projects with `zigeng` CLI
+### Zero-Boilerplate Projects with `zengy` CLI
 
-If you want to configure a project with an agnostic `game.toml` (without writing Zig boilerplate or forcing a specific scripting language or UI template), download a Release bundle and use the `zigeng` CLI:
+If you want to configure a project with an agnostic `game.toml` (without writing Zig boilerplate or forcing a specific scripting language or UI template), download a Release bundle and use the `zengy` CLI:
 
 ```bash
 # Create a minimal agnostic project (game.toml)
-zigeng new my-game
+zengy new my-game
 cd my-game
-zigeng install
-zigeng run
+zengy install
+zengy run
 
 # Or install individual official packages into ./packages/ for custom Zig builds
-zigeng list-official
-zigeng add physics
+zengy list-official
+zengy add physics
 ```
 
 ---

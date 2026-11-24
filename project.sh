@@ -1,17 +1,17 @@
 #!/bin/sh
-# Sandbox test for zigeng on macOS/Linux (POSIX counterpart of project.bat).
+# Sandbox test for zengy on macOS/Linux (POSIX counterpart of project.bat).
 #
 #   sh project.sh <project> [ticks] [--nobuild]
 #
 # Steps:
 #   1. zig build -Doptimize=ReleaseSafe            (CLI + runtime; plugins are built in ReleaseSafe too)
-#   2. zigeng add --fork=<root> <spec>             for each line of projects/<project>/plugins.txt
-#   3. zigeng install                              reads projects/<project>/game.toml (second install path)
-#   4. zigeng-runtime --headless --ticks N         must print status ok and physics_backend true
+#   2. zengy add --fork=<root> <spec>             for each line of projects/<project>/plugins.txt
+#   3. zengy install                              reads projects/<project>/game.toml (second install path)
+#   4. zengy-runtime --headless --ticks N         must print status ok and physics_backend true
 # Exit code 0 only if every step passes.
 set -eu
 
-# `pwd -W` gives a Windows path under Git Bash (the zigeng CLI cannot open /f/... paths); plain pwd elsewhere.
+# `pwd -W` gives a Windows path under Git Bash (the zengy CLI cannot open /f/... paths); plain pwd elsewhere.
 ROOT=$(cd "$(dirname "$0")" && { pwd -W 2>/dev/null || pwd; })
 BIN="$ROOT/zig-out/bin"
 NAME=${1:-}
@@ -42,17 +42,17 @@ if [ -f plugins.txt ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         line=$(printf '%s' "$line" | tr -d '\r')   # tolerate CRLF files (Windows checkouts)
         case "$line" in ''|\#*) continue ;; esac
-        echo "[test] zigeng add $line"
-        "$BIN/zigeng" add --fork="$ROOT" "$line" || { echo "[test] FAILED: zigeng add $line"; exit 1; }
+        echo "[test] zengy add $line"
+        "$BIN/zengy" add --fork="$ROOT" "$line" || { echo "[test] FAILED: zengy add $line"; exit 1; }
     done < plugins.txt
 fi
 
-echo "[test] zigeng install (from game.toml)"
-"$BIN/zigeng" install --fork="$ROOT" || { echo "[test] FAILED: zigeng install"; exit 1; }
+echo "[test] zengy install (from game.toml)"
+"$BIN/zengy" install --fork="$ROOT" || { echo "[test] FAILED: zengy install"; exit 1; }
 
-echo "[test] zigeng-runtime --headless --ticks $TICKS"
+echo "[test] zengy-runtime --headless --ticks $TICKS"
 # The runtime reports its JSON on stderr (std.debug.print), so capture both streams.
-OUT=$("$BIN/zigeng-runtime" --headless --ticks "$TICKS" 2>&1) || { echo "[test] FAILED: runtime exited non-zero"; echo "$OUT"; exit 1; }
+OUT=$("$BIN/zengy-runtime" --headless --ticks "$TICKS" 2>&1) || { echo "[test] FAILED: runtime exited non-zero"; echo "$OUT"; exit 1; }
 echo "$OUT"
 
 # Field order in the runtime JSON is not guaranteed, so check each field on its own.

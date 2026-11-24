@@ -159,11 +159,13 @@ pub const App = struct {
 
     /// Resolves and builds all modules, starts them, compiles schedules, and runs `.startup`.
     pub fn initialize(self: *App) !void {
+        if (self.state == .stopped or self.state == .stopping) return error.InvalidAppState;
         if (self.state == .initialized or self.state == .running) return;
 
         try self.modules.buildAll(self);
         self.state = .configured;
 
+        errdefer self.state = .stopped;
         try self.modules.startAll(self);
         errdefer self.modules.stopAll(self);
 
@@ -209,7 +211,7 @@ pub const App = struct {
         self.diagnostics.frame_count += 1;
     }
 
-    /// Initializes the app and runs the main loop until `quit()` or `config.max_frames` is reached.
+    /// Initializes the app and runs the deterministic headless loop until `quit()` or `config.max_frames` is reached.
     pub fn run(self: *App) !void {
         try self.initialize();
         self.state = .running;
@@ -220,6 +222,28 @@ pub const App = struct {
                 if (frame >= limit) break;
             }
             try self.tick(self.config.fixed_dt);
+            frame += 1;
+        }
+
+        self.shutdown();
+    }
+
+    /// Initializes the app and runs a monotonic real-time loop using `io` clock until `quit()` or `config.max_frames`.
+    pub fn runRealtime(self: *App, io: std.Io) !void {
+        try self.initialize();
+        self.state = .running;
+
+        var last = std.Io.Clock.now(.awake, io);
+        var frame: u64 = 0;
+        while (!self.should_quit) {
+            if (self.config.max_frames) |limit| {
+                if (frame >= limit) break;
+            }
+            const now = std.Io.Clock.now(.awake, io);
+            const raw_dt = @as(f64, @floatFromInt(last.durationTo(now).nanoseconds)) / 1_000_000_000.0;
+            last = now;
+            const dt = @min(@max(raw_dt, 0.0), 0.25);
+            try self.tick(dt);
             frame += 1;
         }
 

@@ -135,7 +135,7 @@ pub fn main() !void {
     try app.registerModule(render_2d.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
-        .title = "ZigEng — Visual 2D Hello (D3)",
+        .title = "Zengy — Visual 2D Hello (D3)",
         .width = 1280,
         .height = 720,
         .resizable = true,

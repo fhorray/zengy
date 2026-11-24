@@ -17,7 +17,7 @@ test "JsonService std.json and yyjson produce identical structural stats" {
     try testing.expect(app.services.hasService("engine.format.json", 1));
 
     const sample =
-        \\{"name":"zigeng","version":1,"items":[10,20,30]}
+        \\{"name":"zengy","version":1,"items":[10,20,30]}
     ;
 
     const s1 = try json_format.JsonService.inspectStdJson(testing.allocator, sample);

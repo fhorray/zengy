@@ -74,6 +74,13 @@ const DrawBatch = struct {
     scissor: ?ScissorRect,
 };
 
+const OffscreenTarget = struct {
+    handle: graphics.RenderTargetHandle,
+    texture: *c.SDL_GPUTexture,
+    width: u32,
+    height: u32,
+};
+
 const SdlGpuState = struct {
     allocator: std.mem.Allocator,
     app: *engine.App,
@@ -118,6 +125,7 @@ const SdlGpuState = struct {
     queued_quads: std.ArrayList(TexturedQuad),
     tex_vertices: std.ArrayList(Vertex2DTextured),
     tex_batches: std.ArrayList(DrawBatch),
+    offscreen_targets: std.ArrayList(OffscreenTarget),
     graphics_svc: graphics.GraphicsDeviceService,
 };
 
@@ -470,7 +478,69 @@ fn uploadTextureRgba8Internal(
     return tex;
 }
 
-fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []const graphics.DrawCommand) !void {
+fn createOffscreenColorTexture(device: *c.SDL_GPUDevice, diag: *engine.Diagnostics, format: c.SDL_GPUTextureFormat, width: u32, height: u32) !*c.SDL_GPUTexture {
+    const w = if (width == 0) @as(u32, 1) else width;
+    const h = if (height == 0) @as(u32, 1) else height;
+    return c.SDL_CreateGPUTexture(device, &std.mem.zeroInit(c.SDL_GPUTextureCreateInfo, .{
+        .type = c.SDL_GPU_TEXTURETYPE_2D,
+        .format = format,
+        .usage = c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        .width = w,
+        .height = h,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+    })) orelse sdlFail(diag, "SDL_CreateGPUTexture (offscreen) failed");
+}
+
+fn onCreateSurface(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, window_handle: u64, width: u32, height: u32) !void {
+    if (window_handle != 0) return;
+    const state: *SdlGpuState = @ptrCast(@alignCast(raw_ctx));
+    const tex = try createOffscreenColorTexture(state.device, state.diagnostics, state.swapchain_format, width, height);
+    errdefer c.SDL_ReleaseGPUTexture(state.device, tex);
+    try state.offscreen_targets.append(state.allocator, .{
+        .handle = handle,
+        .texture = tex,
+        .width = width,
+        .height = height,
+    });
+}
+
+fn onResizeSurface(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, width: u32, height: u32) void {
+    const state: *SdlGpuState = @ptrCast(@alignCast(raw_ctx));
+    for (state.offscreen_targets.items) |*ot| {
+        if (std.meta.eql(ot.handle, handle)) {
+            if (ot.width == width and ot.height == height) return;
+            const new_tex = createOffscreenColorTexture(state.device, state.diagnostics, state.swapchain_format, width, height) catch return;
+            _ = c.SDL_WaitForGPUIdle(state.device);
+            c.SDL_ReleaseGPUTexture(state.device, ot.texture);
+            ot.texture = new_tex;
+            ot.width = width;
+            ot.height = height;
+            return;
+        }
+    }
+}
+
+fn onDestroySurface(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle) void {
+    const state: *SdlGpuState = @ptrCast(@alignCast(raw_ctx));
+    for (state.offscreen_targets.items, 0..) |ot, i| {
+        if (std.meta.eql(ot.handle, handle)) {
+            _ = c.SDL_WaitForGPUIdle(state.device);
+            c.SDL_ReleaseGPUTexture(state.device, ot.texture);
+            _ = state.offscreen_targets.swapRemove(i);
+            return;
+        }
+    }
+}
+
+fn findOffscreenTarget(state: *const SdlGpuState, handle: graphics.RenderTargetHandle) ?OffscreenTarget {
+    for (state.offscreen_targets.items) |ot| {
+        if (std.meta.eql(ot.handle, handle)) return ot;
+    }
+    return null;
+}
+
+fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands: []const graphics.DrawCommand) !void {
     const state: *SdlGpuState = @ptrCast(@alignCast(raw_ctx));
     defer {
         state.ndc_vertices.clearRetainingCapacity();
@@ -593,10 +663,13 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
         state.graphics_svc.setDeviceAvailable(false);
         return sdlFail(state.diagnostics, "SDL_AcquireGPUCommandBuffer failed");
     };
+    var cmd_submitted = false;
+    errdefer if (!cmd_submitted) {
+        _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
+    };
 
     if (pos_count > 0 or tex_count > 0) {
         const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buf) orelse {
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
             return sdlFail(state.diagnostics, "SDL_BeginGPUCopyPass failed");
         };
         if (pos_count > 0) {
@@ -609,7 +682,6 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
                 std.mem.sliceAsBytes(state.ndc_vertices.items),
             ) catch |err| {
                 c.SDL_EndGPUCopyPass(copy_pass);
-                _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
                 return err;
             };
         }
@@ -623,24 +695,29 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
                 std.mem.sliceAsBytes(state.tex_vertices.items),
             ) catch |err| {
                 c.SDL_EndGPUCopyPass(copy_pass);
-                _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
                 return err;
             };
         }
         c.SDL_EndGPUCopyPass(copy_pass);
     }
 
-    var swapchain_tex: ?*c.SDL_GPUTexture = null;
+    var target_tex: ?*c.SDL_GPUTexture = null;
     var tex_w: u32 = 0;
     var tex_h: u32 = 0;
-    if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(cmd_buf, state.sdl_window, &swapchain_tex, &tex_w, &tex_h)) {
-        _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
-        state.graphics_svc.setDeviceAvailable(false);
-        return sdlFail(state.diagnostics, "SDL_WaitAndAcquireGPUSwapchainTexture failed");
+    if (findOffscreenTarget(state, handle)) |ot| {
+        target_tex = ot.texture;
+        tex_w = ot.width;
+        tex_h = ot.height;
+    } else {
+        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(cmd_buf, state.sdl_window, &target_tex, &tex_w, &tex_h)) {
+            state.graphics_svc.setDeviceAvailable(false);
+            return sdlFail(state.diagnostics, "SDL_WaitAndAcquireGPUSwapchainTexture failed");
+        }
     }
 
     // Minimized or occluded window: submit empty command buffer and return cleanly.
-    if (swapchain_tex == null or tex_w == 0 or tex_h == 0) {
+    if (target_tex == null or tex_w == 0 or tex_h == 0) {
+        cmd_submitted = true;
         _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
         return;
     }
@@ -650,7 +727,7 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
     if (has_3d) {
         const depth_tex = try ensureDepthTexture(state, tex_w, tex_h);
         const color_3d = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
-            .texture = swapchain_tex.?,
+            .texture = target_tex.?,
             .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
             .load_op = c.SDL_GPU_LOADOP_CLEAR,
             .store_op = c.SDL_GPU_STOREOP_STORE,
@@ -664,7 +741,6 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
             .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
         });
         const pass_3d = c.SDL_BeginGPURenderPass(cmd_buf, &color_3d, 1, &depth_target) orelse {
-            _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
             return sdlFail(state.diagnostics, "SDL_BeginGPURenderPass (3D) failed");
         };
         c.SDL_SetGPUViewport(pass_3d, &.{
@@ -691,14 +767,13 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
 
     const color_load_op: c.SDL_GPULoadOp = if (has_3d) c.SDL_GPU_LOADOP_LOAD else c.SDL_GPU_LOADOP_CLEAR;
     const color_target = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
-        .texture = swapchain_tex.?,
+        .texture = target_tex.?,
         .clear_color = .{ .r = clear_color.r, .g = clear_color.g, .b = clear_color.b, .a = clear_color.a },
         .load_op = color_load_op,
         .store_op = c.SDL_GPU_STOREOP_STORE,
     });
 
     const render_pass = c.SDL_BeginGPURenderPass(cmd_buf, &color_target, 1, null) orelse {
-        _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
         return sdlFail(state.diagnostics, "SDL_BeginGPURenderPass failed");
     };
 
@@ -755,6 +830,7 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
 
     c.SDL_EndGPURenderPass(render_pass);
 
+    cmd_submitted = true;
     if (!c.SDL_SubmitGPUCommandBuffer(cmd_buf)) {
         state.graphics_svc.setDeviceAvailable(false);
         return sdlFail(state.diagnostics, "SDL_SubmitGPUCommandBuffer failed");
@@ -762,6 +838,9 @@ fn onPresent(raw_ctx: *anyopaque, _: graphics.RenderTargetHandle, commands: []co
 }
 
 const BACKEND_VTABLE = graphics.BackendVTable{
+    .on_create_surface = onCreateSurface,
+    .on_resize_surface = onResizeSurface,
+    .on_destroy_surface = onDestroySurface,
     .on_present = onPresent,
 };
 
@@ -994,6 +1073,7 @@ fn buildModule(raw_app: *anyopaque) !void {
         .queued_quads = .empty,
         .tex_vertices = .empty,
         .tex_batches = .empty,
+        .offscreen_targets = .empty,
         .graphics_svc = undefined,
     });
 
@@ -1064,6 +1144,11 @@ fn stopModule(raw_app: *anyopaque) void {
 
         c.SDL_ReleaseWindowFromGPUDevice(state.device, state.sdl_window);
         c.SDL_DestroyGPUDevice(state.device);
+
+        for (state.offscreen_targets.items) |ot| {
+            c.SDL_ReleaseGPUTexture(state.device, ot.texture);
+        }
+        state.offscreen_targets.deinit(state.allocator);
 
         state.queued_meshes.deinit(state.allocator);
         state.ndc_vertices.deinit(state.allocator);

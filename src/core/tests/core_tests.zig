@@ -462,3 +462,124 @@ test "event_subscribe_during_drain: subscribing during callback is safe and runs
     _ = bus.drain();
     try testing.expectEqual(@as(usize, 1), st.second_calls);
 }
+
+test "Audit 3.1: Scheduler.stepFrame sets fixed_dt in fixed_update and restores frame_dt in update" {
+    const DtSpy = struct {
+        var fixed_dts: [4]f32 = undefined;
+        var fixed_count: usize = 0;
+        var update_dt: f32 = 0;
+
+        fn onFixed(ctx: *engine.SystemContext) !void {
+            fixed_dts[fixed_count] = ctx.deltaSeconds();
+            fixed_count += 1;
+        }
+        fn onUpdate(ctx: *engine.SystemContext) !void {
+            update_dt = ctx.deltaSeconds();
+        }
+    };
+    DtSpy.fixed_count = 0;
+    DtSpy.update_dt = 0;
+
+    var app = engine.App.init(testing.allocator, .{ .fixed_dt = 1.0 / 60.0 });
+    defer app.deinit();
+    try app.addSystem(.{ .name = "spy_fixed", .stage = .fixed_update, .run = DtSpy.onFixed });
+    try app.addSystem(.{ .name = "spy_update", .stage = .update, .run = DtSpy.onUpdate });
+
+    // 50ms frame should run 3 fixed ticks (~16.67ms each) and 1 update (~50ms).
+    try app.tick(0.050);
+    try testing.expectEqual(@as(usize, 3), DtSpy.fixed_count);
+    for (0..3) |i| {
+        try testing.expectApproxEqAbs(@as(f32, 1.0 / 60.0), DtSpy.fixed_dts[i], 0.0001);
+    }
+    try testing.expectApproxEqAbs(@as(f32, 0.050), DtSpy.update_dt, 0.0001);
+}
+
+test "Audit 3.2-3.6: World registration guard, layout validation, deferred spawn & align(64)" {
+    const Aligned64 = struct { value: u64 align(64) };
+
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    var events = engine.EventBus.init(testing.allocator, 8, .drop_newest);
+    defer events.deinit();
+    var cmds = engine.CommandBuffer.init(testing.allocator);
+    defer cmds.deinit();
+
+    // Deferred spawn + set with align(64) before component registration
+    const pending_e = try cmds.spawn();
+    try testing.expect(!world.isAlive(pending_e));
+    try cmds.set(pending_e, Aligned64, .{ .value = 99 });
+    try cmds.apply(&world, &events);
+    try testing.expectEqual(@as(usize, 1), world.entity_count);
+
+    // Querying keeps active_queries > 0 and blocks registering new components + CommandBuffer.apply
+    var q = try world.query(.{ .read = .{Aligned64} });
+    defer q.deinit();
+    const row = q.next().?;
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(row.read(Aligned64)) % 64);
+    try testing.expectEqual(@as(u64, 99), row.read(Aligned64).value);
+
+    try testing.expectError(error.MutationDuringActiveQuery, world.registerComponent(Position));
+    try cmds.set(row.entity, Position, .{ .x = 1, .y = 2 });
+    try testing.expectError(error.MutationDuringActiveQuery, cmds.apply(&world, &events));
+    cmds.clear();
+    q.deinit();
+
+    // Layout mismatch rejected on duplicate component name with different size/align
+    _ = try world.registerComponentDesc(.{ .name = "custom.Item", .size = 8, .alignment = 8, .schema_version = 1 });
+    try testing.expectError(error.ComponentLayoutMismatch, world.registerComponentDesc(.{ .name = "custom.Item", .size = 16, .alignment = 8, .schema_version = 1 }));
+}
+
+test "Audit 3.7, 3.9, 3.11 & 7.1: Scheduler errors, App terminal stopped, AmbiguousProvider, ResourceRegistry deinit" {
+    const Dummy = struct {
+        fn run(_: *engine.SystemContext) !void {}
+    };
+
+    var sched = engine.scheduler.Scheduler.init(testing.allocator);
+    defer sched.deinit();
+    try sched.addSystem(.{ .name = "A", .stage = .update, .run = Dummy.run });
+    try testing.expectError(error.DuplicateSystem, sched.addSystem(.{ .name = "A", .stage = .update, .run = Dummy.run }));
+
+    try sched.addSystem(.{ .name = "B", .stage = .update, .run = Dummy.run, .after = &.{"missing"} });
+    try testing.expectError(error.UnknownSystemDependency, sched.buildStageSchedule(.update));
+
+    var sched_cross = engine.scheduler.Scheduler.init(testing.allocator);
+    defer sched_cross.deinit();
+    try sched_cross.addSystem(.{ .name = "FixedSys", .stage = .fixed_update, .run = Dummy.run });
+    try sched_cross.addSystem(.{ .name = "UpdateSys", .stage = .update, .run = Dummy.run, .after = &.{"FixedSys"} });
+    try testing.expectError(error.InvalidCrossStageDependency, sched_cross.buildStageSchedule(.update));
+
+    var sched_self = engine.scheduler.Scheduler.init(testing.allocator);
+    defer sched_self.deinit();
+    try sched_self.addSystem(.{ .name = "SelfSys", .stage = .update, .run = Dummy.run, .before = &.{"SelfSys"} });
+    try testing.expectError(error.InvalidSelfDependency, sched_self.buildStageSchedule(.update));
+
+    // App stopped state is terminal
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+    try app.run();
+    try testing.expectError(error.InvalidAppState, app.initialize());
+
+    // ModuleRegistry rejects ambiguous providers
+    const ModStub = struct {
+        fn build(_: *anyopaque) !void {}
+    };
+    var mreg = engine.ModuleRegistry.init(testing.allocator);
+    defer mreg.deinit();
+    try mreg.register(.{ .descriptor = .{ .id = "p1", .version = "1", .provides_capabilities = &.{"cap.dup"} }, .build = ModStub.build });
+    try mreg.register(.{ .descriptor = .{ .id = "p2", .version = "1", .provides_capabilities = &.{"cap.dup"} }, .build = ModStub.build });
+    try mreg.register(.{ .descriptor = .{ .id = "c", .version = "1", .required_capabilities = &.{"cap.dup"} }, .build = ModStub.build });
+    try testing.expectError(error.AmbiguousProvider, mreg.resolve());
+
+    // ResourceRegistry calls deinit() on overwrite and remove
+    const TrackedRes = struct {
+        buf: []u8,
+        pub fn deinit(self: *@This()) void {
+            testing.allocator.free(self.buf);
+        }
+    };
+    var rreg = engine.ResourceRegistry.init(testing.allocator);
+    defer rreg.deinit();
+    try rreg.insert(TrackedRes, .{ .buf = try testing.allocator.alloc(u8, 16) });
+    try rreg.insert(TrackedRes, .{ .buf = try testing.allocator.alloc(u8, 32) });
+    try testing.expect(rreg.remove(TrackedRes));
+}

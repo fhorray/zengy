@@ -70,7 +70,7 @@ pub fn main() !void {
     try app.registerModule(graphics_sdlgpu.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
-        .title = "ZigEng — Visual GPU Hello (D2)",
+        .title = "Zengy — Visual GPU Hello (D2)",
         .width = 1280,
         .height = 720,
         .resizable = true,

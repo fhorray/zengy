@@ -1,7 +1,7 @@
 //! C ABI Dynamic Plugin Entrypoint (`ae_plugin_entry`) for `official.physics.rapier`.
 //!
-//! Allows `zigeng-runtime` (or any host implementing `include/engine_extension.h`)
-//! to load `zigeng_physics_rapier.{dll,so,dylib}` dynamically and attach `RapierBackend`
+//! Allows `zengy-runtime` (or any host implementing `include/engine_extension.h`)
+//! to load `zengy_physics_rapier.{dll,so,dylib}` dynamically and attach `RapierBackend`
 //! to the host's `engine.physics.backend/1` C-ABI slot.
 
 const std = @import("std");

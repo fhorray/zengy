@@ -6,7 +6,7 @@
 
 ## Layout
 
-Related packages are grouped by category; the public package name used by `zigeng add` is unchanged (for example `zigeng add physics-jolt` installs `packages/physics/jolt/`).
+Related packages are grouped by category; the public package name used by `zengy add` is unchanged (for example `zengy add physics-jolt` installs `packages/physics/jolt/`).
 
 | Category | Directories |
 |---|---|

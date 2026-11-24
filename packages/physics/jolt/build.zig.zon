@@ -4,7 +4,7 @@
     .fingerprint = 0xbdc5a1cdc44bb5f5,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
-        .zigeng = .{
+        .zengy = .{
             .url = "git+https://github.com/fhorray/zigeng#c423b88180457f84924b175aa102b5e3c453c96b",
             .hash = "zigeng-0.1.3-exW4tncSWQBmAJqfxiaiYR4uaTXmiUDkDgk5j1jhY1tq",
         },

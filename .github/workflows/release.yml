@@ -49,14 +49,14 @@ jobs:
       - name: Stage Windows release archive
         run: |
           TAG="${{ needs.meta.outputs.tag }}"
-          STAGE="dist/zigeng-${TAG}-x86_64-windows"
+          STAGE="dist/zengy-${TAG}-x86_64-windows"
           mkdir -p "$STAGE/include"
-          cp zig-out/bin/zigeng.exe zig-out/bin/zigeng-runtime.exe "$STAGE/"
+          cp zig-out/bin/zengy.exe zig-out/bin/zengy-runtime.exe "$STAGE/"
           curl -sL "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20-win32-x64.zip" -o /tmp/sdl3.zip
           unzip -j -o /tmp/sdl3.zip "SDL3.dll" -d "$STAGE/"
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
-          (cd dist && zip -r "zigeng-${TAG}-x86_64-windows.zip" "zigeng-${TAG}-x86_64-windows")
+          (cd dist && zip -r "zengy-${TAG}-x86_64-windows.zip" "zengy-${TAG}-x86_64-windows")
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-bundle
@@ -80,12 +80,12 @@ jobs:
       - name: Stage Linux release archive
         run: |
           TAG="${{ needs.meta.outputs.tag }}"
-          STAGE="dist/zigeng-${TAG}-x86_64-linux"
+          STAGE="dist/zengy-${TAG}-x86_64-linux"
           mkdir -p "$STAGE/include"
-          cp zig-out/bin/zigeng "$STAGE/"
+          cp zig-out/bin/zengy "$STAGE/"
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
-          tar -czf "dist/zigeng-${TAG}-x86_64-linux.tar.gz" -C dist "zigeng-${TAG}-x86_64-linux"
+          tar -czf "dist/zengy-${TAG}-x86_64-linux.tar.gz" -C dist "zengy-${TAG}-x86_64-linux"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64-bundle
@@ -107,23 +107,23 @@ jobs:
       - name: Stage macOS release archive
         run: |
           TAG="${{ needs.meta.outputs.tag }}"
-          STAGE="dist/zigeng-${TAG}-arm64-macos"
+          STAGE="dist/zengy-${TAG}-arm64-macos"
           mkdir -p "$STAGE/include"
-          cp zig-out/bin/zigeng zig-out/bin/zigeng-runtime "$STAGE/"
+          cp zig-out/bin/zengy zig-out/bin/zengy-runtime "$STAGE/"
           SDL3_PREFIX="$(brew --prefix sdl3)"
           cp -L "$SDL3_PREFIX/lib/libSDL3.0.dylib" "$STAGE/libSDL3.0.dylib"
           chmod 755 "$STAGE/libSDL3.0.dylib"
           install_name_tool -id "@rpath/libSDL3.0.dylib" "$STAGE/libSDL3.0.dylib"
-          SDL3_DEP="$(otool -L "$STAGE/zigeng-runtime" | awk '/libSDL3/{print $1; exit}')"
+          SDL3_DEP="$(otool -L "$STAGE/zengy-runtime" | awk '/libSDL3/{print $1; exit}')"
           if [ -n "$SDL3_DEP" ]; then
-            install_name_tool -change "$SDL3_DEP" "@executable_path/libSDL3.0.dylib" "$STAGE/zigeng-runtime"
+            install_name_tool -change "$SDL3_DEP" "@executable_path/libSDL3.0.dylib" "$STAGE/zengy-runtime"
           fi
           codesign --force --sign - "$STAGE/libSDL3.0.dylib"
-          codesign --force --sign - "$STAGE/zigeng-runtime"
-          otool -L "$STAGE/zigeng-runtime"
+          codesign --force --sign - "$STAGE/zengy-runtime"
+          otool -L "$STAGE/zengy-runtime"
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
-          tar -czf "dist/zigeng-${TAG}-arm64-macos.tar.gz" -C dist "zigeng-${TAG}-arm64-macos"
+          tar -czf "dist/zengy-${TAG}-arm64-macos.tar.gz" -C dist "zengy-${TAG}-arm64-macos"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm64-bundle

@@ -66,7 +66,7 @@ fn render3DSystem(ctx: *engine.SystemContext) !void {
         .{ .text = .{
             .x = 20.0,
             .y = 20.0,
-            .content = "ZigEng Phase E: 3D Unlit + Depth + Frustum Culling (WASD move)",
+            .content = "Zengy Phase E: 3D Unlit + Depth + Frustum Culling (WASD move)",
             .color = .{ .r = 0.92, .g = 0.95, .b = 1.0, .a = 1.0 },
         } },
     });
@@ -95,7 +95,7 @@ pub fn main() !void {
     try app.registerModule(render_3d.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
-        .title = "ZigEng — Phase E Visual 3D",
+        .title = "Zengy — Phase E Visual 3D",
         .width = 1280,
         .height = 720,
         .resizable = true,

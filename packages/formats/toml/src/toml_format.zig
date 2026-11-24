@@ -111,7 +111,7 @@ pub const TomlService = struct {
             else => return error.InvalidGameSection,
         };
 
-        const title_s = if (tbl.get("title")) |v| (if (v == .string) v.string else "ZigEng Game") else "ZigEng Game";
+        const title_s = if (tbl.get("title")) |v| (if (v == .string) v.string else "Zengy Game") else "Zengy Game";
         const mode_s = if (tbl.get("mode")) |v| (if (v == .string) v.string else "2d") else "2d";
         const script_s = if (tbl.get("entry_script")) |v| (if (v == .string) v.string else "") else "";
         const ui_s = if (tbl.get("ui")) |v| (if (v == .string) v.string else "") else "";

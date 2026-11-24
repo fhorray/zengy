@@ -1,6 +1,6 @@
 # `official.physics` (`packages/physics/core`)
 
-Agnostic, ECS-first physics contract for `zigeng`.
+Agnostic, ECS-first physics contract for `zengy`.
 
 ## Design
 

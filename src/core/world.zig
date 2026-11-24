@@ -14,11 +14,13 @@
 const std = @import("std");
 const resources = @import("resources.zig");
 
+/// Generational identifier distinguishing separate `World` instances.
 pub const WorldId = packed struct(u64) {
     index: u32,
     generation: u32,
 };
 
+/// Generational 64-bit entity handle; `generation == 0` marks invalid/pending handles.
 pub const EntityHandle = packed struct(u64) {
     index: u32,
     generation: u32,
@@ -41,21 +43,40 @@ pub const EntityHandle = packed struct(u64) {
     }
 };
 
+/// Persistent 128-bit entity identifier preserved across scene snapshots.
 pub const EntityGuid = u128;
+/// Deterministic hash identifier for a component type.
 pub const ComponentTypeId = u64;
 
 const ABSENT_INDEX: u32 = std.math.maxInt(u32);
+
+/// Schema metadata used to register and validate component pools (name, size, alignment, version).
+pub const ComponentDescriptor = struct {
+    name: []const u8,
+    size: usize,
+    alignment: usize = 16,
+    schema_version: u32 = 1,
+};
 
 const ComponentPool = struct {
     type_id: ComponentTypeId,
     name: []const u8,
     elem_size: usize,
+    elem_align: usize,
+    schema_version: u32,
     stride: usize,
     sparse: std.ArrayList(u32),
     dense_entities: std.ArrayList(EntityHandle),
     dense_bytes: std.array_list.Aligned(u8, .@"64"),
 
-    fn init(allocator: std.mem.Allocator, type_id: ComponentTypeId, name: []const u8, elem_size: usize, elem_align: usize) !ComponentPool {
+    fn init(
+        allocator: std.mem.Allocator,
+        type_id: ComponentTypeId,
+        name: []const u8,
+        elem_size: usize,
+        elem_align: usize,
+        schema_version: u32,
+    ) !ComponentPool {
         const name_copy = try allocator.dupe(u8, name);
         const safe_align = if (elem_align == 0) 1 else elem_align;
         const stride = if (elem_size == 0) 0 else std.mem.alignForward(usize, elem_size, safe_align);
@@ -63,6 +84,8 @@ const ComponentPool = struct {
             .type_id = type_id,
             .name = name_copy,
             .elem_size = elem_size,
+            .elem_align = safe_align,
+            .schema_version = schema_version,
             .stride = stride,
             .sparse = .empty,
             .dense_entities = .empty,
@@ -165,6 +188,7 @@ const ComponentPool = struct {
     }
 };
 
+/// Generational ECS container owning entity lifecycles and sparse-set component pools.
 pub const World = struct {
     allocator: std.mem.Allocator,
     id: WorldId,
@@ -173,7 +197,7 @@ pub const World = struct {
     free_indices: std.ArrayList(u32),
     guids: std.ArrayList(EntityGuid),
     next_guid: u128,
-    pools: std.AutoHashMapUnmanaged(ComponentTypeId, ComponentPool),
+    pools: std.AutoHashMapUnmanaged(ComponentTypeId, *ComponentPool),
     name_to_type: std.StringHashMapUnmanaged(ComponentTypeId),
     active_queries: u32,
     entity_count: usize,
@@ -196,8 +220,9 @@ pub const World = struct {
 
     pub fn deinit(self: *World) void {
         var it = self.pools.valueIterator();
-        while (it.next()) |pool| {
-            pool.deinit(self.allocator);
+        while (it.next()) |pool_ptr| {
+            pool_ptr.*.deinit(self.allocator);
+            self.allocator.destroy(pool_ptr.*);
         }
         self.pools.deinit(self.allocator);
 
@@ -222,33 +247,49 @@ pub const World = struct {
     }
 
     pub fn registerComponent(self: *World, comptime T: type) !ComponentTypeId {
-        const tid = comptimeTypeId(T);
-        if (self.pools.contains(tid)) return tid;
+        return self.registerComponentDesc(.{
+            .name = @typeName(T),
+            .size = @sizeOf(T),
+            .alignment = @alignOf(T),
+            .schema_version = 1,
+        });
+    }
 
-        var pool = try ComponentPool.init(self.allocator, tid, @typeName(T), @sizeOf(T), @alignOf(T));
-        errdefer pool.deinit(self.allocator);
+    pub fn registerComponentDesc(self: *World, desc: ComponentDescriptor) !ComponentTypeId {
+        const tid = dynamicTypeId(desc.name);
+        const safe_align = if (desc.alignment == 0) 1 else desc.alignment;
+        if (self.pools.get(tid)) |existing| {
+            if (!std.mem.eql(u8, existing.name, desc.name)) {
+                return error.ComponentNameCollision;
+            }
+            if (existing.elem_size != desc.size or existing.elem_align != safe_align or existing.schema_version != desc.schema_version) {
+                return error.ComponentLayoutMismatch;
+            }
+            return tid;
+        }
+        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+
+        const pool_ptr = try self.allocator.create(ComponentPool);
+        errdefer self.allocator.destroy(pool_ptr);
+        pool_ptr.* = try ComponentPool.init(self.allocator, tid, desc.name, desc.size, safe_align, desc.schema_version);
+        errdefer pool_ptr.deinit(self.allocator);
+
         try self.pools.ensureUnusedCapacity(self.allocator, 1);
         try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
-        const key_copy = try self.allocator.dupe(u8, @typeName(T));
+        const key_copy = try self.allocator.dupe(u8, desc.name);
 
-        self.pools.putAssumeCapacity(tid, pool);
+        self.pools.putAssumeCapacity(tid, pool_ptr);
         self.name_to_type.putAssumeCapacity(key_copy, tid);
         return tid;
     }
 
     pub fn registerDynamicComponent(self: *World, name: []const u8, size: usize) !ComponentTypeId {
-        const tid = dynamicTypeId(name);
-        if (self.pools.contains(tid)) return tid;
-
-        var pool = try ComponentPool.init(self.allocator, tid, name, size, 16);
-        errdefer pool.deinit(self.allocator);
-        try self.pools.ensureUnusedCapacity(self.allocator, 1);
-        try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
-        const key_copy = try self.allocator.dupe(u8, name);
-
-        self.pools.putAssumeCapacity(tid, pool);
-        self.name_to_type.putAssumeCapacity(key_copy, tid);
-        return tid;
+        return self.registerComponentDesc(.{
+            .name = name,
+            .size = size,
+            .alignment = 16,
+            .schema_version = 1,
+        });
     }
 
     pub fn spawn(self: *World) !EntityHandle {
@@ -285,8 +326,8 @@ pub const World = struct {
         try self.free_indices.ensureUnusedCapacity(self.allocator, 1);
 
         var it = self.pools.valueIterator();
-        while (it.next()) |pool| {
-            _ = pool.remove(entity);
+        while (it.next()) |pool_ptr| {
+            _ = pool_ptr.*.remove(entity);
         }
 
         self.alive_flags.items[entity.index] = false;
@@ -316,7 +357,7 @@ pub const World = struct {
         if (!self.isAlive(entity)) return error.InvalidEntity;
 
         const tid = try self.registerComponent(T);
-        const pool = self.pools.getPtr(tid).?;
+        const pool = self.pools.get(tid).?;
         try pool.setBytes(self.allocator, entity, std.mem.asBytes(&value));
     }
 
@@ -324,40 +365,40 @@ pub const World = struct {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
         if (!self.isAlive(entity)) return error.InvalidEntity;
 
-        const pool = self.pools.getPtr(tid) orelse return error.ComponentNotRegistered;
+        const pool = self.pools.get(tid) orelse return error.ComponentNotRegistered;
         try pool.setBytes(self.allocator, entity, bytes);
     }
 
     pub fn get(self: *World, entity: EntityHandle, comptime T: type) ?*T {
         if (!self.isAlive(entity)) return null;
-        const pool = self.pools.getPtr(comptimeTypeId(T)) orelse return null;
+        const pool = self.pools.get(comptimeTypeId(T)) orelse return null;
         const bytes = pool.getBytes(entity) orelse return null;
         return @ptrCast(@alignCast(bytes.ptr));
     }
 
     pub fn getConst(self: *const World, entity: EntityHandle, comptime T: type) ?*const T {
         if (!self.isAlive(entity)) return null;
-        const pool = self.pools.getPtr(comptimeTypeId(T)) orelse return null;
+        const pool = self.pools.get(comptimeTypeId(T)) orelse return null;
         const bytes = pool.getBytesConst(entity) orelse return null;
         return @ptrCast(@alignCast(bytes.ptr));
     }
 
     pub fn getRaw(self: *World, entity: EntityHandle, tid: ComponentTypeId) ?[]u8 {
         if (!self.isAlive(entity)) return null;
-        const pool = self.pools.getPtr(tid) orelse return null;
+        const pool = self.pools.get(tid) orelse return null;
         return pool.getBytes(entity);
     }
 
     pub fn has(self: *const World, entity: EntityHandle, comptime T: type) bool {
         if (!self.isAlive(entity)) return false;
-        const pool = self.pools.getPtr(comptimeTypeId(T)) orelse return false;
+        const pool = self.pools.get(comptimeTypeId(T)) orelse return false;
         return pool.has(entity);
     }
 
     pub fn remove(self: *World, entity: EntityHandle, comptime T: type) !bool {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
         if (!self.isAlive(entity)) return false;
-        const pool = self.pools.getPtr(comptimeTypeId(T)) orelse return false;
+        const pool = self.pools.get(comptimeTypeId(T)) orelse return false;
         return pool.remove(entity);
     }
 
@@ -441,7 +482,7 @@ pub fn Query(comptime spec: anytype) type {
             var missing = false;
 
             inline for (write_types, 0..) |T, idx| {
-                const pool = world.pools.getPtr(World.comptimeTypeId(T));
+                const pool = world.pools.get(World.comptimeTypeId(T));
                 w_pools[idx] = pool;
                 if (pool == null) {
                     missing = true;
@@ -450,7 +491,7 @@ pub fn Query(comptime spec: anytype) type {
                 }
             }
             inline for (read_types, 0..) |T, idx| {
-                const pool = world.pools.getPtr(World.comptimeTypeId(T));
+                const pool = world.pools.get(World.comptimeTypeId(T));
                 r_pools[idx] = pool;
                 if (pool == null) {
                     missing = true;

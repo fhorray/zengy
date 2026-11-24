@@ -167,10 +167,7 @@ fn buildModule(raw_app: *anyopaque) !void {
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
-    if (app.resources.get(Render2DFrame)) |frame| {
-        frame.deinit();
-        _ = app.resources.remove(Render2DFrame);
-    }
+    _ = app.resources.remove(Render2DFrame);
 }
 
 pub fn module() engine.Module {

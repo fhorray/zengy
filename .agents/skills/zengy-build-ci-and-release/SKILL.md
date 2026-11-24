@@ -1,12 +1,12 @@
 ---
-name: zigeng-build-ci-and-release
+name: zengy-build-ci-and-release
 description: >-
   Build targets, local verification commands, GitHub Actions CI workflows, and
-  release tagging procedures for zigeng. Use when running tests, updating
+  release tagging procedures for zengy. Use when running tests, updating
   .github/workflows/, or preparing a release.
 ---
 
-# `zigeng` Build, CI & Release Runbook
+# `zengy` Build, CI & Release Runbook
 
 ## Toolchain
 
@@ -42,9 +42,9 @@ zig build cli -Doptimize=ReleaseSafe
 2. **Release (`.github/workflows/release.yml`)**:
    - Triggers on `v*` tags (e.g., `git tag v0.1.7 && git push origin v0.1.7`) or `workflow_dispatch`.
    - Produces:
-     - `zigeng-<tag>-x86_64-windows.zip` (`zigeng.exe`, `zigeng-runtime.exe`, `SDL3.dll`, `include/engine_extension.h`)
-     - `zigeng-<tag>-x86_64-linux.tar.gz` (`zigeng` CLI, `include/engine_extension.h`)
-     - `zigeng-<tag>-arm64-macos.tar.gz` (`zigeng`, `zigeng-runtime`, `libSDL3.0.dylib` rewired with `@executable_path` + ad-hoc `codesign`, `include/engine_extension.h`)
+     - `zengy-<tag>-x86_64-windows.zip` (`zengy.exe`, `zengy-runtime.exe`, `SDL3.dll`, `include/engine_extension.h`)
+     - `zengy-<tag>-x86_64-linux.tar.gz` (`zengy` CLI, `include/engine_extension.h`)
+     - `zengy-<tag>-arm64-macos.tar.gz` (`zengy`, `zengy-runtime`, `libSDL3.0.dylib` rewired with `@executable_path` + ad-hoc `codesign`, `include/engine_extension.h`)
 
 ## Before Tagging a Release
 

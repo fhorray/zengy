@@ -285,10 +285,7 @@ fn stopModule(raw_app: *anyopaque) void {
     if (app.resources.get(physics.PhysicsService)) |svc| {
         svc.setBackend(null, null);
     }
-    if (app.resources.get(JoltBackend)) |backend| {
-        backend.deinit();
-        _ = app.resources.remove(JoltBackend);
-    }
+    _ = app.resources.remove(JoltBackend);
 }
 
 pub fn module() engine.Module {

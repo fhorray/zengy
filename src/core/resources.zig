@@ -18,6 +18,12 @@ const ResourceEntry = struct {
     destroy_fn: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
+fn deinitResourceIfSupported(comptime T: type, typed: *T) void {
+    if (@hasDecl(T, "deinit") and @TypeOf(T.deinit) == fn (*T) void) {
+        typed.deinit();
+    }
+}
+
 /// Type-erased registry of singleton resources owned by an `App` or `World`.
 pub const ResourceRegistry = struct {
     allocator: std.mem.Allocator,
@@ -39,24 +45,28 @@ pub const ResourceRegistry = struct {
     }
 
     /// Inserts or overwrites a resource of type `T`.
+    /// If `T` defines `pub fn deinit(*T) void`, it is invoked on overwrite, `remove()`, and `deinit()`.
     pub fn insert(self: *ResourceRegistry, comptime T: type, value: T) !void {
         const key = typeId(T);
-        if (self.entries.get(key)) |existing| {
+        const Destroy = struct {
+            fn call(raw: *anyopaque, alloc: std.mem.Allocator) void {
+                const typed: *T = @ptrCast(@alignCast(raw));
+                deinitResourceIfSupported(T, typed);
+                alloc.destroy(typed);
+            }
+        };
+
+        if (self.entries.getPtr(key)) |existing| {
             const typed: *T = @ptrCast(@alignCast(existing.ptr));
+            deinitResourceIfSupported(T, typed);
             typed.* = value;
+            existing.destroy_fn = Destroy.call;
             return;
         }
 
         const ptr = try self.allocator.create(T);
         errdefer self.allocator.destroy(ptr);
         ptr.* = value;
-
-        const Destroy = struct {
-            fn call(raw: *anyopaque, alloc: std.mem.Allocator) void {
-                const typed: *T = @ptrCast(@alignCast(raw));
-                alloc.destroy(typed);
-            }
-        };
 
         try self.entries.put(self.allocator, key, .{
             .ptr = ptr,

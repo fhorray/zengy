@@ -159,10 +159,7 @@ fn buildModule(raw_app: *anyopaque) !void {
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
-    if (app.resources.get(EditorShellService)) |svc| {
-        svc.deinit();
-        _ = app.resources.remove(EditorShellService);
-    }
+    _ = app.resources.remove(EditorShellService);
 }
 
 pub fn module() engine.Module {

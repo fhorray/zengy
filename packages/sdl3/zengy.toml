@@ -1,4 +1,4 @@
-# Install flow executed by `zigeng add` inside the user's project (nothing binary lives in this repo).
+# Install flow executed by `zengy add` inside the user's project (nothing binary lives in this repo).
 name = "sdl3"
 
 [[dependency]]

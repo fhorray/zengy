@@ -21,12 +21,7 @@ fn buildModule(raw_app: *anyopaque) !void {
     const drv = app.resources.get(TestDriver).?;
 
     try app.resources.insert(CaptureService, try CaptureService.init(app.allocator, 128, 128));
-    errdefer {
-        if (app.resources.get(CaptureService)) |c| {
-            c.deinit();
-            _ = app.resources.remove(CaptureService);
-        }
-    }
+    errdefer _ = app.resources.remove(CaptureService);
     const cap = app.resources.get(CaptureService).?;
 
     try app.services.register(.{
@@ -53,10 +48,7 @@ fn buildModule(raw_app: *anyopaque) !void {
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
-    if (app.resources.get(CaptureService)) |cap| {
-        cap.deinit();
-        _ = app.resources.remove(CaptureService);
-    }
+    _ = app.resources.remove(CaptureService);
     _ = app.resources.remove(TestDriver);
 }
 

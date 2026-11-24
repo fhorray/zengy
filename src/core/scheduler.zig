@@ -18,6 +18,7 @@ const events_mod = @import("events.zig");
 const resources_mod = @import("resources.zig");
 const diagnostics_mod = @import("diagnostics.zig");
 
+/// Execution phase within a single frame or lifecycle transition.
 pub const Stage = enum(usize) {
     startup = 0,
     pre_update = 1,
@@ -30,6 +31,7 @@ pub const Stage = enum(usize) {
     pub const count = 7;
 };
 
+/// Execution thread affinity hint for future parallel stage scheduling.
 pub const ThreadAffinity = enum {
     main,
     render,
@@ -37,6 +39,8 @@ pub const ThreadAffinity = enum {
     any,
 };
 
+/// Per-invocation view passed to every system function, exposing world, commands, events,
+/// resources, diagnostics, and current/fixed delta time.
 pub const SystemContext = struct {
     world: *world_mod.World,
     commands: *commands_mod.CommandBuffer,
@@ -59,8 +63,10 @@ pub const SystemContext = struct {
     }
 };
 
+/// Signature implemented by all ECS system callbacks.
 pub const SystemFn = *const fn (ctx: *SystemContext) anyerror!void;
 
+/// Registration metadata controlling stage placement, ordering constraints, and access hints.
 pub const SystemDescriptor = struct {
     name: []const u8,
     stage: Stage = .update,
@@ -85,6 +91,18 @@ const StoredSystem = struct {
     thread_affinity: ThreadAffinity,
 };
 
+/// Errors returned when adding systems, resolving stage schedules, or stepping frames.
+pub const SchedulerError = error{
+    DuplicateSystem,
+    DependencyCycle,
+    UnknownSystemDependency,
+    InvalidSelfDependency,
+    InvalidCrossStageDependency,
+    InvalidDeltaTime,
+    OutOfMemory,
+};
+
+/// Deterministic stage-based system scheduler with fixed-timestep accumulator.
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
     stages: [Stage.count]std.ArrayList(StoredSystem),
@@ -149,6 +167,11 @@ pub const Scheduler = struct {
 
     pub fn addSystem(self: *Scheduler, desc: SystemDescriptor) !void {
         const s_idx = @intFromEnum(desc.stage);
+        for (self.stages[s_idx].items) |existing| {
+            if (std.mem.eql(u8, existing.name, desc.name)) {
+                return error.DuplicateSystem;
+            }
+        }
         const name_copy = try self.allocator.dupe(u8, desc.name);
         errdefer self.allocator.free(name_copy);
 
@@ -200,19 +223,49 @@ pub const Scheduler = struct {
 
         for (systems, 0..) |sys, i| {
             for (sys.before) |target_name| {
+                if (std.mem.eql(u8, target_name, sys.name)) return error.InvalidSelfDependency;
+                var found = false;
                 for (systems, 0..) |other, j| {
                     if (i != j and std.mem.eql(u8, other.name, target_name)) {
                         try adj[i].append(self.allocator, j);
                         indegree[j] += 1;
+                        found = true;
+                        break;
                     }
+                }
+                if (!found) {
+                    for (0..Stage.count) |other_stage| {
+                        if (other_stage == s_idx) continue;
+                        for (self.stages[other_stage].items) |other| {
+                            if (std.mem.eql(u8, other.name, target_name)) {
+                                return error.InvalidCrossStageDependency;
+                            }
+                        }
+                    }
+                    return error.UnknownSystemDependency;
                 }
             }
             for (sys.after) |dep_name| {
+                if (std.mem.eql(u8, dep_name, sys.name)) return error.InvalidSelfDependency;
+                var found = false;
                 for (systems, 0..) |other, j| {
                     if (i != j and std.mem.eql(u8, other.name, dep_name)) {
                         try adj[j].append(self.allocator, i);
                         indegree[i] += 1;
+                        found = true;
+                        break;
                     }
+                }
+                if (!found) {
+                    for (0..Stage.count) |other_stage| {
+                        if (other_stage == s_idx) continue;
+                        for (self.stages[other_stage].items) |other| {
+                            if (std.mem.eql(u8, other.name, dep_name)) {
+                                return error.InvalidCrossStageDependency;
+                            }
+                        }
+                    }
+                    return error.UnknownSystemDependency;
                 }
             }
         }
@@ -306,6 +359,7 @@ pub const Scheduler = struct {
 
         self.accumulator += frame_dt;
         var fixed_steps: u32 = 0;
+        ctx.dt = @floatCast(self.fixed_dt);
         while (self.accumulator >= self.fixed_dt and fixed_steps < self.max_fixed_steps) {
             try self.runStage(.fixed_update, ctx);
             self.accumulator -= self.fixed_dt;
@@ -316,6 +370,7 @@ pub const Scheduler = struct {
             self.accumulator = 0.0;
         }
 
+        ctx.dt = @floatCast(frame_dt);
         try self.runStage(.update, ctx);
         try self.runStage(.post_update, ctx);
         if (self.render_extract_enabled) {

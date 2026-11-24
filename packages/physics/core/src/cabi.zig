@@ -4,7 +4,7 @@
 //! crosses a shared-library boundary uses *only* the `extern` types below: Zig auto-layout structs,
 //! tagged unions and error unions are NOT stable between a host and a plugin built in different
 //! optimize modes (Debug keeps declaration order, release modes reorder fields), which used to
-//! segfault `zigeng-runtime` when it loaded a ReleaseSafe plugin.
+//! segfault `zengy-runtime` when it loaded a ReleaseSafe plugin.
 //!
 //! Handshake: the host registers the capability `engine.physics.backend` v1 whose API is a `Slot`.
 //! A plugin validates `abi_version` / `struct_size`, then stores its `Backend` vtable and context in
@@ -303,6 +303,57 @@ pub fn vtableFor(comptime B: type) *const Backend {
 // ---------------------------------------------------------------------------------------------
 // Host-side helpers used by `PhysicsService` when a plugin filled the slot.
 // ---------------------------------------------------------------------------------------------
+
+pub fn hostCreateBody(
+    slot: *const Slot,
+    entity: engine.EntityHandle,
+    pos: [3]f32,
+    body: physics.RigidBody,
+    collider: ?physics.Collider,
+) !u64 {
+    const vt = slot.vtable orelse return error.MissingPhysicsBackend;
+    const f = vt.create_body orelse return error.UnsupportedPhysicsOp;
+    const desc = bodyDescFrom(entity, pos, body, collider);
+    var out_id: u64 = 0;
+    if (f(slot.ctx.?, &desc, &out_id) != OK) return error.PhysicsBackendFailed;
+    return out_id;
+}
+
+pub fn hostSetTransform(slot: *const Slot, body_id: u64, pos: [3]f32, rot_euler: [3]f32) void {
+    const vt = slot.vtable orelse return;
+    const f = vt.set_transform orelse return;
+    const xf: Transform = .{ .pos = pos, .rot_euler = rot_euler };
+    f(slot.ctx.?, body_id, &xf);
+}
+
+pub fn hostGetTransform(slot: *const Slot, body_id: u64) ?physics.BodyTransform {
+    const vt = slot.vtable orelse return null;
+    const f = vt.get_transform orelse return null;
+    var out: Transform = undefined;
+    if (!f(slot.ctx.?, body_id, &out)) return null;
+    return .{ .pos = out.pos, .rot_euler = out.rot_euler };
+}
+
+pub fn hostSetVelocity(slot: *const Slot, body_id: u64, vel: physics.Velocity) void {
+    const vt = slot.vtable orelse return;
+    const f = vt.set_velocity orelse return;
+    const cv = velocityToC(vel);
+    f(slot.ctx.?, body_id, &cv);
+}
+
+pub fn hostGetVelocity(slot: *const Slot, body_id: u64) ?physics.Velocity {
+    const vt = slot.vtable orelse return null;
+    const f = vt.get_velocity orelse return null;
+    var out: Velocity = undefined;
+    if (!f(slot.ctx.?, body_id, &out)) return null;
+    return velocityFromC(out);
+}
+
+pub fn hostApplyForce(slot: *const Slot, body_id: u64, force: [3]f32) void {
+    const vt = slot.vtable orelse return;
+    const f = vt.apply_force orelse return;
+    f(slot.ctx.?, body_id, &force);
+}
 
 pub fn hostStep(slot: *const Slot, dt: f32, gravity: [3]f32) !void {
     const vt = slot.vtable orelse return;

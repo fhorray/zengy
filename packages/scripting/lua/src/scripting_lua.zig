@@ -15,7 +15,7 @@ const scripting_host = @import("scripting_host");
 const c = @import("lua_c");
 
 pub const MODULE_OWNER_ID: u64 = 2020;
-const BRIDGE_REG_KEY = "_zigeng_bridge";
+const BRIDGE_REG_KEY = "_zengy_bridge";
 
 const LuaRuntimeState = struct {
     allocator: std.mem.Allocator,
@@ -147,7 +147,7 @@ fn loadLuaScript(raw: *anyopaque, source_name: []const u8, source: []const u8) !
     st.next_mod_id += 1;
 
     var key_buf: [48]u8 = undefined;
-    const key = try std.fmt.bufPrintSentinel(&key_buf, "_zigeng_mod_{d}", .{id}, 0);
+    const key = try std.fmt.bufPrintSentinel(&key_buf, "_zengy_mod_{d}", .{id}, 0);
     c.lua_setfield(st.L, c.LUA_REGISTRYINDEX, key.ptr);
     return id;
 }
@@ -156,7 +156,7 @@ fn invokeLuaScript(raw: *anyopaque, script_id: u64, fn_name: []const u8, arg: []
     const st: *LuaRuntimeState = @ptrCast(@alignCast(raw));
 
     var key_buf: [48]u8 = undefined;
-    const key = std.fmt.bufPrintSentinel(&key_buf, "_zigeng_mod_{d}", .{script_id}, 0) catch {
+    const key = std.fmt.bufPrintSentinel(&key_buf, "_zengy_mod_{d}", .{script_id}, 0) catch {
         return .{ .ok = false, .error_message = "invalid script id" };
     };
     _ = c.lua_getfield(st.L, c.LUA_REGISTRYINDEX, key.ptr);
@@ -200,7 +200,7 @@ fn invokeLuaScript(raw: *anyopaque, script_id: u64, fn_name: []const u8, arg: []
 fn unloadLuaScript(raw: *anyopaque, script_id: u64) void {
     const st: *LuaRuntimeState = @ptrCast(@alignCast(raw));
     var key_buf: [48]u8 = undefined;
-    const key = std.fmt.bufPrintSentinel(&key_buf, "_zigeng_mod_{d}", .{script_id}, 0) catch return;
+    const key = std.fmt.bufPrintSentinel(&key_buf, "_zengy_mod_{d}", .{script_id}, 0) catch return;
     c.lua_pushnil(st.L);
     c.lua_setfield(st.L, c.LUA_REGISTRYINDEX, key.ptr);
 }

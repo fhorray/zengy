@@ -1,7 +1,7 @@
 .{
-    .name = .zigeng,
+    .name = .zengy,
     .version = "0.1.5",
-    .fingerprint = 0x4f1cee9bb6b8157b,
+    .fingerprint = 0x3894da901a447641,
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .z_toml = .{

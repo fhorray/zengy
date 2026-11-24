@@ -12,6 +12,7 @@
 const std = @import("std");
 const engine = @import("engine");
 
+/// Owner ID used when registering asset services and default importers.
 pub const MODULE_OWNER_ID: u64 = 2006;
 
 /// Opaque generational handle to a loaded asset artifact.
@@ -26,6 +27,7 @@ pub const AssetArtifact = struct {
     bytes: []u8,
 };
 
+/// Callback signature implemented by asset format importers.
 pub const ImportFn = *const fn (allocator: std.mem.Allocator, uri: []const u8, raw_source: []const u8) anyerror!AssetArtifact;
 
 /// Importer plugin contract registered by official or community asset packages.
@@ -52,6 +54,8 @@ pub const AssetService = struct {
     allocator: std.mem.Allocator,
     importers: std.ArrayList(ImporterDescriptor),
     assets: std.ArrayList(AssetSlot),
+    free_indices: std.ArrayList(u32),
+    retired_allocs: std.ArrayList([]u8),
     uri_to_index: std.StringHashMapUnmanaged(u32),
 
     pub fn init(allocator: std.mem.Allocator) AssetService {
@@ -59,19 +63,31 @@ pub const AssetService = struct {
             .allocator = allocator,
             .importers = .empty,
             .assets = .empty,
+            .free_indices = .empty,
+            .retired_allocs = .empty,
             .uri_to_index = .empty,
         };
     }
 
+    pub fn collectGarbage(self: *AssetService) void {
+        for (self.retired_allocs.items) |buf| {
+            self.allocator.free(buf);
+        }
+        self.retired_allocs.clearRetainingCapacity();
+    }
+
     pub fn deinit(self: *AssetService) void {
+        self.collectGarbage();
+        self.retired_allocs.deinit(self.allocator);
         for (self.assets.items) |slot| {
-            self.allocator.free(slot.uri);
+            if (slot.uri.len > 0) self.allocator.free(slot.uri);
             if (slot.alive) {
                 self.allocator.free(slot.kind);
                 self.allocator.free(slot.bytes);
             }
         }
         self.assets.deinit(self.allocator);
+        self.free_indices.deinit(self.allocator);
         for (self.importers.items) |imp| {
             self.allocator.free(imp.id);
             self.allocator.free(imp.extension);
@@ -147,9 +163,24 @@ pub const AssetService = struct {
         const uri_copy = try self.allocator.dupe(u8, uri);
         errdefer self.allocator.free(uri_copy);
 
-        const idx: u32 = @intCast(self.assets.items.len);
         const hash = std.hash.Wyhash.hash(0, raw_source);
+        if (self.free_indices.pop()) |reused_idx| {
+            const slot = &self.assets.items[reused_idx];
+            const gen = if (slot.generation == 0) @as(u32, 1) else slot.generation;
+            try self.uri_to_index.put(self.allocator, uri_copy, reused_idx);
+            slot.* = .{
+                .uri = uri_copy,
+                .kind = artifact.kind,
+                .bytes = artifact.bytes,
+                .content_hash = hash,
+                .version = 1,
+                .generation = gen,
+                .alive = true,
+            };
+            return .{ .index = reused_idx, .generation = gen };
+        }
 
+        const idx: u32 = @intCast(self.assets.items.len);
         try self.assets.append(self.allocator, .{
             .uri = uri_copy,
             .kind = artifact.kind,
@@ -166,31 +197,38 @@ pub const AssetService = struct {
     }
 
     /// Re-imports an existing asset in place, bumping its version while preserving its handle.
+    /// Retired payloads stay valid until `collectGarbage()` or `deinit()`.
     pub fn reload(self: *AssetService, handle: AssetHandle, new_source: []const u8) !void {
         const slot = self.getSlotMut(handle) orelse return error.InvalidAssetHandle;
         const importer = self.resolveImporter(slot.uri) orelse return error.ImporterNotFound;
         const artifact = try importer.import_fn(self.allocator, slot.uri, new_source);
+        errdefer {
+            self.allocator.free(artifact.kind);
+            self.allocator.free(artifact.bytes);
+        }
 
-        self.allocator.free(slot.kind);
-        self.allocator.free(slot.bytes);
+        try self.retired_allocs.append(self.allocator, @constCast(slot.kind));
+        try self.retired_allocs.append(self.allocator, slot.bytes);
         slot.kind = artifact.kind;
         slot.bytes = artifact.bytes;
         slot.content_hash = std.hash.Wyhash.hash(0, new_source);
         slot.version += 1;
     }
 
-    /// Releases an asset and bumps its generation so stale handles are rejected.
+    /// Releases an asset, bumps its generation so stale handles are rejected, and queues slot reuse.
     pub fn unload(self: *AssetService, handle: AssetHandle) bool {
         const slot = self.getSlotMut(handle) orelse return false;
         _ = self.uri_to_index.remove(slot.uri);
         self.allocator.free(slot.uri);
         slot.uri = &.{};
-        self.allocator.free(slot.kind);
+        self.retired_allocs.append(self.allocator, @constCast(slot.kind)) catch self.allocator.free(slot.kind);
         slot.kind = &.{};
-        self.allocator.free(slot.bytes);
+        self.retired_allocs.append(self.allocator, slot.bytes) catch self.allocator.free(slot.bytes);
         slot.bytes = &.{};
         slot.alive = false;
         slot.generation +%= 1;
+        if (slot.generation == 0) slot.generation = 1;
+        self.free_indices.append(self.allocator, handle.index) catch {};
         return true;
     }
 
@@ -235,10 +273,7 @@ fn buildModule(raw_app: *anyopaque) !void {
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
-    if (app.resources.get(AssetService)) |svc| {
-        svc.deinit();
-        _ = app.resources.remove(AssetService);
-    }
+    _ = app.resources.remove(AssetService);
 }
 
 pub fn module() engine.Module {

@@ -96,7 +96,7 @@ pub fn main() !void {
     try app.registerModule(ui_core.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
-        .title = "ZigEng — Visual UI Hello (D4)",
+        .title = "Zengy — Visual UI Hello (D4)",
         .width = 1280,
         .height = 720,
         .resizable = true,
@@ -119,7 +119,7 @@ pub fn main() !void {
     // Build UI using the official HTML-like markup frontend.
     try ui_markup.parseIntoTree(allocator,
         \\<panel id="root">
-        \\  <label id="title">ZigEng D4 — UI & Text (High-DPI)</label>
+        \\  <label id="title">Zengy D4 — UI & Text (High-DPI)</label>
         \\  <label id="status">Clicks: 0</label>
         \\  <button id="inc_btn" action="demo.increment">Click Me (+1)</button>
         \\  <text-input id="input_box">Type here...</text-input>

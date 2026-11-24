@@ -1,4 +1,4 @@
-// Build script for the Modular Zig Engine (`zigeng`).
+// Build script for the Modular Zig Engine (`zengy`).
 //
 // Targets:
 // - `engine`: Minimal headless core SDK module (`src/engine.zig`)
@@ -289,33 +289,33 @@ pub fn build(b: *std.Build) void {
     cli_mod.addImport("assets", assets_mod);
     cli_mod.addImport("testing_sdk", testing_sdk_mod);
     cli_mod.addImport("toml_format", toml_format_mod);
-    cli_mod.addAnonymousImport("py_zigeng_init_pyi", .{
-        .root_source_file = b.path("packages/scripting/python/typings/zigeng/__init__.pyi"),
+    cli_mod.addAnonymousImport("py_zengy_init_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zengy/__init__.pyi"),
     });
-    cli_mod.addAnonymousImport("py_zigeng_input_pyi", .{
-        .root_source_file = b.path("packages/scripting/python/typings/zigeng/input.pyi"),
+    cli_mod.addAnonymousImport("py_zengy_input_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zengy/input.pyi"),
     });
-    cli_mod.addAnonymousImport("py_zigeng_key_pyi", .{
-        .root_source_file = b.path("packages/scripting/python/typings/zigeng/Key.pyi"),
+    cli_mod.addAnonymousImport("py_zengy_key_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zengy/Key.pyi"),
     });
-    cli_mod.addAnonymousImport("py_zigeng_init_pyi", .{
-        .root_source_file = b.path("packages/scripting/python/typings/zigeng/__init__.pyi"),
+    cli_mod.addAnonymousImport("py_zengy_init_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zengy/__init__.pyi"),
     });
-    cli_mod.addAnonymousImport("py_zigeng_input_pyi", .{
-        .root_source_file = b.path("packages/scripting/python/typings/zigeng/input.pyi"),
+    cli_mod.addAnonymousImport("py_zengy_input_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zengy/input.pyi"),
     });
-    cli_mod.addAnonymousImport("py_zigeng_key_pyi", .{
-        .root_source_file = b.path("packages/scripting/python/typings/zigeng/Key.pyi"),
+    cli_mod.addAnonymousImport("py_zengy_key_pyi", .{
+        .root_source_file = b.path("packages/scripting/python/typings/zengy/Key.pyi"),
     });
 
     const cli_exe = b.addExecutable(.{
-        .name = "zigeng",
+        .name = "zengy",
         .root_module = cli_mod,
     });
     b.installArtifact(cli_exe);
 
-    // CLI-only step: builds and installs `zigeng` without linking SDL3 (used by the Linux release).
-    const cli_step = b.step("cli", "Build and install only the zigeng CLI (no SDL3 needed)");
+    // CLI-only step: builds and installs `zengy` without linking SDL3 (used by the Linux release).
+    const cli_step = b.step("cli", "Build and install only the zengy CLI (no SDL3 needed)");
     cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
 
     const run_cli = b.addRunArtifact(cli_exe);
@@ -324,7 +324,7 @@ pub fn build(b: *std.Build) void {
     if (b.option([]const u8, "cli-arg", "Optional argument for CLI subcommand")) |arg| {
         run_cli.addArg(arg);
     }
-    const run_cli_step = b.step("run-cli", "Run the zigeng CLI (doctor, packages, list-official, new, run, add)");
+    const run_cli_step = b.step("run-cli", "Run the zengy CLI (doctor, packages, list-official, new, run, add)");
     run_cli_step.dependOn(&run_cli.step);
 
     // Integrated Playground example (`examples/playground`)
@@ -630,7 +630,7 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("physics", physics_mod);
 
     const runtime_exe = b.addExecutable(.{
-        .name = "zigeng-runtime",
+        .name = "zengy-runtime",
         .root_module = runtime_mod,
     });
     b.installArtifact(runtime_exe);
@@ -649,7 +649,7 @@ pub fn build(b: *std.Build) void {
     bench_mod.addImport("json_format", json_format_mod);
 
     const bench_exe = b.addExecutable(.{
-        .name = "zigeng-bench",
+        .name = "zengy-bench",
         .root_module = bench_mod,
     });
     b.installArtifact(bench_exe);

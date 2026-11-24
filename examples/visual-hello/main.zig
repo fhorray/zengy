@@ -24,7 +24,7 @@ pub fn main() !void {
 
     // Insert the window configuration before initialize(); the module reads it on build.
     try app.resources.insert(window_sdl3.WindowConfig, .{
-        .title = "ZigEng — Visual Hello (D1)",
+        .title = "Zengy — Visual Hello (D1)",
         .width = 1280,
         .height = 720,
         .resizable = true,

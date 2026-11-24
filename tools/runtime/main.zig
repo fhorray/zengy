@@ -1,4 +1,4 @@
-//! Manifesto-Driven Visual Game Runtime (`zigeng-runtime`).
+//! Manifesto-Driven Visual Game Runtime (`zengy-runtime`).
 //!
 //! Reads `game.toml` from the current working directory and runs the user's game
 //! without requiring any Zig boilerplate:
@@ -36,7 +36,7 @@ const RuntimeState = struct {
     gfx: *graphics.GraphicsDeviceService,
     tree: *ui_core.UiTree,
     has_ui: bool,
-    host: *scripting_host.ScriptingHost,
+    host: ?*scripting_host.ScriptingHost,
     script: ?scripting_host.ScriptModuleHandle,
     rt: graphics.RenderTargetHandle,
     cmds: std.ArrayList(graphics.DrawCommand),
@@ -49,7 +49,9 @@ fn readFileCwd(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8
 fn onUiAction(user_ctx: ?*anyopaque, ev: engine.EventEnvelope) void {
     const st: *RuntimeState = @ptrCast(@alignCast(user_ctx orelse return));
     if (st.script) |sc| {
-        _ = st.host.invokeScript(sc, "on_ui_action", ev.payload);
+        if (st.host) |h| {
+            _ = h.invokeScript(sc, "on_ui_action", ev.payload);
+        }
     }
 }
 
@@ -66,16 +68,18 @@ fn invokeOptionalHook(
         {
             return;
         }
-        std.debug.print("[zigeng-runtime] script error in '{s}': {s}\n", .{ fn_name, res.error_message });
+        std.debug.print("[zengy-runtime] script error in '{s}': {s}\n", .{ fn_name, res.error_message });
     }
 }
 
 fn runtimeFixedUpdateSystem(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(RuntimeState) orelse return;
     if (st.script) |sc| {
-        var dt_buf: [32]u8 = undefined;
-        const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.fixedDeltaSeconds()}) catch "0.01667";
-        invokeOptionalHook(st.host, sc, "fixed_update", dt_str);
+        if (st.host) |h| {
+            var dt_buf: [32]u8 = undefined;
+            const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.fixedDeltaSeconds()}) catch "0.01667";
+            invokeOptionalHook(h, sc, "fixed_update", dt_str);
+        }
     }
 }
 
@@ -112,16 +116,20 @@ fn runtimeUpdateSystem(ctx: *engine.SystemContext) !void {
     if (st.app.resources.get(scripting_host.ScriptDrawQueue)) |q| q.clear();
 
     if (st.script) |sc| {
-        var dt_buf: [32]u8 = undefined;
-        const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
-        invokeOptionalHook(st.host, sc, "update", dt_str);
+        if (st.host) |h| {
+            var dt_buf: [32]u8 = undefined;
+            const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
+            invokeOptionalHook(h, sc, "update", dt_str);
+        }
     }
 }
 
 fn runtimeDestroySystem(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(RuntimeState) orelse return;
     if (st.script) |sc| {
-        invokeOptionalHook(st.host, sc, "destroy", "");
+        if (st.host) |h| {
+            invokeOptionalHook(h, sc, "destroy", "");
+        }
     }
 }
 
@@ -204,8 +212,8 @@ fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App
         }
     }
 
-    // 2. Auto-load compiled plugins in .zigeng/plugins/
-    var dir = std.Io.Dir.cwd().openDir(io, ".zigeng/plugins", .{ .iterate = true }) catch |err| switch (err) {
+    // 2. Auto-load compiled plugins in .zengy/plugins/
+    var dir = std.Io.Dir.cwd().openDir(io, ".zengy/plugins", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return loaded_count,
         else => return err,
     };
@@ -216,7 +224,7 @@ fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App
         if (entry.kind != .file) continue;
         if (!isSharedLibName(entry.name)) continue;
 
-        const full_path = try std.fmt.allocPrint(allocator, ".zigeng/plugins/{s}", .{entry.name});
+        const full_path = try std.fmt.allocPrint(allocator, ".zengy/plugins/{s}", .{entry.name});
         defer allocator.free(full_path);
 
         const ph = try app.ensurePluginHost();
@@ -227,6 +235,20 @@ fn loadDynamicPlugins(allocator: std.mem.Allocator, io: std.Io, app: *engine.App
     }
 
     return loaded_count;
+}
+
+fn needsPhysicsModule(plugins: []const []const u8) bool {
+    for (plugins) |p| {
+        if (std.mem.eql(u8, p, "physics") or std.mem.indexOf(u8, p, "physics") != null) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn scriptLanguageForPath(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".lua")) return "lua";
+    return "python";
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -251,7 +273,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const manifest_bytes = readFileCwd(allocator, io, "game.toml") catch |err| {
-        std.debug.print("[zigeng-runtime] could not read 'game.toml' in current directory: {}\n", .{err});
+        std.debug.print("[zengy-runtime] could not read 'game.toml' in current directory: {}\n", .{err});
         return err;
     };
     defer allocator.free(manifest_bytes);
@@ -277,31 +299,26 @@ pub fn main(init: std.process.Init) !void {
         try app.registerModule(graphics_sdlgpu.module());
         try app.registerModule(ui_core.module());
     }
-    try app.registerModule(scripting_host.module());
-    try app.registerModule(scripting_lua.module());
-    try app.registerModule(scripting_python.module());
+    if (entry_script) |sp| {
+        try app.registerModule(scripting_host.module());
+        if (std.mem.eql(u8, scriptLanguageForPath(sp), "lua")) {
+            try app.registerModule(scripting_lua.module());
+        } else {
+            try app.registerModule(scripting_python.module());
+        }
+    }
 
     var has_scene = false;
-    var has_physics = false;
     for (manifest.plugins) |plugin_name| {
         if (std.mem.eql(u8, plugin_name, "scene")) {
             if (!has_scene) {
                 try app.registerModule(scene.module());
                 has_scene = true;
             }
-        } else if (std.mem.eql(u8, plugin_name, "physics")) {
-            if (!has_physics) {
-                try app.registerModule(physics.module());
-                has_physics = true;
-            }
-        } else {
-            // Dynamic plugins (e.g. physics backends, owner/repo, URLs, ./local-path, or shared libs)
-            // are loaded via PluginHost; ensure the physics contract is available if they attach to it.
-            if (!has_physics) {
-                try app.registerModule(physics.module());
-                has_physics = true;
-            }
         }
+    }
+    if (needsPhysicsModule(manifest.plugins)) {
+        try app.registerModule(physics.module());
     }
 
     if (headless) {
@@ -311,26 +328,22 @@ pub fn main(init: std.process.Init) !void {
         try app.initialize();
         const dynamic_loaded = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
 
-        const host = app.resources.get(scripting_host.ScriptingHost).?;
         var loaded_script: ?scripting_host.ScriptModuleHandle = null;
         if (entry_script) |sp| {
-            if (sp.len > 0) {
-                const src = try readFileCwd(allocator, io, sp);
-                defer allocator.free(src);
-                const rt_idx: u16 = if (std.mem.endsWith(u8, sp, ".lua")) 0 else 1;
-                loaded_script = try host.loadScript(rt_idx, sp, src);
-            }
-        }
-        try app.resources.insert(HeadlessScriptState, .{
-            .host = host,
-            .script = loaded_script,
-        });
-        if (loaded_script) |sc| {
-            invokeOptionalHook(host, sc, "start", "");
+            const host = app.resources.get(scripting_host.ScriptingHost).?;
+            const src = try readFileCwd(allocator, io, sp);
+            defer allocator.free(src);
+            const rt_idx = host.findRuntimeByLanguage(scriptLanguageForPath(sp)) orelse return error.MissingScriptingRuntime;
+            loaded_script = try host.loadScript(rt_idx, sp, src);
+            try app.resources.insert(HeadlessScriptState, .{
+                .host = host,
+                .script = loaded_script,
+            });
+            invokeOptionalHook(host, loaded_script.?, "start", "");
         }
 
         var t: u64 = 0;
-        while (t < headless_ticks) : (t += 1) {
+        while (t < headless_ticks and !app.should_quit) : (t += 1) {
             try app.tick(1.0 / 60.0);
         }
 
@@ -339,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
         app.shutdown();
         std.debug.print(
             "{{\"mode\":\"headless\",\"ticks\":{d},\"dynamic_plugins\":{d},\"physics_steps\":{d},\"physics_backend\":{},\"status\":\"ok\"}}\n",
-            .{ headless_ticks, dynamic_loaded, phys_steps, phys_backend },
+            .{ t, dynamic_loaded, phys_steps, phys_backend },
         );
         return;
     }
@@ -365,30 +378,23 @@ pub fn main(init: std.process.Init) !void {
     const gfx: *graphics.GraphicsDeviceService = @ptrCast(@alignCast(@constCast(g_entry.api_ptr)));
     const u_entry = try app.services.getService("engine.ui.tree", 1);
     const tree: *ui_core.UiTree = @ptrCast(@alignCast(@constCast(u_entry.api_ptr)));
-    const host = app.resources.get(scripting_host.ScriptingHost).?;
 
     var has_ui = false;
     if (ui_path) |up| {
-        if (up.len > 0) {
-            const ui_src = try readFileCwd(allocator, io, up);
-            defer allocator.free(ui_src);
-            try ui_markup.parseIntoTree(allocator, ui_src, tree);
-            has_ui = true;
-        }
+        const ui_src = try readFileCwd(allocator, io, up);
+        defer allocator.free(ui_src);
+        try ui_markup.parseIntoTree(allocator, ui_src, tree);
+        has_ui = true;
     }
 
+    const host_opt: ?*scripting_host.ScriptingHost = app.resources.get(scripting_host.ScriptingHost);
     var loaded_script: ?scripting_host.ScriptModuleHandle = null;
     if (entry_script) |sp| {
-        if (sp.len > 0) {
-            const src = try readFileCwd(allocator, io, sp);
-            defer allocator.free(src);
-            // Runtime 0 = Lua, Runtime 1 = Python (PocketPy)
-            const rt_idx: u16 = if (std.mem.endsWith(u8, sp, ".lua")) 0 else 1;
-            loaded_script = try host.loadScript(rt_idx, sp, src);
-        }
-    }
-    if (loaded_script) |sc| {
-        invokeOptionalHook(host, sc, "start", "");
+        const host = host_opt.?;
+        const src = try readFileCwd(allocator, io, sp);
+        defer allocator.free(src);
+        const rt_idx = host.findRuntimeByLanguage(scriptLanguageForPath(sp)) orelse return error.MissingScriptingRuntime;
+        loaded_script = try host.loadScript(rt_idx, sp, src);
     }
 
     const px = window_sdl3.pixelSize(&app);
@@ -401,13 +407,17 @@ pub fn main(init: std.process.Init) !void {
         .gfx = gfx,
         .tree = tree,
         .has_ui = has_ui,
-        .host = host,
+        .host = host_opt,
         .script = loaded_script,
         .rt = rt,
         .cmds = .empty,
     });
     const st_ptr = app.resources.get(RuntimeState).?;
     defer st_ptr.cmds.deinit(allocator);
+
+    if (loaded_script) |sc| {
+        invokeOptionalHook(host_opt.?, sc, "start", "");
+    }
 
     _ = try app.events.subscribe(9010, "ui.action", onUiAction, st_ptr);
 

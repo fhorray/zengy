@@ -1,5 +1,5 @@
 [package]
-name = "zigeng_rapier_ffi"
+name = "zengy_rapier_ffi"
 version = "0.1.0"
 edition = "2021"
 

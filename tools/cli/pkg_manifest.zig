@@ -1,6 +1,6 @@
-//! Package install manifest (`zigeng.toml`) parsing and `build.zig` hook generation.
+//! Package install manifest (`zengy.toml`) parsing and `build.zig` hook generation.
 //!
-//! Every package (official or community) may ship a `zigeng.toml` that declares how `zigeng add`
+//! Every package (official or community) may ship a `zengy.toml` that declares how `zengy add`
 //! must provision it in the *user's* project, so no binaries ever need to live in the package repo:
 //!
 //! ```toml
@@ -25,7 +25,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Anchor line the generated hooks are inserted after (must live inside `build()` after `target`).
-pub const ANCHOR = "// zigeng:install-hooks";
+pub const ANCHOR = "// zengy:install-hooks";
 
 pub const Dependency = struct {
     name: []const u8 = "",
@@ -220,11 +220,11 @@ fn basename(path: []const u8) []const u8 {
 }
 
 fn beginMarker(arena: std.mem.Allocator, pkg: []const u8) Error![]u8 {
-    return std.fmt.allocPrint(arena, "// zigeng:begin {s}", .{pkg});
+    return std.fmt.allocPrint(arena, "// zengy:begin {s}", .{pkg});
 }
 
 fn endMarker(arena: std.mem.Allocator, pkg: []const u8) Error![]u8 {
-    return std.fmt.allocPrint(arena, "// zigeng:end {s}", .{pkg});
+    return std.fmt.allocPrint(arena, "// zengy:end {s}", .{pkg});
 }
 
 /// Renders the marker-delimited hook block (no trailing newline). Requires `b` and `target`
@@ -247,8 +247,8 @@ pub fn renderBlock(arena: std.mem.Allocator, pkg: []const u8, m: Manifest) Error
         try out.appendSlice(arena, try std.fmt.allocPrint(
             arena,
             \\    if ({s}) {{
-            \\        if (b.lazyDependency("{s}", .{{}})) |zigeng_dep| {{
-            \\            b.getInstallStep().dependOn(&b.addInstallBinFile(zigeng_dep.path("{s}"), "{s}").step);
+            \\        if (b.lazyDependency("{s}", .{{}})) |zengy_dep| {{
+            \\            b.getInstallStep().dependOn(&b.addInstallBinFile(zengy_dep.path("{s}"), "{s}").step);
             \\        }}
             \\    }}
             \\
@@ -363,18 +363,18 @@ test "block render and idempotent apply" {
     );
     const block = try renderBlock(a, "sdl3", m);
     try std.testing.expect(std.mem.indexOf(u8, block, "target.result.os.tag == .windows") != null);
-    try std.testing.expect(std.mem.indexOf(u8, block, "zigeng_dep.path(\"bin/SDL3.dll\"), \"SDL3.dll\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "zengy_dep.path(\"bin/SDL3.dll\"), \"SDL3.dll\"") != null);
 
-    const src = "pub fn build(b: *std.Build) void {\n    const target = b.standardTargetOptions(.{});\n    // zigeng:install-hooks\n}\n";
+    const src = "pub fn build(b: *std.Build) void {\n    const target = b.standardTargetOptions(.{});\n    // zengy:install-hooks\n}\n";
     const once = try applyBlock(a, src, "sdl3", block);
-    try std.testing.expect(std.mem.indexOf(u8, once, "zigeng:begin sdl3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, once, "zengy:begin sdl3") != null);
     try std.testing.expect(std.mem.endsWith(u8, once, "\n}\n"));
     const twice = try applyBlock(a, once, "sdl3", block);
     try std.testing.expectEqualStrings(once, twice);
 
-    const changed = try applyBlock(a, once, "sdl3", "    // zigeng:begin sdl3\n    // zigeng:end sdl3");
+    const changed = try applyBlock(a, once, "sdl3", "    // zengy:begin sdl3\n    // zengy:end sdl3");
     try std.testing.expect(std.mem.indexOf(u8, changed, "lazyDependency") == null);
 
     try std.testing.expectError(error.NoAnchor, applyBlock(a, "pub fn build() void {}\n", "sdl3", block));
-    try std.testing.expectError(error.UnterminatedBlock, applyBlock(a, "// zigeng:begin sdl3\n", "sdl3", block));
+    try std.testing.expectError(error.UnterminatedBlock, applyBlock(a, "// zengy:begin sdl3\n", "sdl3", block));
 }

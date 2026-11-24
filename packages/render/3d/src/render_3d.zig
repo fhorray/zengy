@@ -12,6 +12,7 @@ const engine = @import("engine");
 pub const math3d = @import("math3d.zig");
 pub const gltf = @import("gltf.zig");
 
+/// Owner ID used when registering 3D rendering services and components.
 pub const MODULE_OWNER_ID: u64 = 2009;
 
 /// 3D spatial transform component.
@@ -39,6 +40,7 @@ pub const Camera3D = struct {
     far: f32 = 1000.0,
     aspect: f32 = 16.0 / 9.0,
     active: bool = true,
+    priority: i32 = 0,
 
     pub fn viewProjMatrix(self: Camera3D, aspect_override: ?f32) math3d.Mat4 {
         const eye = math3d.Vec3{ .x = self.position[0], .y = self.position[1], .z = self.position[2] };
@@ -51,11 +53,12 @@ pub const Camera3D = struct {
     }
 };
 
-/// Reference to a mesh asset handle, material ID, tint color, and bounding radius (> 0 enables frustum culling).
+/// Reference to a mesh asset handle, material ID, tint color, and local bounding sphere (> 0 enables frustum culling).
 pub const MeshRef = struct {
     mesh_asset: u64,
     material_id: u32 = 0,
     bounds_radius: f32 = 0.0,
+    bounds_offset: [3]f32 = .{ 0.0, 0.0, 0.0 },
     color: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
 };
 
@@ -112,6 +115,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
     svc.culled_count = 0;
 
     var active_cam: ?Camera3D = null;
+    var active_cam_entity_idx: u32 = std.math.maxInt(u32);
     {
         var cam_q = try ctx.query(.{ .read = .{Camera3D} });
         defer cam_q.deinit();
@@ -119,7 +123,13 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
             const c = row.read(Camera3D);
             if (c.active) {
                 svc.active_cameras += 1;
-                if (active_cam == null) active_cam = c.*;
+                if (active_cam == null or
+                    c.priority > active_cam.?.priority or
+                    (c.priority == active_cam.?.priority and row.entity.index < active_cam_entity_idx))
+                {
+                    active_cam = c.*;
+                    active_cam_entity_idx = row.entity.index;
+                }
             }
         }
     }
@@ -134,18 +144,24 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
     while (mesh_q.next()) |row| {
         const t = row.read(Transform3D);
         const m = row.read(MeshRef);
+        const model = t.toModelMatrix();
 
         if (m.bounds_radius > 0.0) {
             const max_scale = @max(@abs(t.scale[0]), @max(@abs(t.scale[1]), @abs(t.scale[2])));
             const world_radius = m.bounds_radius * max_scale;
-            const center = math3d.Vec3{ .x = t.position[0], .y = t.position[1], .z = t.position[2] };
+            const ox = m.bounds_offset[0];
+            const oy = m.bounds_offset[1];
+            const oz = m.bounds_offset[2];
+            const center = math3d.Vec3{
+                .x = model.m[0] * ox + model.m[4] * oy + model.m[8] * oz + model.m[12],
+                .y = model.m[1] * ox + model.m[5] * oy + model.m[9] * oz + model.m[13],
+                .z = model.m[2] * ox + model.m[6] * oy + model.m[10] * oz + model.m[14],
+            };
             if (!frustum.intersectsSphere(center, world_radius)) {
                 svc.culled_count += 1;
                 continue;
             }
         }
-
-        const model = t.toModelMatrix();
         const mvp = math3d.Mat4.mul(vp, model);
         try svc.extracted_draws.append(svc.allocator, .{
             .entity = row.entity,
@@ -187,10 +203,7 @@ fn buildModule(raw_app: *anyopaque) !void {
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
-    if (app.resources.get(Render3DService)) |svc| {
-        svc.deinit();
-        _ = app.resources.remove(Render3DService);
-    }
+    _ = app.resources.remove(Render3DService);
 }
 
 pub fn module() engine.Module {

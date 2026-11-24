@@ -368,10 +368,7 @@ fn buildModule(raw_app: *anyopaque) !void {
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
-    if (app.resources.get(UiTree)) |tree| {
-        tree.deinit();
-        _ = app.resources.remove(UiTree);
-    }
+    _ = app.resources.remove(UiTree);
 }
 
 pub fn module() engine.Module {

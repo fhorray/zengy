@@ -1,4 +1,4 @@
-# Releasing, CI/CD & Distribution (`zigeng`)
+# Releasing, CI/CD & Distribution (`zengy`)
 
 ## 1. Current `engine-cli` Scope
 
@@ -48,7 +48,7 @@ git push origin v0.1.0
 Or trigger manually from GitHub Actions (`Run workflow`) / `gh workflow run release.yml -f tag=v0.1.0`.
 
 The release workflow builds `ReleaseSafe` archives for:
-- `zigeng-<tag>-x86_64-windows.zip` (all visual `.exe`s, `playground.exe`, `engine-cli.exe`, `include/engine_extension.h`)
-- `zigeng-<tag>-x86_64-linux.tar.gz` (`headless-ecs`, `playground`, `engine-cli`, `c_plugin`, `include/engine_extension.h`)
+- `zengy-<tag>-x86_64-windows.zip` (all visual `.exe`s, `playground.exe`, `engine-cli.exe`, `include/engine_extension.h`)
+- `zengy-<tag>-x86_64-linux.tar.gz` (`headless-ecs`, `playground`, `engine-cli`, `c_plugin`, `include/engine_extension.h`)
 
 and publishes them to **GitHub Releases**, where end users can download and extract the archive directly.

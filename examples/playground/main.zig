@@ -75,7 +75,7 @@ pub fn main() !void {
     const g_entry = try app.services.getService("engine.graphics.device", 1);
     const gfx: *graphics.GraphicsDeviceService = @ptrCast(@alignCast(@constCast(g_entry.api_ptr)));
 
-    const wh = try win.createWindow(.{ .title = "ZigEng Playground", .width = 1280, .height = 720 });
+    const wh = try win.createWindow(.{ .title = "Zengy Playground", .width = 1280, .height = 720 });
     const rt = try gfx.createSurface(@bitCast(wh), 1280, 720);
 
     // 4. Populate UiTree using the HTML-like markup frontend and lay it out.
@@ -83,7 +83,7 @@ pub fn main() !void {
     try ui_markup.parseIntoTree(allocator,
         \\<ui-document>
         \\  <panel id="playground.hud">
-        \\    <label id="title">ZigEng Playground</label>
+        \\    <label id="title">Zengy Playground</label>
         \\    <button id="spawn_btn" action="playground.spawn">Spawn Entity</button>
         \\  </panel>
         \\</ui-document>
@@ -98,7 +98,7 @@ pub fn main() !void {
         .priority = 100,
         .import_fn = playgroundTextImporter,
     });
-    const config_asset = try asset_svc.loadFromBytes("project://welcome.txt", "Hello from ZigEng Playground!");
+    const config_asset = try asset_svc.loadFromBytes("project://welcome.txt", "Hello from Zengy Playground!");
 
     // 6. Spawn 2D hierarchy + 3D camera & mesh entities.
     const root_2d = try app.world.spawn();

@@ -1,9 +1,9 @@
 // Build script for the optional Rapier3D backend plugin (`official.physics.rapier`).
 //
 // Kept out of the root build like `physics-jolt`: `cargo` (Rust) is only needed when this package is
-// built (`cd packages/physics/rapier && zig build`, or `zigeng add`), never for the engine itself.
+// built (`cd packages/physics/rapier && zig build`, or `zengy add`), never for the engine itself.
 //
-// Outputs: `zigeng_physics_rapier` shared library (Rapier is linked in as a Rust staticlib).
+// Outputs: `zengy_physics_rapier` shared library (Rapier is linked in as a Rust staticlib).
 
 const std = @import("std");
 
@@ -11,18 +11,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zigeng = b.dependency("zigeng", .{ .target = target, .optimize = optimize });
-    const engine_mod = zigeng.module("engine");
-    const physics_mod = zigeng.module("physics");
+    const zengy = b.dependency("zengy", .{ .target = target, .optimize = optimize });
+    const engine_mod = zengy.module("engine");
+    const physics_mod = zengy.module("physics");
 
     // 1. Rust staticlib (`crate-type = ["staticlib"]`) built by cargo on the user's machine.
     const cargo = b.addSystemCommand(&.{ "cargo", "build", "--release" });
     cargo.setCwd(b.path("."));
 
     const static_lib = if (target.result.abi == .msvc)
-        "target/release/zigeng_rapier_ffi.lib"
+        "target/release/zengy_rapier_ffi.lib"
     else
-        "target/release/libzigeng_rapier_ffi.a";
+        "target/release/libzengy_rapier_ffi.a";
 
     // 2. Zig backend wrapping the FFI.
     const rapier_mod = b.addModule("physics_rapier", .{
@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const plugin_lib = b.addLibrary(.{
-        .name = "zigeng_physics_rapier",
+        .name = "zengy_physics_rapier",
         .linkage = .dynamic,
         .root_module = plugin_mod,
     });

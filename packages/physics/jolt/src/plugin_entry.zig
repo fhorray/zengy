@@ -1,7 +1,7 @@
 //! C ABI Dynamic Plugin Entrypoint (`ae_plugin_entry`) for `official.physics.jolt`.
 //!
-//! Allows `zigeng-runtime` (or any host implementing `include/engine_extension.h`)
-//! to load `zigeng_physics_jolt.{dll,so,dylib}` dynamically and attach `JoltBackend`
+//! Allows `zengy-runtime` (or any host implementing `include/engine_extension.h`)
+//! to load `zengy_physics_jolt.{dll,so,dylib}` dynamically and attach `JoltBackend`
 //! to the host's `engine.physics.backend/1` C-ABI slot.
 
 const std = @import("std");

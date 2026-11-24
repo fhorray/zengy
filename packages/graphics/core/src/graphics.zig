@@ -234,6 +234,13 @@ pub const GraphicsDeviceService = struct {
         if (!slot.alive or slot.generation != handle.generation) return null;
         return slot.presented_frames;
     }
+
+    pub fn getTargetWindowHandle(self: *const GraphicsDeviceService, handle: RenderTargetHandle) ?u64 {
+        if (handle.index >= self.targets.items.len) return null;
+        const slot = &self.targets.items[handle.index];
+        if (!slot.alive or slot.generation != handle.generation) return null;
+        return slot.window_handle;
+    }
 };
 
 fn buildModule(raw_app: *anyopaque) !void {
@@ -259,10 +266,7 @@ fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     app.scheduler.render_extract_enabled = false;
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
-    if (app.resources.get(GraphicsDeviceService)) |svc| {
-        svc.deinit();
-        _ = app.resources.remove(GraphicsDeviceService);
-    }
+    _ = app.resources.remove(GraphicsDeviceService);
 }
 
 pub fn module() engine.Module {

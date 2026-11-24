@@ -1,5 +1,5 @@
 ---
-name: zigeng-c-abi-and-ffi
+name: zengy-c-abi-and-ffi
 description: >-
   Rules and verification steps for the versioned C ABI (include/engine_extension.h)
   and dynamic native plugins (.dll/.so/.dylib). Use when editing include/engine_extension.h,

@@ -11,6 +11,7 @@
 
 const std = @import("std");
 
+/// Capability and lifecycle metadata declared by every `Module`.
 pub const ModuleDescriptor = struct {
     id: []const u8,
     version: []const u8,
@@ -19,6 +20,7 @@ pub const ModuleDescriptor = struct {
     optional_capabilities: []const []const u8 = &.{},
 };
 
+/// Execution lifecycle state tracked for each registered module.
 pub const ModuleLifecycleState = enum {
     discovered,
     resolved,
@@ -28,6 +30,7 @@ pub const ModuleLifecycleState = enum {
     failed,
 };
 
+/// Pluggable application module with lifecycle hooks (`build`, `start`, `stop`).
 pub const Module = struct {
     descriptor: ModuleDescriptor,
     build: *const fn (app_ctx: *anyopaque) anyerror!void,
@@ -40,13 +43,16 @@ const RegisteredModule = struct {
     state: ModuleLifecycleState = .discovered,
 };
 
+/// Errors emitted while registering or topologically resolving modules.
 pub const ModuleError = error{
     DuplicateModule,
     MissingRequiredCapability,
+    AmbiguousProvider,
     DependencyCycle,
     OutOfMemory,
 };
 
+/// Topological module registry guaranteeing ordered init, rollback on failure, and reverse teardown.
 pub const ModuleRegistry = struct {
     allocator: std.mem.Allocator,
     modules: std.ArrayList(RegisteredModule),
@@ -74,15 +80,18 @@ pub const ModuleRegistry = struct {
         try self.modules.append(self.allocator, .{ .module = module });
     }
 
-    fn findProviderModule(self: *const ModuleRegistry, capability: []const u8) ?usize {
+    fn findProviderModule(self: *const ModuleRegistry, capability: []const u8) ModuleError!?usize {
+        var matched: ?usize = null;
         for (self.modules.items, 0..) |mod, idx| {
             for (mod.module.descriptor.provides_capabilities) |cap| {
                 if (std.mem.eql(u8, cap, capability)) {
-                    return idx;
+                    if (matched != null) return error.AmbiguousProvider;
+                    matched = idx;
+                    break;
                 }
             }
         }
-        return null;
+        return matched;
     }
 
     pub fn resolve(self: *ModuleRegistry) ModuleError![]const usize {
@@ -103,14 +112,14 @@ pub const ModuleRegistry = struct {
 
         for (self.modules.items, 0..) |mod, i| {
             for (mod.module.descriptor.required_capabilities) |req| {
-                const provider_idx = self.findProviderModule(req) orelse return error.MissingRequiredCapability;
+                const provider_idx = (try self.findProviderModule(req)) orelse return error.MissingRequiredCapability;
                 if (provider_idx != i) {
                     try adj[provider_idx].append(self.allocator, i);
                     indegree[i] += 1;
                 }
             }
             for (mod.module.descriptor.optional_capabilities) |opt| {
-                if (self.findProviderModule(opt)) |provider_idx| {
+                if (try self.findProviderModule(opt)) |provider_idx| {
                     if (provider_idx != i) {
                         try adj[provider_idx].append(self.allocator, i);
                         indegree[i] += 1;

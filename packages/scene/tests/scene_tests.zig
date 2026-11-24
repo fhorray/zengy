@@ -36,4 +36,60 @@ test "Transform2D parent-child propagation and SceneSnapshot restore" {
     defer restored_world.deinit();
     const count = try snap.restore(&restored_world);
     try testing.expectEqual(@as(usize, 2), count);
+
+    // Verify restored hierarchy & persistent GUIDs
+    var rq = try restored_world.query(.{ .read = .{scene.Transform2D} });
+    var found_parent_link = false;
+    const parent_guid_orig = app.world.getGuid(parent).?;
+    const child_guid_orig = app.world.getGuid(child).?;
+    while (rq.next()) |row| {
+        const g = restored_world.getGuid(row.entity).?;
+        if (g == child_guid_orig) {
+            const p_comp = restored_world.getConst(row.entity, scene.Parent).?;
+            try testing.expectEqual(parent_guid_orig, restored_world.getGuid(p_comp.entity).?);
+            found_parent_link = true;
+        }
+    }
+    rq.deinit();
+    try testing.expect(found_parent_link);
+}
+
+test "Transform2D propagates parent rotation + scale and breaks Parent cycles safely" {
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+
+    try app.registerModule(scene.module());
+
+    // Parent at (10, 0) rotated +90 deg with scale 2x
+    const p = try app.world.spawn();
+    try app.world.set(p, scene.Transform2D, .{
+        .x = 10,
+        .y = 0,
+        .rotation_rad = std.math.pi / 2.0,
+        .scale_x = 2.0,
+        .scale_y = 2.0,
+    });
+    // Child at local (5, 0) -> scaled (10, 0) -> rotated 90 deg (0, 10) -> world (10, 10)
+    const c = try app.world.spawn();
+    try app.world.set(c, scene.Transform2D, .{ .x = 5, .y = 0 });
+    try app.world.set(c, scene.Parent, .{ .entity = p });
+
+    // Cycle pair A <-> B must not explode coordinates
+    const a = try app.world.spawn();
+    const b = try app.world.spawn();
+    try app.world.set(a, scene.Transform2D, .{ .x = 3, .y = 4 });
+    try app.world.set(b, scene.Transform2D, .{ .x = 7, .y = 8 });
+    try app.world.set(a, scene.Parent, .{ .entity = b });
+    try app.world.set(b, scene.Parent, .{ .entity = a });
+
+    try app.run();
+
+    const ct = app.world.getConst(c, scene.Transform2D).?;
+    try testing.expectApproxEqAbs(@as(f32, 10.0), ct.world_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 10.0), ct.world_y, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), ct.world_scale_x, 0.001);
+
+    const at = app.world.getConst(a, scene.Transform2D).?;
+    try testing.expectApproxEqAbs(@as(f32, 3.0), at.world_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 4.0), at.world_y, 0.001);
 }

@@ -1,4 +1,4 @@
-"""Type stubs for the embedded `zigeng` Python scripting API (PocketPy v2.2.0)."""
+"""Type stubs for the embedded `zengy` Python scripting API (PocketPy v2.2.0)."""
 
 from __future__ import annotations
 

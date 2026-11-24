@@ -1,6 +1,6 @@
-# Getting Started with `zigeng`
+# Getting Started with `zengy`
 
-This guide walks you through setting up `zigeng`, running the built-in examples, composing your own headless or visual application, and using `engine-cli`.
+This guide walks you through setting up `zengy`, running the built-in examples, composing your own headless or visual application, and using `engine-cli`.
 
 ## 1. Prerequisites
 
@@ -68,7 +68,7 @@ try app.registerModule(render_2d.module());
 try app.registerModule(ui_core.module());
 
 try app.resources.insert(window_sdl3.WindowConfig, .{
-    .title = "My ZigEng Game",
+    .title = "My Zengy Game",
     .width = 1280,
     .height = 720,
     .resizable = true,

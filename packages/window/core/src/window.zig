@@ -19,7 +19,7 @@ pub const WindowHandle = packed struct(u64) {
 };
 
 pub const WindowDescriptor = struct {
-    title: []const u8 = "ZigEng Window",
+    title: []const u8 = "Zengy Window",
     width: u32 = 1280,
     height: u32 = 720,
     dpi_scale: f32 = 1.0,

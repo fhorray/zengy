@@ -1,12 +1,12 @@
 ---
-name: zigeng-architecture-and-packages
+name: zengy-architecture-and-packages
 description: >-
   Architectural boundaries, module/capability/provider contracts, and package
-  layout rules for zigeng. Use when adding or modifying core modules, official
+  layout rules for zengy. Use when adding or modifying core modules, official
   packages under packages/, or capability interfaces.
 ---
 
-# `zigeng` Architecture & Package Layout
+# `zengy` Architecture & Package Layout
 
 ## Non-Negotiable Architectural Rules
 
@@ -33,4 +33,4 @@ Related packages are grouped under category subdirectories in `packages/`, while
 2. Register the module and its test suite in `build.zig` (`addModuleTest` in the `test` step).
 3. Register its public name, entry file, and summary in `OFFICIAL_PACKAGES` and `packageDir()` inside `tools/cli/main.zig`.
 4. Document the package and its capability ID in `packages/README.md`.
-5. If the package requires external platform artifacts in a user's `build.zig` project, add a validated `zigeng.toml` manifest (see `tools/cli/pkg_manifest.zig`).
+5. If the package requires external platform artifacts in a user's `build.zig` project, add a validated `zengy.toml` manifest (see `tools/cli/pkg_manifest.zig`).

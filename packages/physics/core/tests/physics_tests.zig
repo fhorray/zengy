@@ -94,4 +94,58 @@ test "official.physics module registers components and runs fixed_update" {
 
     const svc = app.resources.get(physics.PhysicsService).?;
     try std.testing.expect(svc.step_count >= 1);
+    try std.testing.expectEqual(@as(u64, 0), svc.active_step_count);
+}
+
+test "PhysicsService rejects half-null setBackend and syncs ECS bodies with backend" {
+    const SyncMock = struct {
+        created: u32 = 0,
+        pos: [3]f32 = .{ 0, 10, 0 },
+
+        fn createBody(ctx: *anyopaque, _: engine.EntityHandle, pos: [3]f32, _: physics.RigidBody, _: ?physics.Collider) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.created += 1;
+            self.pos = pos;
+            return 77;
+        }
+        fn stepFn(ctx: *anyopaque, dt: f32, gravity: [3]f32) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.pos[1] += gravity[1] * dt;
+        }
+        fn getTransform(ctx: *anyopaque, _: u64) ?physics.BodyTransform {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return .{ .pos = self.pos, .rot_euler = .{ 0, 0, 0 } };
+        }
+        const vt = physics.PhysicsBackendVTable{
+            .create_body = createBody,
+            .step = stepFn,
+            .get_transform = getTransform,
+        };
+    };
+
+    var app = engine.App.init(std.testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(physics.module());
+    try app.initialize();
+
+    const svc = app.resources.get(physics.PhysicsService).?;
+    // Half-null backend must safely clear instead of leaving invalid ctx pointer
+    svc.setBackend(&SyncMock.vt, null);
+    try std.testing.expect(!svc.hasBackend());
+    try svc.step(1.0 / 60.0);
+
+    var mock = SyncMock{};
+    svc.setBackend(&SyncMock.vt, &mock);
+    try std.testing.expect(svc.hasBackend());
+
+    const e = try app.world.spawn();
+    try app.world.set(e, physics.RigidBody, .{ .body_type = .dynamic });
+    try app.world.set(e, physics.PhysicsTransform, .{ .pos = .{ 0, 10, 0 } });
+
+    try app.tick(1.0 / 60.0); // sync_in creates body & steps
+    try app.tick(1.0 / 60.0); // sync_out writes simulated transform back
+    try std.testing.expectEqual(@as(u32, 1), mock.created);
+    try std.testing.expect(svc.active_step_count >= 2);
+    const pt = app.world.getConst(e, physics.PhysicsTransform).?;
+    try std.testing.expect(pt.pos[1] < 10.0);
 }

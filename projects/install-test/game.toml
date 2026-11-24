@@ -3,5 +3,5 @@ title = "install-test"
 width = 1280
 height = 720
 mode = "2d"
-# Exercised by `zigeng install` (reads this file). The path is relative to this project folder.
+# Exercised by `zengy install` (reads this file). The path is relative to this project folder.
 plugins = ["physics", "../../packages/physics/jolt"]

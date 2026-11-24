@@ -1,10 +1,10 @@
-"""Input helpers bound on `zigeng.input`."""
+"""Input helpers bound on `zengy.input`."""
 
 from __future__ import annotations
 
 
 def is_key_down(scancode: int) -> bool:
-    """Return True while the given SDL scancode (see `zigeng.Key`) is held."""
+    """Return True while the given SDL scancode (see `zengy.Key`) is held."""
     ...
 
 

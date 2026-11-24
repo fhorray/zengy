@@ -1,5 +1,5 @@
-#ifndef ZIGENG_JOLT_C_API_H
-#define ZIGENG_JOLT_C_API_H
+#ifndef ZENGY_JOLT_C_API_H
+#define ZENGY_JOLT_C_API_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -61,4 +61,4 @@ bool jolt_world_raycast(
 }
 #endif
 
-#endif // ZIGENG_JOLT_C_API_H
+#endif // ZENGY_JOLT_C_API_H

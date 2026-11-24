@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    std.debug.print("=== ZigEng Benchmark Suite ===\n", .{});
+    std.debug.print("=== Zengy Benchmark Suite ===\n", .{});
 
     // 1. World spawn + set (10,000 entities)
     var world = engine.World.init(allocator, .{ .index = 0, .generation = 1 });

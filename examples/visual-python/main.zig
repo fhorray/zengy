@@ -15,7 +15,7 @@ const scripting_host = @import("scripting_host");
 const scripting_python = @import("scripting_python");
 
 const PYTHON_SOURCE =
-    \\import zigeng
+    \\import zengy
     \\import math
     \\
     \\t = 0.0
@@ -30,7 +30,7 @@ const PYTHON_SOURCE =
     \\        r = 0.25 + 0.12 * i
     \\        g = 0.85 - 0.10 * i
     \\        b = 0.95
-    \\        zigeng.draw_rect(x, y, 56.0, 56.0, r, g, b, 0.9)
+    \\        zengy.draw_rect(x, y, 56.0, 56.0, r, g, b, 0.9)
     \\
 ;
 
@@ -106,7 +106,7 @@ pub fn main() !void {
     try app.registerModule(scripting_python.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
-        .title = "ZigEng — Visual Python (PocketPy + SDL_GPU)",
+        .title = "Zengy — Visual Python (PocketPy + SDL_GPU)",
         .width = 1280,
         .height = 720,
         .resizable = true,

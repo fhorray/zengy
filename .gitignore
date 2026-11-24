@@ -15,5 +15,6 @@ target/
 *.rmeta
 *.pdb
 
-# Plugins/caches installed by `zigeng add` inside projects
-.zigeng/
+# Plugins/caches installed by `zengy add` inside projects
+.zengy/
+.tmp

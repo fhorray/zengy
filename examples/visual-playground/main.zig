@@ -227,7 +227,7 @@ pub fn main() !void {
     try app.registerModule(ui_core.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
-        .title = "ZigEng — Visual Playground (D5)",
+        .title = "Zengy — Visual Playground (D5)",
         .width = 1280,
         .height = 720,
         .resizable = true,
@@ -254,7 +254,7 @@ pub fn main() !void {
 
     try ui_markup.parseIntoTree(allocator,
         \\<panel id="pg_panel">
-        \\  <label id="pg_title">ZigEng Visual Playground</label>
+        \\  <label id="pg_title">Zengy Visual Playground</label>
         \\  <label id="pg_fps">FPS: -- | Sprites: 0</label>
         \\  <button id="spawn_btn" action="playground.spawn">Spawn Sprite</button>
         \\  <button id="log_dn" action="playground.scroll_down">Scroll Log Down</button>
