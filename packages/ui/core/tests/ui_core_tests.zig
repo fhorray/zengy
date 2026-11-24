@@ -142,3 +142,28 @@ test "UiTree v2 generational ids, Tab navigation, pointer capture, and overlay l
     tree.removeSubtree(b2);
     try testing.expectEqual(@as(?usize, null), tree.resolveId(b2_id));
 }
+
+test "UiTree.clear invalidates old handles and destroyed slots are reused" {
+    var tree = ui_core.UiTree.init(testing.allocator);
+    defer tree.deinit();
+
+    const a = try tree.createNode(null, .{ .id = "a", .kind = .panel });
+    const old_a = tree.idOf(a).?;
+    tree.clear();
+    // Old handles must stay dead even though the slot index is handed out again.
+    try testing.expect(tree.resolveId(old_a) == null);
+    const b = try tree.createNode(null, .{ .id = "b", .kind = .panel });
+    try testing.expect(tree.resolveId(old_a) == null);
+    try testing.expect(tree.resolveId(tree.idOf(b).?) != null);
+
+    // Removing and recreating nodes must not grow the slot array.
+    for (0..100) |i| {
+        const n = try tree.createNode(b, .{ .id = "", .kind = .panel });
+        const h = tree.idOf(n).?;
+        tree.removeSubtree(n);
+        try testing.expect(tree.resolveId(h) == null);
+        _ = i;
+    }
+    try testing.expect(tree.nodes.items.len <= 3);
+    try testing.expectEqual(@as(usize, 1), tree.nodeCount());
+}

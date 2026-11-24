@@ -11,6 +11,13 @@
 //!   `max_component_alignment` (64) aligned; larger or non-power-of-two alignments are rejected.
 //! - A per-entity membership bitset records which pools hold the entity, so `despawn`
 //!   visits only the pools actually present instead of every registered pool.
+//! - Change tracking is opt-in per component (`enableChangeTracking`); `Query` filters
+//!   `.added`/`.changed` compare against the running system's last-run tick, `.without`
+//!   excludes, and `.optional` exposes `Row.optional(T)`.
+//! - Pointers from `get`/`getRaw`/`Query` rows are valid only until the next structural
+//!   mutation (`spawn`, `despawn`, `set` of a new component, `remove`, `CommandBuffer.apply`);
+//!   never store them across stages. Mutable access marks tracked components as changed.
+//! - An `EntityHandle` does not encode its `World`: never pass handles between Worlds.
 //! - `active_queries` tracks open iterators and rejects structural mutations (`spawn`,
 //!   `despawn`, `set`, `remove`) while a query is active; use `CommandBuffer` instead.
 

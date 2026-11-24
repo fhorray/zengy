@@ -258,6 +258,9 @@ pub const UiTree = struct {
     nodes: std.ArrayList(UiNode),
     roots: std.ArrayList(usize),
     id_index: std.StringHashMapUnmanaged(usize),
+    /// Indices of dead slots available for reuse. Their `generation` was already bumped, so
+    /// handles to the previous occupant stay invalid.
+    free_slots: std.ArrayList(usize) = .empty,
     focused_node: ?usize,
     hovered_node: ?usize = null,
     pressed_node: ?usize = null,
@@ -302,26 +305,44 @@ pub const UiTree = struct {
         }
         self.nodes.deinit(self.allocator);
         self.roots.deinit(self.allocator);
+        self.free_slots.deinit(self.allocator);
     }
 
-    /// Clears all nodes while retaining backing capacity.
+    /// Destroys every node while retaining backing capacity. Slots are kept (dead, generation
+    /// bumped) and reused by later `createNode` calls, so `UiNodeId`s from before the clear can
+    /// never resolve to a node created after it.
     pub fn clear(self: *UiTree) void {
         self.id_index.clearRetainingCapacity();
-        for (self.nodes.items) |*node| {
-            if (node.alive) {
-                self.allocator.free(node.id);
-                self.allocator.free(node.text);
-                self.allocator.free(node.action);
-            }
-            node.children.deinit(self.allocator);
+        // Reserved by createNode (free_slots capacity >= nodes.len), so this cannot fail.
+        self.free_slots.clearRetainingCapacity();
+        var i = self.nodes.items.len;
+        while (i > 0) {
+            i -= 1;
+            const node = &self.nodes.items[i];
+            if (node.alive) self.killNode(node);
+            node.children.clearRetainingCapacity();
+            node.parent = null;
+            self.free_slots.appendAssumeCapacity(i); // reverse order: lowest index is reused first
         }
-        self.nodes.clearRetainingCapacity();
         self.roots.clearRetainingCapacity();
         self.focused_node = null;
         self.hovered_node = null;
         self.pressed_node = null;
         self.pointer_capture_node = null;
         self.focus_visible = false;
+    }
+
+    /// Frees a node's owned strings and marks it dead with a fresh generation.
+    fn killNode(self: *UiTree, node: *UiNode) void {
+        self.allocator.free(node.id);
+        self.allocator.free(node.text);
+        self.allocator.free(node.action);
+        node.id = &.{};
+        node.text = &.{};
+        node.action = &.{};
+        node.alive = false;
+        node.generation +%= 1;
+        if (node.generation == 0) node.generation = 1; // 0 is reserved for "no handle"
     }
 
     /// Creates a node under `parent_idx` (or as a root when `null`) and returns its index.
@@ -339,14 +360,19 @@ pub const UiTree = struct {
         } else {
             try self.roots.ensureUnusedCapacity(self.allocator, 1);
         }
-        try self.nodes.ensureUnusedCapacity(self.allocator, 1);
+        // Keep free_slots able to hold every slot so destroying nodes never allocates.
+        try self.free_slots.ensureTotalCapacity(self.allocator, self.nodes.items.len + 1);
+        if (self.free_slots.items.len == 0) try self.nodes.ensureUnusedCapacity(self.allocator, 1);
         if (id_copy.len > 0) {
             try self.id_index.ensureUnusedCapacity(self.allocator, 1);
         }
 
-        const idx = self.nodes.items.len;
+        const reused = self.free_slots.pop();
+        const idx = reused orelse self.nodes.items.len;
         const auto_focusable = desc.focusable or desc.kind == .button or desc.kind == .textbox;
-        self.nodes.appendAssumeCapacity(.{
+        const prior_generation: u32 = if (reused) |r| self.nodes.items[r].generation else 1;
+        const prior_children: std.ArrayList(usize) = if (reused) |r| self.nodes.items[r].children else .empty;
+        const fresh: UiNode = .{
             .id = id_copy,
             .kind = desc.kind,
             .text = text_copy,
@@ -354,9 +380,9 @@ pub const UiTree = struct {
             .action = action_copy,
             .style = desc.style,
             .layout = .{},
-            .children = .empty,
+            .children = prior_children, // keeps the dead slot's capacity instead of leaking it
             .parent = parent_idx,
-            .generation = 1,
+            .generation = prior_generation,
             .alive = true,
             .focused = false,
             .disabled = desc.disabled,
@@ -367,7 +393,8 @@ pub const UiTree = struct {
             .tab_index = desc.tab_index,
             .user_tag = desc.user_tag,
             .paint_extra = desc.paint_extra,
-        });
+        };
+        if (reused != null) self.nodes.items[idx] = fresh else self.nodes.appendAssumeCapacity(fresh);
 
         if (parent_idx) |p| {
             self.nodes.items[p].children.appendAssumeCapacity(idx);
@@ -436,14 +463,9 @@ pub const UiTree = struct {
         if (self.pressed_node == idx) self.pressed_node = null;
         if (self.pointer_capture_node == idx) self.pointer_capture_node = null;
 
-        self.allocator.free(node.id);
-        self.allocator.free(node.text);
-        self.allocator.free(node.action);
-        node.id = &.{};
-        node.text = &.{};
-        node.action = &.{};
-        node.alive = false;
-        node.generation +%= 1;
+        self.killNode(node);
+        node.parent = null;
+        self.free_slots.appendAssumeCapacity(idx);
     }
 
     /// Removes all children of `parent_idx` while keeping the parent node intact.
