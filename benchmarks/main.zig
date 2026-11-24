@@ -135,6 +135,49 @@ pub fn main(init: std.process.Init) !void {
         .{ @as(f64, @floatFromInt(sc_ns)) / 1_000_000.0, @as(f64, @floatFromInt(sc_ns)) / 10_000_000.0 },
     );
 
+    // 7. Despawn cost vs. number of registered component types (membership index regression guard)
+    inline for (.{ 8, 100, 400 }) |type_count| {
+        var w = engine.World.init(allocator, .{ .index = 1, .generation = 1 });
+        defer w.deinit();
+        var name_buf: [32]u8 = undefined;
+        for (0..type_count) |i| {
+            _ = try w.registerDynamicComponent(try std.fmt.bufPrint(&name_buf, "bench.T{d}", .{i}), 8);
+        }
+        const n = 50_000;
+        const handles = try allocator.alloc(engine.EntityHandle, n);
+        defer allocator.free(handles);
+        for (handles) |*h| {
+            h.* = try w.spawn();
+            try w.set(h.*, Position, .{});
+        }
+        const t0 = std.Io.Clock.now(.awake, io);
+        for (handles) |h| _ = try w.despawn(h);
+        const ns = elapsedNs(io, t0);
+        std.debug.print(
+            "7. Despawn ({d} registered types, {d} entities): {d:.1} ns/entity\n",
+            .{ type_count, n, @as(f64, @floatFromInt(ns)) / @as(f64, n) },
+        );
+    }
+
+    // 8. Scene2D propagation on a deep chain (O(N) regression guard; was O(N x depth))
+    {
+        var deep_app = engine.App.init(allocator, .{ .max_frames = 1 });
+        defer deep_app.deinit();
+        try deep_app.registerModule(scene.module());
+        var prev = try deep_app.world.spawn();
+        try deep_app.world.set(prev, scene.Transform2D, .{ .x = 1 });
+        for (1..8000) |_| {
+            const e = try deep_app.world.spawn();
+            try deep_app.world.set(e, scene.Transform2D, .{ .x = 1 });
+            try deep_app.world.set(e, scene.Parent, .{ .entity = prev });
+            prev = e;
+        }
+        const t0 = std.Io.Clock.now(.awake, io);
+        try deep_app.run();
+        const ns = elapsedNs(io, t0);
+        std.debug.print("8. Scene2D propagate (chain depth 8000): {d:.3} ms\n", .{@as(f64, @floatFromInt(ns)) / 1_000_000.0});
+    }
+
     // 6. JSON benchmark: std.json vs yyjson (small ~5KB, medium ~500KB, large ~5MB)
     const sizes = [_]usize{ 100, 10_000, 100_000 };
     const labels = [_][]const u8{ "~5 KB", "~500 KB", "~5 MB" };

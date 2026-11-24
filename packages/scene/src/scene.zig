@@ -141,69 +141,112 @@ const Mat2D = struct {
     }
 };
 
-fn hasParentCycle(world: *const engine.World, start: engine.EntityHandle) bool {
-    var slow = start;
-    var fast = start;
-    while (true) {
-        const f1 = world.getConst(fast, Parent) orelse return false;
-        const f2 = world.getConst(f1.entity, Parent) orelse return false;
-        fast = f2.entity;
-        const s1 = world.getConst(slow, Parent) orelse return false;
-        slow = s1.entity;
-        if (std.meta.eql(slow, fast)) return true;
-    }
-}
+/// Resolved world-space state of one node during a propagation pass.
+const Resolved = struct {
+    m: Mat2D,
+    rot: f32,
+    sx: f32,
+    sy: f32,
+    /// True when the node's ancestor chain loops; such nodes fall back to local-only values.
+    cyclic: bool,
 
-/// Propagates local `Transform2D` (translation, rotation, scale) through `Parent` chains
-/// with cycle protection.
+    fn local(t: Transform2D, cyclic: bool) Resolved {
+        return .{ .m = Mat2D.fromTransform(t), .rot = t.rotation_rad, .sx = t.scale_x, .sy = t.scale_y, .cyclic = cyclic };
+    }
+
+    fn compose(base: Resolved, t: Transform2D) Resolved {
+        if (base.cyclic) return local(t, true);
+        return .{
+            .m = Mat2D.mul(base.m, Mat2D.fromTransform(t)),
+            .rot = base.rot + t.rotation_rad,
+            .sx = base.sx * t.scale_x,
+            .sy = base.sy * t.scale_y,
+            .cyclic = false,
+        };
+    }
+};
+
+const node_unvisited: u8 = 0;
+const node_in_progress: u8 = 1;
+const node_done: u8 = 2;
+
+/// Propagates local `Transform2D` (translation, rotation, scale) through `Parent` chains.
+///
+/// Each node is resolved exactly once per pass (parents before children, memoized by entity
+/// slot), so cost is O(N) instead of O(N x depth). Entities whose ancestor chain contains a
+/// cycle fall back to their local values. Scratch buffers are allocated per pass.
 pub fn propagateTransformsSystem(ctx: *engine.SystemContext) !void {
-    var chain: std.ArrayList(Transform2D) = .empty;
-    defer chain.deinit(ctx.world.allocator);
+    const allocator = ctx.world.allocator;
+    const slots = ctx.world.generations.items.len;
+
+    const state = try allocator.alloc(u8, slots);
+    defer allocator.free(state);
+    @memset(state, node_unvisited);
+    const resolved = try allocator.alloc(Resolved, slots);
+    defer allocator.free(resolved);
+    var stack: std.ArrayList(engine.EntityHandle) = .empty;
+    defer stack.deinit(allocator);
 
     var q = try ctx.query(.{ .write = .{Transform2D} });
     defer q.deinit();
 
     while (q.next()) |row| {
         const t = row.write(Transform2D);
-        if (hasParentCycle(ctx.world, row.entity)) {
-            const local_m = Mat2D.fromTransform(t.*);
-            t.world_x = local_m.tx;
-            t.world_y = local_m.ty;
-            t.world_rotation_rad = t.rotation_rad;
-            t.world_scale_x = t.scale_x;
-            t.world_scale_y = t.scale_y;
-            continue;
+        if (state[row.entity.index] != node_done) {
+            try resolveChain(ctx.world, row.entity, state, resolved, &stack, allocator);
         }
+        const r = resolved[row.entity.index];
+        t.world_x = r.m.tx;
+        t.world_y = r.m.ty;
+        t.world_rotation_rad = r.rot;
+        t.world_scale_x = r.sx;
+        t.world_scale_y = r.sy;
+    }
+}
 
-        chain.clearRetainingCapacity();
-        var curr = row.entity;
-        while (ctx.world.getConst(curr, Parent)) |parent_comp| {
-            const parent_t = ctx.world.getConst(parent_comp.entity, Transform2D) orelse break;
-            try chain.append(ctx.world.allocator, parent_t.*);
-            curr = parent_comp.entity;
+/// Walks up from `start` to the nearest resolved ancestor (or root/cycle), then resolves the
+/// walked nodes top-down.
+fn resolveChain(
+    world: *const engine.World,
+    start: engine.EntityHandle,
+    state: []u8,
+    resolved: []Resolved,
+    stack: *std.ArrayList(engine.EntityHandle),
+    allocator: std.mem.Allocator,
+) !void {
+    stack.clearRetainingCapacity();
+    var base: ?Resolved = null;
+    var cyclic = false;
+    var cur = start;
+    while (true) {
+        const idx = cur.index;
+        if (state[idx] == node_done) {
+            base = resolved[idx];
+            break;
         }
-
-        var world_m = Mat2D{ .a = 1, .b = 0, .c = 0, .d = 1, .tx = 0, .ty = 0 };
-        var world_rot: f32 = 0;
-        var world_sx: f32 = 1;
-        var world_sy: f32 = 1;
-
-        var i = chain.items.len;
-        while (i > 0) {
-            i -= 1;
-            const pt = chain.items[i];
-            world_m = Mat2D.mul(world_m, Mat2D.fromTransform(pt));
-            world_rot += pt.rotation_rad;
-            world_sx *= pt.scale_x;
-            world_sy *= pt.scale_y;
+        if (state[idx] == node_in_progress) {
+            cyclic = true;
+            break;
         }
+        state[idx] = node_in_progress;
+        try stack.append(allocator, cur);
+        const parent = world.getConst(cur, Parent) orelse break;
+        // A parent without Transform2D acts as a root, matching previous behaviour.
+        if (world.getConst(parent.entity, Transform2D) == null) break;
+        cur = parent.entity;
+    }
 
-        world_m = Mat2D.mul(world_m, Mat2D.fromTransform(t.*));
-        t.world_x = world_m.tx;
-        t.world_y = world_m.ty;
-        t.world_rotation_rad = world_rot + t.rotation_rad;
-        t.world_scale_x = world_sx * t.scale_x;
-        t.world_scale_y = world_sy * t.scale_y;
+    while (stack.pop()) |h| {
+        const t = world.getConst(h, Transform2D).?.*;
+        const r = if (cyclic or (base != null and base.?.cyclic))
+            Resolved.local(t, true)
+        else if (base) |b|
+            b.compose(t)
+        else
+            Resolved.local(t, false);
+        resolved[h.index] = r;
+        state[h.index] = node_done;
+        base = r;
     }
 }
 

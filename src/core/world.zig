@@ -7,7 +7,10 @@
 //! Memory & Safety Guarantees:
 //! - `EntityHandle` packs `(index: u32, generation: u32)`; despawning bumps generation
 //!   so stale handles are deterministically rejected by `isAlive()`, `get()`, and `set()`.
-//! - Each component type is stored in a 16-byte-aligned dense sparse-set `ComponentPool`.
+//! - Each component type is stored in a dense sparse-set `ComponentPool` whose backing is
+//!   `max_component_alignment` (64) aligned; larger or non-power-of-two alignments are rejected.
+//! - A per-entity membership bitset records which pools hold the entity, so `despawn`
+//!   visits only the pools actually present instead of every registered pool.
 //! - `active_queries` tracks open iterators and rejects structural mutations (`spawn`,
 //!   `despawn`, `set`, `remove`) while a query is active; use `CommandBuffer` instead.
 
@@ -50,6 +53,9 @@ pub const ComponentTypeId = u64;
 
 const ABSENT_INDEX: u32 = std.math.maxInt(u32);
 
+/// Largest component alignment supported by pool backing storage (bytes).
+pub const max_component_alignment: usize = 64;
+
 /// Schema metadata used to register and validate component pools (name, size, alignment, version).
 pub const ComponentDescriptor = struct {
     name: []const u8,
@@ -65,6 +71,8 @@ const ComponentPool = struct {
     elem_align: usize,
     schema_version: u32,
     stride: usize,
+    /// Dense index of this pool in `World.pool_list`; also its membership bit position.
+    pool_index: u32 = 0,
     sparse: std.ArrayList(u32),
     dense_entities: std.ArrayList(EntityHandle),
     dense_bytes: std.array_list.Aligned(u8, .@"64"),
@@ -77,9 +85,12 @@ const ComponentPool = struct {
         elem_align: usize,
         schema_version: u32,
     ) !ComponentPool {
-        const name_copy = try allocator.dupe(u8, name);
         const safe_align = if (elem_align == 0) 1 else elem_align;
-        const stride = if (elem_size == 0) 0 else std.mem.alignForward(usize, elem_size, safe_align);
+        const stride = if (elem_size == 0) 0 else blk: {
+            const sum = std.math.add(usize, elem_size, safe_align - 1) catch return error.ComponentSizeOverflow;
+            break :blk sum & ~(safe_align - 1);
+        };
+        const name_copy = try allocator.dupe(u8, name);
         return .{
             .type_id = type_id,
             .name = name_copy,
@@ -198,6 +209,11 @@ pub const World = struct {
     guids: std.ArrayList(EntityGuid),
     next_guid: u128,
     pools: std.AutoHashMapUnmanaged(ComponentTypeId, *ComponentPool),
+    /// Pools in registration order; index == `ComponentPool.pool_index`.
+    pool_list: std.ArrayList(*ComponentPool),
+    /// Flat per-entity membership bitset: `membership_words` u64 words per entity slot.
+    membership: std.ArrayList(u64),
+    membership_words: usize,
     name_to_type: std.StringHashMapUnmanaged(ComponentTypeId),
     active_queries: u32,
     entity_count: usize,
@@ -212,6 +228,9 @@ pub const World = struct {
             .guids = .empty,
             .next_guid = 1,
             .pools = .empty,
+            .pool_list = .empty,
+            .membership = .empty,
+            .membership_words = 1,
             .name_to_type = .empty,
             .active_queries = 0,
             .entity_count = 0,
@@ -225,6 +244,8 @@ pub const World = struct {
             self.allocator.destroy(pool_ptr.*);
         }
         self.pools.deinit(self.allocator);
+        self.pool_list.deinit(self.allocator);
+        self.membership.deinit(self.allocator);
 
         var name_it = self.name_to_type.keyIterator();
         while (name_it.next()) |key| {
@@ -258,6 +279,8 @@ pub const World = struct {
     pub fn registerComponentDesc(self: *World, desc: ComponentDescriptor) !ComponentTypeId {
         const tid = dynamicTypeId(desc.name);
         const safe_align = if (desc.alignment == 0) 1 else desc.alignment;
+        if (!std.math.isPowerOfTwo(safe_align)) return error.InvalidComponentAlignment;
+        if (safe_align > max_component_alignment) return error.UnsupportedComponentAlignment;
         if (self.pools.get(tid)) |existing| {
             if (!std.mem.eql(u8, existing.name, desc.name)) {
                 return error.ComponentNameCollision;
@@ -275,9 +298,13 @@ pub const World = struct {
         errdefer pool_ptr.deinit(self.allocator);
 
         try self.pools.ensureUnusedCapacity(self.allocator, 1);
+        try self.pool_list.ensureUnusedCapacity(self.allocator, 1);
         try self.name_to_type.ensureUnusedCapacity(self.allocator, 1);
+        try self.growMembership(self.pool_list.items.len + 1);
         const key_copy = try self.allocator.dupe(u8, desc.name);
 
+        pool_ptr.pool_index = @intCast(self.pool_list.items.len);
+        self.pool_list.appendAssumeCapacity(pool_ptr);
         self.pools.putAssumeCapacity(tid, pool_ptr);
         self.name_to_type.putAssumeCapacity(key_copy, tid);
         return tid;
@@ -290,6 +317,42 @@ pub const World = struct {
             .alignment = 16,
             .schema_version = 1,
         });
+    }
+
+    /// Widens the per-entity membership rows so `pool_count` bits fit; no-op when they already do.
+    fn growMembership(self: *World, pool_count: usize) !void {
+        const needed = @max(1, (pool_count + 63) / 64);
+        if (needed <= self.membership_words) return;
+        const slots = self.generations.items.len;
+        var fresh: std.ArrayList(u64) = .empty;
+        errdefer fresh.deinit(self.allocator);
+        try fresh.resize(self.allocator, slots * needed);
+        @memset(fresh.items, 0);
+        for (0..slots) |i| {
+            @memcpy(fresh.items[i * needed ..][0..self.membership_words], self.membership.items[i * self.membership_words ..][0..self.membership_words]);
+        }
+        self.membership.deinit(self.allocator);
+        self.membership = fresh;
+        self.membership_words = needed;
+    }
+
+    fn membershipRow(self: *World, entity_index: u32) []u64 {
+        return self.membership.items[@as(usize, entity_index) * self.membership_words ..][0..self.membership_words];
+    }
+
+    fn markMember(self: *World, entity_index: u32, pool: *const ComponentPool) void {
+        self.membershipRow(entity_index)[pool.pool_index / 64] |= @as(u64, 1) << @intCast(pool.pool_index % 64);
+    }
+
+    fn clearMember(self: *World, entity_index: u32, pool: *const ComponentPool) void {
+        self.membershipRow(entity_index)[pool.pool_index / 64] &= ~(@as(u64, 1) << @intCast(pool.pool_index % 64));
+    }
+
+    /// Stores bytes for `entity` in `pool`, updating membership only after the pool mutation succeeded.
+    fn storeBytes(self: *World, entity: EntityHandle, pool: *ComponentPool, bytes: []const u8) !void {
+        const was_member = pool.has(entity);
+        try pool.setBytes(self.allocator, entity, bytes);
+        if (!was_member) self.markMember(entity.index, pool);
     }
 
     pub fn spawn(self: *World) !EntityHandle {
@@ -308,10 +371,12 @@ pub const World = struct {
         try self.generations.ensureUnusedCapacity(self.allocator, 1);
         try self.alive_flags.ensureUnusedCapacity(self.allocator, 1);
         try self.guids.ensureUnusedCapacity(self.allocator, 1);
+        try self.membership.ensureUnusedCapacity(self.allocator, self.membership_words);
 
         const guid = self.next_guid;
         self.next_guid += 1;
         const idx: u32 = @intCast(self.generations.items.len);
+        self.membership.appendNTimesAssumeCapacity(0, self.membership_words);
         self.generations.appendAssumeCapacity(1);
         self.alive_flags.appendAssumeCapacity(true);
         self.guids.appendAssumeCapacity(guid);
@@ -325,9 +390,16 @@ pub const World = struct {
 
         try self.free_indices.ensureUnusedCapacity(self.allocator, 1);
 
-        var it = self.pools.valueIterator();
-        while (it.next()) |pool_ptr| {
-            _ = pool_ptr.*.remove(entity);
+        // Visit only the pools that actually hold this entity.
+        const row = self.membershipRow(entity.index);
+        for (row, 0..) |*word, wi| {
+            var bits = word.*;
+            while (bits != 0) {
+                const bit = @ctz(bits);
+                bits &= bits - 1;
+                _ = self.pool_list.items[wi * 64 + bit].remove(entity);
+            }
+            word.* = 0;
         }
 
         self.alive_flags.items[entity.index] = false;
@@ -358,7 +430,7 @@ pub const World = struct {
 
         const tid = try self.registerComponent(T);
         const pool = self.pools.get(tid).?;
-        try pool.setBytes(self.allocator, entity, std.mem.asBytes(&value));
+        try self.storeBytes(entity, pool, std.mem.asBytes(&value));
     }
 
     pub fn setRaw(self: *World, entity: EntityHandle, tid: ComponentTypeId, bytes: []const u8) !void {
@@ -366,7 +438,7 @@ pub const World = struct {
         if (!self.isAlive(entity)) return error.InvalidEntity;
 
         const pool = self.pools.get(tid) orelse return error.ComponentNotRegistered;
-        try pool.setBytes(self.allocator, entity, bytes);
+        try self.storeBytes(entity, pool, bytes);
     }
 
     pub fn get(self: *World, entity: EntityHandle, comptime T: type) ?*T {
@@ -399,7 +471,21 @@ pub const World = struct {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
         if (!self.isAlive(entity)) return false;
         const pool = self.pools.get(comptimeTypeId(T)) orelse return false;
-        return pool.remove(entity);
+        return self.removeFromPool(entity, pool);
+    }
+
+    /// Removes the component identified by `tid` from `entity`; returns whether it was present.
+    pub fn removeRaw(self: *World, entity: EntityHandle, tid: ComponentTypeId) !bool {
+        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        if (!self.isAlive(entity)) return false;
+        const pool = self.pools.get(tid) orelse return false;
+        return self.removeFromPool(entity, pool);
+    }
+
+    fn removeFromPool(self: *World, entity: EntityHandle, pool: *ComponentPool) bool {
+        if (!pool.remove(entity)) return false;
+        self.clearMember(entity.index, pool);
+        return true;
     }
 
     pub fn query(self: *World, comptime spec: anytype) !Query(spec) {

@@ -583,3 +583,46 @@ test "Audit 3.7, 3.9, 3.11 & 7.1: Scheduler errors, App terminal stopped, Ambigu
     try rreg.insert(TrackedRes, .{ .buf = try testing.allocator.alloc(u8, 32) });
     try testing.expect(rreg.remove(TrackedRes));
 }
+
+test "World rejects invalid component alignment and size overflow" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    try testing.expectError(error.InvalidComponentAlignment, world.registerComponentDesc(.{ .name = "bad.Align12", .size = 12, .alignment = 12 }));
+    try testing.expectError(error.UnsupportedComponentAlignment, world.registerComponentDesc(.{ .name = "bad.Align128", .size = 128, .alignment = 128 }));
+    try testing.expectError(error.ComponentSizeOverflow, world.registerComponentDesc(.{ .name = "bad.Huge", .size = std.math.maxInt(usize) - 2, .alignment = 16 }));
+    try testing.expectEqual(@as(usize, 0), world.pools.count());
+}
+
+test "World membership index: despawn clears every pool across >64 registered types" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+
+    // Entities spawned before the registry grows past one membership word must survive the re-layout.
+    const early = try world.spawn();
+    var ids: [130]engine.ComponentTypeId = undefined;
+    var buf: [24]u8 = undefined;
+    for (&ids, 0..) |*id, i| {
+        id.* = try world.registerDynamicComponent(try std.fmt.bufPrint(&buf, "member.T{d}", .{i}), 8);
+    }
+    const late = try world.spawn();
+    const payload: [8]u8 = @splat(7);
+    for ([_]usize{ 0, 63, 64, 129 }) |i| {
+        try world.setRaw(early, ids[i], &payload);
+        try world.setRaw(late, ids[i], &payload);
+    }
+    try testing.expect(try world.removeRaw(early, ids[64]));
+    try testing.expect(!(try world.removeRaw(early, ids[64])));
+
+    try testing.expect(try world.despawn(early));
+    for (ids) |id| try testing.expect(world.getRaw(early, id) == null);
+    for ([_]usize{ 0, 63, 64, 129 }) |i| try testing.expect(world.getRaw(late, ids[i]) != null);
+
+    // Reused slot must not inherit stale membership.
+    const reused = try world.spawn();
+    try testing.expectEqual(early.index, reused.index);
+    try testing.expect(world.getRaw(reused, ids[0]) == null);
+    try world.setRaw(reused, ids[129], &payload);
+    try testing.expect(try world.despawn(reused));
+    try testing.expect(try world.despawn(late));
+    for (world.pool_list.items) |pool| try testing.expectEqual(@as(usize, 0), pool.dense_entities.items.len);
+}

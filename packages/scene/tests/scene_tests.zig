@@ -93,3 +93,37 @@ test "Transform2D propagates parent rotation + scale and breaks Parent cycles sa
     try testing.expectApproxEqAbs(@as(f32, 3.0), at.world_x, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 4.0), at.world_y, 0.001);
 }
+
+test "Transform2D propagation resolves deep chains once and keeps cycle descendants local" {
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+    try app.registerModule(scene.module());
+
+    var prev = try app.world.spawn();
+    try app.world.set(prev, scene.Transform2D, .{ .x = 1 });
+    const depth = 3000;
+    for (1..depth) |_| {
+        const e = try app.world.spawn();
+        try app.world.set(e, scene.Transform2D, .{ .x = 1 });
+        try app.world.set(e, scene.Parent, .{ .entity = prev });
+        prev = e;
+    }
+
+    // A two-node cycle plus a child hanging off it: all fall back to local values.
+    const a = try app.world.spawn();
+    const b = try app.world.spawn();
+    const c = try app.world.spawn();
+    try app.world.set(a, scene.Transform2D, .{ .x = 10 });
+    try app.world.set(b, scene.Transform2D, .{ .x = 20 });
+    try app.world.set(c, scene.Transform2D, .{ .x = 30 });
+    try app.world.set(a, scene.Parent, .{ .entity = b });
+    try app.world.set(b, scene.Parent, .{ .entity = a });
+    try app.world.set(c, scene.Parent, .{ .entity = a });
+
+    try app.run();
+
+    try testing.expectApproxEqAbs(@as(f32, depth), app.world.getConst(prev, scene.Transform2D).?.world_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 10), app.world.getConst(a, scene.Transform2D).?.world_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 20), app.world.getConst(b, scene.Transform2D).?.world_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 30), app.world.getConst(c, scene.Transform2D).?.world_x, 0.001);
+}

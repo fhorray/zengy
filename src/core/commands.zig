@@ -179,9 +179,7 @@ pub const CommandBuffer = struct {
                 .remove_raw => |r| {
                     const target = resolveEntity(r.entity, spawned.items);
                     if (world.isAlive(target)) {
-                        if (world.pools.get(r.type_id)) |pool| {
-                            _ = pool.remove(target);
-                        }
+                        _ = try world.removeRaw(target, r.type_id);
                     }
                 },
                 .emit_event => |e| {
