@@ -749,3 +749,33 @@ test "App.runRealtime paces frames to min_frame_ns and failed frames still shut 
         try testing.expectEqual(engine.AppState.stopped, app.state);
     }
 }
+
+var lifecycle_stops: u32 = 0;
+fn noopSystem(_: *engine.SystemContext) !void {}
+fn lcBuildOk(_: *anyopaque) anyerror!void {}
+fn lcStop(_: *anyopaque) void {
+    lifecycle_stops += 1;
+}
+fn lcBuildAddsSystem(raw: *anyopaque) anyerror!void {
+    const app: *engine.App = @ptrCast(@alignCast(raw));
+    try app.addSystem(.{ .name = "lc.leaked", .stage = .update, .run = noopSystem });
+}
+fn lcStartFails(_: *anyopaque) anyerror!void {
+    return error.StartFailed;
+}
+
+test "App.initialize rolls back systems and stops every built module when start fails" {
+    lifecycle_stops = 0;
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(.{ .descriptor = .{ .id = "lc.a", .version = "1.0.0", .provides_capabilities = &.{"lc.cap/1"} }, .build = lcBuildOk, .stop = lcStop });
+    try app.registerModule(.{
+        .descriptor = .{ .id = "lc.b", .version = "1.0.0", .required_capabilities = &.{"lc.cap/1"} },
+        .build = lcBuildAddsSystem,
+        .start = lcStartFails,
+        .stop = lcStop,
+    });
+    try testing.expectError(error.StartFailed, app.initialize());
+    try testing.expectEqual(@as(u32, 2), lifecycle_stops); // both A and the failed-start B
+    for (app.scheduler.stages) |stage| try testing.expectEqual(@as(usize, 0), stage.items.len);
+}

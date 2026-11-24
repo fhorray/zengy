@@ -182,16 +182,17 @@ pub const ModuleRegistry = struct {
     }
 
     pub fn startAll(self: *ModuleRegistry, app_ctx: *anyopaque) !void {
-        for (self.resolved_order.items, 0..) |mod_idx, pos| {
+        for (self.resolved_order.items) |mod_idx| {
             const mod = &self.modules.items[mod_idx];
             if (mod.module.start) |start_fn| {
                 start_fn(app_ctx) catch |err| {
                     mod.state = .failed;
-                    // Rollback all previously started AND built modules in reverse topological order.
+                    // Rollback all started AND built modules in reverse topological order. The module
+                    // whose `start` failed was already built, so its `stop` must release that state too.
+                    mod.state = .built;
                     var j = self.resolved_order.items.len;
                     while (j > 0) {
                         j -= 1;
-                        if (j == pos) continue;
                         const prev_idx = self.resolved_order.items[j];
                         const prev_mod = &self.modules.items[prev_idx];
                         if (prev_mod.state == .started or prev_mod.state == .built) {
@@ -201,6 +202,7 @@ pub const ModuleRegistry = struct {
                             prev_mod.state = .stopped;
                         }
                     }
+                    mod.state = .failed;
                     return err;
                 };
             }

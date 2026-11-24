@@ -322,6 +322,30 @@ pub const Scheduler = struct {
         return false;
     }
 
+    /// Snapshot of per-stage system counts, used to roll back systems added by a failed module.
+    pub const Checkpoint = [Stage.count]usize;
+
+    pub fn checkpoint(self: *const Scheduler) Checkpoint {
+        var cp: Checkpoint = undefined;
+        for (0..Stage.count) |i| cp[i] = self.stages[i].items.len;
+        return cp;
+    }
+
+    /// Removes every system registered after `cp` was taken and marks affected stages for rebuild.
+    pub fn rollbackTo(self: *Scheduler, cp: Checkpoint) void {
+        for (0..Stage.count) |i| {
+            while (self.stages[i].items.len > cp[i]) {
+                const sys = self.stages[i].pop().?;
+                self.allocator.free(sys.name);
+                freeStringSlice(self.allocator, sys.reads);
+                freeStringSlice(self.allocator, sys.writes);
+                freeStringSlice(self.allocator, sys.before);
+                freeStringSlice(self.allocator, sys.after);
+                self.dirty[i] = true;
+            }
+        }
+    }
+
     /// Rejects non-finite or non-positive fixed timesteps before they can poison the accumulator.
     fn validateFixedTimestep(self: *const Scheduler) !void {
         if (!std.math.isFinite(self.fixed_dt) or self.fixed_dt <= 0.0) return error.InvalidFixedTimestep;

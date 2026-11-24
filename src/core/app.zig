@@ -165,6 +165,11 @@ pub const App = struct {
         if (self.state == .stopped or self.state == .stopping) return error.InvalidAppState;
         if (self.state == .initialized or self.state == .running) return;
 
+        // Systems registered by modules that later fail are removed again so a failed
+        // initialize leaves the scheduler as it was.
+        const sched_checkpoint = self.scheduler.checkpoint();
+        errdefer self.scheduler.rollbackTo(sched_checkpoint);
+
         try self.modules.buildAll(self);
         self.state = .configured;
 
