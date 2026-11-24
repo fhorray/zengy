@@ -1,0 +1,33 @@
+{
+  "name": "03 — Cornell Box (GI & Reference)",
+  "camera_pos": [0.0, 3.0, 9.8],
+  "camera_target": [0.0, 2.8, -1.0],
+  "sky_tint": [0.04, 0.05, 0.08],
+  "horizon_tint": [0.08, 0.09, 0.12],
+  "ground_albedo": [0.05, 0.05, 0.06],
+  "sun_dir": [0.0, -1.0, -0.15],
+  "sun_color": [1.0, 0.96, 0.90],
+  "sun_lux": 0.0,
+  "fog_enabled": false,
+  "fog_density": 0.01,
+  "volumetric_enabled": false,
+  "bloom_enabled": true,
+  "ssao_enabled": true,
+  "objects": [
+    { "shape": "cuboid", "pos": [0.0, -0.25, 0.0], "scale": [8.4, 0.5, 8.4], "color": [0.80, 0.80, 0.78], "roughness": 0.88, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [0.0, 6.25, 0.0], "scale": [8.4, 0.5, 8.4], "color": [0.80, 0.80, 0.78], "roughness": 0.88, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [0.0, 3.0, -4.25], "scale": [8.4, 6.5, 0.5], "color": [0.80, 0.80, 0.78], "roughness": 0.88, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [-4.25, 3.0, 0.0], "scale": [0.5, 6.5, 8.4], "color": [0.82, 0.14, 0.12], "roughness": 0.85, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [4.25, 3.0, 0.0], "scale": [0.5, 6.5, 8.4], "color": [0.14, 0.72, 0.18], "roughness": 0.85, "metallic": 0.0 },
+
+    { "shape": "cuboid", "pos": [0.0, 5.95, 0.0], "scale": [2.4, 0.12, 2.4], "color": [1.0, 0.98, 0.92], "roughness": 0.2, "metallic": 0.0, "emissive": [5.5, 5.0, 4.2] },
+
+    { "shape": "cuboid", "pos": [-1.45, 1.8, -1.2], "scale": [2.0, 3.6, 2.0], "color": [0.82, 0.82, 0.80], "roughness": 0.82, "metallic": 0.0 },
+    { "shape": "cuboid", "pos": [1.55, 1.0, 0.9], "scale": [1.9, 2.0, 1.9], "color": [0.82, 0.82, 0.80], "roughness": 0.82, "metallic": 0.0 },
+    { "shape": "sphere", "pos": [1.55, 2.65, 0.9], "scale": [1.3, 1.3, 1.3], "color": [0.95, 0.95, 0.96], "roughness": 0.08, "metallic": 0.98 },
+    { "shape": "sphere", "pos": [-1.45, 4.15, -1.2], "scale": [1.1, 1.1, 1.1], "color": [0.96, 0.78, 0.28], "roughness": 0.22, "metallic": 0.92 }
+  ],
+  "point_lights": [
+    { "pos": [0.0, 5.4, 0.0], "color": [1.0, 0.95, 0.86], "lumens": 3000.0, "range": 14.0, "shadows": true }
+  ]
+}

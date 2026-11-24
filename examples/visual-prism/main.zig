@@ -9,10 +9,14 @@
 //!   `QualityPreset` switching (`Q`), and `HeliosService` hybrid cache (`H`)
 //!
 //! Controls:
-//! - Tab: Next JSON scene (`01_sunlit_plaza.json` <-> `02_volumetric_cathedral.json`)
+//! - Tab: Next JSON scene (`01_sunlit_plaza`, `02_volumetric_cathedral`, `03_cornell_box`, `04_stress_gallery`)
 //! - W/A/S/D (+Shift sprint, Q/E down/up) + Right-Click Drag: Fly FreeCamera
 //! - 1 / 2 / 3 / 4: Toggle Shadows / SSAO / Volumetric Fog / Bloom
 //! - 5: Cycle QualityPreset (`low`, `medium`, `high`, `ultra`)
+//! - N: Cycle Sky & Time of Day (`Scene` -> `HDRI` -> `Day` -> `Dusk` -> `Night`)
+//! - R: Toggle Sun Rotation (Day/Sunset cycle)
+//! - T: Cycle Tonemapper (`AgX Base`, `AgX Punchy`, `ACES`, `PBR Neutral`, `Neutral`)
+//! - X / V / F: Toggle Auto Exposure / Vignette / Distance Fog
 //! - H: Cycle Helios tier (`off`, `low`, `medium`, `high`)
 //! - P: Toggle 3D ReflectionProbe / LocalFogVolume / SH9 ProbeVolume gizmos
 //! - G: Toggle visible bounding-sphere gizmos
@@ -34,10 +38,17 @@ const shapes = @import("shapes");
 const dev_tools = @import("dev_tools");
 const prism = @import("prism");
 const helios = @import("helios");
+const testing_sdk = @import("testing_sdk");
+const capture_mod = testing_sdk.render_regression;
+
+const SKY_HDR_BYTES = @embedFile("sky_hdr");
 
 const SCENE_FILES = [_][]const u8{
     @embedFile("scene/01_sunlit_plaza.json"),
     @embedFile("scene/02_volumetric_cathedral.json"),
+    @embedFile("scene/03_cornell_box.json"),
+    @embedFile("scene/04_stress_gallery.json"),
+    @embedFile("scene/05_material_and_shadow_lab.json"),
 };
 
 const JsonObject = struct {
@@ -55,6 +66,7 @@ const JsonPointLight = struct {
     color: [3]f32,
     lumens: f32 = 1500.0,
     range: f32 = 14.0,
+    shadows: bool = true,
 };
 
 const JsonScene = struct {
@@ -118,6 +130,18 @@ const PrismShowcaseState = struct {
     show_bounds: bool = false,
     show_volumes: bool = false,
     preset: prism.extensions.QualityPreset = .high,
+    sky_preset: u8 = 0, // 0=Scene, 1=HDRI, 2=Day, 3=Dusk, 4=Night
+    rotate_sun: bool = false,
+    sun_angle: f32 = 0.75,
+    tonemap_idx: u8 = 0, // 0=AgX Base, 1=AgX Punchy, 2=ACES, 3=PBR Neutral, 4=Neutral
+    base_fog_enabled: bool = false,
+    base_fog_density: f32 = 0.015,
+    scene_sky_tint: [3]f32 = .{ 0.14, 0.38, 0.85 },
+    scene_horizon_tint: [3]f32 = .{ 0.52, 0.70, 0.92 },
+    scene_ground_albedo: [3]f32 = .{ 0.14, 0.14, 0.16 },
+    scene_sun_dir: [3]f32 = .{ -0.45, -0.75, -0.45 },
+    scene_sun_color: [3]f32 = .{ 1.0, 0.96, 0.90 },
+    scene_sun_lux: f32 = 24000.0,
     dyn_res: prism.reflections.DynamicResolutionController = .{},
     probe: prism.reflections.ReflectionProbe = .{
         .id = 1,
@@ -130,11 +154,24 @@ const PrismShowcaseState = struct {
         .shape = .box,
         .center = .{ 0.0, 2.5, -2.0 },
         .half_extents = .{ 6.0, 2.8, 6.0 },
-        .density = 0.025,
+        .density = 0.012,
         .height_falloff = 0.12,
-        .edge_fade = 1.2,
+        .edge_fade = 1.6,
     },
     gi_vol: prism.baked_gi.IrradianceProbeVolume,
+    gi_bvh: helios.ray_query.Bvh,
+    gi_materials: std.ArrayList(helios.indirect_rt.SurfaceMaterial) = .empty,
+    gi_emitters: std.ArrayList(helios.gi_solver.DirectPointEmitter) = .empty,
+    gi_vpls: std.ArrayList(helios.gi_solver.VirtualPointLight) = .empty,
+    gi_vpl_entities: std.ArrayList(engine.EntityHandle) = .empty,
+    gi_stats: helios.gi_solver.GiSolveStats = .{},
+    gi_dirty: bool = true,
+    gi_frame_counter: u32 = 0,
+    capture_dir: ?[]const u8 = null,
+    capture_io: std.Io = undefined,
+    capture_step: u8 = 0,
+    capture_wait: u32 = 0,
+    capture_pending: bool = false,
     opaque_q: std.ArrayList(prism.QueueEntry) = .empty,
     transparent_q: std.ArrayList(prism.QueueEntry) = .empty,
     batches: std.ArrayList(prism.DrawBatch) = .empty,
@@ -146,15 +183,128 @@ const PrismShowcaseState = struct {
     hud3_len: usize = 0,
     hud4: [240]u8 = @splat(0),
     hud4_len: usize = 0,
+    hud5: [240]u8 = @splat(0),
+    hud5_len: usize = 0,
 
     pub fn deinit(self: *PrismShowcaseState) void {
         self.spawned.deinit(self.app.allocator);
         self.gi_vol.deinit();
+        self.gi_bvh.deinit();
+        self.gi_materials.deinit(self.app.allocator);
+        self.gi_emitters.deinit(self.app.allocator);
+        self.gi_vpls.deinit(self.app.allocator);
+        self.gi_vpl_entities.deinit(self.app.allocator);
         self.opaque_q.deinit(self.app.allocator);
         self.transparent_q.deinit(self.app.allocator);
         self.batches.deinit(self.app.allocator);
     }
 };
+
+fn rebuildHeliosGi(st: *PrismShowcaseState) !void {
+    const allocator = st.app.allocator;
+    // Despawn previous GI bounce VPL entities.
+    for (st.gi_vpl_entities.items) |e| _ = st.app.world.despawn(e) catch false;
+    st.gi_vpl_entities.clearRetainingCapacity();
+    st.gi_vpls.clearRetainingCapacity();
+
+    const hsvc = st.app.resources.get(helios.HeliosService) orelse return;
+    const cfg = helios.gi_solver.configForTier(hsvc.settings.tier);
+    if (cfg.max_vpls == 0) {
+        st.gi_stats = .{};
+        st.gi_dirty = false;
+        return;
+    }
+
+    var sun_opt: ?helios.gi_solver.DirectSunEmitter = null;
+    if (st.app.world.get(st.sun_entity, render_3d.pbr.DirectionalLight)) |sun| {
+        if (sun.illuminance_lux > 50.0) {
+            sun_opt = .{
+                .direction = sun.direction,
+                .color = sun.color,
+                .illuminance_lux = sun.illuminance_lux,
+                .scene_center = .{ 0, 1.5, 0 },
+                .scene_radius = 10.0,
+            };
+        }
+    }
+
+    st.gi_stats = try helios.gi_solver.solveInstantRadiosity(
+        allocator,
+        &st.gi_bvh,
+        st.gi_materials.items,
+        st.gi_emitters.items,
+        sun_opt,
+        cfg,
+        &st.gi_vpls,
+    );
+
+    // Spawn smooth unshadowed bounce VPLs into the ECS world for real-time Forward+ clustered GI.
+    for (st.gi_vpls.items) |vpl| {
+        const ve = try st.app.world.spawn();
+        try st.app.world.set(ve, render_3d.Transform3D, .{ .position = vpl.position });
+        try st.app.world.set(ve, render_3d.pbr.PointLight, .{
+            .color = vpl.color,
+            .intensity_lumens = vpl.lumens,
+            .range = vpl.range,
+            .radius = 0.65,
+            .shadows_enabled = false,
+        });
+        try st.gi_vpl_entities.append(allocator, ve);
+    }
+    st.gi_dirty = false;
+}
+
+fn applySkyPreset(st: *const PrismShowcaseState, sky: *render_3d.pbr.SkyEnvironment, sun: *render_3d.pbr.DirectionalLight, fog: ?*render_3d.pbr.FogSettings, preset: u8) void {
+    switch (preset) {
+        0 => {
+            sky.kind = .procedural;
+            sky.sky_tint = st.scene_sky_tint;
+            sky.horizon_tint = st.scene_horizon_tint;
+            sky.ground_albedo = st.scene_ground_albedo;
+            sun.direction = st.scene_sun_dir;
+            sun.color = st.scene_sun_color;
+            sun.illuminance_lux = st.scene_sun_lux;
+            sun.shadows_enabled = st.graph_opts.enable_shadows and st.scene_sun_lux > 0.0;
+        },
+        1 => {
+            sky.kind = .hdri;
+            sky.horizon_tint = .{ 0.45, 0.56, 0.70 };
+            sun.illuminance_lux = 24000.0;
+            sun.color = .{ 1.0, 0.96, 0.90 };
+            sun.shadows_enabled = st.graph_opts.enable_shadows;
+        },
+        2 => {
+            sky.kind = .procedural;
+            sky.sky_tint = .{ 0.14, 0.38, 0.85 };
+            sky.horizon_tint = .{ 0.52, 0.70, 0.92 };
+            sky.ground_albedo = .{ 0.14, 0.14, 0.16 };
+            sun.illuminance_lux = 24000.0;
+            sun.color = .{ 1.0, 0.96, 0.90 };
+            sun.shadows_enabled = st.graph_opts.enable_shadows;
+        },
+        3 => {
+            sky.kind = .procedural;
+            sky.sky_tint = .{ 0.05, 0.10, 0.28 };
+            sky.horizon_tint = .{ 0.35, 0.20, 0.18 };
+            sky.ground_albedo = .{ 0.04, 0.04, 0.05 };
+            sun.illuminance_lux = 1600.0;
+            sun.color = .{ 1.0, 0.62, 0.38 };
+            sun.shadows_enabled = st.graph_opts.enable_shadows;
+        },
+        else => {
+            sky.kind = .procedural;
+            sky.sky_tint = .{ 0.01, 0.02, 0.06 };
+            sky.horizon_tint = .{ 0.03, 0.05, 0.12 };
+            sky.ground_albedo = .{ 0.01, 0.01, 0.015 };
+            sun.illuminance_lux = 180.0;
+            sun.color = .{ 0.55, 0.70, 1.0 };
+            sun.shadows_enabled = st.graph_opts.enable_shadows;
+        },
+    }
+    if (fog) |fg| {
+        fg.color = .{ sky.horizon_tint[0] * 0.65, sky.horizon_tint[1] * 0.65, sky.horizon_tint[2] * 0.65 };
+    }
+}
 
 fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
     const allocator = st.app.allocator;
@@ -184,6 +334,18 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         hsvc.cache.invalidateAll();
     }
 
+    // Save scene-authored atmosphere & sun defaults so [N] can cycle HDRI/Day/Dusk/Night and return to Scene.
+    st.sky_preset = 0;
+    st.rotate_sun = false;
+    st.scene_sky_tint = sc.sky_tint;
+    st.scene_horizon_tint = sc.horizon_tint;
+    st.scene_ground_albedo = sc.ground_albedo;
+    st.scene_sun_dir = sc.sun_dir;
+    st.scene_sun_color = sc.sun_color;
+    st.scene_sun_lux = sc.sun_lux;
+    st.base_fog_enabled = sc.fog_enabled;
+    st.base_fog_density = sc.fog_density;
+
     // Update SkyEnvironment, FogSettings, PostProcessSettings, and DirectionalLight.
     if (st.app.resources.get(render_3d.pbr.SkyEnvironment)) |sky| {
         sky.kind = .procedural;
@@ -194,6 +356,7 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
     if (st.app.resources.get(render_3d.pbr.FogSettings)) |fg| {
         fg.enabled = sc.fog_enabled;
         fg.density = sc.fog_density;
+        fg.color = .{ sc.horizon_tint[0] * 0.65, sc.horizon_tint[1] * 0.65, sc.horizon_tint[2] * 0.65 };
         fg.volumetric.enabled = sc.volumetric_enabled;
     }
     if (st.app.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| {
@@ -204,7 +367,8 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         sun.direction = sc.sun_dir;
         sun.color = sc.sun_color;
         sun.illuminance_lux = sc.sun_lux;
-        sun.shadows_enabled = true;
+        sun.shadow_normal_bias = 0.025;
+        sun.shadows_enabled = sc.sun_lux > 0.0;
     }
 
     st.graph_opts = .{
@@ -214,8 +378,13 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         .enable_bloom = sc.bloom_enabled,
     };
 
-    // Spawn JSON objects.
-    for (sc.objects) |obj| {
+    // Spawn JSON objects & populate Helios GI BVH geometry + materials.
+    st.gi_materials.clearRetainingCapacity();
+    st.gi_emitters.clearRetainingCapacity();
+    var gi_tris = std.ArrayList(helios.ray_query.BvhTriangle).empty;
+    defer gi_tris.deinit(allocator);
+
+    for (sc.objects, 0..) |obj, oi| {
         const mat = try mats.add(.{
             .base_color = .{ obj.color[0], obj.color[1], obj.color[2], 1.0 },
             .roughness = obj.roughness,
@@ -226,9 +395,22 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         try st.app.world.set(e, render_3d.Transform3D, .{ .position = obj.pos, .scale = obj.scale });
         try st.app.world.set(e, render_3d.MeshRef, .{ .mesh_asset = st.assets.meshForName(obj.shape), .material_handle = mat });
         try st.spawned.append(allocator, e);
-    }
 
-    // Spawn JSON point lights.
+        try st.gi_materials.append(allocator, .{
+            .albedo = obj.color,
+            .emissive = obj.emissive,
+            .roughness = obj.roughness,
+            .metallic = obj.metallic,
+        });
+        const half_ext = if (std.mem.eql(u8, obj.shape, "plane"))
+            [3]f32{ obj.scale[0] * 0.5, 0.05, obj.scale[2] * 0.5 }
+        else
+            [3]f32{ obj.scale[0] * 0.5, obj.scale[1] * 0.5, obj.scale[2] * 0.5 };
+        try helios.gi_solver.appendBoxTriangles(allocator, &gi_tris, obj.pos, half_ext, @intCast(oi));
+    }
+    try st.gi_bvh.build(gi_tris.items);
+
+    // Spawn JSON point lights & record direct emitters for Helios GI.
     for (sc.point_lights) |pl| {
         const le = try st.app.world.spawn();
         try st.app.world.set(le, render_3d.Transform3D, .{ .position = pl.pos });
@@ -236,10 +418,19 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
             .color = pl.color,
             .intensity_lumens = pl.lumens,
             .range = pl.range,
-            .shadows_enabled = true,
+            .shadows_enabled = pl.shadows,
         });
         try st.spawned.append(allocator, le);
+        try st.gi_emitters.append(allocator, .{
+            .position = pl.pos,
+            .color = pl.color,
+            .lumens = pl.lumens,
+            .range = pl.range,
+        });
     }
+
+    st.gi_dirty = true;
+    try rebuildHeliosGi(st);
 }
 
 fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
@@ -264,14 +455,75 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
     }
     if (keys.justPressed(.digit_3)) {
         st.graph_opts.enable_volumetric = !st.graph_opts.enable_volumetric;
+        if (st.graph_opts.enable_volumetric) st.base_fog_enabled = true;
         if (ctx.resources.get(render_3d.pbr.FogSettings)) |fg| {
-            fg.enabled = st.graph_opts.enable_volumetric;
+            fg.enabled = st.base_fog_enabled or st.graph_opts.enable_volumetric;
             fg.volumetric.enabled = st.graph_opts.enable_volumetric;
         }
     }
     if (keys.justPressed(.digit_4)) {
         st.graph_opts.enable_bloom = !st.graph_opts.enable_bloom;
         if (ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| pp.bloom.enabled = st.graph_opts.enable_bloom;
+    }
+    if (keys.justPressed(.key_n)) {
+        st.sky_preset = (st.sky_preset + 1) % 5;
+        if (ctx.resources.get(render_3d.pbr.SkyEnvironment)) |sky| {
+            if (ctx.world.get(st.sun_entity, render_3d.pbr.DirectionalLight)) |sun| {
+                applySkyPreset(st, sky, sun, ctx.resources.get(render_3d.pbr.FogSettings), st.sky_preset);
+                st.gi_dirty = true;
+            }
+        }
+    }
+    if (keys.justPressed(.key_r)) {
+        st.rotate_sun = !st.rotate_sun;
+        if (st.rotate_sun) {
+            if (ctx.world.get(st.sun_entity, render_3d.pbr.DirectionalLight)) |sun| {
+                if (sun.illuminance_lux <= 0.0) {
+                    sun.illuminance_lux = 18000.0;
+                    sun.shadows_enabled = st.graph_opts.enable_shadows;
+                }
+            }
+            st.gi_dirty = true;
+        }
+    }
+    if (keys.justPressed(.key_t)) {
+        st.tonemap_idx = (st.tonemap_idx + 1) % 5;
+        if (ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| {
+            switch (st.tonemap_idx) {
+                0 => {
+                    pp.tonemap_mode = .agx;
+                    pp.tonemap_look = .base;
+                },
+                1 => {
+                    pp.tonemap_mode = .agx;
+                    pp.tonemap_look = .punchy;
+                },
+                2 => pp.tonemap_mode = .aces,
+                3 => pp.tonemap_mode = .pbr_neutral,
+                else => pp.tonemap_mode = .neutral,
+            }
+        }
+    }
+    if (keys.justPressed(.key_x)) {
+        if (ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| pp.auto_exposure.enabled = !pp.auto_exposure.enabled;
+    }
+    if (keys.justPressed(.key_v)) {
+        if (ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| pp.vignette.enabled = !pp.vignette.enabled;
+    }
+    if (keys.justPressed(.key_f)) {
+        st.base_fog_enabled = !st.base_fog_enabled;
+        if (ctx.resources.get(render_3d.pbr.FogSettings)) |fg| {
+            fg.enabled = st.base_fog_enabled;
+            fg.volumetric.enabled = st.base_fog_enabled and st.graph_opts.enable_volumetric;
+        }
+    }
+    if (st.rotate_sun) {
+        st.sun_angle += ctx.dt * 0.35;
+        if (ctx.world.get(st.sun_entity, render_3d.pbr.DirectionalLight)) |sun| {
+            sun.direction = .{ -@cos(st.sun_angle) * 0.6, -@max(@sin(st.sun_angle), 0.05), -0.45 };
+        }
+        st.gi_frame_counter += 1;
+        if (st.gi_frame_counter % 6 == 0) st.gi_dirty = true;
     }
     if (keys.justPressed(.key_g)) st.show_bounds = !st.show_bounds;
     if (keys.justPressed(.key_p)) st.show_volumes = !st.show_volumes;
@@ -283,6 +535,61 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
                 .medium => .high,
                 .high => .off,
             };
+            st.gi_dirty = true;
+        }
+    }
+    if (st.gi_dirty) {
+        try rebuildHeliosGi(st);
+    }
+
+    // Optional automated screenshot capture (`ZENGY_PRISM_CAPTURE=<dir>`) to visually verify GI OFF vs HIGH.
+    if (st.capture_dir) |cdir| {
+        if (st.capture_pending) {
+            if (graphics_sdlgpu.takeCapture(st.app)) |img_val| {
+                var img = img_val;
+                defer img.deinit(st.app.allocator);
+                const rgb = try capture_mod.displayToRgb8(st.app.allocator, img);
+                defer st.app.allocator.free(rgb);
+                const png = try capture_mod.encodePngRgb8(st.app.allocator, img.width, img.height, rgb);
+                defer st.app.allocator.free(png);
+                const fname: []const u8 = switch (st.capture_step) {
+                    0 => "cornell_gi_off.png",
+                    1 => "cornell_gi_high.png",
+                    else => "material_lab_gi_high.png",
+                };
+                const path = try std.fmt.allocPrint(st.app.allocator, "{s}/{s}", .{ cdir, fname });
+                defer st.app.allocator.free(path);
+                const file = try std.Io.Dir.cwd().createFile(st.capture_io, path, .{});
+                defer file.close(st.capture_io);
+                try file.writeStreamingAll(st.capture_io, png);
+                st.capture_pending = false;
+                st.capture_step += 1;
+                st.capture_wait = 0;
+                if (st.capture_step >= 3) {
+                    st.app.quit();
+                    return;
+                }
+            }
+        } else {
+            if (st.capture_wait == 0) {
+                if (st.capture_step == 0) {
+                    if (ctx.resources.get(helios.HeliosService)) |hsvc| hsvc.settings.tier = .off;
+                    try loadJsonScene(st, 2); // 03_cornell_box.json with GI OFF
+                    if (ctx.world.get(st.cam_entity, camera.FreeCamera)) |fc| fc.state.initialized = false;
+                } else if (st.capture_step == 1) {
+                    if (ctx.resources.get(helios.HeliosService)) |hsvc| hsvc.settings.tier = .high;
+                    try rebuildHeliosGi(st); // 03_cornell_box.json with GI HIGH
+                } else if (st.capture_step == 2) {
+                    if (ctx.resources.get(helios.HeliosService)) |hsvc| hsvc.settings.tier = .high;
+                    try loadJsonScene(st, 4); // 05_material_and_shadow_lab.json with GI HIGH
+                    if (ctx.world.get(st.cam_entity, camera.FreeCamera)) |fc| fc.state.initialized = false;
+                }
+            }
+            st.capture_wait += 1;
+            if (st.capture_wait >= 45) {
+                graphics_sdlgpu.requestCapture(st.app, .final);
+                st.capture_pending = true;
+            }
         }
     }
     if (keys.justPressed(.digit_5)) {
@@ -366,6 +673,16 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
     // Stages 06-09 live evaluation & optional 3D debug volumes ([P] toggle).
     const probe_w = prism.reflections.probeInfluenceWeight(st.probe, cam_pose.position);
     const local_fog = prism.atmosphere.evaluateLocalFogDensity(st.fog_vol, cam_pose.position);
+    if (ctx.resources.get(render_3d.pbr.FogSettings)) |fg| {
+        if (local_fog > 0.001) {
+            fg.enabled = true;
+            fg.density = st.base_fog_density + local_fog * 0.65;
+        } else {
+            fg.enabled = st.base_fog_enabled;
+            fg.density = st.base_fog_density;
+            fg.volumetric.enabled = st.base_fog_enabled and st.graph_opts.enable_volumetric;
+        }
+    }
     const dyn_scale = st.dyn_res.update(@floatCast(prof.totalFrameMs()));
     const gi_sample = st.gi_vol.sampleIrradiance(cam_pose.position, .{ 0, 1, 0 });
     var helios_tier_name: []const u8 = "off";
@@ -405,6 +722,14 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
                 }
             }
         }
+        for (st.gi_vpls.items) |vpl| {
+            giz.sphere(vpl.position, 0.18, 10, .{
+                std.math.clamp(vpl.color[0], 0.1, 1.0),
+                std.math.clamp(vpl.color[1], 0.1, 1.0),
+                std.math.clamp(vpl.color[2], 0.1, 1.0),
+                0.95,
+            });
+        }
     }
 
     var pass_buf: [160]u8 = @splat(0);
@@ -432,12 +757,40 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
     ) catch "Controls";
     st.hud3_len = h3.len;
 
+    const vmem = prism.editor_api.estimateViewMemoryBytes(
+        vw,
+        vh,
+        st.graph_opts.enable_ssao,
+        st.graph_opts.enable_volumetric,
+        st.graph_opts.enable_bloom,
+        true,
+    );
+    const vram_mb = @as(f64, @floatFromInt(vmem.totalBytes())) / (1024.0 * 1024.0);
     const h4 = std.fmt.bufPrint(
         &st.hud4,
-        "Hist:{d}f | ProbeW:{d:.2} DynRes:{d:.0}% LocalFog:{d:.3} | GI:({d:.2},{d:.2},{d:.2}) | [H]Helios:{s}({d})",
-        .{ tstate.valid_frames, probe_w, dyn_scale * 100.0, local_fog, gi_sample[0], gi_sample[1], gi_sample[2], helios_tier_name, helios_cells },
+        "Hist:{d}f | ProbeW:{d:.2} DynRes:{d:.0}% VRAM:{d:.1}MB | [H]Helios:{s} ({d} VPL / {d} rays, {d} cells)",
+        .{ tstate.valid_frames, probe_w, dyn_scale * 100.0, vram_mb, helios_tier_name, st.gi_stats.vpl_count, st.gi_stats.rays_cast, helios_cells },
     ) catch "Stages";
     st.hud4_len = h4.len;
+
+    const sky_label: []const u8 = switch (st.sky_preset) {
+        0 => "Scene",
+        1 => "HDRI",
+        2 => "Day",
+        3 => "Dusk",
+        else => "Night",
+    };
+    const pp_opt = ctx.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings);
+    const tm_name: []const u8 = if (pp_opt) |pp| @tagName(pp.tonemap_mode) else "agx";
+    const tm_look: []const u8 = if (pp_opt) |pp| (if (pp.tonemap_mode == .agx and pp.tonemap_look == .punchy) "(Punchy)" else "") else "";
+    const ae_on: bool = if (pp_opt) |pp| pp.auto_exposure.enabled else true;
+    const vig_on: bool = if (pp_opt) |pp| pp.vignette.enabled else false;
+    const h5 = std.fmt.bufPrint(
+        &st.hud5,
+        "[N]Sky:{s} | [R]SunRot:{any} | [T]Tonemap:{s}{s} | [X]AutoExp:{any} | [V]Vig:{any} | [F]Fog:{any}",
+        .{ sky_label, st.rotate_sun, tm_name, tm_look, ae_on, vig_on, st.base_fog_enabled },
+    ) catch "PBR";
+    st.hud5_len = h5.len;
 }
 
 fn renderOverlay(ctx: *engine.SystemContext) !void {
@@ -456,6 +809,7 @@ fn renderOverlay(ctx: *engine.SystemContext) !void {
         .{ .text = .{ .x = 16, .y = 38, .content = st.hud2[0..st.hud2_len], .color = .{ .r = 0.88, .g = 0.92, .b = 1.0, .a = 1.0 } } },
         .{ .text = .{ .x = 16, .y = 60, .content = st.hud3[0..st.hud3_len], .color = .{ .r = 1.0, .g = 0.93, .b = 0.72, .a = 1.0 } } },
         .{ .text = .{ .x = 16, .y = 82, .content = st.hud4[0..st.hud4_len], .color = .{ .r = 0.65, .g = 0.90, .b = 1.0, .a = 1.0 } } },
+        .{ .text = .{ .x = 16, .y = 104, .content = st.hud5[0..st.hud5_len], .color = .{ .r = 0.96, .g = 0.80, .b = 1.0, .a = 1.0 } } },
     });
     try st.gfx.present(st.rt);
 }
@@ -483,8 +837,15 @@ pub fn main(init: std.process.Init) !void {
         .height = 720,
         .resizable = true,
     });
+    var hdri = try render_3d.ibl.loadRadianceHdrFromMemory(allocator, SKY_HDR_BYTES);
+    defer hdri.deinit();
+
     try app.resources.insert(render_3d.pbr.SkyEnvironment, .{
         .kind = .procedural,
+        .hdri_pixels = hdri.pixels,
+        .hdri_width = hdri.width,
+        .hdri_height = hdri.height,
+        .hdri_exposure_ev = -0.6,
         .sky_tint = .{ 0.14, 0.40, 0.88 },
         .horizon_tint = .{ 0.58, 0.76, 0.96 },
         .ground_albedo = .{ 0.16, 0.17, 0.19 },
@@ -495,12 +856,12 @@ pub fn main(init: std.process.Init) !void {
     });
     try app.resources.insert(render_3d.pbr.FogSettings, .{
         .enabled = false,
-        .density = 0.015,
-        .start_distance = 3.0,
+        .density = 0.010,
+        .start_distance = 4.0,
         .volumetric = .{
             .enabled = false,
             .anisotropy = 0.68,
-            .scattering = 0.24,
+            .scattering = 0.18,
             .max_distance = 75.0,
         },
     });
@@ -559,6 +920,14 @@ pub fn main(init: std.process.Init) !void {
         .bloom = .{ .enabled = true, .intensity = 0.30, .threshold = 1.1, .scatter = 0.72 },
         .ssao = .{ .enabled = true, .radius = 0.65, .intensity = 1.25, .bias = 0.03 },
         .contact_shadows = .{ .enabled = true, .length = 0.45, .thickness = 0.12, .opacity = 0.8 },
+        .quality = .{
+            .shadows = .{
+                .normal_offset = true,
+                .prioritize_local_lights = true,
+                .static_cache = true,
+                .adaptive_atlas = true,
+            },
+        },
         .tonemap_mode = .agx,
         .tonemap_look = .base,
     });
@@ -581,6 +950,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (app.resources.get(helios.HeliosService)) |hsvc| {
+        hsvc.settings.tier = .high;
+    }
+
+    const cap_dir: ?[]const u8 = init.environ_map.get("ZENGY_PRISM_CAPTURE");
+    if (cap_dir) |d| {
+        std.Io.Dir.cwd().createDirPath(init.io, d) catch {};
+    }
+
     try app.resources.insert(PrismShowcaseState, .{
         .app = &app,
         .gfx = gfx,
@@ -590,8 +968,10 @@ pub fn main(init: std.process.Init) !void {
         .view_id = view_id,
         .assets = assets,
         .gi_vol = gi_vol,
+        .gi_bvh = helios.ray_query.Bvh.init(allocator),
+        .capture_dir = cap_dir,
+        .capture_io = init.io,
     });
-    defer if (app.resources.get(PrismShowcaseState)) |s| s.deinit();
 
     try loadJsonScene(app.resources.get(PrismShowcaseState).?, 0);
     try window_sdl3.runVisualLoop(&app);

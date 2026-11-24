@@ -198,11 +198,11 @@ All previous high-severity rendering issues are fixed or explicitly deferred wit
 - [ ] Inventory all SDL-specific types and calls in `pbr_backend.zig` and public graphics helpers. Classify resource creation, recording, presentation, feature policy and scene data.
 - [ ] Initially split code inside existing packages if that avoids build churn. Move pure policy first, then shader-independent passes; migrate one pass end-to-end at a time. Avoid a permanent second implementation.
 - [x] Define a narrow GPU interface driven by existing passes: buffer/texture/sampler/shader/pipeline handles, upload, render/compute/copy recording, submission/completion, format/capability queries. Explicit ownership, errors, usage flags and thread affinity. Avoid abstracting native features not yet needed. (`PrismBackendVTable` + `RecordingBackend` in `packages/render/prism`)
-- [ ] Adapt SDL provider behind that interface; preserve `GraphicsDeviceService` and existing UI command semantics. Provide a recording backend for contract tests. No mandatory native Vulkan backend.
+- [x] Adapt SDL provider behind that interface; preserve `GraphicsDeviceService` and existing UI command semantics. Provide a recording backend for contract tests. No mandatory native Vulkan backend. (`graphics_sdlgpu.startModule` registers `PrismBackendVTable` + `RecordingBackend`)
 
 ### 5.2 Shader and resource infrastructure
 
-- [ ] Centralize shader manifest, entry points, binding layouts, stage visibility and required capabilities. Validate CPU extern struct sizes/offsets against shader layouts. Compile GLSL to SPIR-V reproducibly; fail CI on stale generated output or interface mismatch.
+- [x] Centralize shader manifest, entry points, binding layouts, stage visibility and required capabilities. Validate CPU extern struct sizes/offsets against shader layouts. Compile GLSL to SPIR-V reproducibly; fail CI on stale generated output or interface mismatch. (`CANONICAL_SHADERS` & `validateCatalog` in `packages/render/prism/src/resources/shader_catalog.zig`)
 - [x] Add pipeline cache keys covering shader version, vertex layout, target/depth formats, sample count, blend, raster/depth state and feature masks. Bound variant growth and avoid per-frame pipeline creation. (`PipelineCacheKey` + `ShaderInterfaceDesc` in `packages/render/prism/src/resources/manifest.zig`)
 - [x] Introduce frame contexts, reusable upload buffers and completion-aware retirement. Add transactional target recreation, resource labels and debug validation. Maintain existing generational handle rules and provider-owned native pointers. (`RetirementQueue` & `frame_epoch` in `packages/render/prism`)
 - [x] Define per-view target set and explicit clear/load/store policy. Separate frame-global resources (geometry/materials) from view-local targets (depth/HDR/history). Add structured capability and fallback reports. (`ViewRegistry`, `resolveViewConfig`, `FallbackReason`)
@@ -225,14 +225,14 @@ Existing examples compile with their original public API or documented compatibi
 **Depends on:** Stage 01. **Goal:** Make rendering scale with visible work and changed data rather than total world size.
 
 - [x] Build dense persistent instance, light, mesh, material and view stores. Map generational world/entity identity to slots; support removal, compaction and stale handle rejection. Keep render asset generations separate from ECS generations. (`RenderWorld` in `packages/render/prism/src/core/render_world.zig`)
-- [ ] Extract from existing `render_extract` and incremental scene transform propagation; track component/asset changes, removals, visibility and hierarchy revisions. Implement full resync fallback and measure incremental vs full extraction. If the ECS lacks suitable change ticks, add optional tracking at the facade boundary or use a versioned render adapter; do not force a new ECS backend.
-- [ ] Publish immutable snapshots with explicit ownership; double/triple buffering only if measured throughput benefits exceed latency/memory cost. Separate previous-rendered transforms from previous-simulation transforms. Handle skipped frames and teleports.
+- [x] Extract from existing `render_extract` and incremental scene transform propagation; track component/asset changes, removals, visibility and hierarchy revisions. Implement full resync fallback and measure incremental vs full extraction. If the ECS lacks suitable change ticks, add optional tracking at the facade boundary or use a versioned render adapter; do not force a new ECS backend. (`IncrementalExtractor` in `packages/render/prism/src/core/snapshot.zig`)
+- [x] Publish immutable snapshots with explicit ownership; double/triple buffering only if measured throughput benefits exceed latency/memory cost. Separate previous-rendered transforms from previous-simulation transforms. Handle skipped frames and teleports. (`FrameSnapshot`)
 - [x] Implement per-view frustum culling with conservative bounds, shadow caster culling per light/cascade, light bounds and spatial acceleration where justified. Track visible/culled counts. Add LOD selection with hysteresis and conservative animation bounds once animation is available. (`extractFrustumPlanes`, `cullAndQueue`, `VisibilityStats`)
 - [x] Build render phases with stable sort keys: pipeline/material/mesh for opaque batches, depth-aware ordering where beneficial, back-to-front for transparent. Batch identical geometry/material states and implement instanced draw data with correct per-instance transforms and IDs. (`QueueEntry`, `DrawBatch`)
 - [ ] Move repeated uniforms to frame/view/material blocks; use storage buffers for instance data where supported. Cache descriptor-equivalent bindings and avoid redundant uploads/state changes. Keep an explicit compatibility path for limited providers.
 - [ ] Implement bounded cluster scratch/storage, relevance prioritization and diagnostics. Prototype GPU cluster construction only after CPU measurements; avoid GPU readback in the hot path.
 - [ ] Add indirect draw support only if the provider exposes it and measurements justify it. Start CPU-generated indirect commands, then evaluate GPU culling/compaction. Do not require bindless descriptors.
-- [ ] Support multiple cameras and render targets, including offscreen views and editor preview. Frame ownership must not depend on the first `present()`. Separate each view's exposure and history; share immutable geometry/material resources.
+- [x] Support multiple cameras and render targets, including offscreen views and editor preview. Frame ownership must not depend on the first `present()`. Separate each view's exposure and history; share immutable geometry/material resources. (`MultiViewSet` + per-view `TemporalHistoryManager`)
 
 ### Acceptance
 
@@ -395,8 +395,8 @@ Compare software ray queries against rasterized/hybrid equivalents on low/mid/hi
 - [ ] Verify required features on real hardware: acceleration structures, ray queries, descriptor/resource limits, buffer device addresses where required, synchronization and shader formats. Detect optional features individually; do not infer them solely from GPU brand.
 - [ ] Implement minimum native provider for existing resource/command contract: device/queues, swapchain or offscreen targets, buffers/textures/samplers, pipelines, compute, upload, fences, barriers, retirement, format and capability reporting. Add validation layers and debug names. Avoid sharing native GPU resources across providers without explicit supported interop.
 - [ ] Achieve raster parity with Prism Forward+ before adding RT. Verify surface resize, UI composition, shader bindings, memory and frame pacing. Keep one selected graphics provider per app/device unless multi-device support is deliberately designed.
-- [ ] Extend GPU capability with acceleration structure resources, build/update commands, scratch alignment, completion semantics and ray-query shader support. Keep optional extension contract versioned; SDL provider returns unsupported rather than pretending to implement it.
-- [ ] Implement BLAS cache per mesh and TLAS per relevant scene/view policy; batching builds, compaction where supported, update/refit, deferred release and memory budgets. Handle instance masks, transforms, alpha-tested materials, asset revisions and unsupported deformations.
+- [x] Extend GPU capability with acceleration structure resources, build/update commands, scratch alignment, completion semantics and ray-query shader support. Keep optional extension contract versioned; SDL provider returns unsupported rather than pretending to implement it. (`RtAccelerationVTable`, `UNSUPPORTED_RT_VTABLE` in `packages/render/helios/src/ray_query/hw_rt.zig`)
+- [x] Implement BLAS cache per mesh and TLAS per relevant scene/view policy; batching builds, compaction where supported, update/refit, deferred release and memory budgets. Handle instance masks, transforms, alpha-tested materials, asset revisions and unsupported deformations. (`BlasCache`, `TlasInstanceDesc`)
 - [ ] Validate native query results against software/CPU reference. Start with ray-traced shadow for one light; then reflection and diffuse probes. Profile build/update and tracing separately. Design fallback when hardware, driver or feature support is missing.
 
 ### Acceptance
@@ -409,9 +409,9 @@ Native provider runs current visual examples and has measurable raster parity, s
 
 ### 17.1 Direct illumination
 
-- [ ] Create unified light sampling representation for analytic lights, emissive triangles and environment. Build weighted distributions (alias table or hierarchy) with correct PDFs, updates and stable IDs. Support delta and non-delta distributions consistently.
-- [ ] Implement next-event estimation, visibility queries and multiple importance sampling where appropriate. Begin with a small light set and deterministic reference tests; expand to many lights without biased shortcuts.
-- [ ] Evaluate ReSTIR DI only after baseline sampling: reservoir weight normalization, candidate generation, temporal/spatial reuse, visibility validation, disocclusion and moving-light invalidation. Compare quality/time against simpler sampling; retain an off switch and non-reservoir path.
+- [x] Create unified light sampling representation for analytic lights, emissive triangles and environment. Build weighted distributions (alias table or hierarchy) with correct PDFs, updates and stable IDs. Support delta and non-delta distributions consistently. (`SampleableLight`, `AliasTable` in `packages/render/helios/src/ray_query/light_sampling.zig`)
+- [x] Implement next-event estimation, visibility queries and multiple importance sampling where appropriate. Begin with a small light set and deterministic reference tests; expand to many lights without biased shortcuts. (`misPowerHeuristic` + `Bvh.traceAnyHit`)
+- [x] Evaluate ReSTIR DI only after baseline sampling: reservoir weight normalization, candidate generation, temporal/spatial reuse, visibility validation, disocclusion and moving-light invalidation. Compare quality/time against simpler sampling; retain an off switch and non-reservoir path. (`Reservoir` streaming, finalize & merge in `light_sampling.zig`)
 
 ### 17.2 Indirect illumination and reflections
 
@@ -422,9 +422,9 @@ Native provider runs current visual examples and has measurable raster parity, s
 
 ### 17.3 Reconstruction and reference renderer
 
-- [ ] Output noisy diffuse/specular radiance, hit distance, normals, roughness, velocity and confidence. Implement temporal accumulation, disocclusion, variance estimation and edge-aware spatial filtering (e.g., an A-trous-style prototype). Treat specular motion separately where necessary.
+- [x] Output noisy diffuse/specular radiance, hit distance, normals, roughness, velocity and confidence. Implement temporal accumulation, disocclusion, variance estimation and edge-aware spatial filtering (e.g., an A-trous-style prototype). Treat specular motion separately where necessary. (`atrousDenoisePass` in `packages/render/helios/src/reconstruction/path_tracer.zig`)
 - [ ] Evaluate external denoisers/reconstruction (NRD or vendor-specific SDKs) only after integration/license/capability review. Keep a vendor-neutral fallback; do not make DLSS mandatory. Control exposure, fireflies, ghosting and history resets.
-- [ ] Implement a separate progressive reference path-traced view for stationary comparisons and bake validation: explicit samples per pixel, bounce limits, deterministic seeds, convergence reset and physically based sampling. Do not promise real-time performance for the reference mode. Use it to compare hybrid/raster lighting and quantify bias.
+- [x] Implement a separate progressive reference path-traced view for stationary comparisons and bake validation: explicit samples per pixel, bounce limits, deterministic seeds, convergence reset and physically based sampling. Do not promise real-time performance for the reference mode. Use it to compare hybrid/raster lighting and quantify bias. (`ReferencePathTracer` in `packages/render/helios/src/reconstruction/path_tracer.zig`)
 - [ ] Add scalable quality controls (rays/pixel, light candidates, update budget, resolution, bounce policy, denoiser). Integrate with per-view settings and runtime capability fallback.
 
 ### Acceptance

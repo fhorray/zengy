@@ -1,0 +1,42 @@
+{
+  "name": "05 — Material & Shadow Calibration Lab",
+  "camera_pos": [0.0, 4.8, 13.8],
+  "camera_target": [0.0, 1.8, -1.0],
+  "sky_tint": [0.16, 0.42, 0.88],
+  "horizon_tint": [0.58, 0.74, 0.94],
+  "ground_albedo": [0.16, 0.16, 0.18],
+  "sun_dir": [-0.72, -0.42, -0.55],
+  "sun_color": [1.0, 0.95, 0.86],
+  "sun_lux": 26000.0,
+  "fog_enabled": false,
+  "fog_density": 0.006,
+  "volumetric_enabled": false,
+  "bloom_enabled": true,
+  "ssao_enabled": true,
+  "objects": [
+    { "shape": "plane", "pos": [0.0, 0.0, 0.0], "scale": [40.0, 1.0, 40.0], "color": [0.42, 0.43, 0.45], "roughness": 0.72, "metallic": 0.0 },
+
+    { "shape": "sphere", "pos": [-6.0, 0.8, -2.5], "scale": [1.6, 1.6, 1.6], "color": [0.95, 0.76, 0.30], "roughness": 0.06, "metallic": 1.0 },
+    { "shape": "sphere", "pos": [-3.0, 0.8, -2.5], "scale": [1.6, 1.6, 1.6], "color": [0.95, 0.76, 0.30], "roughness": 0.25, "metallic": 1.0 },
+    { "shape": "sphere", "pos": [0.0, 0.8, -2.5], "scale": [1.6, 1.6, 1.6], "color": [0.95, 0.76, 0.30], "roughness": 0.50, "metallic": 1.0 },
+    { "shape": "sphere", "pos": [3.0, 0.8, -2.5], "scale": [1.6, 1.6, 1.6], "color": [0.95, 0.76, 0.30], "roughness": 0.75, "metallic": 1.0 },
+    { "shape": "sphere", "pos": [6.0, 0.8, -2.5], "scale": [1.6, 1.6, 1.6], "color": [0.95, 0.76, 0.30], "roughness": 0.95, "metallic": 1.0 },
+
+    { "shape": "sphere", "pos": [-6.0, 0.8, 1.0], "scale": [1.6, 1.6, 1.6], "color": [0.82, 0.16, 0.18], "roughness": 0.08, "metallic": 0.0 },
+    { "shape": "sphere", "pos": [-3.0, 0.8, 1.0], "scale": [1.6, 1.6, 1.6], "color": [0.82, 0.16, 0.18], "roughness": 0.28, "metallic": 0.0 },
+    { "shape": "sphere", "pos": [0.0, 0.8, 1.0], "scale": [1.6, 1.6, 1.6], "color": [0.82, 0.16, 0.18], "roughness": 0.52, "metallic": 0.0 },
+    { "shape": "sphere", "pos": [3.0, 0.8, 1.0], "scale": [1.6, 1.6, 1.6], "color": [0.82, 0.16, 0.18], "roughness": 0.76, "metallic": 0.0 },
+    { "shape": "sphere", "pos": [6.0, 0.8, 1.0], "scale": [1.6, 1.6, 1.6], "color": [0.82, 0.16, 0.18], "roughness": 0.95, "metallic": 0.0 },
+
+    { "shape": "cuboid", "pos": [-7.5, 3.0, -6.0], "scale": [0.9, 6.0, 0.9], "color": [0.76, 0.76, 0.78], "roughness": 0.65, "metallic": 0.0 },
+    { "shape": "cylinder", "pos": [-2.5, 2.5, -6.0], "scale": [1.0, 5.0, 1.0], "color": [0.76, 0.76, 0.78], "roughness": 0.55, "metallic": 0.0 },
+    { "shape": "cone", "pos": [2.5, 2.2, -6.0], "scale": [1.6, 4.4, 1.6], "color": [0.76, 0.76, 0.78], "roughness": 0.60, "metallic": 0.0 },
+    { "shape": "torus", "pos": [7.5, 2.0, -5.5], "scale": [2.2, 2.2, 2.2], "color": [0.85, 0.88, 0.92], "roughness": 0.15, "metallic": 0.95 },
+
+    { "shape": "cuboid", "pos": [0.0, 0.25, 4.2], "scale": [10.0, 0.5, 0.8], "color": [0.18, 0.18, 0.20], "roughness": 0.85, "metallic": 0.0 }
+  ],
+  "point_lights": [
+    { "pos": [-6.5, 3.5, 3.5], "color": [1.0, 0.92, 0.80], "lumens": 900.0, "range": 14.0, "shadows": false },
+    { "pos": [6.5, 3.5, 3.5], "color": [0.75, 0.88, 1.0], "lumens": 900.0, "range": 14.0, "shadows": false }
+  ]
+}

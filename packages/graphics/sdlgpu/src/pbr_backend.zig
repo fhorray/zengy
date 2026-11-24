@@ -405,6 +405,8 @@ pub const PbrGpuState = struct {
     vol_prev_cam: [3]f32 = .{ 0, 0, 0 },
     vol_prev_fwd: [3]f32 = .{ 0, 0, -1 },
     vol_frame: u32 = 0,
+    vol_sp_fader: volumetric_lights.SlotFader = .{},
+    vol_pt_fader: volumetric_lights.SlotFader = .{},
     /// Last render keys of the cached shadow maps (see `ShadowQuality.static_cache`).
     dir_cascade_cache: [4]shadow_plan.CacheKey = @splat(.{}),
     dir_atlas_valid: bool = false,
@@ -1747,11 +1749,12 @@ pub const PbrGpuState = struct {
             var vf_sp_dir: [4][4]f32 = @splat(.{ 0, -1, 0, 0.8 });
             var vf_sp_col: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
             var vf_sp_shadow: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
-            const vf_spick = volumetric_lights.selectRelevantLights(self.frame_data.spot_lights[0..sp_count], self.frame_data.camera_position);
-            for (0..vf_spick.count) |slot| {
-                const li = vf_spick.idx[slot];
+            self.vol_sp_fader.update(self.frame_data.spot_lights[0..sp_count], self.frame_data.camera_position, self.frame_data.dt);
+            for (self.vol_sp_fader.slots, 0..) |s, slot| {
+                if (!s.active or s.weight <= 0.0) continue;
+                const li = s.idx;
                 const sl = self.frame_data.spot_lights[li];
-                const sc = sl.intensity_lumens / 100.0;
+                const sc = (sl.intensity_lumens / 100.0) * s.weight;
                 vf_sp_pos[slot] = .{ sl.position[0], sl.position[1], sl.position[2], sl.range };
                 vf_sp_dir[slot] = .{ sl.direction[0], sl.direction[1], sl.direction[2], @cos(sl.outer_angle_rad) };
                 vf_sp_col[slot] = .{ sl.color[0] * sc, sl.color[1] * sc, sl.color[2] * sc, 1.0 };
@@ -1763,11 +1766,12 @@ pub const PbrGpuState = struct {
             var vf_pt_col: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
             var vf_pt_shadow: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
             // Only lights that received a cluster entry this frame are candidates, so `cl_lights` indices stay valid.
-            const vf_pick = volumetric_lights.selectRelevantLights(self.frame_data.point_lights[0..pt_count], self.frame_data.camera_position);
-            for (0..vf_pick.count) |slot| {
-                const li = vf_pick.idx[slot];
+            self.vol_pt_fader.update(self.frame_data.point_lights[0..pt_count], self.frame_data.camera_position, self.frame_data.dt);
+            for (self.vol_pt_fader.slots, 0..) |s, slot| {
+                if (!s.active or s.weight <= 0.0) continue;
+                const li = s.idx;
                 const pl = self.frame_data.point_lights[li];
-                const sc = pl.intensity_lumens / 100.0;
+                const sc = (pl.intensity_lumens / 100.0) * s.weight;
                 vf_pt_pos[slot] = .{ pl.position[0], pl.position[1], pl.position[2], pl.range };
                 vf_pt_col[slot] = .{ pl.color[0] * sc, pl.color[1] * sc, pl.color[2] * sc, 1.0 };
                 // Local-atlas tile of the first cube face (six consecutive tiles), or -1 when unshadowed.

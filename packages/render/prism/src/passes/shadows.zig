@@ -64,6 +64,93 @@ pub fn estimatePcssPenumbra(
     return std.math.clamp(penumbra, min_radius_texels, max_radius_texels);
 }
 
+/// Golden-angle Vogel disk tap offset in `[-1, 1]^2` rotated by `rotation_rad` (e.g. interleaved gradient noise).
+pub fn rotatedVogelDiskSample(sample_idx: u32, sample_count: u32, rotation_rad: f32) [2]f32 {
+    const count = @max(sample_count, 1);
+    const r = @sqrt((@as(f32, @floatFromInt(sample_idx)) + 0.5) / @as(f32, @floatFromInt(count)));
+    const theta = @as(f32, @floatFromInt(sample_idx)) * 2.399963229728653 + rotation_rad;
+    return .{ r * @cos(theta), r * @sin(theta) };
+}
+
+/// Result of a PCSS blocker search over a shadow depth map.
+pub const PcssBlockerResult = struct {
+    avg_blocker_depth: f32 = 0.0,
+    blocker_count: u32 = 0,
+};
+
+/// Performs a bounded PCSS blocker search over a single-channel depth map (`width * height`),
+/// sampling `sample_count` rotated Vogel taps within `search_radius_texels` around `uv`.
+pub fn pcssBlockerSearch(
+    depth_map: []const f32,
+    width: u32,
+    height: u32,
+    uv: [2]f32,
+    receiver_depth: f32,
+    search_radius_texels: f32,
+    sample_count: u32,
+    rotation_rad: f32,
+) PcssBlockerResult {
+    if (width == 0 or height == 0 or depth_map.len < @as(usize, width) * @as(usize, height)) return .{};
+    const w_f: f32 = @floatFromInt(width);
+    const h_f: f32 = @floatFromInt(height);
+    const count = std.math.clamp(sample_count, 1, 32);
+
+    var sum_depth: f32 = 0.0;
+    var blockers: u32 = 0;
+    for (0..count) |i| {
+        const tap = rotatedVogelDiskSample(@intCast(i), count, rotation_rad);
+        const su = std.math.clamp(uv[0] + (tap[0] * search_radius_texels) / w_f, 0.0, 0.999999);
+        const sv = std.math.clamp(uv[1] + (tap[1] * search_radius_texels) / h_f, 0.0, 0.999999);
+        const px: usize = @intFromFloat(su * w_f);
+        const py: usize = @intFromFloat(sv * h_f);
+        const sample_d = depth_map[py * @as(usize, width) + px];
+        if (sample_d < receiver_depth) {
+            sum_depth += sample_d;
+            blockers += 1;
+        }
+    }
+    if (blockers == 0) return .{};
+    return .{
+        .avg_blocker_depth = sum_depth / @as(f32, @floatFromInt(blockers)),
+        .blocker_count = blockers,
+    };
+}
+
+/// Bounding sphere of a shadow-casting object for per-cascade / per-light frustum culling.
+pub const ShadowCasterSphere = struct {
+    caster_id: u64,
+    center: [3]f32,
+    radius: f32,
+    casts_shadows: bool = true,
+};
+
+/// Culls `casters` against 6 normalized light-frustum planes `[nx, ny, nz, d]` (`dot(n, p) + d >= -r`),
+/// writing surviving caster indices into `out_indices`.
+pub fn cullShadowCasters(
+    allocator: std.mem.Allocator,
+    casters: []const ShadowCasterSphere,
+    frustum_planes: [6][4]f32,
+    out_indices: *std.ArrayList(usize),
+) !usize {
+    out_indices.clearRetainingCapacity();
+    var culled: usize = 0;
+    outer: for (casters, 0..) |c, idx| {
+        if (!c.casts_shadows or c.radius <= 0.0) {
+            culled += 1;
+            continue;
+        }
+        for (frustum_planes) |p| {
+            const dist = p[0] * c.center[0] + p[1] * c.center[1] + p[2] * c.center[2] + p[3];
+            if (dist < -c.radius) {
+                culled += 1;
+                continue :outer;
+            }
+        }
+        try out_indices.append(allocator, idx);
+    }
+    return culled;
+}
+
 /// Candidate local light competing for shadow atlas tiles.
 pub const ShadowLightCandidate = struct {
     light_id: u64,

@@ -16,13 +16,17 @@ pub const pass_graph = @import("core/pass_graph.zig");
 pub const render_world = @import("core/render_world.zig");
 pub const coordinates = @import("core/coordinates.zig");
 pub const extensions = @import("core/extensions.zig");
+pub const snapshot = @import("core/snapshot.zig");
+pub const editor_api = @import("core/editor_api.zig");
 pub const temporal = @import("features/temporal.zig");
 pub const reflections = @import("features/reflections.zig");
 pub const atmosphere = @import("features/atmosphere.zig");
 pub const shadows = @import("passes/shadows.zig");
 pub const photometry = @import("lighting/photometry.zig");
+pub const area_lights = @import("lighting/area_lights.zig");
 pub const baked_gi = @import("lighting/baked_gi.zig");
 pub const manifest = @import("resources/manifest.zig");
+pub const shader_catalog = @import("resources/shader_catalog.zig");
 pub const recording_backend = @import("resources/recording_backend.zig");
 
 pub const LightingMode = types.LightingMode;

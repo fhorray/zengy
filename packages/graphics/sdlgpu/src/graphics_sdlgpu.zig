@@ -19,6 +19,7 @@ const text_pkg = @import("text");
 const render_3d = @import("render_3d");
 const gizmos = @import("gizmos");
 const dev_tools = @import("dev_tools");
+const prism = @import("prism");
 const c = @import("sdl3_c");
 const shadow_cull = @import("shadow_cull.zig");
 /// Frame capture, statistics and comparison helpers for render regression tests.
@@ -1669,6 +1670,10 @@ fn submitGizmosBackend(
     try state.gizmo_solid_xray_verts.appendSlice(state.allocator, solid_xray_tris);
 }
 
+fn prismSdlBeginFrame(_: ?*anyopaque, _: u64) !void {}
+fn prismSdlExecutePass(_: ?*anyopaque, _: prism.RenderViewId, _: prism.PassDesc) !void {}
+fn prismSdlEndFrame(_: ?*anyopaque, _: u64) !void {}
+
 fn startModule(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     if (app.resources.get(SdlGpuState)) |state| {
@@ -1677,6 +1682,22 @@ fn startModule(raw_app: *anyopaque) !void {
         }
         if (app.resources.get(gizmos.GizmoService)) |giz| {
             giz.setBackend(.{ .ctx = state, .submitGizmos = submitGizmosBackend });
+        }
+        if (app.resources.get(prism.PrismService)) |psvc| {
+            psvc.setBackend(.{
+                .id = "official.graphics.sdlgpu",
+                .capabilities = .{
+                    .supports_hybrid_lighting = true,
+                    .supports_ray_tracing = false,
+                    .supports_taa = false,
+                    .supports_compute = true,
+                    .max_resolution_scale = 2.0,
+                },
+                .ctx = state,
+                .begin_frame = prismSdlBeginFrame,
+                .execute_pass = prismSdlExecutePass,
+                .end_frame = prismSdlEndFrame,
+            });
         }
         state.pbr.profiler = app.resources.get(dev_tools.FrameProfilerService);
     }

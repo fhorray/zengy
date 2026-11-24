@@ -12,6 +12,11 @@ pub const contract = @import("hybrid/lighting_contract.zig");
 pub const ssgi = @import("hybrid/ssgi.zig");
 pub const radiance_cache = @import("hybrid/radiance_cache.zig");
 pub const ray_query = @import("ray_query/bvh.zig");
+pub const hw_rt = @import("ray_query/hw_rt.zig");
+pub const light_sampling = @import("ray_query/light_sampling.zig");
+pub const indirect_rt = @import("ray_query/indirect_rt.zig");
+pub const gi_solver = @import("ray_query/gi_solver.zig");
+pub const path_tracer = @import("reconstruction/path_tracer.zig");
 
 pub const HeliosQualityTier = contract.HeliosQualityTier;
 pub const HeliosDebugMode = contract.HeliosDebugMode;

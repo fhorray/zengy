@@ -92,3 +92,188 @@ test "Stage 11 Helios software BVH closest-hit and any-hit match brute-force ref
         }
     }
 }
+
+const MockRtState = struct { builds: usize = 0, destroys: usize = 0 };
+fn mockBuildBlas(ctx: ?*anyopaque, _: u64, _: []const u8, _: []const u8) !helios.hw_rt.BlasHandle {
+    const s: *MockRtState = @ptrCast(@alignCast(ctx.?));
+    s.builds += 1;
+    return .{ .index = @intCast(s.builds), .generation = 1 };
+}
+fn mockDestroyBlas(ctx: ?*anyopaque, _: helios.hw_rt.BlasHandle) void {
+    const s: *MockRtState = @ptrCast(@alignCast(ctx.?));
+    s.destroys += 1;
+}
+fn mockBuildTlas(_: ?*anyopaque, _: []const helios.hw_rt.TlasInstanceDesc) !helios.hw_rt.TlasHandle {
+    return .{ .index = 1, .generation = 1 };
+}
+fn mockDestroyTlas(_: ?*anyopaque, _: helios.hw_rt.TlasHandle) void {}
+
+test "Stage 12 RT acceleration contract & BLAS cache and Stage 13 AliasTable, ReSTIR DI, PathTracer, A-Trous" {
+    // Stage 12: SDL fallback explicitly rejects hardware RT
+    var cache = helios.hw_rt.BlasCache.init(testing.allocator);
+    try testing.expectError(
+        error.UnsupportedHardwareRayTracing,
+        cache.getOrBuild(helios.hw_rt.UNSUPPORTED_RT_VTABLE, 1, 1, &.{}, &.{}),
+    );
+    cache.deinit(helios.hw_rt.UNSUPPORTED_RT_VTABLE);
+
+    // Stage 12: Mock native RT provider caches BLAS by revision and destroys on revision change
+    var mock_rt = MockRtState{};
+    const rt_vt = helios.hw_rt.RtAccelerationVTable{
+        .provider_id = "mock.native.rt",
+        .capabilities = .{ .supports_ray_query = true, .supports_acceleration_structure = true },
+        .ctx = &mock_rt,
+        .build_blas = mockBuildBlas,
+        .destroy_blas = mockDestroyBlas,
+        .build_tlas = mockBuildTlas,
+        .destroy_tlas = mockDestroyTlas,
+    };
+    var native_cache = helios.hw_rt.BlasCache.init(testing.allocator);
+    const b1 = try native_cache.getOrBuild(rt_vt, 10, 1, &.{}, &.{});
+    const b1_again = try native_cache.getOrBuild(rt_vt, 10, 1, &.{}, &.{});
+    try testing.expectEqual(b1.index, b1_again.index);
+    try testing.expectEqual(@as(usize, 1), mock_rt.builds);
+    _ = try native_cache.getOrBuild(rt_vt, 10, 2, &.{}, &.{});
+    try testing.expectEqual(@as(usize, 2), mock_rt.builds);
+    try testing.expectEqual(@as(usize, 1), mock_rt.destroys);
+    native_cache.deinit(rt_vt);
+    try testing.expectEqual(@as(usize, 2), mock_rt.destroys);
+
+    // Stage 13.1: Vose AliasTable PDF normalization & O(1) sampling
+    var alias = try helios.light_sampling.AliasTable.build(testing.allocator, &.{ 1.0, 3.0, 6.0 });
+    defer alias.deinit();
+    var pdf_sum: f32 = 0.0;
+    for (alias.entries) |e| pdf_sum += e.pdf;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), pdf_sum, 1e-5);
+    const samp = alias.sample(0.5, 0.25);
+    try testing.expect(samp.index < 3 and samp.pdf > 0.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), helios.light_sampling.misPowerHeuristic(2.0, 2.0), 1e-5);
+
+    // Stage 13.1: ReSTIR DI Reservoir update, finalize, and temporal/spatial merge
+    var res_a = helios.light_sampling.Reservoir{};
+    _ = res_a.update(0, 0.5, 2.0, 0.1);
+    _ = res_a.update(1, 0.8, 4.0, 0.9);
+    res_a.finalize();
+    try testing.expect(res_a.unbiased_weight > 0.0);
+    var res_b = helios.light_sampling.Reservoir{};
+    _ = res_b.update(2, 1.0, 5.0, 0.2);
+    res_b.finalize();
+    _ = res_a.merge(res_b, 1.0, 0.1);
+    try testing.expectEqual(@as(u32, 3), res_a.sample_count);
+
+    // Stage 13.2 & 13.3: ReferencePathTracer progressive accumulation & A-Trous edge-stopping denoiser
+    const tris = [_]helios.ray_query.BvhTriangle{
+        .{ .v0 = .{ -2, -2, -3 }, .v1 = .{ 2, -2, -3 }, .v2 = .{ 0, 2, -3 }, .instance_id = 0, .primitive_id = 0 },
+    };
+    const mats = [_]helios.path_tracer.PathTraceMaterial{
+        .{ .albedo = .{ 0.8, 0.2, 0.2 }, .emissive = .{ 1.0, 0.5, 0.2 } },
+    };
+    var bvh = helios.ray_query.Bvh.init(testing.allocator);
+    defer bvh.deinit();
+    try bvh.build(&tris);
+
+    var pt = try helios.path_tracer.ReferencePathTracer.init(testing.allocator, .{ .width = 8, .height = 8, .max_bounces = 2 });
+    defer pt.deinit();
+    pt.accumulatePass(&bvh, &mats, .{ 0, 0, 0 });
+    pt.accumulatePass(&bvh, &mats, .{ 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 2), pt.sample_count);
+    const center_px = pt.resolvedPixel(4, 4);
+    try testing.expect(center_px[0] > 0.5);
+
+    // A-Trous edge preservation: sharp depth cliff prevents bleeding across edge
+    const src = [_][3]f32{
+        .{ 1, 1, 1 }, .{ 1, 1, 1 }, .{ 0, 0, 0 },
+        .{ 1, 1, 1 }, .{ 1, 1, 1 }, .{ 0, 0, 0 },
+        .{ 1, 1, 1 }, .{ 1, 1, 1 }, .{ 0, 0, 0 },
+    };
+    const depths = [_]f32{
+        1.0, 1.0, 50.0,
+        1.0, 1.0, 50.0,
+        1.0, 1.0, 50.0,
+    };
+    const norms: [9][3]f32 = @splat(.{ 0, 0, 1 });
+    var dst: [9][3]f32 = @splat(.{ 0, 0, 0 });
+    helios.path_tracer.atrousDenoisePass(&src, &depths, &norms, &dst, 3, 3, 1, 0.5, 16.0, 2.0);
+    try testing.expect(dst[4][0] > 0.95); // Center stays bright, does not bleed from depth=50 column
+    try testing.expect(dst[5][0] < 0.05); // Depth=50 column stays dark
+}
+
+test "Stage 13.2 one-bounce RT indirect diffuse/specular, cache population, and quality budgets" {
+    const tris = [_]helios.ray_query.BvhTriangle{
+        // Emissive red ceiling plane at y = 3
+        .{ .v0 = .{ -4, 3, -4 }, .v1 = .{ 4, 3, -4 }, .v2 = .{ 4, 3, 4 }, .instance_id = 0, .primitive_id = 0 },
+        .{ .v0 = .{ -4, 3, -4 }, .v1 = .{ 4, 3, 4 }, .v2 = .{ -4, 3, 4 }, .instance_id = 0, .primitive_id = 1 },
+    };
+    const mats = [_]helios.indirect_rt.SurfaceMaterial{
+        .{ .albedo = .{ 0.8, 0.1, 0.1 }, .emissive = .{ 3.0, 0.2, 0.1 }, .roughness = 0.4 },
+    };
+    var bvh = helios.ray_query.Bvh.init(testing.allocator);
+    defer bvh.deinit();
+    try bvh.build(&tris);
+
+    var stats = helios.ray_query.QueryStats{};
+    const diff = helios.indirect_rt.traceIndirectDiffuse(&bvh, &mats, .{ 0, 0, 0 }, .{ 0, 1, 0 }, 0.1, 0.2, 20.0, .{ 0.1, 0.2, 0.4 }, &stats);
+    try testing.expect(diff.hit);
+    try testing.expect(diff.radiance_rgb[0] > 2.0);
+    try testing.expect(stats.rays_cast >= 1);
+
+    const spec = helios.indirect_rt.traceIndirectSpecular(&bvh, &mats, .{ 0, 0, 0 }, .{ 0, 1, 0 }, .{ 0, 1, 0 }, 0.1, 0.2, 0.1, 20.0, .{ 0.1, 0.2, 0.4 }, &stats);
+    try testing.expect(spec.hit);
+    try testing.expect(spec.radiance_rgb[0] > 2.0);
+
+    var cache = helios.WorldRadianceCache.init(testing.allocator, 2.0, 64);
+    defer cache.deinit();
+    const avg = try helios.indirect_rt.populateRadianceCacheFromRays(&bvh, &mats, &cache, .{ 0, 0, 0 }, .{ 0, 1, 0 }, 8, 20.0, .{ 0.1, 0.2, 0.4 }, 1, &stats);
+    try testing.expect(avg[0] > 1.5);
+    try testing.expect(cache.query(.{ 0, 0, 0 }, 0, 1) != null);
+
+    const low_b = helios.indirect_rt.budgetForTier(.low);
+    const high_b = helios.indirect_rt.budgetForTier(.high);
+    try testing.expect(high_b.rays_per_pixel > low_b.rays_per_pixel);
+    try testing.expect(high_b.cache_update_budget > low_b.cache_update_budget);
+}
+
+test "Helios Instant-Radiosity BVH GI solver produces colored bounce VPLs in a Cornell room" {
+    var tris = std.ArrayList(helios.ray_query.BvhTriangle).empty;
+    defer tris.deinit(testing.allocator);
+    // Red left wall (mat 0), green right wall (mat 1), white floor (mat 2)
+    try helios.gi_solver.appendBoxTriangles(testing.allocator, &tris, .{ -4.0, 3.0, 0.0 }, .{ 0.25, 3.0, 4.0 }, 0);
+    try helios.gi_solver.appendBoxTriangles(testing.allocator, &tris, .{ 4.0, 3.0, 0.0 }, .{ 0.25, 3.0, 4.0 }, 1);
+    try helios.gi_solver.appendBoxTriangles(testing.allocator, &tris, .{ 0.0, 0.0, 0.0 }, .{ 4.0, 0.25, 4.0 }, 2);
+
+    const mats = [_]helios.indirect_rt.SurfaceMaterial{
+        .{ .albedo = .{ 0.85, 0.12, 0.10 } },
+        .{ .albedo = .{ 0.12, 0.78, 0.16 } },
+        .{ .albedo = .{ 0.80, 0.80, 0.78 } },
+    };
+    var bvh = helios.ray_query.Bvh.init(testing.allocator);
+    defer bvh.deinit();
+    try bvh.build(tris.items);
+
+    const emitters = [_]helios.gi_solver.DirectPointEmitter{
+        .{ .position = .{ 0.0, 5.0, 0.0 }, .color = .{ 1.0, 0.96, 0.90 }, .lumens = 3000.0, .range = 14.0 },
+    };
+    var vpls = std.ArrayList(helios.gi_solver.VirtualPointLight).empty;
+    defer vpls.deinit(testing.allocator);
+
+    const stats = try helios.gi_solver.solveInstantRadiosity(
+        testing.allocator,
+        &bvh,
+        &mats,
+        &emitters,
+        null,
+        helios.gi_solver.configForTier(.high),
+        &vpls,
+    );
+    try testing.expect(stats.rays_cast >= 64);
+    try testing.expect(vpls.items.len >= 3);
+
+    var found_red = false;
+    var found_green = false;
+    for (vpls.items) |v| {
+        if (v.color[0] > 0.7 and v.color[1] < 0.35) found_red = true;
+        if (v.color[1] > 0.7 and v.color[0] < 0.35) found_green = true;
+    }
+    try testing.expect(found_red);
+    try testing.expect(found_green);
+}

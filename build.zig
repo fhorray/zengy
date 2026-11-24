@@ -636,6 +636,7 @@ pub fn build(b: *std.Build) void {
     graphics_sdlgpu_mod.addImport("render_3d", render_3d_mod);
     graphics_sdlgpu_mod.addImport("gizmos", gizmos_mod);
     graphics_sdlgpu_mod.addImport("dev_tools", dev_tools_mod);
+    graphics_sdlgpu_mod.addImport("prism", prism_mod);
     graphics_sdlgpu_mod.addImport("sdl3_c", sdl3_c_mod);
 
     // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
@@ -1042,6 +1043,10 @@ pub fn build(b: *std.Build) void {
     visual_prism_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_prism_mod.addImport("graphics", graphics_mod);
     visual_prism_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_prism_mod.addImport("testing_sdk", testing_sdk_mod);
+    visual_prism_mod.addAnonymousImport("sky_hdr", .{
+        .root_source_file = b.path("examples/visual-pbr/assets/sky.hdr"),
+    });
     visual_prism_mod.addImport("input", input_mod);
     visual_prism_mod.addImport("input_sdl3", input_sdl3_mod);
     visual_prism_mod.addImport("camera", camera_mod);

@@ -401,3 +401,143 @@ test "Stage 10 ExtensionRegistry ordering, owner revocation, and QualityPreset m
     try testing.expectEqual(@as(u32, 4), high.shadow_cascades);
     try testing.expect(high.pcss_enabled);
 }
+
+test "ShaderCatalog validation, FrameSnapshot immutability, IncrementalExtractor, and MultiViewSet" {
+    try testing.expect(prism.shader_catalog.validateCatalog());
+    const pbr_vs = prism.shader_catalog.findShader("pbr.vert").?;
+    try testing.expectEqual(@as(usize, 32), pbr_vs.interface.vertex_stride);
+    const giz_vs = prism.shader_catalog.findShader("gizmo.vert").?;
+    try testing.expectEqual(@as(usize, 28), giz_vs.interface.vertex_stride);
+
+    var rw = prism.RenderWorld.init(testing.allocator);
+    defer rw.deinit();
+    const id_m = [16]f32{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    const e1 = engine.EntityHandle{ .index = 1, .generation = 1 };
+    const e2 = engine.EntityHandle{ .index = 2, .generation = 1 };
+    rw.beginSync();
+    try rw.upsert(e1, 1, 1, 1, id_m, .{ 0, 0, 0 }, 1.0, false);
+    try rw.upsert(e2, 2, 2, 1, id_m, .{ 2, 0, 0 }, 1.0, false);
+
+    // Immutable FrameSnapshot survives RenderWorld mutation
+    var snap = try prism.snapshot.FrameSnapshot.publishFrom(testing.allocator, 7, 1, &rw);
+    defer snap.deinit();
+    try testing.expect(rw.remove(e1));
+    try testing.expectEqual(@as(usize, 1), rw.count());
+    try testing.expectEqual(@as(usize, 2), snap.instances.len);
+
+    // IncrementalExtractor detects unchanged vs updated vs full-resync
+    var ext = prism.snapshot.IncrementalExtractor.init(testing.allocator);
+    defer ext.deinit();
+    var st1 = prism.snapshot.ExtractionStats{};
+    try testing.expect(try ext.shouldUpload(@bitCast(e1), 1, &st1));
+    ext.finishPass(&st1);
+    try testing.expect(st1.was_full_resync);
+
+    var st2 = prism.snapshot.ExtractionStats{};
+    try testing.expect(!(try ext.shouldUpload(@bitCast(e1), 1, &st2)));
+    try testing.expect(try ext.shouldUpload(@bitCast(e1), 2, &st2));
+    ext.finishPass(&st2);
+    try testing.expect(!st2.was_full_resync);
+    try testing.expectEqual(@as(usize, 1), st2.unchanged);
+    try testing.expectEqual(@as(usize, 1), st2.updated);
+
+    // MultiViewSet maintains independent exposure per view
+    var mvs = prism.snapshot.MultiViewSet.init(testing.allocator);
+    defer mvs.deinit();
+    const v_main = prism.RenderViewId{ .index = 0, .generation = 1 };
+    const v_pip = prism.RenderViewId{ .index = 1, .generation = 1 };
+    try mvs.addView(.{ .view_id = v_main, .label = "main", .exposure_ev100 = 12.0 });
+    try mvs.addView(.{ .view_id = v_pip, .label = "editor_preview", .exposure_ev100 = 10.0, .is_offscreen = true });
+    try testing.expect(mvs.setViewExposure(v_pip, 14.5));
+    try testing.expectApproxEqAbs(@as(f32, 12.0), mvs.views.items[0].exposure_ev100, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 14.5), mvs.views.items[1].exposure_ev100, 1e-5);
+}
+
+test "Phase C PCSS blocker search, shadow caster culling, area lights, IES, and material lobes" {
+    // PCSS blocker search over a synthetic 8x8 depth map with a blocker at depth 0.3
+    var depth_map: [64]f32 = @splat(0.9);
+    depth_map[4 * 8 + 4] = 0.3;
+    depth_map[4 * 8 + 3] = 0.35;
+    const br = prism.shadows.pcssBlockerSearch(&depth_map, 8, 8, .{ 0.5, 0.5 }, 0.6, 2.0, 16, 0.5);
+    try testing.expect(br.blocker_count > 0);
+    try testing.expect(br.avg_blocker_depth < 0.4);
+
+    // Shadow caster frustum culling (box [-10, 10]^3)
+    const planes = [6][4]f32{
+        .{ 1, 0, 0, 10 },  .{ -1, 0, 0, 10 },
+        .{ 0, 1, 0, 10 },  .{ 0, -1, 0, 10 },
+        .{ 0, 0, 1, 10 },  .{ 0, 0, -1, 10 },
+    };
+    const casters = [_]prism.shadows.ShadowCasterSphere{
+        .{ .caster_id = 1, .center = .{ 0, 0, 0 }, .radius = 1.0 },
+        .{ .caster_id = 2, .center = .{ 50, 0, 0 }, .radius = 1.0 },
+        .{ .caster_id = 3, .center = .{ 0, 0, 0 }, .radius = 1.0, .casts_shadows = false },
+    };
+    var visible = std.ArrayList(usize).empty;
+    defer visible.deinit(testing.allocator);
+    const culled = try prism.shadows.cullShadowCasters(testing.allocator, &casters, planes, &visible);
+    try testing.expectEqual(@as(usize, 2), culled);
+    try testing.expectEqual(@as(usize, 1), visible.items.len);
+    try testing.expectEqual(@as(usize, 0), visible.items[0]);
+
+    // Stage 05: Rectangular area light diffuse/specular, IES profile, layer masks, clearcoat & sheen
+    const area_l = prism.area_lights.RectAreaLight{
+        .position = .{ 0, 3, 0 },
+        .right = .{ 1, 0, 0 },
+        .up = .{ 0, 0, 1 },
+        .normal = .{ 0, -1, 0 },
+        .half_width = 1.5,
+        .half_height = 1.0,
+        .luminance_nits = 800.0,
+    };
+    const diff = prism.area_lights.evaluateRectAreaLightDiffuse(area_l, .{ 0, 0, 0 }, .{ 0, 1, 0 });
+    try testing.expect(diff[0] > 10.0);
+    const spec = prism.area_lights.evaluateRectAreaLightSpecular(area_l, .{ 0, 0, 0 }, .{ 0, 1, 0 }, .{ 0, 1, 0 }, 0.25);
+    try testing.expect(spec[0] > 0.0);
+
+    const ies = prism.area_lights.IesProfile{ .samples = &.{ 1.0, 0.5, 0.0 } };
+    try testing.expectApproxEqAbs(@as(f32, 1.0), ies.sampleIntensity(1.0), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), ies.sampleIntensity(0.0), 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), ies.sampleIntensity(-1.0), 1e-4);
+
+    const m1 = prism.area_lights.LightLayerMask{ .bits = 0b0010 };
+    const m2 = prism.area_lights.LightLayerMask{ .bits = 0b0100 };
+    try testing.expect(!m1.overlaps(m2));
+    try testing.expect(m1.overlaps(prism.area_lights.LightLayerMask.ALL));
+
+    try testing.expect(prism.area_lights.evaluateClearcoatLobe(1.0, 0.1, 1.0, 1.0) > 0.0);
+    const sheen = prism.area_lights.evaluateSheenLobe(.{ 1.0, 0.8, 0.6 }, 0.5, 0.3);
+    try testing.expect(sheen[0] > 0.0);
+}
+
+test "Phase D MaterialShaderRegistry hot-reload transactions, PickingTarget, SelectionSet, and ViewMemoryReport" {
+    var reg = prism.editor_api.MaterialShaderRegistry.init(testing.allocator);
+    defer reg.deinit();
+    try reg.register(.{ .id = 7, .name = "custom_water", .active_pipeline = 100, .fallback_pipeline = 1 });
+    try reg.beginHotReload(7, 200);
+    // Rollback preserves last-good pipeline 100
+    try reg.rollbackHotReload(7);
+    try testing.expectEqual(@as(?u64, 100), reg.activePipeline(7));
+    // Commit swaps to 201 and returns 100 for deferred retirement
+    try reg.beginHotReload(7, 201);
+    const commit = try reg.commitHotReload(7);
+    try testing.expectEqual(@as(u64, 100), commit.superseded_pipeline);
+    try testing.expectEqual(@as(u64, 2), commit.new_revision);
+    try testing.expectEqual(@as(?u64, 201), reg.activePipeline(7));
+
+    var pick = try prism.editor_api.PickingTarget.init(testing.allocator, 16, 16);
+    defer pick.deinit();
+    pick.writeEntityId(5, 6, 42);
+    try testing.expectEqual(@as(?u64, 42), pick.pickEntityAt(5, 6));
+    try testing.expectEqual(@as(?u64, null), pick.pickEntityAt(0, 0));
+
+    var sel = prism.editor_api.SelectionSet.init(testing.allocator);
+    defer sel.deinit();
+    try sel.select(42);
+    try testing.expect(sel.isSelected(42));
+    try testing.expect(sel.deselect(42));
+    try testing.expect(!sel.isSelected(42));
+
+    const mem = prism.editor_api.estimateViewMemoryBytes(1920, 1080, true, true, true, true);
+    try testing.expect(mem.totalBytes() > 40 * 1024 * 1024);
+}
