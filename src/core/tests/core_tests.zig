@@ -1423,3 +1423,67 @@ test "property: parallel scheduler equals serial for random system sets" {
         try testing.expectEqualSlices(u64, &sums[0], &sums[1]);
     }
 }
+
+fn churnSystem(ctx: *engine.SystemContext) !void {
+    // Despawn the oldest few entities and spawn replacements every frame.
+    var victims: [4]engine.EntityHandle = undefined;
+    var n: usize = 0;
+    {
+        var q = try ctx.query(.{ .read = .{Health} });
+        defer q.deinit();
+        while (q.next()) |row| {
+            if (n == victims.len) break;
+            victims[n] = row.entity;
+            n += 1;
+        }
+    }
+    for (victims[0..n]) |v| try ctx.commands.despawn(v);
+    for (0..4) |i| {
+        const e = try ctx.commands.spawn();
+        try ctx.commands.set(e, Health, .{ .hp = @intCast(i) });
+        try ctx.commands.set(e, Shield, .{});
+    }
+}
+
+var soak_removed_seen: u64 = 0;
+fn soakObserver(ctx: *engine.SystemContext) !void {
+    var it = ctx.world.removedSince(Health);
+    while (it.next()) |_| soak_removed_seen += 1;
+}
+
+test "soak: long churn keeps entity slots, pools, and logs bounded (and leaks nothing)" {
+    soak_removed_seen = 0;
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.world.enableChangeTracking(Health);
+    _ = try app.registerComponent(Shield);
+    try app.addSystem(.{ .name = "churn", .run = churnSystem });
+    try app.addSystem(.{ .name = "observe", .run = soakObserver, .after = &.{"churn"} });
+    for (0..64) |i| {
+        const e = try app.world.spawn();
+        try app.world.set(e, Health, .{ .hp = @intCast(i) });
+        try app.world.set(e, Shield, .{});
+    }
+
+    const frames = 20_000;
+    var max_slots: usize = 0;
+    var max_log: usize = 0;
+    for (0..frames) |_| {
+        try app.tick(1.0 / 60.0);
+        max_slots = @max(max_slots, app.world.generations.items.len);
+        const pool = app.world.pools.get(engine.World.comptimeTypeId(Health)).?;
+        max_log = @max(max_log, pool.removed_log.items.len);
+    }
+    try testing.expectEqual(@as(usize, 64), app.world.entity_count);
+    // Slots are recycled through the free list instead of growing for 80k spawns.
+    try testing.expect(max_slots <= 64 + 16);
+    // The removal log is pruned every frame, so it never accumulates.
+    try testing.expect(max_log <= 16);
+    // Every despawn was observed exactly once by the system that tracks removals.
+    try testing.expectEqual(@as(u64, frames) * 4 - 4, soak_removed_seen); // last frame's removals land after the final observe
+    // Dense storage matches the live entity count (no orphaned components).
+    inline for (.{ Health, Shield }) |C| {
+        const pool = app.world.pools.get(engine.World.comptimeTypeId(C)).?;
+        try testing.expectEqual(@as(usize, 64), pool.dense_entities.items.len);
+    }
+}
