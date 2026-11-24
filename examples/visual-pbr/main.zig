@@ -227,7 +227,7 @@ pub fn main(init: std.process.Init) !void {
     // Camera with FreeCamera + PostProcessSettings (AutoExposure + Bloom + AgX).
     const cam_e = try app.world.spawn();
     try app.world.set(cam_e, camera.Camera, .{ .order = 0 });
-    try app.world.set(cam_e, camera.Projection, .{ .perspective = .{ .fov_rad = std.math.pi / 3.0, .far = 200.0 } });
+    try app.world.set(cam_e, camera.Projection, .{ .perspective = .{ .fov_rad = std.math.pi / 3.0, .near = 0.25, .far = 200.0 } });
     try app.world.set(cam_e, camera.CameraPose, camera.CameraPose.lookAt(.{ 0, 2.6, 10.0 }, .{ 0, 2.6, 0 }, .{ 0, 1, 0 }));
     try app.world.set(cam_e, camera.FreeCamera, .{ .walk_speed = 7.0, .run_speed = 16.0 });
     try app.world.set(cam_e, camera.FreeCameraState, .{});
@@ -258,15 +258,15 @@ pub fn main(init: std.process.Init) !void {
     // Screen/TV Area Light (RectLight) with dark metallic bezel & pedestal stand.
     const bezel_mat = try mats.add(.{ .base_color = .{ 0.08, 0.09, 0.11, 1.0 }, .metallic = 0.85, .roughness = 0.25 });
     const tv_bezel = try app.world.spawn();
-    try app.world.set(tv_bezel, render_3d.Transform3D, .{ .position = .{ 0.0, 2.8, -4.62 }, .scale = .{ 4.0, 2.2, 0.14 } });
+    try app.world.set(tv_bezel, render_3d.Transform3D, .{ .position = .{ 0.0, 2.8, -4.68 }, .scale = .{ 4.0, 2.2, 0.10 } });
     try app.world.set(tv_bezel, render_3d.MeshRef, .{ .mesh_asset = @bitCast(gpu_cube), .material_handle = bezel_mat });
 
     const tv_stand = try app.world.spawn();
-    try app.world.set(tv_stand, render_3d.Transform3D, .{ .position = .{ 0.0, 0.75, -4.78 }, .scale = .{ 0.45, 2.2, 0.28 } });
+    try app.world.set(tv_stand, render_3d.Transform3D, .{ .position = .{ 0.0, 0.75, -4.78 }, .scale = .{ 0.45, 2.2, 0.20 } });
     try app.world.set(tv_stand, render_3d.MeshRef, .{ .mesh_asset = @bitCast(gpu_cube), .material_handle = bezel_mat });
 
     const tv_panel = try app.world.spawn();
-    try app.world.set(tv_panel, render_3d.Transform3D, .{ .position = .{ 0.0, 2.8, -4.44 }, .scale = .{ 3.6, 1.8, 0.08 } });
+    try app.world.set(tv_panel, render_3d.Transform3D, .{ .position = .{ 0.0, 2.8, -4.35 }, .scale = .{ 3.6, 1.8, 0.08 } });
     const tv_mat = try mats.add(.{
         .base_color = .{ 0.05, 0.08, 0.12, 1.0 },
         .emissive = .{ 0.7, 2.0, 3.8, 1.0 },
