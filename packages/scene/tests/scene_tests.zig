@@ -127,3 +127,102 @@ test "Transform2D propagation resolves deep chains once and keeps cycle descenda
     try testing.expectApproxEqAbs(@as(f32, 20), app.world.getConst(b, scene.Transform2D).?.world_x, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 30), app.world.getConst(c, scene.Transform2D).?.world_x, 0.001);
 }
+
+const graph = scene.graph;
+
+fn spawnNode(world: *engine.World, x: f32) !engine.EntityHandle {
+    const e = try world.spawn();
+    try world.set(e, scene.Transform2D, .{ .x = x });
+    return e;
+}
+
+test "SceneGraph reparent maintains child lists, rejects cycles, and preserves world transform" {
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+    try app.registerModule(scene.module());
+    const w = &app.world;
+
+    const root = try spawnNode(w, 100);
+    const a = try spawnNode(w, 1);
+    const b = try spawnNode(w, 2);
+    const c = try spawnNode(w, 3);
+    try graph.reparent(w, a, root, .{});
+    try graph.reparent(w, b, root, .{});
+    try graph.reparent(w, c, a, .{});
+    try testing.expectEqual(@as(usize, 2), graph.childCount(w, root));
+    try testing.expectEqual(@as(usize, 1), graph.childCount(w, a));
+
+    try testing.expectError(error.HierarchyCycle, graph.reparent(w, root, c, .{}));
+    try testing.expectError(error.HierarchyCycle, graph.reparent(w, a, a, .{}));
+    try testing.expectEqual(@as(usize, 2), graph.childCount(w, root));
+
+    // Head removal and middle removal keep the list consistent.
+    try graph.reparent(w, b, null, .{});
+    try testing.expectEqual(@as(usize, 1), graph.childCount(w, root));
+    try testing.expect(graph.parentOf(w, b) == null);
+
+    // preserve_world: c has world x = 100+1+3 = 104; moving it under b (root at x=2) keeps 104.
+    try app.run();
+    try testing.expectApproxEqAbs(@as(f32, 104), w.getConst(c, scene.Transform2D).?.world_x, 0.001);
+    try graph.reparent(w, c, b, .{ .preserve_world = true });
+    try testing.expectApproxEqAbs(@as(f32, 102), w.getConst(c, scene.Transform2D).?.x, 0.001);
+    try testing.expectEqual(@as(usize, 0), graph.childCount(w, a));
+    try testing.expectEqual(@as(usize, 1), graph.childCount(w, b));
+}
+
+test "SceneGraph despawn policies" {
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+    try app.registerModule(scene.module());
+    const w = &app.world;
+
+    const root = try spawnNode(w, 10);
+    const mid = try spawnNode(w, 5);
+    const leaf1 = try spawnNode(w, 1);
+    const leaf2 = try spawnNode(w, 2);
+    try graph.reparent(w, mid, root, .{});
+    try graph.reparent(w, leaf1, mid, .{});
+    try graph.reparent(w, leaf2, mid, .{});
+    try app.run();
+
+    try graph.despawnNode(w, mid, .reparent_to_parent);
+    try testing.expect(!w.isAlive(mid));
+    try testing.expectEqual(@as(usize, 2), graph.childCount(w, root));
+    try testing.expectEqual(root, graph.parentOf(w, leaf1).?);
+    // world x preserved: 10 + 5 + 1
+    try testing.expectApproxEqAbs(@as(f32, 16), w.getConst(leaf1, scene.Transform2D).?.x + 10, 0.001);
+
+    try graph.despawnNode(w, root, .orphan);
+    try testing.expect(graph.parentOf(w, leaf1) == null);
+    try testing.expect(w.isAlive(leaf1));
+
+    const p = try spawnNode(w, 0);
+    const k1 = try spawnNode(w, 0);
+    const k2 = try spawnNode(w, 0);
+    const gk = try spawnNode(w, 0);
+    try graph.reparent(w, k1, p, .{});
+    try graph.reparent(w, k2, p, .{});
+    try graph.reparent(w, gk, k1, .{});
+    try graph.despawnNode(w, p, .cascade);
+    for ([_]engine.EntityHandle{ p, k1, k2, gk }) |e| try testing.expect(!w.isAlive(e));
+    try testing.expect(w.isAlive(leaf1));
+}
+
+test "SceneGraph rebuildLinks repairs links from raw Parent components and breaks cycles" {
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+    try app.registerModule(scene.module());
+    const w = &app.world;
+
+    const p = try spawnNode(w, 0);
+    const k = try spawnNode(w, 0);
+    const x = try spawnNode(w, 0);
+    const y = try spawnNode(w, 0);
+    try w.set(k, scene.Parent, .{ .entity = p });
+    try w.set(x, scene.Parent, .{ .entity = y });
+    try w.set(y, scene.Parent, .{ .entity = x });
+    try graph.rebuildLinks(w);
+    try testing.expectEqual(@as(usize, 1), graph.childCount(w, p));
+    // Exactly one edge of the 2-cycle survives.
+    try testing.expectEqual(@as(usize, 1), graph.childCount(w, x) + graph.childCount(w, y));
+}

@@ -9,6 +9,9 @@ const engine = @import("engine");
 
 pub const MODULE_OWNER_ID: u64 = 2007;
 
+/// Parent/child index and reparenting operations (see `graph.zig`).
+pub const graph = @import("graph.zig");
+
 /// Local and computed world-space 2D transform component.
 pub const Transform2D = struct {
     x: f32 = 0,
@@ -103,11 +106,12 @@ pub const SceneSnapshot = struct {
                 try target_world.set(child_e, Parent, .{ .entity = parent_e });
             }
         }
+        try graph.rebuildLinks(target_world);
         return self.records.items.len;
     }
 };
 
-const Mat2D = struct {
+pub const Mat2D = struct {
     // 2x3 affine matrix: [ a c tx ; b d ty ]
     a: f32,
     b: f32,
@@ -116,7 +120,53 @@ const Mat2D = struct {
     tx: f32,
     ty: f32,
 
-    fn fromTransform(t: Transform2D) Mat2D {
+    pub const identity: Mat2D = .{ .a = 1, .b = 0, .c = 0, .d = 1, .tx = 0, .ty = 0 };
+
+    /// Matrix of the *world-space* fields (`world_x`, `world_rotation_rad`, ...) of `t`.
+    pub fn fromWorld(t: Transform2D) Mat2D {
+        return fromTransform(.{
+            .x = t.world_x,
+            .y = t.world_y,
+            .rotation_rad = t.world_rotation_rad,
+            .scale_x = t.world_scale_x,
+            .scale_y = t.world_scale_y,
+        });
+    }
+
+    /// Returns the inverse, or null when the matrix is (near-)singular.
+    pub fn inverse(m: Mat2D) ?Mat2D {
+        const det = m.a * m.d - m.b * m.c;
+        if (!std.math.isFinite(det) or @abs(det) < 1e-12) return null;
+        const inv = 1.0 / det;
+        const a = m.d * inv;
+        const b = -m.b * inv;
+        const c = -m.c * inv;
+        const d = m.a * inv;
+        return .{
+            .a = a,
+            .b = b,
+            .c = c,
+            .d = d,
+            .tx = -(a * m.tx + c * m.ty),
+            .ty = -(b * m.tx + d * m.ty),
+        };
+    }
+
+    /// Decomposes into translation, rotation, and scale. Shear cannot be represented by
+    /// `Transform2D` and is discarded (scale_y is taken from the determinant).
+    pub fn decompose(m: Mat2D) Transform2D {
+        const sx = std.math.hypot(m.a, m.b);
+        const det = m.a * m.d - m.b * m.c;
+        return .{
+            .x = m.tx,
+            .y = m.ty,
+            .rotation_rad = std.math.atan2(m.b, m.a),
+            .scale_x = sx,
+            .scale_y = if (sx > 0) det / sx else 0,
+        };
+    }
+
+    pub fn fromTransform(t: Transform2D) Mat2D {
         const cos_r = @cos(t.rotation_rad);
         const sin_r = @sin(t.rotation_rad);
         return .{
@@ -129,7 +179,7 @@ const Mat2D = struct {
         };
     }
 
-    fn mul(parent_m: Mat2D, local_m: Mat2D) Mat2D {
+    pub fn mul(parent_m: Mat2D, local_m: Mat2D) Mat2D {
         return .{
             .a = parent_m.a * local_m.a + parent_m.c * local_m.b,
             .b = parent_m.b * local_m.a + parent_m.d * local_m.b,
