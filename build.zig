@@ -767,6 +767,15 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(plugin_path_tests).step);
 
+    const hook_tracker_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/runtime/hook_tracker.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(hook_tracker_tests).step);
+
     addModuleTest(b, test_step, "src/core/tests/core_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
     }, null);

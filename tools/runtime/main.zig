@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const plugin_paths = @import("plugin_paths.zig");
+const hook_tracker = @import("hook_tracker.zig");
 const engine = @import("engine");
 const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
@@ -41,6 +42,7 @@ const RuntimeState = struct {
     script: ?scripting_host.ScriptModuleHandle,
     rt: graphics.RenderTargetHandle,
     cmds: std.ArrayList(graphics.DrawCommand),
+    hooks: hook_tracker.HookTracker = .{},
 };
 
 fn readFileCwd(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -57,18 +59,27 @@ fn onUiAction(user_ctx: ?*anyopaque, ev: engine.EventEnvelope) void {
 }
 
 fn invokeOptionalHook(
+    tracker: *hook_tracker.HookTracker,
+    hook: hook_tracker.Hook,
     host: *scripting_host.ScriptingHost,
     sc: scripting_host.ScriptModuleHandle,
     fn_name: []const u8,
     arg: []const u8,
 ) void {
+    if (!tracker.shouldCall(hook)) return;
     const res = host.invokeScript(sc, fn_name, arg);
-    if (!res.ok) {
-        if (std.mem.eql(u8, res.error_message, "python function not found") or
-            std.mem.eql(u8, res.error_message, "lua function not found"))
-        {
-            return;
-        }
+    if (res.ok) {
+        tracker.recordSuccess();
+        return;
+    }
+    // A hook the script does not define is optional: remember that and stop looking it up.
+    if (std.mem.eql(u8, res.error_message, "python function not found") or
+        std.mem.eql(u8, res.error_message, "lua function not found"))
+    {
+        tracker.markMissing(hook);
+        return;
+    }
+    if (tracker.recordError(res.error_message)) {
         std.debug.print("[zengy-runtime] script error in '{s}': {s}\n", .{ fn_name, res.error_message });
     }
 }
@@ -79,7 +90,7 @@ fn runtimeFixedUpdateSystem(ctx: *engine.SystemContext) !void {
         if (st.host) |h| {
             var dt_buf: [32]u8 = undefined;
             const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.fixedDeltaSeconds()}) catch "0.01667";
-            invokeOptionalHook(h, sc, "fixed_update", dt_str);
+            invokeOptionalHook(&st.hooks, .fixed_update, h, sc, "fixed_update", dt_str);
         }
     }
 }
@@ -120,7 +131,7 @@ fn runtimeUpdateSystem(ctx: *engine.SystemContext) !void {
         if (st.host) |h| {
             var dt_buf: [32]u8 = undefined;
             const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
-            invokeOptionalHook(h, sc, "update", dt_str);
+            invokeOptionalHook(&st.hooks, .update, h, sc, "update", dt_str);
         }
     }
 }
@@ -129,7 +140,7 @@ fn runtimeDestroySystem(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(RuntimeState) orelse return;
     if (st.script) |sc| {
         if (st.host) |h| {
-            invokeOptionalHook(h, sc, "destroy", "");
+            invokeOptionalHook(&st.hooks, .destroy, h, sc, "destroy", "");
         }
     }
 }
@@ -137,6 +148,7 @@ fn runtimeDestroySystem(ctx: *engine.SystemContext) !void {
 const HeadlessScriptState = struct {
     host: *scripting_host.ScriptingHost,
     script: ?scripting_host.ScriptModuleHandle,
+    hooks: hook_tracker.HookTracker = .{},
 };
 
 fn headlessFixedUpdateSystem(ctx: *engine.SystemContext) !void {
@@ -144,7 +156,7 @@ fn headlessFixedUpdateSystem(ctx: *engine.SystemContext) !void {
     if (st.script) |sc| {
         var dt_buf: [32]u8 = undefined;
         const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.fixedDeltaSeconds()}) catch "0.01667";
-        invokeOptionalHook(st.host, sc, "fixed_update", dt_str);
+        invokeOptionalHook(&st.hooks, .fixed_update, st.host, sc, "fixed_update", dt_str);
     }
 }
 
@@ -153,14 +165,14 @@ fn headlessUpdateSystem(ctx: *engine.SystemContext) !void {
     if (st.script) |sc| {
         var dt_buf: [32]u8 = undefined;
         const dt_str = std.fmt.bufPrint(&dt_buf, "{d:.5}", .{ctx.dt}) catch "0.016";
-        invokeOptionalHook(st.host, sc, "update", dt_str);
+        invokeOptionalHook(&st.hooks, .update, st.host, sc, "update", dt_str);
     }
 }
 
 fn headlessDestroySystem(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(HeadlessScriptState) orelse return;
     if (st.script) |sc| {
-        invokeOptionalHook(st.host, sc, "destroy", "");
+        invokeOptionalHook(&st.hooks, .destroy, st.host, sc, "destroy", "");
     }
 }
 
@@ -324,7 +336,7 @@ pub fn main(init: std.process.Init) !void {
                 .host = host,
                 .script = loaded_script,
             });
-            invokeOptionalHook(host, loaded_script.?, "start", "");
+            invokeOptionalHook(&app.resources.get(HeadlessScriptState).?.hooks, .start, host, loaded_script.?, "start", "");
         }
 
         var t: u64 = 0;
@@ -401,7 +413,7 @@ pub fn main(init: std.process.Init) !void {
     defer st_ptr.cmds.deinit(allocator);
 
     if (loaded_script) |sc| {
-        invokeOptionalHook(host_opt.?, sc, "start", "");
+        invokeOptionalHook(&st_ptr.hooks, .start, host_opt.?, sc, "start", "");
     }
 
     _ = try app.events.subscribe(9010, "ui.action", onUiAction, st_ptr);
