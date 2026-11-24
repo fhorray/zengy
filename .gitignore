@@ -8,5 +8,12 @@ zig-out/
 .DS_Store
 zig-pkg/
 
-# Rust build output (plugins built with cargo)
+# Rust build output (plugins built with cargo); Cargo.lock stays tracked for reproducible builds
 target/
+**/*.rs.bk
+*.rlib
+*.rmeta
+*.pdb
+
+# Plugins/caches installed by `zigeng add` inside projects
+.zigeng/
