@@ -939,3 +939,102 @@ test "ResourceRegistry destroys in reverse insertion order, overwrite runs deini
     try testing.expectEqual(@as(u8, 'a'), res_destroy_log[1]);
     try testing.expectEqual(@as(u8, 'B'), res_destroy_log[2]);
 }
+
+const PropA = struct { v: u32 = 0 };
+const PropB = struct { v: u32 = 0, w: u32 = 0 };
+const PropTag = struct {};
+
+test "property: World matches a reference model under random structural operations" {
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rng = prng.random();
+
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    try world.enableChangeTracking(PropA);
+    _ = try world.registerComponent(PropB);
+    _ = try world.registerComponent(PropTag);
+
+    const Model = struct { handle: engine.EntityHandle, a: ?u32 = null, b: ?u32 = null, tag: bool = false };
+    var model: std.ArrayList(Model) = .empty;
+    defer model.deinit(testing.allocator);
+    var dead: std.ArrayList(engine.EntityHandle) = .empty;
+    defer dead.deinit(testing.allocator);
+
+    for (0..20_000) |step| {
+        switch (rng.uintLessThan(u8, 7)) {
+            0, 1 => try model.append(testing.allocator, .{ .handle = try world.spawn() }),
+            2 => if (model.items.len > 0) {
+                const i = rng.uintLessThan(usize, model.items.len);
+                try testing.expect(try world.despawn(model.items[i].handle));
+                try dead.append(testing.allocator, model.items[i].handle);
+                _ = model.swapRemove(i);
+            },
+            3 => if (model.items.len > 0) {
+                const m = &model.items[rng.uintLessThan(usize, model.items.len)];
+                const v = rng.int(u32);
+                try world.set(m.handle, PropA, .{ .v = v });
+                m.a = v;
+            },
+            4 => if (model.items.len > 0) {
+                const m = &model.items[rng.uintLessThan(usize, model.items.len)];
+                const v = rng.int(u32);
+                try world.set(m.handle, PropB, .{ .v = v, .w = ~v });
+                m.b = v;
+            },
+            5 => if (model.items.len > 0) {
+                const m = &model.items[rng.uintLessThan(usize, model.items.len)];
+                if (rng.boolean()) {
+                    try world.set(m.handle, PropTag, .{});
+                    m.tag = true;
+                } else {
+                    try testing.expectEqual(m.tag, try world.remove(m.handle, PropTag));
+                    m.tag = false;
+                }
+            },
+            else => if (model.items.len > 0) {
+                const m = &model.items[rng.uintLessThan(usize, model.items.len)];
+                if (rng.boolean()) {
+                    try testing.expectEqual(m.a != null, try world.remove(m.handle, PropA));
+                    m.a = null;
+                } else {
+                    try testing.expectEqual(m.b != null, try world.remove(m.handle, PropB));
+                    m.b = null;
+                }
+            },
+        }
+
+        if (step % 500 != 0) continue;
+        try testing.expectEqual(model.items.len, world.entity_count);
+        for (model.items) |m| {
+            try testing.expect(world.isAlive(m.handle));
+            try testing.expectEqual(m.a, if (world.getConst(m.handle, PropA)) |c| c.v else null);
+            try testing.expectEqual(m.b, if (world.getConst(m.handle, PropB)) |c| c.v else null);
+            try testing.expectEqual(m.tag, world.has(m.handle, PropTag));
+        }
+        for (dead.items) |h| {
+            try testing.expect(!world.isAlive(h));
+            try testing.expect(world.getConst(h, PropA) == null);
+        }
+        // Query results must equal the model's view of "has A and B", without .without(Tag) hits.
+        var expected: usize = 0;
+        for (model.items) |m| {
+            if (m.a != null and m.b != null and !m.tag) expected += 1;
+        }
+        var q = try world.query(.{ .read = .{ PropA, PropB }, .without = .{PropTag} });
+        defer q.deinit();
+        var got: usize = 0;
+        while (q.next()) |row| {
+            got += 1;
+            try testing.expectEqual(row.read(PropB).v, ~row.read(PropB).w);
+        }
+        try testing.expectEqual(expected, got);
+    }
+
+    // Every pool's dense arrays stay parallel (tracked arrays included).
+    for (world.pool_list.items) |pool| {
+        if (pool.tracked) {
+            try testing.expectEqual(pool.dense_entities.items.len, pool.added_ticks.items.len);
+            try testing.expectEqual(pool.dense_entities.items.len, pool.changed_ticks.items.len);
+        }
+    }
+}

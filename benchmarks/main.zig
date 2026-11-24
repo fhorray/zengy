@@ -178,6 +178,38 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("8. Scene2D propagate (chain depth 8000): {d:.3} ms\n", .{@as(f64, @floatFromInt(ns)) / 1_000_000.0});
     }
 
+    // 9. CommandBuffer.apply (spawn + 2 sets per entity) and tracked-write iteration
+    {
+        var cw = engine.World.init(allocator, .{ .index = 2, .generation = 1 });
+        defer cw.deinit();
+        var ev = engine.EventBus.init(allocator, 8, .drop_newest);
+        defer ev.deinit();
+        var cmds = engine.CommandBuffer.init(allocator);
+        defer cmds.deinit();
+        const n = 10_000;
+        for (0..n) |_| {
+            const e = try cmds.spawn();
+            try cmds.set(e, Position, .{});
+            try cmds.set(e, Velocity, .{});
+        }
+        const t0 = std.Io.Clock.now(.awake, io);
+        try cmds.apply(&cw, &ev);
+        const apply_ns = elapsedNs(io, t0);
+        std.debug.print("9. CommandBuffer.apply ({d} spawn+2set): {d:.1} ns/entity\n", .{ n, @as(f64, @floatFromInt(apply_ns)) / @as(f64, n) });
+
+        try cw.enableChangeTracking(Position);
+        const t1 = std.Io.Clock.now(.awake, io);
+        var q = try cw.query(.{ .write = .{Position}, .read = .{Velocity} });
+        defer q.deinit();
+        var count: usize = 0;
+        while (q.next()) |row| {
+            row.write(Position).x += row.read(Velocity).x;
+            count += 1;
+        }
+        const it_ns = elapsedNs(io, t1);
+        std.debug.print("9. Tracked write iterate ({d} entities): {d:.1} ns/entity\n", .{ count, @as(f64, @floatFromInt(it_ns)) / @as(f64, @floatFromInt(count)) });
+    }
+
     // 6. JSON benchmark: std.json vs yyjson (small ~5KB, medium ~500KB, large ~5MB)
     const sizes = [_]usize{ 100, 10_000, 100_000 };
     const labels = [_][]const u8{ "~5 KB", "~500 KB", "~5 MB" };
