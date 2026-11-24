@@ -66,13 +66,23 @@ pub const CommandBuffer = struct {
         self.pending_spawns = 0;
     }
 
-    /// Queues an entity spawn and returns a pending handle (`generation == 0`) that can be
-    /// passed to subsequent `set()`, `remove()`, or `despawn()` calls in the same buffer.
+    /// Queues an entity spawn and returns a pending handle (`generation == 0`, `index == n + 1`
+    /// for the n-th spawn) that can be passed to subsequent `set()`, `remove()`, or `despawn()`
+    /// calls in the same buffer. The `+ 1` bias guarantees the all-zero bit pattern (a
+    /// zero-initialized `EntityHandle`) is never mistaken for a pending spawn.
+    ///
+    /// Limitation: pending handles embedded *inside* component payloads are not rewritten;
+    /// only the command's target entity is resolved.
     pub fn spawn(self: *CommandBuffer) !EntityHandle {
-        const pending_idx = self.pending_spawns;
+        if (self.pending_spawns >= std.math.maxInt(u32) - 1) return error.TooManyPendingSpawns;
         try self.commands.append(self.allocator, .{ .spawn_empty = {} });
         self.pending_spawns += 1;
-        return .{ .index = pending_idx, .generation = 0 };
+        return .{ .index = self.pending_spawns, .generation = 0 };
+    }
+
+    /// Returns true when `entity` is a pending handle produced by `spawn()` (not yet applied).
+    pub fn isPending(entity: EntityHandle) bool {
+        return entity.generation == 0 and entity.index != 0 and entity.index != std.math.maxInt(u32);
     }
 
     pub fn despawn(self: *CommandBuffer, entity: EntityHandle) !void {
@@ -124,8 +134,8 @@ pub const CommandBuffer = struct {
     }
 
     fn resolveEntity(entity: EntityHandle, spawned: []const EntityHandle) EntityHandle {
-        if (entity.generation == 0 and entity.index < spawned.len) {
-            return spawned[entity.index];
+        if (isPending(entity) and entity.index - 1 < spawned.len) {
+            return spawned[entity.index - 1];
         }
         return entity;
     }
@@ -134,10 +144,24 @@ pub const CommandBuffer = struct {
         if (self.commands.items.len == 0) return;
         if (world.active_queries > 0) return error.MutationDuringActiveQuery;
 
-        // Pre-validate component schemas against already-registered pools before mutating world.
+        // Pre-validate every command before mutating the world so that schema errors are reported
+        // up front instead of leaving a half-applied buffer. Layouts are also cross-checked
+        // between commands that introduce the same new type.
+        var seen: std.AutoHashMapUnmanaged(ComponentTypeId, struct { name: []const u8, size: usize, alignment: usize }) = .empty;
+        defer seen.deinit(self.allocator);
         for (self.commands.items) |cmd| {
             switch (cmd) {
                 .set_raw => |s| {
+                    if (!std.math.isPowerOfTwo(s.alignment)) return error.InvalidComponentAlignment;
+                    if (s.alignment > world_mod.max_component_alignment) return error.UnsupportedComponentAlignment;
+                    const gop = try seen.getOrPut(self.allocator, s.type_id);
+                    if (gop.found_existing) {
+                        const prev = gop.value_ptr.*;
+                        if (!std.mem.eql(u8, prev.name, s.type_name)) return error.ComponentNameCollision;
+                        if (prev.size != s.bytes.len or prev.alignment != s.alignment) return error.ComponentLayoutMismatch;
+                    } else {
+                        gop.value_ptr.* = .{ .name = s.type_name, .size = s.bytes.len, .alignment = s.alignment };
+                    }
                     if (world.pools.get(s.type_id)) |pool| {
                         if (!std.mem.eql(u8, pool.name, s.type_name)) {
                             return error.ComponentNameCollision;

@@ -99,6 +99,7 @@ pub const SchedulerError = error{
     InvalidSelfDependency,
     InvalidCrossStageDependency,
     InvalidDeltaTime,
+    InvalidFixedTimestep,
     OutOfMemory,
 };
 
@@ -321,6 +322,11 @@ pub const Scheduler = struct {
         return false;
     }
 
+    /// Rejects non-finite or non-positive fixed timesteps before they can poison the accumulator.
+    fn validateFixedTimestep(self: *const Scheduler) !void {
+        if (!std.math.isFinite(self.fixed_dt) or self.fixed_dt <= 0.0) return error.InvalidFixedTimestep;
+    }
+
     pub fn runStage(self: *Scheduler, stage: Stage, ctx: *SystemContext) !void {
         if (stage == .render_extract and !self.render_extract_enabled) return;
 
@@ -342,6 +348,7 @@ pub const Scheduler = struct {
     /// Executes exactly one `.fixed_update` tick deterministically (no accumulator)
     /// and drains any events emitted during the tick.
     pub fn stepFixedTick(self: *Scheduler, ctx: *SystemContext) !void {
+        try self.validateFixedTimestep();
         ctx.dt = @floatCast(self.fixed_dt);
         ctx.fixed_dt = @floatCast(self.fixed_dt);
         try self.runStage(.fixed_update, ctx);
@@ -352,9 +359,12 @@ pub const Scheduler = struct {
         if (!std.math.isFinite(frame_dt) or frame_dt < 0.0) {
             return error.InvalidDeltaTime;
         }
+        try self.validateFixedTimestep();
         ctx.dt = @floatCast(frame_dt);
         ctx.fixed_dt = @floatCast(self.fixed_dt);
 
+        // A failing stage aborts the frame; drop accumulated time so a retry cannot replay it.
+        errdefer self.accumulator = 0.0;
         try self.runStage(.pre_update, ctx);
 
         self.accumulator += frame_dt;
@@ -365,7 +375,7 @@ pub const Scheduler = struct {
             self.accumulator -= self.fixed_dt;
             fixed_steps += 1;
         }
-        if (fixed_steps == self.max_fixed_steps and self.accumulator > self.fixed_dt) {
+        if (fixed_steps == self.max_fixed_steps and self.accumulator >= self.fixed_dt) {
             // Prevent spiral of death by clamping excess accumulator
             self.accumulator = 0.0;
         }

@@ -496,6 +496,8 @@ pub const World = struct {
 pub fn Query(comptime spec: anytype) type {
     const write_types = if (@hasField(@TypeOf(spec), "write")) spec.write else .{};
     const read_types = if (@hasField(@TypeOf(spec), "read")) spec.read else .{};
+    // `.without = .{T, ...}` excludes entities that currently hold any listed component.
+    const without_types = if (@hasField(@TypeOf(spec), "without")) spec.without else .{};
     const total_terms = write_types.len + read_types.len;
 
     return struct {
@@ -559,6 +561,8 @@ pub fn Query(comptime spec: anytype) type {
         driver_pool: ?*ComponentPool,
         write_pools: [write_types.len]?*ComponentPool,
         read_pools: [read_types.len]?*ComponentPool,
+        /// Pools of excluded types; null when the type is not registered (nothing to exclude).
+        without_pools: [without_types.len]?*ComponentPool,
         cursor: usize,
 
         pub fn init(world: *World) !Self {
@@ -586,12 +590,18 @@ pub fn Query(comptime spec: anytype) type {
                 }
             }
 
+            var x_pools: [without_types.len]?*ComponentPool = @splat(null);
+            inline for (without_types, 0..) |T, idx| {
+                x_pools[idx] = world.pools.get(World.comptimeTypeId(T));
+            }
+
             world.active_queries += 1;
             return .{
                 .world = world,
                 .driver_pool = if (missing) null else smallest,
                 .write_pools = w_pools,
                 .read_pools = r_pools,
+                .without_pools = x_pools,
                 .cursor = 0,
             };
         }
@@ -614,6 +624,13 @@ pub fn Query(comptime spec: anytype) type {
                 var w_dense: [write_types.len]u32 = undefined;
                 var r_dense: [read_types.len]u32 = undefined;
                 var matches = true;
+
+                inline for (0..without_types.len) |idx| {
+                    if (self.without_pools[idx]) |pool| {
+                        if (pool.has(entity)) matches = false;
+                    }
+                }
+                if (!matches) continue;
 
                 inline for (0..write_types.len) |idx| {
                     const pool = self.write_pools[idx].?;

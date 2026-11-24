@@ -626,3 +626,103 @@ test "World membership index: despawn clears every pool across >64 registered ty
     try testing.expect(try world.despawn(late));
     for (world.pool_list.items) |pool| try testing.expectEqual(@as(usize, 0), pool.dense_entities.items.len);
 }
+
+const Frozen = struct { tag: u8 = 0 };
+
+test "Query .without excludes entities holding the listed component" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    _ = try world.registerComponent(Position);
+    _ = try world.registerComponent(Frozen);
+
+    var frozen: engine.EntityHandle = undefined;
+    for (0..5) |i| {
+        const e = try world.spawn();
+        try world.set(e, Position, .{ .x = @floatFromInt(i) });
+        if (i == 2) {
+            try world.set(e, Frozen, .{});
+            frozen = e;
+        }
+    }
+    {
+        var q = try world.query(.{ .read = .{Position}, .without = .{Frozen} });
+        defer q.deinit();
+        var n: usize = 0;
+        while (q.next()) |row| : (n += 1) try testing.expect(!std.meta.eql(row.entity, frozen));
+        try testing.expectEqual(@as(usize, 4), n);
+    }
+    // Unregistered excluded type excludes nothing.
+    const Unregistered = struct { a: u8 };
+    var q2 = try world.query(.{ .read = .{Position}, .without = .{Unregistered} });
+    defer q2.deinit();
+    var n2: usize = 0;
+    while (q2.next()) |_| n2 += 1;
+    try testing.expectEqual(@as(usize, 5), n2);
+}
+
+test "CommandBuffer pending handles are never all-zero and zero handle is not pending" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    var events = engine.EventBus.init(testing.allocator, 8, .drop_newest);
+    defer events.deinit();
+    var cmds = engine.CommandBuffer.init(testing.allocator);
+    defer cmds.deinit();
+
+    const first = try cmds.spawn();
+    try testing.expect(first.toU64() != 0);
+    try testing.expect(engine.CommandBuffer.isPending(first));
+    try testing.expect(!engine.CommandBuffer.isPending(engine.EntityHandle.fromU64(0)));
+    try testing.expect(!engine.CommandBuffer.isPending(engine.EntityHandle.invalid));
+
+    // A zero-initialized handle must not resolve to the first spawn.
+    const second = try cmds.spawn();
+    try cmds.set(first, Position, .{ .x = 1 });
+    try cmds.set(second, Position, .{ .x = 2 });
+    try cmds.set(engine.EntityHandle.fromU64(0), Position, .{ .x = 99 });
+    try cmds.apply(&world, &events);
+    var q = try world.query(.{ .read = .{Position} });
+    defer q.deinit();
+    var sum: f32 = 0;
+    while (q.next()) |row| sum += row.read(Position).x;
+    try testing.expectEqual(@as(f32, 3), sum);
+}
+
+test "CommandBuffer.apply rejects conflicting layouts before mutating the world" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    var events = engine.EventBus.init(testing.allocator, 8, .drop_newest);
+    defer events.deinit();
+    var cmds = engine.CommandBuffer.init(testing.allocator);
+    defer cmds.deinit();
+
+    const e = try world.spawn();
+    try cmds.set(e, Position, .{ .x = 1 });
+    // Same type id, different layout, queued in the same buffer.
+    try cmds.commands.append(testing.allocator, .{ .set_raw = .{
+        .entity = e,
+        .type_id = engine.World.comptimeTypeId(Position),
+        .type_name = @typeName(Position),
+        .alignment = @alignOf(Position),
+        .bytes = &.{ 1, 2, 3 },
+    } });
+    try testing.expectError(error.ComponentLayoutMismatch, cmds.apply(&world, &events));
+    try testing.expect(!world.has(e, Position));
+}
+
+test "Scheduler rejects invalid fixed timesteps and clamps excess accumulator" {
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+    var ctx = app.makeSystemContext(0.016);
+    const sched = &app.scheduler;
+
+    for ([_]f64{ 0.0, -1.0, std.math.nan(f64), std.math.inf(f64) }) |bad| {
+        sched.fixed_dt = bad;
+        try testing.expectError(error.InvalidFixedTimestep, sched.stepFrame(0.016, &ctx));
+        try testing.expectError(error.InvalidFixedTimestep, sched.stepFixedTick(&ctx));
+    }
+
+    sched.fixed_dt = 0.5;
+    sched.max_fixed_steps = 2;
+    try testing.expectEqual(@as(u32, 2), try sched.stepFrame(100.0, &ctx));
+    try testing.expectEqual(@as(f64, 0.0), sched.accumulator);
+}
