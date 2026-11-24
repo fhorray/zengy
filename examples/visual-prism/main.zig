@@ -49,6 +49,7 @@ const SCENE_FILES = [_][]const u8{
     @embedFile("scene/03_cornell_box.json"),
     @embedFile("scene/04_stress_gallery.json"),
     @embedFile("scene/05_material_and_shadow_lab.json"),
+    @embedFile("scene/06_dark_room_sunbeam.json"),
 };
 
 const JsonObject = struct {
@@ -167,6 +168,7 @@ const PrismShowcaseState = struct {
     gi_stats: helios.gi_solver.GiSolveStats = .{},
     gi_dirty: bool = true,
     gi_frame_counter: u32 = 0,
+    indoor_blend: f32 = 0.0,
     capture_dir: ?[]const u8 = null,
     capture_io: std.Io = undefined,
     capture_step: u8 = 0,
@@ -218,12 +220,13 @@ fn rebuildHeliosGi(st: *PrismShowcaseState) !void {
     var sun_opt: ?helios.gi_solver.DirectSunEmitter = null;
     if (st.app.world.get(st.sun_entity, render_3d.pbr.DirectionalLight)) |sun| {
         if (sun.illuminance_lux > 50.0) {
+            const focus = if (st.app.world.get(st.cam_entity, camera.CameraPose)) |cp| cp.position else [3]f32{ 0, 1.5, 0 };
             sun_opt = .{
                 .direction = sun.direction,
                 .color = sun.color,
                 .illuminance_lux = sun.illuminance_lux,
-                .scene_center = .{ 0, 1.5, 0 },
-                .scene_radius = 10.0,
+                .scene_center = if (st.scene_index == 5) .{ 0.0, 1.5, -2.0 } else focus,
+                .scene_radius = if (st.scene_index == 5) 7.5 else 10.0,
             };
         }
     }
@@ -555,7 +558,8 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
                 const fname: []const u8 = switch (st.capture_step) {
                     0 => "cornell_gi_off.png",
                     1 => "cornell_gi_high.png",
-                    else => "material_lab_gi_high.png",
+                    2 => "dark_room_inside_gi_off.png",
+                    else => "dark_room_inside_gi_high.png",
                 };
                 const path = try std.fmt.allocPrint(st.app.allocator, "{s}/{s}", .{ cdir, fname });
                 defer st.app.allocator.free(path);
@@ -565,7 +569,7 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
                 st.capture_pending = false;
                 st.capture_step += 1;
                 st.capture_wait = 0;
-                if (st.capture_step >= 3) {
+                if (st.capture_step >= 4) {
                     st.app.quit();
                     return;
                 }
@@ -580,13 +584,17 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
                     if (ctx.resources.get(helios.HeliosService)) |hsvc| hsvc.settings.tier = .high;
                     try rebuildHeliosGi(st); // 03_cornell_box.json with GI HIGH
                 } else if (st.capture_step == 2) {
-                    if (ctx.resources.get(helios.HeliosService)) |hsvc| hsvc.settings.tier = .high;
-                    try loadJsonScene(st, 4); // 05_material_and_shadow_lab.json with GI HIGH
+                    if (ctx.resources.get(helios.HeliosService)) |hsvc| hsvc.settings.tier = .off;
+                    try loadJsonScene(st, 5); // 06_dark_room_sunbeam.json inside room, GI OFF
+                    cam_pose.* = camera.CameraPose.lookAt(.{ -0.4, 2.3, 1.6 }, .{ -0.6, 1.8, -4.0 }, .{ 0, 1, 0 });
                     if (ctx.world.get(st.cam_entity, camera.FreeCamera)) |fc| fc.state.initialized = false;
+                } else if (st.capture_step == 3) {
+                    if (ctx.resources.get(helios.HeliosService)) |hsvc| hsvc.settings.tier = .high;
+                    try rebuildHeliosGi(st); // 06_dark_room_sunbeam.json inside room, GI HIGH
                 }
             }
             st.capture_wait += 1;
-            if (st.capture_wait >= 45) {
+            if (st.capture_wait >= 60) {
                 graphics_sdlgpu.requestCapture(st.app, .final);
                 st.capture_pending = true;
             }
@@ -668,6 +676,62 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
                 giz.sphere(inst.bounds_center, inst.bounds_radius, 12, .{ 0.25, 0.95, 0.65, 0.55 });
             }
         }
+    }
+
+    // In Scene 06 (Dark Room Sunbeam), smoothly blend outdoor sky IBL occlusion across the doorway
+    // (spatial smoothstep + temporal lerp) so there is zero abrupt pop when walking in or out.
+    if (st.scene_index == 5 and st.sky_preset == 0) {
+        const p = cam_pose.position;
+        // Signed distance inside the room box [-5.1..5.1, -0.2..6.1, -7.1..3.3] with a 3.0m soft doorway ramp.
+        const dx = @max(@abs(p[0]) - 5.1, 0.0);
+        const dy = @max(@max(-0.2 - p[1], p[1] - 6.1), 0.0);
+        const dz = @max(@max(-7.1 - p[2], p[2] - 3.3), 0.0);
+        const outside_dist = @sqrt(dx * dx + dy * dy + dz * dz);
+        const t = 1.0 - std.math.clamp(outside_dist / 3.0, 0.0, 1.0);
+        const spatial_inside = t * t * (3.0 - 2.0 * t);
+        const alpha = 1.0 - @exp(-@as(f32, @floatCast(ctx.dt)) * 4.5);
+        st.indoor_blend += (spatial_inside - st.indoor_blend) * alpha;
+
+        const scale: f32 = 1.0 - st.indoor_blend * 0.985;
+        if (ctx.resources.get(render_3d.pbr.SkyEnvironment)) |sky| {
+            sky.sky_tint = .{ st.scene_sky_tint[0] * scale, st.scene_sky_tint[1] * scale, st.scene_sky_tint[2] * scale };
+            sky.horizon_tint = .{ st.scene_horizon_tint[0] * scale, st.scene_horizon_tint[1] * scale, st.scene_horizon_tint[2] * scale };
+            sky.ground_albedo = .{ st.scene_ground_albedo[0] * scale, st.scene_ground_albedo[1] * scale, st.scene_ground_albedo[2] * scale };
+        }
+        if (ctx.resources.get(render_3d.pbr.AmbientLight)) |amb| {
+            amb.brightness = 0.05 * (1.0 - st.indoor_blend) + 0.004 * st.indoor_blend;
+        }
+    } else {
+        st.indoor_blend = 0.0;
+        if (ctx.resources.get(render_3d.pbr.AmbientLight)) |amb| amb.brightness = 0.05;
+    }
+
+    // In Scene 06 (Dark Room Sunbeam), smoothly blend outdoor sky IBL occlusion across the doorway
+    // (spatial smoothstep + temporal lerp) so there is zero abrupt pop when walking in or out.
+    if (st.scene_index == 5 and st.sky_preset == 0) {
+        const p = cam_pose.position;
+        // Signed distance inside the room box [-5.1..5.1, -0.2..6.1, -7.1..3.3] with a 3.0m soft doorway ramp.
+        const dx = @max(@abs(p[0]) - 5.1, 0.0);
+        const dy = @max(@max(-0.2 - p[1], p[1] - 6.1), 0.0);
+        const dz = @max(@max(-7.1 - p[2], p[2] - 3.3), 0.0);
+        const outside_dist = @sqrt(dx * dx + dy * dy + dz * dz);
+        const t = 1.0 - std.math.clamp(outside_dist / 3.0, 0.0, 1.0);
+        const spatial_inside = t * t * (3.0 - 2.0 * t);
+        const alpha = 1.0 - @exp(-@as(f32, @floatCast(ctx.dt)) * 4.5);
+        st.indoor_blend += (spatial_inside - st.indoor_blend) * alpha;
+
+        const scale: f32 = 1.0 - st.indoor_blend * 0.985;
+        if (ctx.resources.get(render_3d.pbr.SkyEnvironment)) |sky| {
+            sky.sky_tint = .{ st.scene_sky_tint[0] * scale, st.scene_sky_tint[1] * scale, st.scene_sky_tint[2] * scale };
+            sky.horizon_tint = .{ st.scene_horizon_tint[0] * scale, st.scene_horizon_tint[1] * scale, st.scene_horizon_tint[2] * scale };
+            sky.ground_albedo = .{ st.scene_ground_albedo[0] * scale, st.scene_ground_albedo[1] * scale, st.scene_ground_albedo[2] * scale };
+        }
+        if (ctx.resources.get(render_3d.pbr.AmbientLight)) |amb| {
+            amb.brightness = 0.05 * (1.0 - st.indoor_blend) + 0.004 * st.indoor_blend;
+        }
+    } else {
+        st.indoor_blend = 0.0;
+        if (ctx.resources.get(render_3d.pbr.AmbientLight)) |amb| amb.brightness = 0.05;
     }
 
     // Stages 06-09 live evaluation & optional 3D debug volumes ([P] toggle).
@@ -916,7 +980,7 @@ pub fn main(init: std.process.Init) !void {
     try app.world.set(cam_e, camera.FreeCamera, .{ .walk_speed = 8.0, .run_speed = 18.0 });
     try app.world.set(cam_e, camera.FreeCameraState, .{});
     try app.world.set(cam_e, render_3d.pbr.PostProcessSettings, .{
-        .auto_exposure = .{ .enabled = true, .min_ev100 = -2.0, .max_ev100 = 3.0, .speed_brighten = 3.0, .speed_darken = 1.5 },
+        .auto_exposure = .{ .enabled = true, .min_ev100 = -3.5, .max_ev100 = 4.5, .speed_brighten = 1.8, .speed_darken = 2.5 },
         .bloom = .{ .enabled = true, .intensity = 0.30, .threshold = 1.1, .scatter = 0.72 },
         .ssao = .{ .enabled = true, .radius = 0.65, .intensity = 1.25, .bias = 0.03 },
         .contact_shadows = .{ .enabled = true, .length = 0.45, .thickness = 0.12, .opacity = 0.8 },

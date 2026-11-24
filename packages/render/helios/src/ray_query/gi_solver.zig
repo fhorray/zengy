@@ -65,9 +65,9 @@ pub const GiSolveStats = struct {
 pub fn configForTier(tier: contract.HeliosQualityTier) GiSolveConfig {
     return switch (tier) {
         .off => .{ .max_vpls = 0, .rays_per_point = 0, .sun_grid_side = 0, .max_bounces = 0 },
-        .low => .{ .max_vpls = 4, .rays_per_point = 32, .sun_grid_side = 4, .max_bounces = 1, .merge_radius = 4.2, .normal_offset = 0.75, .bounce_energy_scale = 0.70, .vpl_range = 12.0 },
-        .medium => .{ .max_vpls = 6, .rays_per_point = 48, .sun_grid_side = 6, .max_bounces = 1, .merge_radius = 3.6, .normal_offset = 0.75, .bounce_energy_scale = 0.92, .vpl_range = 13.0 },
-        .high => .{ .max_vpls = 8, .rays_per_point = 64, .sun_grid_side = 7, .max_bounces = 2, .merge_radius = 3.4, .normal_offset = 0.80, .bounce_energy_scale = 1.10, .vpl_range = 14.0 },
+        .low => .{ .max_vpls = 4, .rays_per_point = 32, .sun_grid_side = 10, .max_bounces = 1, .merge_radius = 4.2, .normal_offset = 0.75, .bounce_energy_scale = 0.70, .vpl_range = 12.0 },
+        .medium => .{ .max_vpls = 6, .rays_per_point = 48, .sun_grid_side = 14, .max_bounces = 1, .merge_radius = 3.6, .normal_offset = 0.75, .bounce_energy_scale = 0.92, .vpl_range = 13.0 },
+        .high => .{ .max_vpls = 8, .rays_per_point = 64, .sun_grid_side = 18, .max_bounces = 2, .merge_radius = 3.4, .normal_offset = 0.80, .bounce_energy_scale = 1.15, .vpl_range = 14.0 },
     };
 }
 
@@ -151,14 +151,15 @@ fn addOrMergeVpl(
     cand: VirtualPointLight,
     merge_radius: f32,
 ) !void {
-    if (cand.lumens < 4.0) return;
+    if (cand.lumens < 0.05) return;
     const r2 = merge_radius * merge_radius;
     for (vpls.items) |*v| {
         const dx = v.position[0] - cand.position[0];
         const dy = v.position[1] - cand.position[1];
         const dz = v.position[2] - cand.position[2];
         const same_dir = dot3(v.normal, cand.normal) > 0.35;
-        if (dx * dx + dy * dy + dz * dz <= r2 and same_dir) {
+        const col_diff = @abs(v.color[0] - cand.color[0]) + @abs(v.color[1] - cand.color[1]) + @abs(v.color[2] - cand.color[2]);
+        if (dx * dx + dy * dy + dz * dz <= r2 and same_dir and col_diff < 0.45) {
             const total = v.lumens + cand.lumens;
             const w0 = v.lumens / total;
             const w1 = cand.lumens / total;
@@ -291,7 +292,7 @@ pub fn solveInstantRadiosity(
             const fwd = normalize3(cross3(s_dir, right));
             const side = config.sun_grid_side;
             const total_rays = side * side;
-            const sun_flux_per_ray = (s.illuminance_lux * 0.032 * config.bounce_energy_scale) / @as(f32, @floatFromInt(total_rays));
+            const sun_flux_per_ray = (s.illuminance_lux * 0.22 * config.bounce_energy_scale) / @as(f32, @floatFromInt(total_rays));
 
             for (0..side) |iy| {
                 for (0..side) |ix| {
@@ -323,26 +324,41 @@ pub fn solveInstantRadiosity(
                         .position = hit_p,
                         .normal = n,
                         .color = .{ rgb[0] / max_c, rgb[1] / max_c, rgb[2] / max_c },
-                        .lumens = sun_flux_per_ray * max_c * ndotl * 4.0,
+                        .lumens = sun_flux_per_ray * max_c * ndotl * 4.5,
                         .range = config.vpl_range * 1.15,
                         .bounce_depth = 1,
-                    }, config.merge_radius * 1.4);
+                    }, config.merge_radius * 1.1);
                 }
             }
         }
     }
 
-    // 3. Sort VPLs by descending lumens and keep top `config.max_vpls` (clamped for smooth indirect fill).
-    std.mem.sort(VirtualPointLight, raw_vpls.items, {}, struct {
-        fn lessThan(_: void, a: VirtualPointLight, b: VirtualPointLight) bool {
-            return a.lumens > b.lumens;
+    // 3. Rank VPLs by bounced flux boosted by chromatic saturation and proximity to scene_center
+    //    so vivid interior color-bleed bounces (e.g. a sunlit red floor inside a room) are never
+    //    evicted by dull distant roof/ground bounces.
+    const focus = if (sun) |s| s.scene_center else [3]f32{ 0, 1.5, 0 };
+    const SortCtx = struct { focus: [3]f32 };
+    std.mem.sort(VirtualPointLight, raw_vpls.items, SortCtx{ .focus = focus }, struct {
+        fn score(v: VirtualPointLight, f: [3]f32) f32 {
+            const dx = v.position[0] - f[0];
+            const dy = v.position[1] - f[1];
+            const dz = v.position[2] - f[2];
+            const d2 = dx * dx + dy * dy + dz * dz;
+            const max_c = @max(v.color[0], @max(v.color[1], v.color[2]));
+            const min_c = @min(v.color[0], @min(v.color[1], v.color[2]));
+            const sat = max_c - min_c;
+            return (v.lumens * (1.0 + sat * 3.0)) / (1.0 + 0.04 * d2);
+        }
+        fn lessThan(ctx: SortCtx, a: VirtualPointLight, b: VirtualPointLight) bool {
+            return score(a, ctx.focus) > score(b, ctx.focus);
         }
     }.lessThan);
 
     const keep = @min(raw_vpls.items.len, config.max_vpls);
     for (raw_vpls.items[0..keep]) |v| {
+        if (v.lumens < 4.0) continue;
         var clamped = v;
-        clamped.lumens = @min(clamped.lumens, 520.0);
+        clamped.lumens = @min(clamped.lumens, 780.0);
         try out_vpls.append(allocator, clamped);
     }
 
