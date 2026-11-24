@@ -312,6 +312,10 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli_exe);
 
+    // CLI-only step: builds and installs `zigeng` without linking SDL3 (used by the Linux release).
+    const cli_step = b.step("cli", "Build and install only the zigeng CLI (no SDL3 needed)");
+    cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+
     const run_cli = b.addRunArtifact(cli_exe);
     const cli_cmd = b.option([]const u8, "cli-cmd", "CLI subcommand (doctor, packages, list-official, new, run, add)") orelse "doctor";
     run_cli.addArg(cli_cmd);

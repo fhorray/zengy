@@ -72,15 +72,17 @@ jobs:
         with:
           version: 0.17.1
       - name: Run tests & build Linux x64 CLI (ReleaseSafe)
+        # The CLI does not link SDL3. The runtime and demos do, so they are not part of the Linux
+        # bundle: on Linux, install SDL3 from your package manager to build them yourself.
         run: |
           zig build test -Doptimize=ReleaseSafe
-          zig build install -Doptimize=ReleaseSafe || true
+          zig build cli -Doptimize=ReleaseSafe
       - name: Stage Linux release archive
         run: |
           TAG="${{ needs.meta.outputs.tag }}"
           STAGE="dist/zigeng-${TAG}-x86_64-linux"
           mkdir -p "$STAGE/include"
-          cp zig-out/bin/zigeng zig-out/bin/zigeng-runtime "$STAGE/"
+          cp zig-out/bin/zigeng "$STAGE/"
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
           tar -czf "dist/zigeng-${TAG}-x86_64-linux.tar.gz" -C dist "zigeng-${TAG}-x86_64-linux"
