@@ -105,3 +105,17 @@ platforms = ["windows-x86_64"]
 - Projects with `build.zig.zon`: dependencies for the host platform are fetched and the hook block is written between `// zigeng:begin <pkg>` / `// zigeng:end <pkg>` right after the `// zigeng:install-hooks` anchor (place it inside `build()` after `const target = ...`). Re-running replaces the block (idempotent). Without the anchor the CLI prints the block to paste.
 - `game.toml` projects have no `build.zig.zon`, so nothing is edited: `zigeng-runtime` already ships its runtime libraries.
 - Manifests are untrusted input and become Zig code: only `https://` URLs, identifier-safe names, relative paths without `..`, and no quotes or backslashes are accepted (`tools/cli/pkg_manifest.zig`).
+
+## 5. Plugin dependency on zigeng (`--fork`)
+
+Plugins that use engine modules (`physics/jolt`, `physics/rapier`) depend on `zigeng` by pinned URL and hash in their `build.zig.zon`, so they build anywhere (including a user project that only received the plugin folder):
+
+```zig
+.zigeng = .{
+    .url = "git+https://github.com/fhorray/zigeng#<commit>",
+    .hash = "zigeng-<version>-...",   // `zig fetch <url>` prints it
+},
+```
+
+- **Developing inside the zigeng repository:** override the pin with the local checkout, no network needed: `zig build --fork=<zigeng-root>` in the plugin directory, or `zigeng add --fork=<zigeng-root> <plugin>` (also `ZIGENG_FORK`). `project.bat` does this for the sandbox projects.
+- **Bumping the pin:** when `physics/core` or the plugin ABI (`cabi.ABI_VERSION`) changes, update `url`/`hash` in each plugin to a pushed commit or release tag. Plugins built against an older ABI are rejected at load time with a clear error instead of crashing.

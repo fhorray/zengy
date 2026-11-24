@@ -287,6 +287,9 @@ fn provisionPackageDir(allocator: std.mem.Allocator, io: std.Io, dir: []const u8
 }
 
 /// Runs `argv` inside `cwd` without a shell (no quoting or path-separator pitfalls) and echoes its output.
+/// Optional local zigeng checkout (`--fork=<path>` or `ZIGENG_FORK`) forwarded to plugin builds.
+var g_fork_path: ?[]const u8 = null;
+
 fn runArgvIn(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: []const u8) !void {
     const res = try std.process.run(allocator, io, .{ .argv = argv, .cwd = .{ .path = cwd } });
     defer allocator.free(res.stdout);
@@ -344,7 +347,17 @@ fn compileAndInstallPluginDir(allocator: std.mem.Allocator, io: std.Io, dir_path
 
     if (has_zig) {
         std.debug.print("[zigeng] Building plugin '{s}' locally with zig...\n", .{label});
-        try runArgvIn(allocator, io, &.{ "zig", "build", "-Doptimize=ReleaseSafe" }, dir_path);
+        if (g_fork_path) |fork| {
+            // Local zigeng checkout overrides the pinned `zigeng` dependency of the plugin
+            // (`zig build --fork`); used when developing inside the zigeng repository.
+            const abs_fork = try std.Io.Dir.cwd().realPathFileAlloc(io, fork, allocator);
+            defer allocator.free(abs_fork);
+            const fork_arg = try std.fmt.allocPrint(allocator, "--fork={s}", .{abs_fork});
+            defer allocator.free(fork_arg);
+            try runArgvIn(allocator, io, &.{ "zig", "build", "-Doptimize=ReleaseSafe", fork_arg }, dir_path);
+        } else {
+            try runArgvIn(allocator, io, &.{ "zig", "build", "-Doptimize=ReleaseSafe" }, dir_path);
+        }
         const out_dir = try std.fmt.allocPrint(allocator, "{s}/zig-out", .{dir_path});
         defer allocator.free(out_dir);
         try copyPluginLibs(allocator, io, out_dir, true);
@@ -511,11 +524,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, cmd, "add")) {
-        const pkg_spec = args_it.next() orelse {
-            std.debug.print("Usage: zigeng add <package | owner/repo[@tag] | github-url | ./local-path>\n", .{});
+        g_fork_path = init.environ_map.get("ZIGENG_FORK");
+        var pkg_spec: ?[]const u8 = null;
+        while (args_it.next()) |a| {
+            if (std.mem.startsWith(u8, a, "--fork=")) {
+                g_fork_path = a["--fork=".len..];
+            } else if (pkg_spec == null) {
+                pkg_spec = a;
+            }
+        }
+        const spec = pkg_spec orelse {
+            std.debug.print("Usage: zigeng add [--fork=<zigeng-checkout>] <package | owner/repo[@tag] | github-url | ./local-path>\n", .{});
             return;
         };
-        try installPluginSpec(allocator, init.io, pkg_spec);
+        try installPluginSpec(allocator, init.io, spec);
         return;
     }
 

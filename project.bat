@@ -42,7 +42,7 @@ pushd "%PROJ%"
 if exist plugins.txt (
     for /f "usebackq eol=# tokens=* delims=" %%P in ("plugins.txt") do (
         echo [test] zigeng add %%P
-        "%BIN%\zigeng.exe" add "%%P"
+        "%BIN%\zigeng.exe" add "--fork=%ROOT%" "%%P"
         if errorlevel 1 (
             echo [test] FAILED: zigeng add %%P
             popd
