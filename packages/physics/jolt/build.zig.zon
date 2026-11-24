@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .zengy = .{
-            .url = "git+https://github.com/fhorray/zigeng#c423b88180457f84924b175aa102b5e3c453c96b",
-            .hash = "zigeng-0.1.3-exW4tncSWQBmAJqfxiaiYR4uaTXmiUDkDgk5j1jhY1tq",
+            .url = "git+https://github.com/fhorray/zigeng#7940f93c7f39d741539d5355349fb2317fdebde6",
+            .hash = "zengy-0.1.5-QXZEGlmmWQAk6se8A04DXxPCSlLlnwEma13sYo9hh3kv",
         },
         .jolt = .{
             .url = "https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.7.0.tar.gz",
