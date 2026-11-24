@@ -205,6 +205,7 @@ pub const UiNodeDescriptor = struct {
     id: []const u8,
     kind: NodeKind,
     text: []const u8 = "",
+    placeholder: []const u8 = "",
     action: []const u8 = "",
     style: UiStyle = .{},
     focusable: bool = false,
@@ -222,6 +223,7 @@ pub const UiNode = struct {
     id: []const u8,
     kind: NodeKind,
     text: []const u8,
+    placeholder: []const u8 = "",
     action: []const u8,
     style: UiStyle,
     layout: Rect,
@@ -348,6 +350,7 @@ pub const UiTree = struct {
             .id = id_copy,
             .kind = desc.kind,
             .text = text_copy,
+            .placeholder = desc.placeholder,
             .action = action_copy,
             .style = desc.style,
             .layout = .{},
@@ -872,6 +875,9 @@ pub const UiTree = struct {
             if (prev < self.nodes.items.len) {
                 self.nodes.items[prev].focused = false;
                 self.nodes.items[prev].focus_visible = false;
+                if (self.nodes.items[prev].kind == .textbox) {
+                    self.nodes.items[prev].selected = false;
+                }
             }
         }
         self.focus_visible = via_keyboard;
@@ -1205,6 +1211,27 @@ pub const UiTree = struct {
                     .y = base_tx_y,
                     .content = node.text,
                     .color = node.style.text_color,
+                    .scale = node.style.font_scale,
+                    .align_mode = switch (node.style.text_align) {
+                        .left => .left,
+                        .center => .center,
+                        .right => .right,
+                    },
+                    .box_width = inner_w_txt,
+                },
+            });
+        } else if (node.kind == .textbox and node.placeholder.len > 0) {
+            try out_cmds.append(allocator, .{
+                .text = .{
+                    .x = node.layout.x + pad_txt.left,
+                    .y = base_tx_y,
+                    .content = node.placeholder,
+                    .color = .{
+                        .r = node.style.text_color.r,
+                        .g = node.style.text_color.g,
+                        .b = node.style.text_color.b,
+                        .a = node.style.text_color.a * 0.45,
+                    },
                     .scale = node.style.font_scale,
                     .align_mode = switch (node.style.text_align) {
                         .left => .left,

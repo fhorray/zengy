@@ -10,6 +10,7 @@ const rounded = @import("../rounded_corners.zig");
 /// Configuration properties for `textInput`.
 pub const TextInputProps = struct {
     text: []const u8 = "",
+    placeholder: []const u8 = "",
     max_len: usize = 256,
     disabled: bool = false,
     width_spec: ?ui_core.SizeSpec = null,
@@ -29,6 +30,7 @@ pub fn textInput(
         .id = "",
         .kind = .textbox,
         .text = props.text,
+        .placeholder = props.placeholder,
         .focusable = true,
         .disabled = props.disabled,
         .cursor = .text,
@@ -286,7 +288,7 @@ pub fn numberInput(
         .style = .{
             .position = .absolute,
             .left = 2,
-            .top = 5,
+            .top = 4,
             .width = 14,
             .height = 14,
             .min_height = 14,
@@ -309,7 +311,7 @@ pub fn numberInput(
         .style = .{
             .position = .absolute,
             .right = 2,
-            .top = 5,
+            .top = 4,
             .width = 14,
             .height = 14,
             .min_height = 14,
@@ -521,6 +523,11 @@ pub const ComboboxHandles = struct {
     selected_idx: usize = 0,
 };
 
+/// Configuration options for `comboboxEx`.
+pub const ComboboxOptions = struct {
+    search_placeholder: []const u8 = "Search...",
+};
+
 /// Creates a searchable `Combobox` (up to 32 options) with real-time case-insensitive filtering.
 pub fn combobox(
     tree: *ui_core.UiTree,
@@ -529,6 +536,21 @@ pub fn combobox(
     parent: ?usize,
     options: []const []const u8,
     selected_idx: usize,
+    tag: []const u8,
+    level: theme.SurfaceLevel,
+) !ComboboxHandles {
+    return comboboxEx(tree, mgr, th, parent, options, selected_idx, .{}, tag, level);
+}
+
+/// Creates a searchable `Combobox` with customizable `ComboboxOptions`.
+pub fn comboboxEx(
+    tree: *ui_core.UiTree,
+    mgr: *ui_widgets.WidgetManager,
+    th: *const theme.UiTheme,
+    parent: ?usize,
+    options: []const []const u8,
+    selected_idx: usize,
+    opts: ComboboxOptions,
     tag: []const u8,
     level: theme.SurfaceLevel,
 ) !ComboboxHandles {
@@ -589,9 +611,30 @@ pub fn combobox(
     const popup_id = tree.idOf(popup_idx).?;
     const search_id = try textInput(tree, mgr, th, popup_idx, .{
         .text = "",
+        .placeholder = opts.search_placeholder,
         .tag = tag,
         .level = .floating,
     });
+    if (tree.resolveId(search_id)) |s_idx| {
+        tree.nodes.items[s_idx].style.padding_edges = .{ .left = 8, .right = 24, .top = 4, .bottom = 4 };
+        const icon_col = th.color(.text_dim, .floating);
+        _ = try tree.createNode(s_idx, .{
+            .id = "",
+            .kind = .custom,
+            .pickable = false,
+            .style = .{
+                .position = .absolute,
+                .right = 7,
+                .top = 6,
+                .width = 12,
+                .height = 12,
+                .min_height = 12,
+                .padding = 0,
+                .bg_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            },
+            .paint_extra = .{ .icon = .{ .kind = .search, .size = 12, .color = .{ .r = icon_col.r, .g = icon_col.g, .b = icon_col.b, .a = 0.55 } } },
+        });
+    }
     const list_idx = try tree.createNode(popup_idx, .{
         .id = "",
         .kind = .panel,
@@ -601,6 +644,7 @@ pub fn combobox(
             .height = if (options.len > 5) 140 else @as(f32, @floatFromInt(@max(@as(usize, 1), options.len) * 26)),
             .padding = 0,
             .gap = 2,
+            .clip_children = true,
             .bg_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
         },
     });

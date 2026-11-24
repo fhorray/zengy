@@ -283,7 +283,13 @@ pub const WidgetManager = struct {
 
         // Keyboard Tab navigation.
         if (input.wasKeyPressed(window.KeyCode.tab)) {
+            const prev_focus = tree.focused_node;
             _ = tree.focusNext(input.modifiers.shift);
+            if (prev_focus) |pf| {
+                if (tree.focused_node != pf) {
+                    self.clearFocusedEditState(tree, pf);
+                }
+            }
         }
 
         // Scroll wheel over scrollable containers.
@@ -316,13 +322,13 @@ pub const WidgetManager = struct {
                     tree.setFocus(h_idx, false);
                 }
                 if (prev_focus != null and prev_focus != h_idx) {
-                    self.commitEditingNumberInput(tree, prev_focus.?);
+                    self.clearFocusedEditState(tree, prev_focus.?);
                 }
                 if (tree.idOf(h_idx)) |hid| {
                     try self.onPointerDown(tree, hid, input);
                 }
             } else if (prev_focus) |pf| {
-                self.commitEditingNumberInput(tree, pf);
+                self.clearFocusedEditState(tree, pf);
             }
         }
 
@@ -409,6 +415,16 @@ pub const WidgetManager = struct {
         }
     }
 
+    fn clearFocusedEditState(self: *WidgetManager, tree: *ui_core.UiTree, node_idx: usize) void {
+        const nid = tree.idOf(node_idx) orelse return;
+        const b = self.findByNode(nid) orelse return;
+        switch (b.behavior) {
+            .number_input => self.commitEditingNumberInput(tree, node_idx),
+            .text_input => |*ti| ti.edit.clearSelection(tree, node_idx),
+            else => {},
+        }
+    }
+
     fn commitEditingNumberInput(self: *WidgetManager, tree: *ui_core.UiTree, node_idx: usize) void {
         const nid = tree.idOf(node_idx) orelse return;
         const b = self.findByNode(nid) orelse return;
@@ -420,6 +436,7 @@ pub const WidgetManager = struct {
         ni.value = events.NumericValue.fromF64(ni.value, clamped);
         ni.mode = .idle;
         tree.nodes.items[node_idx].kind = .custom;
+        ni.edit.clearSelection(tree, node_idx);
     }
 
     fn isDescendantOrSelf(tree: *const ui_core.UiTree, node_idx: usize, ancestor_idx: usize) bool {
@@ -973,11 +990,13 @@ pub const WidgetManager = struct {
                         ni.value = events.NumericValue.fromF64(ni.value, clamped);
                         ni.mode = .idle;
                         tree.nodes.items[idx].kind = .custom;
+                        ni.edit.clearSelection(tree, idx);
                         self.undo_history.push(.{ .widget_numeric = .{ .node = fid, .prev = prev_val, .next = ni.value } });
                         try self.event_queue.push(.{ .node = fid, .tag = b.tag, .is_final = true, .payload = .{ .value_numeric = ni.value } });
                     } else if (out.cancelled) {
                         ni.mode = .idle;
                         tree.nodes.items[idx].kind = .custom;
+                        ni.edit.clearSelection(tree, idx);
                     }
                 }
             },

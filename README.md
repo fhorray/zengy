@@ -99,8 +99,8 @@ When you are ready to add graphics, simply register the optional modules you wan
 | **GPU Rendering** | `graphics-sdlgpu` (or `graphics` for headless) | SDL_GPU (Vulkan/SPIR-V) with 2D batching, scissor clipping & 3D depth |
 | **2D Scenes & Sprites** | `scene` + `render-2d` | `Transform2D`, `Camera2D`, `Sprite`, `Visibility`, layer sorting |
 | **3D Scenes & glTF** | `render-3d` | `Transform3D`, `Camera3D`, `MeshRef`, glTF 2.0 loader, frustum culling |
-| **UI & Text** | `ui-core`, `ui-markup`, `text` | Retained flex layout, HTML-like markup, clickable buttons, textboxes |
-| **Editor & Tooling UI** | `ui-widgets`, `ui-plume` | Headless widget runtime + opinionated widget kit for editors, inspectors, and tooling |
+| **UI & Text** | `ui-core`, `ui-markup`, `text` | Shared retained UI IR (`ui-core`) for any frontend, HTML-like in-game markup (`ui-markup`), TTF text & icons ([ADR-0001](docs/adr/0001-layered-ui-architecture.md)) |
+| **Editor & Tooling UI** | `ui-widgets`, `ui-plume` | Visual-agnostic widget runtime + opinionated widget kit for editors, inspectors, and tooling |
 | **Scripting** | `scripting-host` + `scripting-lua` or `scripting-python` | Bring your own language, or opt into Lua 5.4 / PocketPy (Python) |
 | **C / Native Plugins** | `include/engine_extension.h` | Load `.dll` / `.so` / `.dylib` plugins dynamically at runtime |
 | **Automated Testing** | `testing` + `zengy` CLI | Deterministic TOML scenarios & offscreen framebuffer capture |
