@@ -316,6 +316,14 @@ pub const World = struct {
         self.guids.deinit(self.allocator);
     }
 
+    /// Sets the high 64 bits of every `EntityGuid` this world generates, so GUIDs minted by
+    /// different worlds, projects, or streamed cells never collide (`guid = namespace << 64 | seq`).
+    /// Must be called before the first spawn (`error.WorldNotEmpty` otherwise).
+    pub fn setGuidNamespace(self: *World, namespace: u64) !void {
+        if (self.generations.items.len != 0) return error.WorldNotEmpty;
+        self.next_guid = (@as(u128, namespace) << 64) | 1;
+    }
+
     pub fn comptimeTypeId(comptime T: type) ComponentTypeId {
         return dynamicTypeId(@typeName(T));
     }

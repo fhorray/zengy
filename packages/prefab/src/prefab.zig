@@ -171,6 +171,25 @@ pub fn instantiate(
     return .{ .allocator = allocator, .handles = handles };
 }
 
+/// Replaces a live instance with a freshly instantiated one (hot reload of an edited prefab).
+/// The new instance is built and fully validated first; only then are the old entities despawned,
+/// so any failure leaves `old` untouched and running. On success `old` is consumed (its handles
+/// are freed) and the new `Instance` is returned.
+pub fn reinstantiate(
+    allocator: std.mem.Allocator,
+    world: *engine.World,
+    types: *const engine.TypeRegistry,
+    prefab: *const Prefab,
+    old: *Instance,
+    opts: InstantiateOptions,
+) !Instance {
+    const fresh = try instantiate(allocator, world, types, prefab, opts);
+    for (old.handles) |h| _ = world.despawn(h) catch {};
+    old.deinit();
+    old.handles = &.{};
+    return fresh;
+}
+
 /// Named prefab store registered as a resource by `module()` (`engine.prefab/1`).
 pub const PrefabLibrary = struct {
     allocator: std.mem.Allocator,

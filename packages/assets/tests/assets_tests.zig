@@ -144,3 +144,41 @@ test "AssetService survives allocation failures at every point without leaks, do
         try testing.expectEqual(svc.assets.items.len, live + svc.free_indices.items.len);
     }
 }
+
+test "AssetService dependency graph: cycles rejected, dependents invalidated on reload, shared assets protected" {
+    const RawImp = struct {
+        fn importFn(allocator: std.mem.Allocator, _: []const u8, raw: []const u8) !assets.AssetArtifact {
+            return .{ .kind = try allocator.dupe(u8, "raw"), .bytes = try allocator.dupe(u8, raw) };
+        }
+    };
+    var svc = assets.AssetService.init(testing.allocator);
+    defer svc.deinit();
+    try svc.registerImporter(.{ .id = "raw", .extension = ".raw", .import_fn = RawImp.importFn });
+
+    const tex = try svc.loadFromBytes("project://tex.raw", "t");
+    const mat = try svc.loadFromBytes("project://mat.raw", "m");
+    const mesh = try svc.loadFromBytes("project://mesh.raw", "x");
+    try svc.addDependency(mat, tex);
+    try svc.addDependency(mesh, mat);
+    try svc.addDependency(mesh, mat); // duplicate is a no-op
+    try testing.expectEqual(@as(usize, 1), svc.dependenciesOf(mesh).len);
+
+    try testing.expectError(error.DependencyCycle, svc.addDependency(tex, mesh)); // would close a loop
+    try testing.expectError(error.DependencyCycle, svc.addDependency(mat, mat));
+
+    const users = try svc.dependentsOf(testing.allocator, tex);
+    defer testing.allocator.free(users);
+    try testing.expectEqual(@as(usize, 2), users.len); // mat and (transitively) mesh
+
+    const before = svc.getVersion(mesh).?;
+    try testing.expectEqual(@as(usize, 2), try svc.reloadAndInvalidate(tex, "t2"));
+    try testing.expectEqual(before + 1, svc.getVersion(mesh).?);
+
+    try testing.expect(!svc.unloadIfUnreferenced(tex)); // mat still uses it
+    try testing.expect(svc.unloadIfUnreferenced(mesh));
+    try testing.expect(svc.unloadIfUnreferenced(mat));
+    try testing.expect(svc.unloadIfUnreferenced(tex));
+    // A reused slot starts with no stale dependencies.
+    const again = try svc.loadFromBytes("project://again.raw", "a");
+    try testing.expectEqual(@as(usize, 0), svc.dependenciesOf(again).len);
+}

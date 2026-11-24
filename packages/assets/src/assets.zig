@@ -47,6 +47,8 @@ const AssetSlot = struct {
     version: u32,
     generation: u32,
     alive: bool,
+    /// Assets this one was built from (e.g. a material's textures); see `addDependency`.
+    dependencies: std.ArrayList(AssetHandle) = .empty,
 };
 
 /// Optional asset registry, importer resolver, and artifact cache.
@@ -86,6 +88,7 @@ pub const AssetService = struct {
                 self.allocator.free(slot.bytes);
             }
         }
+        for (self.assets.items) |*slot| slot.dependencies.deinit(self.allocator);
         self.assets.deinit(self.allocator);
         self.free_indices.deinit(self.allocator);
         for (self.importers.items) |imp| {
@@ -180,6 +183,7 @@ pub const AssetService = struct {
                 .version = 1,
                 .generation = gen,
                 .alive = true,
+                .dependencies = slot.dependencies, // emptied by unload; keep its capacity
             };
             return .{ .index = reused_idx, .generation = gen };
         }
@@ -230,6 +234,7 @@ pub const AssetService = struct {
         self.retired_allocs.ensureUnusedCapacity(self.allocator, 2) catch return false;
         self.free_indices.ensureUnusedCapacity(self.allocator, 1) catch return false;
 
+        slot.dependencies.clearRetainingCapacity();
         _ = self.uri_to_index.remove(slot.uri);
         self.allocator.free(slot.uri);
         slot.uri = &.{};
@@ -242,6 +247,76 @@ pub const AssetService = struct {
         if (slot.generation == 0) slot.generation = 1;
         self.free_indices.appendAssumeCapacity(handle.index);
         return true;
+    }
+
+    /// Records that `asset` depends on `depends_on` (for example a material on its textures).
+    /// Rejects stale handles, self-dependency, duplicates (no-op), and cycles (`DependencyCycle`).
+    pub fn addDependency(self: *AssetService, asset: AssetHandle, depends_on: AssetHandle) !void {
+        const slot = self.getSlotMut(asset) orelse return error.InvalidAssetHandle;
+        if (self.getSlotMut(depends_on) == null) return error.InvalidAssetHandle;
+        if (std.meta.eql(asset, depends_on) or self.dependsOn(depends_on, asset)) return error.DependencyCycle;
+        for (slot.dependencies.items) |d| {
+            if (std.meta.eql(d, depends_on)) return;
+        }
+        try slot.dependencies.append(self.allocator, depends_on);
+    }
+
+    /// Direct dependencies of `asset` (empty for stale handles).
+    pub fn dependenciesOf(self: *const AssetService, asset: AssetHandle) []const AssetHandle {
+        if (asset.index >= self.assets.items.len) return &.{};
+        const slot = &self.assets.items[asset.index];
+        if (!slot.alive or slot.generation != asset.generation) return &.{};
+        return slot.dependencies.items;
+    }
+
+    /// True when `asset` reaches `target` through its (transitive) dependencies.
+    pub fn dependsOn(self: *const AssetService, asset: AssetHandle, target: AssetHandle) bool {
+        return self.dependsOnDepth(asset, target, self.assets.items.len);
+    }
+
+    fn dependsOnDepth(self: *const AssetService, asset: AssetHandle, target: AssetHandle, budget: usize) bool {
+        if (budget == 0) return true; // longer than the asset table: only possible with a cycle
+        for (self.dependenciesOf(asset)) |d| {
+            if (std.meta.eql(d, target) or self.dependsOnDepth(d, target, budget - 1)) return true;
+        }
+        return false;
+    }
+
+    /// Returns every live asset that (transitively) depends on `asset`. Caller frees the slice.
+    pub fn dependentsOf(self: *const AssetService, allocator: std.mem.Allocator, asset: AssetHandle) ![]AssetHandle {
+        var out: std.ArrayList(AssetHandle) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.assets.items, 0..) |slot, i| {
+            if (!slot.alive) continue;
+            const h: AssetHandle = .{ .index = @intCast(i), .generation = slot.generation };
+            if (self.dependsOn(h, asset)) try out.append(allocator, h);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Unloads `asset` only when no live asset depends on it; returns false (nothing changes)
+    /// otherwise, so shared textures are not freed from under their users.
+    pub fn unloadIfUnreferenced(self: *AssetService, asset: AssetHandle) bool {
+        if (self.getSlotMut(asset) == null) return false;
+        for (self.assets.items, 0..) |slot, i| {
+            if (!slot.alive) continue;
+            const h: AssetHandle = .{ .index = @intCast(i), .generation = slot.generation };
+            for (slot.dependencies.items) |d| {
+                if (std.meta.eql(d, asset) and !std.meta.eql(h, asset)) return false;
+            }
+        }
+        return self.unload(asset);
+    }
+
+    /// Reloads `asset` from `new_source` and bumps the version of every transitive dependent so
+    /// consumers know to rebuild. Returns the number of dependents invalidated. If the reload
+    /// fails nothing is invalidated.
+    pub fn reloadAndInvalidate(self: *AssetService, asset: AssetHandle, new_source: []const u8) !usize {
+        try self.reload(asset, new_source);
+        const deps = try self.dependentsOf(self.allocator, asset);
+        defer self.allocator.free(deps);
+        for (deps) |d| self.getSlotMut(d).?.version += 1;
+        return deps.len;
     }
 
     pub fn getBytes(self: *const AssetService, handle: AssetHandle) ?[]const u8 {
@@ -292,7 +367,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.assets",
-            .version = "0.1.1",
+            .version = "0.2.0",
             .provides_capabilities = &.{"engine.assets/1"},
         },
         .build = buildModule,

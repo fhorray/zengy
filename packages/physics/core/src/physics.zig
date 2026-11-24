@@ -365,9 +365,13 @@ pub fn physicsSyncInSystem(ctx: *engine.SystemContext) !void {
         } else if (rb.body_type == .kinematic) {
             svc.setBodyTransform(body_id, xf.pos, xf.rot_euler);
         }
-        if (ctx.world.get(row.entity, ExternalForce)) |ef| {
-            svc.applyForce(body_id, .{ ef.x, ef.y, ef.z });
-            if (!ef.persistent) {
+        if (ctx.world.getConst(row.entity, ExternalForce)) |cef| {
+            // Skip the backend call for zero force: it is a no-op that would still cost a lookup
+            // and a Zig/backend crossing for every body with the component on every step.
+            if (cef.x == 0 and cef.y == 0 and cef.z == 0) continue;
+            svc.applyForce(body_id, .{ cef.x, cef.y, cef.z });
+            if (!cef.persistent) {
+                const ef = ctx.world.get(row.entity, ExternalForce).?;
                 ef.x = 0;
                 ef.y = 0;
                 ef.z = 0;
@@ -472,7 +476,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.physics",
-            .version = "0.2.0",
+            .version = "0.2.1",
             .provides_capabilities = &.{ "engine.physics/1", "engine.physics.backend/1" },
         },
         .build = buildModule,

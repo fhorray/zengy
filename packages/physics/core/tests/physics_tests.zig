@@ -229,3 +229,37 @@ test "Physics bodies are destroyed with their entities, rotated at creation, and
     try app.tickFixed();
     try std.testing.expectEqual(@as(u32, 1), mock2.live);
 }
+
+test "Zero external force never reaches the backend; non-zero force is applied once and cleared" {
+    const ForceMock = struct {
+        force_calls: u32 = 0,
+        fn createBody(_: *anyopaque, _: engine.EntityHandle, _: [3]f32, _: physics.RigidBody, _: ?physics.Collider) anyerror!u64 {
+            return 5;
+        }
+        fn applyForce(ctx: *anyopaque, _: u64, _: [3]f32) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.force_calls += 1;
+        }
+        const vt = physics.PhysicsBackendVTable{ .create_body = createBody, .apply_force = applyForce };
+    };
+    var app = engine.App.init(std.testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(physics.module());
+    try app.initialize();
+    const svc = app.resources.get(physics.PhysicsService).?;
+    var mock = ForceMock{};
+    svc.setBackend(&ForceMock.vt, &mock);
+
+    const e = try app.world.spawn();
+    try app.world.set(e, physics.RigidBody, .{ .body_type = .dynamic });
+    try app.world.set(e, physics.PhysicsTransform, .{});
+    try app.world.set(e, physics.ExternalForce, .{});
+    try app.tickFixed();
+    try app.tickFixed();
+    try std.testing.expectEqual(@as(u32, 0), mock.force_calls);
+
+    try app.world.set(e, physics.ExternalForce, .{ .x = 3 });
+    try app.tickFixed();
+    try app.tickFixed();
+    try std.testing.expectEqual(@as(u32, 1), mock.force_calls);
+}

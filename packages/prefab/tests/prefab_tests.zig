@@ -181,3 +181,32 @@ test "JSON loader builds a prefab and overrides from authoring text, strictly" {
     };
     for (bad) |b| try testing.expectError(b.err, prefab.json.parsePrefab(testing.allocator, &types, b.text));
 }
+
+test "reinstantiate swaps instances atomically and keeps the old one on failure" {
+    var types = engine.TypeRegistry.init(testing.allocator);
+    defer types.deinit();
+    const s = try types.registerSchema("game", "Stats", 1, .blittable, &.{.{ .name = "hp", .field_type = .i32_t }});
+    var pf = prefab.Prefab.init(testing.allocator);
+    defer pf.deinit();
+    try pf.addEntity("a", null);
+    var b4: [4]u8 = @splat(0);
+    try pf.addComponent("a", s, &b4);
+
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    var inst = try prefab.instantiate(testing.allocator, &world, &types, &pf, .{});
+    const old_handle = inst.handles[0];
+
+    // Failing reload (bad override target) keeps the running instance.
+    try testing.expectError(error.UnknownOverrideTarget, prefab.reinstantiate(testing.allocator, &world, &types, &pf, &inst, .{
+        .overrides = &.{.{ .local_id = "zzz", .stable_id = s.stable_id, .field = "hp", .value = .{ .i32_t = 1 } }},
+    }));
+    try testing.expect(world.isAlive(old_handle));
+    try testing.expectEqual(@as(usize, 1), world.entity_count);
+
+    var fresh = try prefab.reinstantiate(testing.allocator, &world, &types, &pf, &inst, .{});
+    defer fresh.deinit();
+    try testing.expect(!world.isAlive(old_handle));
+    try testing.expect(world.isAlive(fresh.handles[0]));
+    try testing.expectEqual(@as(usize, 1), world.entity_count);
+}

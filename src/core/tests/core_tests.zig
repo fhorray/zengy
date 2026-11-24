@@ -1144,3 +1144,20 @@ test "Scheduler.parallelBatches groups only conflict-free, unordered systems" {
     }
     try testing.expectEqual(@as(usize, 6), flat);
 }
+
+test "World.setGuidNamespace partitions GUIDs and is rejected once entities exist" {
+    var a = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer a.deinit();
+    var b = engine.World.init(testing.allocator, .{ .index = 1, .generation = 1 });
+    defer b.deinit();
+    try a.setGuidNamespace(0xA);
+    try b.setGuidNamespace(0xB);
+    const ea = try a.spawn();
+    const eb = try b.spawn();
+    const ga = a.getGuid(ea).?;
+    const gb = b.getGuid(eb).?;
+    try testing.expect(ga != gb);
+    try testing.expectEqual(@as(u64, 0xA), @as(u64, @truncate(ga >> 64)));
+    try testing.expectEqual(@as(u64, 0xB), @as(u64, @truncate(gb >> 64)));
+    try testing.expectError(error.WorldNotEmpty, a.setGuidNamespace(0xC));
+}
