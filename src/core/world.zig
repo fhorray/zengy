@@ -289,6 +289,10 @@ pub const World = struct {
     name_to_type: std.StringHashMapUnmanaged(ComponentTypeId),
     active_queries: u32,
     entity_count: usize,
+    /// True while the scheduler runs systems concurrently: every mutating `World` API (including
+    /// `set` over existing components) fails with `error.MutationDuringParallelPhase`, so parallel
+    /// systems can only read, write through query rows / `get`, and record `CommandBuffer` commands.
+    parallel_phase: bool = false,
     /// High 8 bits of every generation this world hands out (`WorldId.index & 0xFF`), so a handle
     /// minted by another world never validates here. World index 0 uses tag 0, which keeps its
     /// handles identical to untagged ones. Worlds whose ids differ only above 8 bits share a tag.
@@ -341,6 +345,12 @@ pub const World = struct {
         self.guids.deinit(self.allocator);
     }
 
+    /// Fails when a structural mutation is not allowed right now (open query or parallel phase).
+    pub fn checkMutable(self: *const World) !void {
+        if (@atomicLoad(u32, &self.active_queries, .acquire) > 0) return error.MutationDuringActiveQuery;
+        if (@atomicLoad(bool, &self.parallel_phase, .acquire)) return error.MutationDuringParallelPhase;
+    }
+
     /// Sets the high 64 bits of every `EntityGuid` this world generates, so GUIDs minted by
     /// different worlds, projects, or streamed cells never collide (`guid = namespace << 64 | seq`).
     /// Must be called before the first spawn (`error.WorldNotEmpty` otherwise).
@@ -380,7 +390,7 @@ pub const World = struct {
             }
             return tid;
         }
-        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        try self.checkMutable();
 
         const pool_ptr = try self.allocator.create(ComponentPool);
         errdefer self.allocator.destroy(pool_ptr);
@@ -454,7 +464,7 @@ pub const World = struct {
 
     /// Type-id variant of `enableChangeTracking` for dynamically registered components.
     pub fn enableChangeTrackingRaw(self: *World, tid: ComponentTypeId) !void {
-        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        try self.checkMutable();
         const pool = self.pools.get(tid) orelse return error.ComponentNotRegistered;
         try pool.enableTracking(self.allocator);
     }
@@ -532,7 +542,7 @@ pub const World = struct {
     }
 
     pub fn spawn(self: *World) !EntityHandle {
-        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        try self.checkMutable();
 
         if (self.free_indices.pop()) |idx| {
             const guid = self.next_guid;
@@ -561,7 +571,7 @@ pub const World = struct {
     }
 
     pub fn despawn(self: *World, entity: EntityHandle) !bool {
-        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        try self.checkMutable();
         if (!self.isAlive(entity)) return false;
 
         try self.free_indices.ensureUnusedCapacity(self.allocator, 1);
@@ -610,7 +620,7 @@ pub const World = struct {
     }
 
     pub fn set(self: *World, entity: EntityHandle, comptime T: type, value: T) !void {
-        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        try self.checkMutable();
         if (!self.isAlive(entity)) return error.InvalidEntity;
 
         const tid = try self.registerComponent(T);
@@ -619,7 +629,7 @@ pub const World = struct {
     }
 
     pub fn setRaw(self: *World, entity: EntityHandle, tid: ComponentTypeId, bytes: []const u8) !void {
-        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        try self.checkMutable();
         if (!self.isAlive(entity)) return error.InvalidEntity;
 
         const pool = self.pools.get(tid) orelse return error.ComponentNotRegistered;
@@ -655,7 +665,7 @@ pub const World = struct {
     }
 
     pub fn remove(self: *World, entity: EntityHandle, comptime T: type) !bool {
-        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        try self.checkMutable();
         if (!self.isAlive(entity)) return false;
         const pool = self.pools.get(comptimeTypeId(T)) orelse return false;
         return try self.removeFromPool(entity, pool);
@@ -663,7 +673,7 @@ pub const World = struct {
 
     /// Removes the component identified by `tid` from `entity`; returns whether it was present.
     pub fn removeRaw(self: *World, entity: EntityHandle, tid: ComponentTypeId) !bool {
-        if (self.active_queries > 0) return error.MutationDuringActiveQuery;
+        try self.checkMutable();
         if (!self.isAlive(entity)) return false;
         const pool = self.pools.get(tid) orelse return false;
         return try self.removeFromPool(entity, pool);
@@ -761,7 +771,7 @@ pub fn Query(comptime spec: anytype) type {
                             return &Zst.dummy;
                         }
                         const pool = self.query_ptr.write_pools[idx].?;
-                        if (pool.tracked) pool.changed_ticks.items[self.w_dense[idx]] = self.query_ptr.world.tick;
+                        if (pool.tracked) pool.changed_ticks.items[self.w_dense[idx]] = self.query_ptr.write_tick;
                         const start = @as(usize, self.w_dense[idx]) * pool.stride;
                         return @ptrCast(@alignCast(pool.dense_bytes.items[start .. start + pool.elem_size].ptr));
                     }
@@ -779,11 +789,19 @@ pub fn Query(comptime spec: anytype) type {
         added_pools: [added_types.len]?*ComponentPool,
         changed_pools: [changed_types.len]?*ComponentPool,
         optional_pools: [optional_types.len]?*ComponentPool,
-        /// Change-detection threshold copied from `World.query_since` at creation.
+        /// Change-detection threshold (`World.query_since` for `init`, the system's for `initWith`).
         since: u64,
+        /// Tick stamped on components written through `Row.write`.
+        write_tick: u64,
         cursor: usize,
 
         pub fn init(world: *World) !Self {
+            return initWith(world, world.query_since, world.tick);
+        }
+
+        /// Like `init` but with explicit change-detection state, so concurrently running systems
+        /// each use their own threshold and write tick instead of the shared world values.
+        pub fn initWith(world: *World, since: u64, write_tick: u64) !Self {
             var smallest: ?*ComponentPool = null;
             var w_pools: [write_types.len]?*ComponentPool = @splat(null);
             var r_pools: [read_types.len]?*ComponentPool = @splat(null);
@@ -836,7 +854,7 @@ pub fn Query(comptime spec: anytype) type {
                 op_pools[idx] = world.pools.get(World.comptimeTypeId(T));
             }
 
-            world.active_queries += 1;
+            _ = @atomicRmw(u32, &world.active_queries, .Add, 1, .acq_rel);
             return .{
                 .world = world,
                 .driver_pool = if (missing) null else smallest,
@@ -846,7 +864,8 @@ pub fn Query(comptime spec: anytype) type {
                 .added_pools = ad_pools,
                 .changed_pools = ch_pools,
                 .optional_pools = op_pools,
-                .since = world.query_since,
+                .since = since,
+                .write_tick = write_tick,
                 .cursor = 0,
             };
         }
@@ -868,8 +887,8 @@ pub fn Query(comptime spec: anytype) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.world.active_queries > 0) {
-                self.world.active_queries -= 1;
+            if (@atomicLoad(u32, &self.world.active_queries, .acquire) > 0) {
+                _ = @atomicRmw(u32, &self.world.active_queries, .Sub, 1, .acq_rel);
             }
         }
 

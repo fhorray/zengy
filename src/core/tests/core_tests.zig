@@ -1232,3 +1232,142 @@ test "removed-component events: remove, despawn, per-system visibility, and prun
     try app.tick(1.0 / 60.0);
     try testing.expectEqual(@as(u32, 2), removed_seen);
 }
+
+const PC1 = struct { v: u64 = 0 };
+const PC2 = struct { v: u64 = 0 };
+const PC3 = struct { v: u64 = 0 };
+const PC4 = struct { v: u64 = 0 };
+
+fn addSystem(comptime C: type, comptime delta: u64) engine.scheduler.SystemFn {
+    return struct {
+        fn run(ctx: *engine.SystemContext) !void {
+            var q = try ctx.query(.{ .write = .{C} });
+            defer q.deinit();
+            while (q.next()) |row| row.write(C).v += delta;
+        }
+    }.run;
+}
+
+fn spawnerSystem(ctx: *engine.SystemContext) !void {
+    for (0..5) |i| {
+        const e = try ctx.commands.spawn();
+        try ctx.commands.set(e, PC1, .{ .v = 1000 + i });
+    }
+}
+
+fn spawnerSystem2(ctx: *engine.SystemContext) !void {
+    for (0..3) |i| {
+        const e = try ctx.commands.spawn();
+        try ctx.commands.set(e, PC2, .{ .v = 2000 + i });
+    }
+}
+
+fn buildParallelWorld(app: *engine.App, parallel: bool) !void {
+    for (0..2000) |_| {
+        const e = try app.world.spawn();
+        try app.world.set(e, PC1, .{});
+        try app.world.set(e, PC2, .{});
+        try app.world.set(e, PC3, .{});
+        try app.world.set(e, PC4, .{});
+    }
+    const aff: engine.scheduler.ThreadAffinity = if (parallel) .worker else .main;
+    try app.addSystem(.{ .name = "p1", .run = addSystem(PC1, 1), .writes = &.{"PC1"}, .thread_affinity = aff });
+    try app.addSystem(.{ .name = "p2", .run = addSystem(PC2, 2), .writes = &.{"PC2"}, .thread_affinity = aff });
+    try app.addSystem(.{ .name = "p3", .run = addSystem(PC3, 3), .writes = &.{"PC3"}, .thread_affinity = aff });
+    try app.addSystem(.{ .name = "p4", .run = addSystem(PC4, 4), .writes = &.{"PC4"}, .thread_affinity = aff });
+    try app.addSystem(.{ .name = "spawn1", .run = spawnerSystem, .thread_affinity = aff, .reads = &.{"X1"} });
+    try app.addSystem(.{ .name = "spawn2", .run = spawnerSystem2, .thread_affinity = aff, .reads = &.{"X2"} });
+}
+
+fn sumOf(world: *engine.World, comptime C: type) !u64 {
+    var q = try world.query(.{ .read = .{C} });
+    defer q.deinit();
+    var total: u64 = 0;
+    while (q.next()) |row| total += row.read(C).v;
+    return total;
+}
+
+test "parallel scheduler matches serial execution exactly (components, commands, entity count)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .limited(3) });
+    defer threaded.deinit();
+
+    var serial = engine.App.init(testing.allocator, .{});
+    defer serial.deinit();
+    try buildParallelWorld(&serial, false);
+    var par = engine.App.init(testing.allocator, .{});
+    defer par.deinit();
+    try buildParallelWorld(&par, true);
+    par.scheduler.setParallel(threaded.io());
+
+    for (0..20) |_| {
+        try serial.tick(1.0 / 60.0);
+        try par.tick(1.0 / 60.0);
+    }
+    try testing.expectEqual(serial.world.entity_count, par.world.entity_count);
+    try testing.expectEqual(@as(usize, 2000 + 20 * 8), par.world.entity_count);
+    inline for (.{ PC1, PC2, PC3, PC4 }) |C| {
+        try testing.expectEqual(try sumOf(&serial.world, C), try sumOf(&par.world, C));
+    }
+    // Absolute check so "both wrong the same way" is impossible. PC1 over 20 ticks:
+    // 2000 original entities * 20 increments, plus 5 spawned per tick (values 1000..1004, sum 5010)
+    // that then receive one increment per remaining tick: 5 * (0 + 1 + ... + 19).
+    const expected_pc1: u64 = 2000 * 20 + 20 * 5010 + 5 * 190;
+    try testing.expectEqual(expected_pc1, try sumOf(&par.world, PC1));
+}
+
+var barrier_arrived: std.atomic.Value(u32) = .init(0);
+var barrier_all_met: std.atomic.Value(u32) = .init(0);
+
+fn barrierSystem(ctx: *engine.SystemContext) !void {
+    _ = ctx;
+    _ = barrier_arrived.fetchAdd(1, .acq_rel);
+    var spins: u32 = 0;
+    // Only returns early when all three systems are inside at the same time.
+    while (barrier_arrived.load(.acquire) < 3 and spins < 200_000_000) : (spins += 1) std.atomic.spinLoopHint();
+    if (barrier_arrived.load(.acquire) >= 3) _ = barrier_all_met.fetchAdd(1, .acq_rel);
+}
+
+test "parallel scheduler really runs eligible systems concurrently" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .limited(3) });
+    defer threaded.deinit();
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    barrier_arrived.store(0, .release);
+    barrier_all_met.store(0, .release);
+    try app.addSystem(.{ .name = "b1", .run = barrierSystem, .thread_affinity = .worker, .reads = &.{"r1"} });
+    try app.addSystem(.{ .name = "b2", .run = barrierSystem, .thread_affinity = .any, .reads = &.{"r2"} });
+    try app.addSystem(.{ .name = "b3", .run = barrierSystem, .thread_affinity = .worker, .reads = &.{"r3"} });
+    app.scheduler.setParallel(threaded.io());
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 3), barrier_all_met.load(.acquire));
+}
+
+fn badStructuralSystem(ctx: *engine.SystemContext) !void {
+    _ = try ctx.world.spawn(); // forbidden while systems run concurrently
+}
+
+fn okSystem(ctx: *engine.SystemContext) !void {
+    _ = ctx;
+}
+
+test "parallel phase rejects direct structural mutation and reports it deterministically" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{ .async_limit = .limited(3) });
+    defer threaded.deinit();
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.addSystem(.{ .name = "ok1", .run = okSystem, .thread_affinity = .worker, .reads = &.{"a"} });
+    try app.addSystem(.{ .name = "bad", .run = badStructuralSystem, .thread_affinity = .worker, .reads = &.{"b"} });
+    try app.addSystem(.{ .name = "ok2", .run = okSystem, .thread_affinity = .worker, .reads = &.{"c"} });
+    app.scheduler.setParallel(threaded.io());
+    try testing.expectError(error.MutationDuringParallelPhase, app.tick(1.0 / 60.0));
+    // The phase flag is always cleared, so the main thread can mutate again afterwards.
+    try testing.expect(!app.world.parallel_phase);
+    _ = try app.world.spawn();
+
+    // The same system on the main thread (serial) is allowed to spawn.
+    var serial = engine.App.init(testing.allocator, .{});
+    defer serial.deinit();
+    try serial.addSystem(.{ .name = "bad", .run = badStructuralSystem, .thread_affinity = .main });
+    try serial.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(usize, 1), serial.world.entity_count);
+}

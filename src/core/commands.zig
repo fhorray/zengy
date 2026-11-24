@@ -129,6 +129,42 @@ pub const CommandBuffer = struct {
         });
     }
 
+    /// Appends every command of `other` to this buffer, in order, re-basing pending-spawn handles
+    /// so they stay unique. Used to merge per-worker buffers deterministically after a parallel
+    /// batch. `other` is left untouched (clear or free it afterwards). Strings and component bytes
+    /// are copied into this buffer's arena.
+    pub fn append(self: *CommandBuffer, other: *const CommandBuffer) !void {
+        if (@as(u64, self.pending_spawns) + other.pending_spawns >= std.math.maxInt(u32) - 1) return error.TooManyPendingSpawns;
+        try self.commands.ensureUnusedCapacity(self.allocator, other.commands.items.len);
+        const base = self.pending_spawns;
+        const scratch = self.arena.allocator();
+        for (other.commands.items) |cmd| {
+            var c = cmd;
+            switch (c) {
+                .spawn_empty => {},
+                .despawn => |*e| e.* = rebase(e.*, base),
+                .set_raw => |*sr| {
+                    sr.entity = rebase(sr.entity, base);
+                    sr.type_name = try scratch.dupe(u8, sr.type_name);
+                    sr.bytes = try scratch.dupe(u8, sr.bytes);
+                },
+                .remove_raw => |*r| r.entity = rebase(r.entity, base),
+                .emit_event => |*ev| {
+                    ev.name = try scratch.dupe(u8, ev.name);
+                    ev.payload = try scratch.dupe(u8, ev.payload);
+                    if (ev.entity_handle != 0) ev.entity_handle = rebase(EntityHandle.fromU64(ev.entity_handle), base).toU64();
+                },
+            }
+            self.commands.appendAssumeCapacity(c);
+        }
+        self.pending_spawns += other.pending_spawns;
+    }
+
+    fn rebase(e: EntityHandle, base: u32) EntityHandle {
+        if (!isPending(e)) return e;
+        return .{ .index = e.index + base, .generation = 0 };
+    }
+
     pub fn pendingCount(self: *const CommandBuffer) usize {
         return self.commands.items.len;
     }
@@ -142,7 +178,7 @@ pub const CommandBuffer = struct {
 
     pub fn apply(self: *CommandBuffer, world: *World, events: *EventBus) !void {
         if (self.commands.items.len == 0) return;
-        if (world.active_queries > 0) return error.MutationDuringActiveQuery;
+        try world.checkMutable();
 
         // Pre-validate every command before mutating the world so that schema errors are reported
         // up front instead of leaving a half-applied buffer. Layouts are also cross-checked

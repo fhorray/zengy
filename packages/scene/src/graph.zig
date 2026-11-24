@@ -116,7 +116,7 @@ fn unlink(world: *World, child: EntityHandle, old_parent: ?EntityHandle) void {
 /// `preserve_world`, singular parent transforms (`error.SingularTransform`). All fallible work
 /// happens before the links change, so an error leaves the hierarchy untouched.
 pub fn reparent(world: *World, child: EntityHandle, new_parent: ?EntityHandle, opts: ReparentOptions) !void {
-    if (world.active_queries > 0) return error.MutationDuringActiveQuery;
+    try world.checkMutable();
     if (!world.isAlive(child)) return error.InvalidEntity;
     if (new_parent) |np| {
         if (!world.isAlive(np)) return error.InvalidEntity;

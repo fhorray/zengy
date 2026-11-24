@@ -10,6 +10,11 @@
 //! - Read/write conflict detection helper (`hasWriteConflict`).
 //! - Fixed-timestep accumulator for `.fixed_update` with `max_fixed_steps` clamping.
 //! - Automatic `CommandBuffer.apply()` barrier after every stage and `EventBus.drain()` per frame.
+//! - Opt-in parallel execution (`Scheduler.setParallel`): systems marked `.worker`/`.any` that the
+//!   conflict analysis (`parallelBatches`) proves independent run concurrently on a `std.Io`
+//!   thread pool. Each gets its own change-detection tick and `CommandBuffer`; buffers merge in
+//!   schedule order, so results equal serial execution. While a parallel run is active the world
+//!   rejects structural mutation (`error.MutationDuringParallelPhase`).
 
 const std = @import("std");
 const world_mod = @import("world.zig");
@@ -49,6 +54,10 @@ pub const SystemContext = struct {
     diagnostics: *diagnostics_mod.Diagnostics,
     dt: f32,
     fixed_dt: f32,
+    /// Change-detection clock value of this system's run (0 outside scheduled runs).
+    tick: u64 = 0,
+    /// `.added`/`.changed` threshold: the tick at which this system last ran.
+    query_since: u64 = 0,
 
     pub fn deltaSeconds(self: *const SystemContext) f32 {
         return self.dt;
@@ -59,6 +68,8 @@ pub const SystemContext = struct {
     }
 
     pub fn query(self: *SystemContext, comptime spec: anytype) !world_mod.Query(spec) {
+        // Inside a scheduled run `tick != 0` and the system's own change-detection state applies.
+        if (self.tick != 0) return world_mod.Query(spec).initWith(self.world, self.query_since, self.tick);
         return self.world.query(spec);
     }
 };
@@ -115,6 +126,11 @@ pub const Scheduler = struct {
     max_fixed_steps: u32,
     accumulator: f64,
     render_extract_enabled: bool,
+    /// When set, conflict-free systems that opted in (`thread_affinity` `.worker` or `.any`) run
+    /// concurrently on this `Io`'s thread pool (see `setParallel`). Null keeps execution serial.
+    io: ?std.Io = null,
+    /// Cached `parallelBatches` plan per stage, rebuilt whenever the stage's schedule changes.
+    batch_plans: [Stage.count]?BatchPlan = @splat(null),
 
     pub fn init(allocator: std.mem.Allocator) Scheduler {
         var self = Scheduler{
@@ -126,6 +142,8 @@ pub const Scheduler = struct {
             .max_fixed_steps = 8,
             .accumulator = 0.0,
             .render_extract_enabled = false,
+            .io = null,
+            .batch_plans = @splat(null),
         };
         for (&self.stages) |*s| s.* = .empty;
         for (&self.execution_order) |*o| o.* = .empty;
@@ -155,6 +173,10 @@ pub const Scheduler = struct {
     }
 
     pub fn deinit(self: *Scheduler) void {
+        for (&self.batch_plans) |*p| {
+            if (p.*) |*plan| plan.deinit();
+            p.* = null;
+        }
         for (0..Stage.count) |i| {
             for (self.stages[i].items) |sys| {
                 self.allocator.free(sys.name);
@@ -433,28 +455,133 @@ pub const Scheduler = struct {
         if (!std.math.isFinite(self.fixed_dt) or self.fixed_dt <= 0.0) return error.InvalidFixedTimestep;
     }
 
+    /// Enables (non-null) or disables (null) concurrent execution of eligible systems on `io`'s
+    /// thread pool (for example a `std.Io.Threaded`). Results are identical to serial execution as
+    /// long as every system truthfully declares its `reads`/`writes` and parallel systems only
+    /// touch the world through queries, `get`, and their own `CommandBuffer` (structural mutation
+    /// during a parallel phase fails with `error.MutationDuringParallelPhase`). `ctx.events`,
+    /// `ctx.diagnostics`, and resources are not synchronized: parallel systems must not share them.
+    pub fn setParallel(self: *Scheduler, io: ?std.Io) void {
+        self.io = io;
+    }
+
+    fn dropBatchPlan(self: *Scheduler, s_idx: usize) void {
+        if (self.batch_plans[s_idx]) |*p| p.deinit();
+        self.batch_plans[s_idx] = null;
+    }
+
+    fn isParallelEligible(sys: StoredSystem) bool {
+        return !sys.exclusive and (sys.thread_affinity == .worker or sys.thread_affinity == .any);
+    }
+
+    /// Runs one system serially with its own change-detection tick.
+    fn runOne(ctx: *SystemContext, sys: *StoredSystem) !void {
+        // Each system gets its own tick so it sees changes made by others since it last ran,
+        // but not its own writes from that run.
+        ctx.world.advanceTick();
+        ctx.world.query_since = sys.last_run_tick;
+        const run_tick = ctx.world.tick;
+        ctx.tick = run_tick;
+        ctx.query_since = sys.last_run_tick;
+        try sys.run(ctx);
+        sys.last_run_tick = run_tick;
+    }
+
+    fn runTask(run: SystemFn, c: *SystemContext, err: *?anyerror) void {
+        run(c) catch |e| {
+            err.* = e;
+        };
+    }
+
+    /// Walks the stage's batches; consecutive eligible systems inside a batch run concurrently, all
+    /// others run serially in their original position.
+    fn runStageParallel(self: *Scheduler, stage: Stage, ctx: *SystemContext) !void {
+        const s_idx = @intFromEnum(stage);
+        if (self.batch_plans[s_idx] == null) self.batch_plans[s_idx] = try self.parallelBatches(stage);
+        const plan = &self.batch_plans[s_idx].?;
+        const systems = self.stages[s_idx].items;
+        for (0..plan.batchCount()) |b| {
+            const members = plan.batch(b);
+            var i: usize = 0;
+            while (i < members.len) {
+                var j = i;
+                while (j < members.len and isParallelEligible(systems[members[j]])) j += 1;
+                if (j - i >= 2) {
+                    try self.runParallelRun(members[i..j], systems, ctx);
+                    i = j;
+                } else {
+                    try runOne(ctx, &systems[members[i]]);
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn runParallelRun(self: *Scheduler, idxs: []const usize, systems: []StoredSystem, ctx: *SystemContext) !void {
+        const io = self.io.?;
+        const n = idxs.len;
+        const ctxs = try self.allocator.alloc(SystemContext, n);
+        defer self.allocator.free(ctxs);
+        const bufs = try self.allocator.alloc(commands_mod.CommandBuffer, n);
+        defer self.allocator.free(bufs);
+        const errs = try self.allocator.alloc(?anyerror, n);
+        defer self.allocator.free(errs);
+        const ticks = try self.allocator.alloc(u64, n);
+        defer self.allocator.free(ticks);
+
+        var made: usize = 0;
+        defer for (bufs[0..made]) |*bf| bf.deinit();
+        for (idxs, 0..) |sys_idx, k| {
+            ctx.world.advanceTick();
+            ticks[k] = ctx.world.tick;
+            bufs[k] = commands_mod.CommandBuffer.init(self.allocator);
+            made += 1;
+            errs[k] = null;
+            ctxs[k] = ctx.*;
+            ctxs[k].commands = &bufs[k];
+            ctxs[k].tick = ticks[k];
+            ctxs[k].query_since = systems[sys_idx].last_run_tick;
+        }
+
+        @atomicStore(bool, &ctx.world.parallel_phase, true, .release);
+        var group: std.Io.Group = .init;
+        for (idxs, 0..) |sys_idx, k| group.async(io, runTask, .{ systems[sys_idx].run, &ctxs[k], &errs[k] });
+        const awaited = group.await(io);
+        @atomicStore(bool, &ctx.world.parallel_phase, false, .release);
+        awaited catch return error.Canceled;
+
+        // Deterministic outcome: the first failing system in schedule order wins; commands are
+        // merged in schedule order, so results never depend on thread timing.
+        for (errs) |e| if (e) |err| return err;
+        for (idxs, 0..) |sys_idx, k| {
+            systems[sys_idx].last_run_tick = ticks[k];
+            try ctx.commands.append(&bufs[k]);
+        }
+    }
+
     pub fn runStage(self: *Scheduler, stage: Stage, ctx: *SystemContext) !void {
         if (stage == .render_extract and !self.render_extract_enabled) return;
 
         const s_idx = @intFromEnum(stage);
-        if (self.dirty[s_idx]) {
+        const was_dirty = self.dirty[s_idx];
+        if (was_dirty) {
             try self.buildStageSchedule(stage);
         }
 
         {
             errdefer ctx.commands.clear();
-            const systems = self.stages[s_idx].items;
             // Outside systems, queries see every change.
             defer ctx.world.query_since = 0;
-            for (self.execution_order[s_idx].items) |sys_idx| {
-                const sys = &systems[sys_idx];
-                // Each system gets its own tick so it sees changes made by others since it last
-                // ran, but not its own writes from that run.
-                ctx.world.advanceTick();
-                ctx.world.query_since = sys.last_run_tick;
-                const run_tick = ctx.world.tick;
-                try sys.run(ctx);
-                sys.last_run_tick = run_tick;
+            defer {
+                ctx.tick = 0;
+                ctx.query_since = 0;
+            }
+            if (was_dirty) self.dropBatchPlan(s_idx);
+            if (self.io != null) {
+                try self.runStageParallel(stage, ctx);
+            } else {
+                const systems = self.stages[s_idx].items;
+                for (self.execution_order[s_idx].items) |sys_idx| try runOne(ctx, &systems[sys_idx]);
             }
         }
         // Give out-of-system writes and the command flush fresh ticks of their own.

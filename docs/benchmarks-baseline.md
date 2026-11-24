@@ -22,6 +22,8 @@ sections 7-9) on a shared cloud container. Single runs, noisy: compare only on t
 | same, idle frame (nothing changed) | - | 0.023 ms |
 | same, one dirty subtree of 101 nodes | - | 0.035 ms |
 
+| Parallel scheduler, 4 independent systems x 100k entities (4 cores) | 8.75 ms/frame serial | 3.47 ms/frame (2.52x) |
+
 Query plan caching was evaluated and rejected: creating a query costs 14 ns, so a cache would
 add invalidation complexity for no measurable gain.
 

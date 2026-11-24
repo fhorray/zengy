@@ -246,6 +246,55 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
+    // 11. Parallel scheduler: 4 independent systems over 100k entities, serial vs 3 worker threads
+    {
+        const W1 = struct { v: f32 = 1 };
+        const W2 = struct { v: f32 = 1 };
+        const W3 = struct { v: f32 = 1 };
+        const W4 = struct { v: f32 = 1 };
+        const heavy = struct {
+            fn make(comptime C: type) engine.scheduler.SystemFn {
+                return struct {
+                    fn run(ctx: *engine.SystemContext) !void {
+                        var q = try ctx.query(.{ .write = .{C} });
+                        defer q.deinit();
+                        while (q.next()) |row| {
+                            const c = row.write(C);
+                            var x = c.v;
+                            for (0..32) |_| x = x * 1.0001 + 0.0001;
+                            c.v = x;
+                        }
+                    }
+                }.run;
+            }
+        };
+        var times: [2]f64 = undefined;
+        for (0..2) |mode| {
+            var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .limited(3) });
+            defer threaded.deinit();
+            var papp = engine.App.init(allocator, .{});
+            defer papp.deinit();
+            for (0..100_000) |_| {
+                const e = try papp.world.spawn();
+                try papp.world.set(e, W1, .{});
+                try papp.world.set(e, W2, .{});
+                try papp.world.set(e, W3, .{});
+                try papp.world.set(e, W4, .{});
+            }
+            const aff: engine.scheduler.ThreadAffinity = if (mode == 1) .worker else .main;
+            try papp.addSystem(.{ .name = "w1", .run = heavy.make(W1), .writes = &.{"W1"}, .thread_affinity = aff });
+            try papp.addSystem(.{ .name = "w2", .run = heavy.make(W2), .writes = &.{"W2"}, .thread_affinity = aff });
+            try papp.addSystem(.{ .name = "w3", .run = heavy.make(W3), .writes = &.{"W3"}, .thread_affinity = aff });
+            try papp.addSystem(.{ .name = "w4", .run = heavy.make(W4), .writes = &.{"W4"}, .thread_affinity = aff });
+            if (mode == 1) papp.scheduler.setParallel(threaded.io());
+            try papp.tick(1.0 / 60.0); // warm-up (builds schedule and plan)
+            const t0 = std.Io.Clock.now(.awake, io);
+            for (0..10) |_| try papp.tick(1.0 / 60.0);
+            times[mode] = @as(f64, @floatFromInt(elapsedNs(io, t0))) / 10.0 / 1e6;
+        }
+        std.debug.print("11. Parallel scheduler (4 systems x 100k entities): serial {d:.2} ms/frame, parallel {d:.2} ms/frame ({d:.2}x)\n", .{ times[0], times[1], times[0] / times[1] });
+    }
+
     // 6. JSON benchmark: std.json vs yyjson (small ~5KB, medium ~500KB, large ~5MB)
     const sizes = [_]usize{ 100, 10_000, 100_000 };
     const labels = [_][]const u8{ "~5 KB", "~500 KB", "~5 MB" };
