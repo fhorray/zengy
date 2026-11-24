@@ -259,6 +259,8 @@ pub const WidgetManager = struct {
         dt_ms: f32,
     ) !void {
         self.event_queue.clear();
+        // Caret blinking is driven by real elapsed time, not by how often frames run.
+        tree.frame_dt_s = if (std.math.isFinite(dt_ms)) std.math.clamp(dt_ms / 1000.0, 0.0, 0.25) else 0.0;
 
         const down = input.isMouseDown(.left);
         const clicked = input.wasMouseClicked(.left);
@@ -291,7 +293,7 @@ pub const WidgetManager = struct {
             _ = tree.focusNext(input.modifiers.shift);
             if (prev_focus) |pf| {
                 if (tree.focused_node != pf) {
-                    self.clearFocusedEditState(tree, pf);
+                    try self.clearFocusedEditState(tree, pf);
                 }
             }
         }
@@ -326,13 +328,13 @@ pub const WidgetManager = struct {
                     tree.setFocus(h_idx, false);
                 }
                 if (prev_focus != null and prev_focus != h_idx) {
-                    self.clearFocusedEditState(tree, prev_focus.?);
+                    try self.clearFocusedEditState(tree, prev_focus.?);
                 }
                 if (tree.idOf(h_idx)) |hid| {
                     try self.onPointerDown(tree, hid, input);
                 }
             } else if (prev_focus) |pf| {
-                self.clearFocusedEditState(tree, pf);
+                try self.clearFocusedEditState(tree, pf);
             }
         }
 
@@ -419,28 +421,34 @@ pub const WidgetManager = struct {
         }
     }
 
-    fn clearFocusedEditState(self: *WidgetManager, tree: *ui_core.UiTree, node_idx: usize) void {
+    fn clearFocusedEditState(self: *WidgetManager, tree: *ui_core.UiTree, node_idx: usize) !void {
         const nid = tree.idOf(node_idx) orelse return;
         const b = self.findByNode(nid) orelse return;
         switch (b.behavior) {
-            .number_input => self.commitEditingNumberInput(tree, node_idx),
+            .number_input => try self.commitEditingNumberInput(tree, node_idx),
             .text_input => |*ti| ti.edit.clearSelection(tree, node_idx),
             else => {},
         }
     }
 
-    fn commitEditingNumberInput(self: *WidgetManager, tree: *ui_core.UiTree, node_idx: usize) void {
+    /// Parses the edit buffer, clamps it, leaves editing mode, records undo, and emits the final
+    /// value event. Shared by Enter, Tab, and click-away so every confirmation path behaves alike.
+    /// Unparsable or non-finite text keeps the previous value.
+    fn commitEditingNumberInput(self: *WidgetManager, tree: *ui_core.UiTree, node_idx: usize) !void {
         const nid = tree.idOf(node_idx) orelse return;
         const b = self.findByNode(nid) orelse return;
         if (b.behavior != .number_input) return;
         var ni = &b.behavior.number_input;
         if (ni.mode != .editing) return;
-        const parsed = std.fmt.parseFloat(f64, tree.nodes.items[node_idx].text) catch ni.value.asF64();
-        const clamped = ni.range.clamp(parsed);
-        ni.value = events.NumericValue.fromF64(ni.value, clamped);
+        const prev_val = ni.value;
+        const parsed = std.fmt.parseFloat(f64, tree.nodes.items[node_idx].text) catch prev_val.asF64();
+        const safe = if (std.math.isFinite(parsed)) parsed else prev_val.asF64();
+        ni.value = events.NumericValue.fromF64(prev_val, ni.range.clamp(safe));
         ni.mode = .idle;
         tree.nodes.items[node_idx].kind = .custom;
         ni.edit.clearSelection(tree, node_idx);
+        self.undo_history.push(.{ .widget_numeric = .{ .node = nid, .prev = prev_val, .next = ni.value } });
+        try self.event_queue.push(.{ .node = nid, .tag = b.tag, .is_final = true, .payload = .{ .value_numeric = ni.value } });
     }
 
     fn isDescendantOrSelf(tree: *const ui_core.UiTree, node_idx: usize, ancestor_idx: usize) bool {
@@ -988,15 +996,7 @@ pub const WidgetManager = struct {
                     const out = try ni.edit.processInput(tree, idx, input, win_svc, self.allocator, 64, false);
                     if (out.consumed_undo_redo) self.last_edit_consumed_undo = true;
                     if (out.submitted) {
-                        const prev_val = ni.value;
-                        const parsed = std.fmt.parseFloat(f64, tree.nodes.items[idx].text) catch ni.value.asF64();
-                        const clamped = ni.range.clamp(parsed);
-                        ni.value = events.NumericValue.fromF64(ni.value, clamped);
-                        ni.mode = .idle;
-                        tree.nodes.items[idx].kind = .custom;
-                        ni.edit.clearSelection(tree, idx);
-                        self.undo_history.push(.{ .widget_numeric = .{ .node = fid, .prev = prev_val, .next = ni.value } });
-                        try self.event_queue.push(.{ .node = fid, .tag = b.tag, .is_final = true, .payload = .{ .value_numeric = ni.value } });
+                        try self.commitEditingNumberInput(tree, idx);
                     } else if (out.cancelled) {
                         ni.mode = .idle;
                         tree.nodes.items[idx].kind = .custom;

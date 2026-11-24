@@ -267,6 +267,8 @@ pub const UiTree = struct {
     pointer_capture_node: ?usize = null,
     focus_visible: bool = false,
     caret_phase: f32 = 0.0,
+    /// Duration of the current frame in seconds; advances caret blinking (set by the widget runtime).
+    frame_dt_s: f32 = 1.0 / 60.0,
     text_cursor: usize = 0,
     measure_text_fn: ?TextMeasureFn = null,
     measure_text_ctx: ?*anyopaque = null,
@@ -834,7 +836,7 @@ pub const UiTree = struct {
     /// Updates hover, active press, and pointer capture state for the current frame.
     pub fn updatePointer(self: *UiTree, px: f32, py: f32, down: bool, clicked: bool, released: bool) ?usize {
         if (self.focused_node != null) {
-            self.caret_phase = @mod(self.caret_phase + 1.0 / 60.0, 1.0);
+            self.caret_phase = @mod(self.caret_phase + self.frame_dt_s, 1.0);
         }
         if (self.hovered_node) |prev_h| {
             if (prev_h < self.nodes.items.len) self.nodes.items[prev_h].hovered = false;

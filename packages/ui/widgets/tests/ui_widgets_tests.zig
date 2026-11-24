@@ -164,3 +164,57 @@ test "TextEditState never truncates undo snapshots and clips paste on UTF-8 boun
     try testing.expectEqualStrings("one", clip("one\ntwo", 100, false));
     try testing.expectEqualStrings("one\ntwo", clip("one\ntwo", 100, true));
 }
+
+test "NumberInput confirms by Tab with a final event, rejects non-finite text, and caret blinks by elapsed time" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(window.module());
+    try app.registerModule(graphics.module());
+    try app.registerModule(ui_core.module());
+    try app.registerModule(ui_widgets.module());
+    try app.initialize();
+    const tree = app.resources.get(ui_core.UiTree).?;
+    const mgr = app.resources.get(ui_widgets.WidgetManager).?;
+    const input = @as(*window.InputService, @ptrCast(@alignCast(@constCast((try app.services.getService("engine.input", 1)).api_ptr))));
+
+    const root = try tree.createNode(null, .{ .id = "root", .kind = .panel, .style = .{ .width = 300, .height = 200 } });
+    const ni_idx = try tree.createNode(root, .{ .id = "ni", .kind = .textbox, .focusable = true, .style = .{ .height = 24 } });
+    const other_idx = try tree.createNode(root, .{ .id = "other", .kind = .button, .style = .{ .height = 24 } });
+    const ni_id = tree.idOf(ni_idx).?;
+    _ = try mgr.attach(ni_id, "num", .{ .number_input = .{ .value = .{ .f64 = 1.0 }, .range = .{ .min = 0, .max = 100 }, .mode = .editing } });
+    _ = other_idx;
+    tree.layoutTree(300, 200);
+    tree.focused_node = ni_idx;
+    try tree.setNodeText(ni_idx, "42");
+
+    input.beginFrame();
+    input.injectKey(window.KeyCode.tab, true);
+    try mgr.processFrame(tree, input, null, 300, 200);
+
+    const ni = mgr.findByNode(ni_id).?.behavior.number_input;
+    try testing.expectEqual(@as(f64, 42.0), ni.value.f64);
+    try testing.expect(ni.mode == .idle);
+    var finals: usize = 0;
+    for (mgr.eventsSlice()) |ev| {
+        if (std.meta.eql(ev.node, ni_id) and ev.is_final) finals += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), finals);
+
+    // "nan"/"inf" parse as floats but must never become the value.
+    mgr.findByNode(ni_id).?.behavior.number_input.mode = .editing;
+    tree.focused_node = ni_idx;
+    try tree.setNodeText(ni_idx, "nan");
+    input.beginFrame();
+    input.injectKey(window.KeyCode.tab, true);
+    try mgr.processFrame(tree, input, null, 300, 200);
+    try testing.expectEqual(@as(f64, 42.0), mgr.findByNode(ni_id).?.behavior.number_input.value.f64);
+
+    // Caret phase advances by elapsed time: 2 frames of 100 ms -> 0.2, regardless of frame count.
+    tree.focused_node = ni_idx;
+    tree.caret_phase = 0.0;
+    input.beginFrame();
+    try mgr.processFrameWithDt(tree, input, null, 300, 200, 100.0);
+    input.beginFrame();
+    try mgr.processFrameWithDt(tree, input, null, 300, 200, 100.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), tree.caret_phase, 0.001);
+}
