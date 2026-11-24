@@ -19,6 +19,41 @@ pub const PackageManifest = struct {
     abi_major: i64 = 1,
 };
 
+/// Errors of the TOML -> JSON bridge.
+pub const JsonBridgeError = error{ OutOfMemory, UnsupportedTomlValue };
+
+/// Converts a parsed TOML table (as returned by `TomlService.parseTable`) into a JSON object.
+pub fn tableToJsonValue(arena: std.mem.Allocator, table: *const toml.Table) JsonBridgeError!std.json.Value {
+    var out: std.json.ObjectMap = .empty;
+    try out.ensureTotalCapacity(arena, table.count());
+    var it = table.iterator();
+    while (it.next()) |e| {
+        out.putAssumeCapacity(try arena.dupe(u8, e.key_ptr.*), try toJsonValue(arena, e.value_ptr.*));
+    }
+    return .{ .object = out };
+}
+
+/// Converts a parsed TOML value into the equivalent `std.json.Value` tree, so authoring code that
+/// is syntax-agnostic (for example `prefab.json.parsePrefabValue`) can consume TOML documents.
+/// All containers and strings are allocated from `arena` (free by resetting it). Date/time values
+/// have no JSON counterpart and return `error.UnsupportedTomlValue`.
+pub fn toJsonValue(arena: std.mem.Allocator, value: toml.Value) JsonBridgeError!std.json.Value {
+    switch (value) {
+        .string => |s| return .{ .string = try arena.dupe(u8, s) },
+        .integer => |i| return .{ .integer = i.value },
+        .float => |f| return .{ .float = f },
+        .boolean => |b| return .{ .bool = b },
+        .array => |arr| {
+            var out = std.json.Array.init(arena);
+            try out.ensureTotalCapacity(arr.items.len);
+            for (arr.items) |item| out.appendAssumeCapacity(try toJsonValue(arena, item));
+            return .{ .array = out };
+        },
+        .table => |t| return tableToJsonValue(arena, t),
+        .offset_datetime, .local_datetime, .local_date, .local_time => return error.UnsupportedTomlValue,
+    }
+}
+
 /// Engine adapter service over `z-toml`.
 pub const TomlService = struct {
     /// Parses a TOML string into a dynamic `*toml.Table` owned by `allocator`.

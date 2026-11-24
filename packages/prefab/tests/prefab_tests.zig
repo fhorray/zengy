@@ -4,6 +4,7 @@ const std = @import("std");
 const testing = std.testing;
 const engine = @import("engine");
 const prefab = @import("prefab");
+const toml_format = @import("toml_format");
 
 const Link = struct { child: engine.EntityHandle, parent: engine.EntityHandle };
 var links: [8]Link = undefined;
@@ -209,4 +210,57 @@ test "reinstantiate swaps instances atomically and keeps the old one on failure"
     try testing.expect(!world.isAlive(old_handle));
     try testing.expect(world.isAlive(fresh.handles[0]));
     try testing.expectEqual(@as(usize, 1), world.entity_count);
+}
+
+test "TOML authoring files load through the JSON bridge" {
+    var types = engine.TypeRegistry.init(testing.allocator);
+    defer types.deinit();
+    _ = try types.registerSchema("game", "Stats", 1, .blittable, &.{
+        .{ .name = "hp", .field_type = .i32_t },
+        .{ .name = "armor", .field_type = .f32_t },
+    });
+    _ = try types.registerSchema("game", "Pose", 1, .blittable, &.{
+        .{ .name = "alive", .field_type = .bool_t },
+        .{ .name = "pos", .field_type = .vec3_t },
+    });
+
+    const doc =
+        \\[prefab]
+        \\id = "enemy.guard"
+        \\
+        \\[[entities]]
+        \\id = "guard"
+        \\[entities.components."game.Stats"]
+        \\hp = 150
+        \\armor = 2.5
+        \\
+        \\[[entities]]
+        \\id = "sword"
+        \\parent = "guard"
+        \\[entities.components."game.Pose"]
+        \\alive = true
+        \\pos = [0.0, 1.5, 0.0]
+    ;
+    const table = try toml_format.TomlService.parseTable(testing.allocator, doc);
+    defer toml_format.TomlService.freeTable(testing.allocator, table);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const json_doc = try toml_format.tableToJsonValue(arena.allocator(), table);
+
+    var pf = try prefab.json.parsePrefabValue(testing.allocator, &types, json_doc);
+    defer pf.deinit();
+    try testing.expectEqual(@as(usize, 2), pf.entities.items.len);
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    var inst = try prefab.instantiate(testing.allocator, &world, &types, &pf, .{});
+    defer inst.deinit();
+    const stats = types.getLatest("game", "Stats").?;
+    const raw = world.getRaw(inst.find(&pf, "guard").?, engine.World.dynamicTypeId("game.Stats")).?;
+    try testing.expectEqual(@as(i32, 150), (try engine.TypeRegistry.getField(stats, raw, "hp")).i32_t);
+    try testing.expectEqual(@as(f32, 2.5), (try engine.TypeRegistry.getField(stats, raw, "armor")).f32_t);
+
+    // Date/time values have no JSON counterpart and are rejected, not silently dropped.
+    const bad = try toml_format.TomlService.parseTable(testing.allocator, "when = 2026-11-24\n");
+    defer toml_format.TomlService.freeTable(testing.allocator, bad);
+    try testing.expectError(error.UnsupportedTomlValue, toml_format.tableToJsonValue(arena.allocator(), bad));
 }

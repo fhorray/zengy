@@ -839,6 +839,7 @@ pub fn build(b: *std.Build) void {
     addModuleTest(b, test_step, "packages/prefab/tests/prefab_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "prefab", .mod = prefab_mod },
+        .{ .name = "toml_format", .mod = toml_format_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/scene/tests/scene_tests.zig", target, optimize, false, &.{
