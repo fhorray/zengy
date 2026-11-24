@@ -49,6 +49,9 @@ pub const AppConfig = struct {
     event_overflow_policy: events_mod.OverflowPolicy = .drop_newest,
     /// Maximum number of log records retained in the `Diagnostics` ring buffer.
     log_capacity: usize = 256,
+    /// Minimum wall-clock duration of a `runRealtime` frame in nanoseconds. The loop sleeps for the
+    /// remainder so it does not spin a CPU core; `0` disables pacing (e.g. when vsync paces frames).
+    min_frame_ns: u64 = 0,
 };
 
 /// Root application container composing all core subsystems.
@@ -215,6 +218,8 @@ pub const App = struct {
     pub fn run(self: *App) !void {
         try self.initialize();
         self.state = .running;
+        // A failing frame must still stop modules in reverse order instead of leaking them to deinit.
+        errdefer self.shutdown();
 
         var frame: u64 = 0;
         while (!self.should_quit) {
@@ -232,6 +237,7 @@ pub const App = struct {
     pub fn runRealtime(self: *App, io: std.Io) !void {
         try self.initialize();
         self.state = .running;
+        errdefer self.shutdown();
 
         var last = std.Io.Clock.now(.awake, io);
         var frame: u64 = 0;
@@ -245,6 +251,15 @@ pub const App = struct {
             const dt = @min(@max(raw_dt, 0.0), 0.25);
             try self.tick(dt);
             frame += 1;
+
+            if (self.config.min_frame_ns > 0) {
+                const spent = now.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds;
+                const budget: i96 = @intCast(self.config.min_frame_ns);
+                if (spent < budget) {
+                    // Cancelation only shortens the pause; the next frame measures real elapsed time.
+                    std.Io.sleep(io, .fromNanoseconds(budget - spent), .awake) catch {};
+                }
+            }
         }
 
         self.shutdown();

@@ -726,3 +726,26 @@ test "Scheduler rejects invalid fixed timesteps and clamps excess accumulator" {
     try testing.expectEqual(@as(u32, 2), try sched.stepFrame(100.0, &ctx));
     try testing.expectEqual(@as(f64, 0.0), sched.accumulator);
 }
+
+fn failingSystem(_: *engine.SystemContext) !void {
+    return error.SystemFailed;
+}
+
+test "App.runRealtime paces frames to min_frame_ns and failed frames still shut down" {
+    const io = testing.io;
+    {
+        var app = engine.App.init(testing.allocator, .{ .max_frames = 4, .min_frame_ns = 5_000_000 });
+        defer app.deinit();
+        const t0 = std.Io.Clock.now(.awake, io);
+        try app.runRealtime(io);
+        const elapsed = t0.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds;
+        try testing.expect(elapsed >= 15_000_000); // 4 frames, first frame included in budget
+    }
+    {
+        var app = engine.App.init(testing.allocator, .{ .max_frames = 4 });
+        defer app.deinit();
+        try app.addSystem(.{ .name = "boom", .stage = .update, .run = failingSystem });
+        try testing.expectError(error.SystemFailed, app.run());
+        try testing.expectEqual(engine.AppState.stopped, app.state);
+    }
+}
