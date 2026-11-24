@@ -13,7 +13,13 @@
 const std = @import("std");
 const engine = @import("engine");
 
-pub const MODULE_OWNER_ID: u64 = 2010;
+pub const MODULE_OWNER_ID: u64 = 2030;
+
+/// JSON authoring loader (`parsePrefab`, `parseOverrides`).
+pub const json = @import("json_loader.zig");
+
+/// Errors returned by `Prefab` construction.
+pub const PrefabError = error{ DuplicateLocalId, UnknownParent, UnknownEntity };
 
 /// Overrides one field of one component on one prefab entity at instantiation time.
 pub const Override = struct {

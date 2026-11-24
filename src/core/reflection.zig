@@ -248,6 +248,13 @@ pub const TypeRegistry = struct {
         return self.schemas.get(computeSchemaId(any.namespace, any.name, version));
     }
 
+    /// Returns the newest registered schema of `namespace.name`, or null if none is registered.
+    pub fn getLatest(self: *const TypeRegistry, namespace: []const u8, name: []const u8) ?ComponentSchema {
+        const stable = computeStableId(namespace, name);
+        const v = self.latest_version.get(stable) orelse return null;
+        return self.getVersion(stable, v);
+    }
+
     /// Size of the canonical (little-endian, unpadded) encoding of `schema`'s fields.
     pub fn encodedPayloadSize(schema: ComponentSchema) usize {
         var n: usize = 0;

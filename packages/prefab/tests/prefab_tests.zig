@@ -126,3 +126,58 @@ test "official.prefab module provides a PrefabLibrary resource and service" {
     try testing.expectEqualStrings("replacement", lib.get("enemy").?.entities.items[0].local_id);
     try testing.expect(lib.get("missing") == null);
 }
+
+test "JSON loader builds a prefab and overrides from authoring text, strictly" {
+    var types = engine.TypeRegistry.init(testing.allocator);
+    defer types.deinit();
+    _ = try types.registerSchema("game", "Stats", 2, .blittable, &.{
+        .{ .name = "hp", .field_type = .i32_t },
+        .{ .name = "armor", .field_type = .f32_t },
+    });
+    const pose = try types.registerSchema("game", "Pose", 1, .blittable, &.{
+        .{ .name = "alive", .field_type = .bool_t },
+        .{ .name = "pos", .field_type = .vec3_t },
+    });
+    const stats = types.getLatest("game", "Stats").?;
+
+    const doc =
+        \\{ "prefab": { "id": "enemy.guard" },
+        \\  "entities": [
+        \\    { "id": "guard", "components": { "game.Stats": { "hp": 150, "armor": 2.5 } } },
+        \\    { "id": "sword", "parent": "guard", "components": { "game.Pose": { "alive": true, "pos": [0, 1.5, 0] } } } ] }
+    ;
+    var pf = try prefab.json.parsePrefab(testing.allocator, &types, doc);
+    defer pf.deinit();
+    try testing.expectEqual(@as(usize, 2), pf.entities.items.len);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ovs = try prefab.json.parseOverrides(arena.allocator(), &types,
+        \\[ { "entity": "guard", "component": "game.Stats", "field": "hp", "value": 999 } ]
+    );
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    var inst = try prefab.instantiate(testing.allocator, &world, &types, &pf, .{ .overrides = ovs });
+    defer inst.deinit();
+
+    const guard = inst.find(&pf, "guard").?;
+    const sg = world.getRaw(guard, engine.World.dynamicTypeId("game.Stats")).?;
+    try testing.expectEqual(@as(i32, 999), (try engine.TypeRegistry.getField(stats, sg, "hp")).i32_t);
+    try testing.expectEqual(@as(f32, 2.5), (try engine.TypeRegistry.getField(stats, sg, "armor")).f32_t);
+    const sw = world.getRaw(inst.find(&pf, "sword").?, engine.World.dynamicTypeId("game.Pose")).?;
+    try testing.expectEqual([3]f32{ 0, 1.5, 0 }, (try engine.TypeRegistry.getField(pose, sw, "pos")).vec3_t);
+    try testing.expect((try engine.TypeRegistry.getField(pose, sw, "alive")).bool_t);
+
+    // Strictness: each of these must fail loudly.
+    const bad = [_]struct { text: []const u8, err: anyerror }{
+        .{ .text = "{\"entities\":[{\"id\":\"a\",\"components\":{\"game.Nope\":{}}}]}", .err = error.UnknownComponentType },
+        .{ .text = "{\"entities\":[{\"id\":\"a\",\"components\":{\"game.Stats\":{\"mana\":1}}}]}", .err = error.UnknownField },
+        .{ .text = "{\"entities\":[{\"id\":\"a\",\"components\":{\"game.Stats\":{\"hp\":\"many\"}}}]}", .err = error.InvalidFieldValue },
+        .{ .text = "{\"entities\":[{\"id\":\"a\",\"components\":{\"game.Stats\":{\"hp\":99999999999}}}]}", .err = error.InvalidFieldValue },
+        .{ .text = "{\"entities\":[{\"id\":\"a\",\"components\":{\"game.Pose\":{\"pos\":[1,2]}}}]}", .err = error.InvalidFieldValue },
+        .{ .text = "{\"entities\":[{\"id\":\"a\"},{\"id\":\"a\"}]}", .err = error.DuplicateLocalId },
+        .{ .text = "{\"entities\":[{\"id\":\"a\",\"parent\":\"zzz\"}]}", .err = error.UnknownParent },
+        .{ .text = "{\"nothing\":1}", .err = error.InvalidDocument },
+    };
+    for (bad) |b| try testing.expectError(b.err, prefab.json.parsePrefab(testing.allocator, &types, b.text));
+}
