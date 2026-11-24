@@ -18,6 +18,7 @@ const window_sdl3 = @import("window_sdl3");
 const text_pkg = @import("text");
 const render_3d = @import("render_3d");
 const gizmos = @import("gizmos");
+const dev_tools = @import("dev_tools");
 const c = @import("sdl3_c");
 const shadow_cull = @import("shadow_cull.zig");
 /// Frame capture, statistics and comparison helpers for render regression tests.
@@ -1677,6 +1678,7 @@ fn startModule(raw_app: *anyopaque) !void {
         if (app.resources.get(gizmos.GizmoService)) |giz| {
             giz.setBackend(.{ .ctx = state, .submitGizmos = submitGizmosBackend });
         }
+        state.pbr.profiler = app.resources.get(dev_tools.FrameProfilerService);
     }
 }
 

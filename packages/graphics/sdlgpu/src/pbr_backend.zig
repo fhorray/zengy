@@ -10,7 +10,15 @@ const volumetric_lights = @import("volumetric_lights.zig");
 const shadow_cull = @import("shadow_cull.zig");
 const shadow_plan = @import("shadow_plan.zig");
 const graphics = @import("graphics");
+const dev_tools = @import("dev_tools");
 const c = @import("sdl3_c");
+
+fn perfNowNs() u64 {
+    const freq = c.SDL_GetPerformanceFrequency();
+    if (freq == 0) return 0;
+    const cnt = c.SDL_GetPerformanceCounter();
+    return @intCast((@as(u128, cnt) * 1_000_000_000) / @as(u128, freq));
+}
 
 const pbr = render_3d.pbr;
 const ibl = render_3d.ibl;
@@ -307,6 +315,7 @@ pub const PbrGpuState = struct {
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
     diag: *engine.Diagnostics,
+    profiler: ?*dev_tools.FrameProfilerService = null,
 
     pbr_pipeline: *c.SDL_GPUGraphicsPipeline,
     pbr_double_sided_pipeline: *c.SDL_GPUGraphicsPipeline,
@@ -1117,6 +1126,8 @@ pub const PbrGpuState = struct {
             self.ibl_initialized = true;
         }
         try self.advanceIblJob(pp.quality.ibl_rebuild_budget);
+        if (self.profiler) |prof| prof.beginFrame(perfNowNs());
+        var pass_t0: u64 = perfNowNs();
 
         // 1. 4-Cascade Exponential Directional Shadow Map Atlas Pass (2x2 quadrants of 1024x1024)
         var light_vps: [4]math3d.Mat4 = @splat(math3d.Mat4.identity());
@@ -1405,6 +1416,11 @@ pub const PbrGpuState = struct {
             c.SDL_EndGPUCopyPass(cp);
         }
 
+        {
+            const pass_t1 = perfNowNs();
+            if (self.profiler) |prof| prof.recordPass("Shadow", .shadow, pass_t1 -| pass_t0);
+            pass_t0 = pass_t1;
+        }
         // 1.5 Depth Prepass + SSAO + Contact Shadows + Bilateral Blur
         const prepass_ran = pp.ssao.enabled or pp.contact_shadows.enabled;
         const reuse_depth = prepass_ran and pp.quality.reuse_depth_prepass;
@@ -1477,6 +1493,11 @@ pub const PbrGpuState = struct {
             c.SDL_EndGPURenderPass(blur_pass);
         }
 
+        {
+            const pass_t1 = perfNowNs();
+            if (self.profiler) |prof| prof.recordPass("SSAO", .ssao, pass_t1 -| pass_t0);
+            pass_t0 = pass_t1;
+        }
         // 2. Sky Pass into HDR target
         {
             const sky_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
@@ -1684,6 +1705,11 @@ pub const PbrGpuState = struct {
             c.SDL_EndGPURenderPass(pbr_pass);
         }
 
+        {
+            const pass_t1 = perfNowNs();
+            if (self.profiler) |prof| prof.recordPass("Forward+", .forward_plus, pass_t1 -| pass_t0);
+            pass_t0 = pass_t1;
+        }
         // 3.5 Volumetric Fog & God Rays (additive ray-marched scattering into HDR target)
         if (self.frame_data.fog.enabled and self.frame_data.fog.volumetric.enabled) {
             // Ray-march at half resolution by default; the composite pass upsamples depth-aware (~4x fewer marched pixels).
@@ -1853,6 +1879,11 @@ pub const PbrGpuState = struct {
             self.vol_history_valid = false;
         }
 
+        {
+            const pass_t1 = perfNowNs();
+            if (self.profiler) |prof| prof.recordPass("Volumetric", .volumetric, pass_t1 -| pass_t0);
+            pass_t0 = pass_t1;
+        }
         // 4. Compute Auto-Exposure (Histogram -> EV100 Adaptation)
         const min_log2: f32 = -8.0;
         const max_log2: f32 = 8.0;
@@ -1944,6 +1975,11 @@ pub const PbrGpuState = struct {
             break :blk self.bloom_textures[0].?;
         } else self.black_texture;
 
+        {
+            const pass_t1 = perfNowNs();
+            if (self.profiler) |prof| prof.recordPass("Bloom", .bloom, pass_t1 -| pass_t0);
+            pass_t0 = pass_t1;
+        }
         // 6. PostFX Composite + Tonemap -> Swapchain (and, when a final capture is pending, an offscreen copy)
         const capture_final = self.capture_request != null and self.capture_request.? == .final;
         if (capture_final) try self.ensureCaptureFinal(tex_w, tex_h);
@@ -1974,6 +2010,11 @@ pub const PbrGpuState = struct {
             c.SDL_EndGPURenderPass(pf_pass);
         }
 
+        if (self.profiler) |prof| {
+            const pass_t1 = perfNowNs();
+            prof.recordPass("PostFX", .postfx, pass_t1 -| pass_t0);
+            prof.endFrame(pass_t1);
+        }
         if (self.capture_request) |target| {
             self.capture_request = null;
             switch (target) {

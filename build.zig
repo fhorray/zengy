@@ -358,6 +358,49 @@ pub fn build(b: *std.Build) void {
     gizmos_mod.addImport("engine", engine_mod);
     gizmos_mod.addImport("camera", camera_mod);
 
+    const shapes_mod = b.addModule("shapes", .{
+        .root_source_file = b.path("packages/shapes/src/shapes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shapes_mod.addImport("engine", engine_mod);
+    shapes_mod.addImport("render_3d", render_3d_mod);
+
+    const dev_tools_mod = b.addModule("dev_tools", .{
+        .root_source_file = b.path("packages/dev-tools/src/dev_tools.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dev_tools_mod.addImport("engine", engine_mod);
+
+    const picking_mod = b.addModule("picking", .{
+        .root_source_file = b.path("packages/picking/src/picking.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    picking_mod.addImport("engine", engine_mod);
+    picking_mod.addImport("camera", camera_mod);
+    picking_mod.addImport("input", input_mod);
+    picking_mod.addImport("render_3d", render_3d_mod);
+
+    const remote_mod = b.addModule("remote", .{
+        .root_source_file = b.path("packages/remote/src/remote.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const log_mod = b.addModule("log", .{
+        .root_source_file = b.path("packages/log/src/log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    log_mod.addImport("engine", engine_mod);
+
+    remote_mod.addImport("engine", engine_mod);
+    remote_mod.addImport("dev_tools", dev_tools_mod);
+    remote_mod.addImport("editor_shell", editor_shell_mod);
+    remote_mod.addImport("picking", picking_mod);
+    remote_mod.addImport("log", log_mod);
+
     // Diagnostic CLI tool (`tools/cli`)
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("tools/cli/main.zig"),
@@ -577,6 +620,7 @@ pub fn build(b: *std.Build) void {
     graphics_sdlgpu_mod.addImport("text", text_mod);
     graphics_sdlgpu_mod.addImport("render_3d", render_3d_mod);
     graphics_sdlgpu_mod.addImport("gizmos", gizmos_mod);
+    graphics_sdlgpu_mod.addImport("dev_tools", dev_tools_mod);
     graphics_sdlgpu_mod.addImport("sdl3_c", sdl3_c_mod);
 
     // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
@@ -936,6 +980,42 @@ pub fn build(b: *std.Build) void {
     const run_visual_gizmos_step = b.step("run-visual-gizmos", "Open the Visual 3D Gizmos Showcase");
     run_visual_gizmos_step.dependOn(&run_visual_gizmos.step);
 
+    // Visual Shapes + Picking + Profiler + Remote Inspector Showcase. Run with `zig build run-visual-inspector`.
+    const visual_inspector_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-inspector/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_inspector_mod.addImport("engine", engine_mod);
+    visual_inspector_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_inspector_mod.addImport("graphics", graphics_mod);
+    visual_inspector_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_inspector_mod.addImport("input", input_mod);
+    visual_inspector_mod.addImport("input_sdl3", input_sdl3_mod);
+    visual_inspector_mod.addImport("ui_core", ui_core_mod);
+    visual_inspector_mod.addImport("camera", camera_mod);
+    visual_inspector_mod.addImport("render_3d", render_3d_mod);
+    visual_inspector_mod.addImport("gizmos", gizmos_mod);
+    visual_inspector_mod.addImport("shapes", shapes_mod);
+    visual_inspector_mod.addImport("dev_tools", dev_tools_mod);
+    visual_inspector_mod.addImport("editor_shell", editor_shell_mod);
+    visual_inspector_mod.addImport("picking", picking_mod);
+    visual_inspector_mod.addImport("log", log_mod);
+    visual_inspector_mod.addImport("remote", remote_mod);
+
+    const visual_inspector_exe = b.addExecutable(.{
+        .name = "visual-inspector",
+        .root_module = visual_inspector_mod,
+    });
+    b.installArtifact(visual_inspector_exe);
+
+    const run_visual_inspector = b.addSystemCommand(&.{"zig-out/bin/visual-inspector.exe"});
+    run_visual_inspector.setCwd(b.path("."));
+    run_visual_inspector.step.dependOn(b.getInstallStep());
+    const run_visual_inspector_step = b.step("run-visual-inspector", "Open the Visual Shapes, Picking & Profiler Showcase");
+    run_visual_inspector_step.dependOn(&run_visual_inspector.step);
+
     // Render regression harness: renders the fixed scenarios of `visual-pbr` and compares them with
     // `tests/golden/visual-pbr` (`capture-check`) or rewrites those goldens (`capture-update`).
     // Needs a GPU and a window; see docs/roadmap/visual-risk-plan.md.
@@ -1157,6 +1237,43 @@ pub fn build(b: *std.Build) void {
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "camera", .mod = camera_mod },
         .{ .name = "gizmos", .mod = gizmos_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/shapes/tests/shapes_tests.zig", target, optimize, false, &.{
+        .{ .name = "shapes", .mod = shapes_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/dev-tools/tests/dev_tools_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "dev_tools", .mod = dev_tools_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/picking/tests/picking_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "input", .mod = input_mod },
+        .{ .name = "scene", .mod = scene_mod },
+        .{ .name = "camera", .mod = camera_mod },
+        .{ .name = "render_3d", .mod = render_3d_mod },
+        .{ .name = "picking", .mod = picking_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/remote/tests/remote_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "dev_tools", .mod = dev_tools_mod },
+        .{ .name = "editor_shell", .mod = editor_shell_mod },
+        .{ .name = "picking", .mod = picking_mod },
+        .{ .name = "log", .mod = log_mod },
+        .{ .name = "remote", .mod = remote_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/log/tests/log_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "log", .mod = log_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/formats/toml/tests/toml_tests.zig", target, optimize, false, &.{

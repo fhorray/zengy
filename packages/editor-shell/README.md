@@ -4,7 +4,7 @@ Optional modular editor tooling package built on top of `TypeRegistry` and `Comm
 
 ## Features
 
-- **Panel registry**: Dockable editor panels registered as modules without core coupling.
+- **Panel registry**: Dockable editor panels registered as modules without core coupling (includes `editor.hierarchy`, `editor.inspector`, `editor.console`, `editor.profiler`, and `editor.remote`).
 - **Undo/redo history**: Command-based undo/redo stack.
 - **Schema-driven inspector**: Inspects ECS components dynamically using `TypeRegistry` reflection metadata.
 - **Zero runtime overhead**: Never imported by `src/core/` or standalone exported games.
