@@ -7,4 +7,6 @@ Optional deterministic testing and offscreen visual capture package (`engine.tes
 - **Software framebuffer**: Deterministic RGBA8 rasterizer over `graphics.DrawCommand` lists (`clear`, `rect`) without requiring an OS window or GPU.
 - **Pixel & hash assertions**: `readPixel(x, y)` and `computeHash()` for golden-frame regression checks.
 - **PPM export**: `encodePpm()` outputs standard P6 PPM images for visual inspection.
+- **Render regression helpers** (`render_regression`): PNG codec, image statistics (NaN/Inf, speckle, contrast,
+  high-frequency energy) and golden-image comparison for GPU render suites; see `docs/visual-regression-testing.md`.
 - **Scenario driver**: Deterministic TOML-driven test execution used by `zengy test-scenario`.

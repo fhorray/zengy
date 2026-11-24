@@ -149,7 +149,9 @@ pub const DirectionalLight = struct {
     direction: [3]f32 = .{ -0.4, -0.8, -0.45 },
     shadows_enabled: bool = true,
     shadow_depth_bias: f32 = 0.005,
-    shadow_normal_bias: f32 = 0.02,
+    /// Receiver normal offset strength: `shadow_normal_bias * 50` shadow texels at grazing angles (needs
+    /// `ShadowQuality.normal_offset`). 0.05 removes acne at zero depth bias in the acne study scenarios.
+    shadow_normal_bias: f32 = 0.05,
     pcss_enabled: bool = false,
     /// Tangent of the light's apparent half-size for blocker-search PCSS (`ShadowQuality.pcss`); larger values give
     /// wider penumbrae. 0.03 is a soft, readable default; the real sun is about 0.005.
@@ -176,6 +178,8 @@ pub const SpotLight = struct {
     direction: [3]f32 = .{ 0.0, -1.0, 0.0 },
     inner_angle_rad: f32 = 0.35,
     outer_angle_rad: f32 = 0.65,
+    /// Physical size of the light source in metres; sets the penumbra width with `ShadowQuality.pcss`.
+    radius: f32 = 0.05,
     shadows_enabled: bool = false,
     shadow_depth_bias: f32 = 0.02,
 };
@@ -377,9 +381,13 @@ pub const ShadowQuality = struct {
     static_cache: bool = false,
     /// Choose each local light's tile size (256..1024) from its apparent size instead of a fixed 512.
     adaptive_atlas: bool = false,
-    /// Contact-hardening penumbra from a blocker search for directional lights that set `pcss_enabled`.
-    /// Without it `pcss_enabled` only widens the filter with distance.
+    /// Contact-hardening penumbra from a blocker search. Directional lights need `pcss_enabled` (size from
+    /// `pcss_light_size`); point and spot lights use their `radius` as the source size. Without this switch
+    /// `pcss_enabled` only widens the sun's filter with distance and local lights keep a fixed filter.
     pcss: bool = false,
+    /// Smallest depth bias, in metres, applied to the cascade lookup. The default is conservative enough to hide
+    /// acne on any surface; lowering it (with a normal offset) tightens contact shadows.
+    depth_bias_floor_m: f32 = 0.055,
 };
 
 /// Quality and cost switches that do not change what the scene means, only how the backend renders it.
@@ -441,6 +449,7 @@ pub const ExtractedSpotLight = struct {
     range: f32,
     inner_angle_rad: f32,
     outer_angle_rad: f32,
+    radius: f32 = 0.05,
     shadows_enabled: bool,
     shadow_depth_bias: f32 = 0.02,
 };

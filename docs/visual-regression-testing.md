@@ -71,8 +71,9 @@ Open `<scenario>.diff.png` next to `<scenario>.png`, then the matching `.hdr.png
 
 ## Code map
 
-- `packages/graphics/sdlgpu/src/capture.zig`: PNG codec (8-bit RGB, zlib), HDR statistics, speckle and contrast
-  metrics, image comparison. Pure Zig, unit tested without a GPU.
+- `packages/testing/src/render_regression.zig` (`testing_sdk.render_regression`): PNG codec (8-bit RGB, zlib), HDR
+  statistics, speckle, contrast and high-frequency metrics, image comparison. Pure Zig and provider-agnostic; it works on
+  `graphics.CaptureImage`, the capture contract type in `graphics`, so any graphics provider can feed it.
 - `graphics_sdlgpu.requestCapture` / `takeCapture`: read back `final`, `hdr`, or `ssao`.
   `final` renders the post-process pass a second time into an offscreen texture, so the capture never contains
   the HUD and never reads the swapchain.

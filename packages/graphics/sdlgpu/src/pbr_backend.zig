@@ -9,7 +9,7 @@ const gpu_resources = @import("gpu_resources.zig");
 const volumetric_lights = @import("volumetric_lights.zig");
 const shadow_cull = @import("shadow_cull.zig");
 const shadow_plan = @import("shadow_plan.zig");
-const capture = @import("capture.zig");
+const graphics = @import("graphics");
 const c = @import("sdl3_c");
 
 const pbr = render_3d.pbr;
@@ -159,6 +159,8 @@ const VolCompositeParams = extern struct {
 const GpuPointLight = extern struct {
     pos_range: [4]f32 = .{ 0, 0, 0, 1 },
     col_radius: [4]f32 = .{ 0, 0, 0, -1 },
+    /// x = light source radius in metres.
+    shadow_params: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 const GpuSpotLight = extern struct {
@@ -193,6 +195,8 @@ const ClusterLightsBuffer = extern struct {
 const LocalShadowBuffer = extern struct {
     shadow_vp: [16][16]f32 = @splat(math3d.Mat4.identity().m),
     atlas_rect: [16][4]f32 = @splat(.{ 0, 0, 0.25, 0.25 }),
+    /// Per tile: x = tan(half fov), y = near, z = far of the tile's perspective projection.
+    info: [16][4]f32 = @splat(.{ 1, 0.1, 1, 0 }),
 };
 
 const SkyUniforms = extern struct {
@@ -409,13 +413,13 @@ pub const PbrGpuState = struct {
     /// Format of the swapchain, needed to read a final-frame capture back correctly.
     swapchain_format: c.SDL_GPUTextureFormat = c.SDL_GPU_TEXTUREFORMAT_INVALID,
     /// Pending request for the next frame, consumed by `renderFrame`.
-    capture_request: ?capture.Target = null,
+    capture_request: ?graphics.CaptureTarget = null,
     /// Offscreen copy of the final frame (without the 2D overlay); only allocated while captures are used.
     capture_final_tex: ?*c.SDL_GPUTexture = null,
     capture_final_w: u32 = 0,
     capture_final_h: u32 = 0,
     capture_pending: ?PendingCapture = null,
-    capture_result: ?capture.Image = null,
+    capture_result: ?graphics.CaptureImage = null,
     /// Reused across frames so cluster construction does not allocate in steady state.
     cluster_scratch: cluster.ClusterScratch = .{},
     /// Lit-pass submission order, rebuilt every frame; reused to avoid per-frame allocation.
@@ -443,7 +447,7 @@ pub const PbrGpuState = struct {
 
         const pbr_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, PBR_VERT_SPV, 0, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_vs);
-        const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 11, 4, 1);
+        const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 12, 4, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_fs);
         const pbr_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_pipe);
@@ -1251,11 +1255,13 @@ pub const PbrGpuState = struct {
                 for (0..6) |f| {
                     const tgt = math3d.Vec3{ .x = eye.x + dirs[f].x, .y = eye.y + dirs[f].y, .z = eye.z + dirs[f].z };
                     local_sh_data.shadow_vp[first + f] = math3d.Mat4.mul(p_proj, math3d.Mat4.lookAt(eye, tgt, ups[f])).m;
+                    local_sh_data.info[first + f] = .{ @tan(std.math.pi * 0.256), 0.1, @max(pl.range, 1.0), 0 };
                 }
             }
             cl_lights.points[i] = .{
                 .pos_range = .{ pl.position[0], pl.position[1], pl.position[2], pl.range },
                 .col_radius = .{ pl.color[0] * sc, pl.color[1] * sc, pl.color[2] * sc, tile_id },
+                .shadow_params = .{ pl.radius, 0, 0, 0 },
             };
         }
 
@@ -1273,12 +1279,14 @@ pub const PbrGpuState = struct {
                 const tgt = math3d.Vec3{ .x = eye.x + dir.x, .y = eye.y + dir.y, .z = eye.z + dir.z };
                 const s_proj = perspectiveMat(std.math.clamp(sl.outer_angle_rad * 2.0, 0.2, std.math.pi * 0.9), 1.0, 0.1, @max(sl.range, 1.0));
                 local_sh_data.shadow_vp[tile] = math3d.Mat4.mul(s_proj, math3d.Mat4.lookAt(eye, tgt, up)).m;
+                const spot_fov = std.math.clamp(sl.outer_angle_rad * 2.0, 0.2, std.math.pi * 0.9);
+                local_sh_data.info[tile] = .{ @tan(spot_fov * 0.5), 0.1, @max(sl.range, 1.0), 0 };
             }
             cl_lights.spots[i] = .{
                 .pos_range = .{ sl.position[0], sl.position[1], sl.position[2], sl.range },
                 .dir_cos_inner = .{ sl.direction[0], sl.direction[1], sl.direction[2], @cos(sl.inner_angle_rad) },
                 .col_cos_outer = .{ sl.color[0] * sc, sl.color[1] * sc, sl.color[2] * sc, @cos(sl.outer_angle_rad) },
-                .shadow_params = .{ tile_id, sl.shadow_depth_bias, 0, 0 },
+                .shadow_params = .{ tile_id, sl.shadow_depth_bias, sl.radius, 0 },
             };
         }
 
@@ -1652,7 +1660,7 @@ pub const PbrGpuState = struct {
                     .cascade_depth_ranges = cascade_depth_ranges,
                     .cluster_factors = .{ built_clusters.factors.z_scale, built_clusters.factors.z_bias, 1.0, if (mat.alpha_mode == .mask) mat.alpha_cutoff else -1.0 },
                     .probe_volumetric = .{ @floatFromInt(pr_count), pcss_on, vol_on, self.frame_data.fog.volumetric.scattering },
-                    .cascade_info = .{ cascade_count, if (has_dir) self.frame_data.directional_lights[0].pcss_light_size else 0.03, 0, 0 },
+                    .cascade_info = .{ cascade_count, if (has_dir) self.frame_data.directional_lights[0].pcss_light_size else 0.03, shadow_q.depth_bias_floor_m, if (shadow_q.pcss) 1.0 else 0.0 },
                 };
                 c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &fu, @sizeOf(PbrFragUniforms));
                 const pbr_samplers = [_]c.SDL_GPUTextureSamplerBinding{
@@ -1668,6 +1676,7 @@ pub const PbrGpuState = struct {
                     .{ .texture = em_t, .sampler = self.material_sampler },
                     // Raw (non-comparison) view of the cascade depth for the PCSS blocker search.
                     .{ .texture = self.shadow_texture, .sampler = nearest_sampler },
+                    .{ .texture = self.local_shadow_texture, .sampler = nearest_sampler },
                 };
                 c.SDL_BindGPUFragmentSamplers(pbr_pass, 0, &pbr_samplers, pbr_samplers.len);
                 c.SDL_DrawGPUIndexedPrimitives(pbr_pass, gm.index_count, 1, 0, 0, 0);
@@ -1977,12 +1986,12 @@ pub const PbrGpuState = struct {
 
     /// Asks the next rendered frame to read back `target`. The image is available from `takeCapture` after
     /// that frame has been submitted and `finishCapture` has run.
-    pub fn requestCapture(self: *PbrGpuState, target: capture.Target) void {
+    pub fn requestCapture(self: *PbrGpuState, target: graphics.CaptureTarget) void {
         self.capture_request = target;
     }
 
     /// Moves the finished capture out of the backend. The caller owns the image.
-    pub fn takeCapture(self: *PbrGpuState) ?capture.Image {
+    pub fn takeCapture(self: *PbrGpuState) ?graphics.CaptureImage {
         const img = self.capture_result orelse return null;
         self.capture_result = null;
         return img;

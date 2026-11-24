@@ -299,6 +299,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 .range = sl.range,
                 .inner_angle_rad = sl.inner_angle_rad,
                 .outer_angle_rad = sl.outer_angle_rad,
+                .radius = sl.radius,
                 .shadows_enabled = sl.shadows_enabled,
                 .shadow_depth_bias = sl.shadow_depth_bias,
             });
@@ -453,7 +454,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.render.3d",
-            .version = "0.5.1",
+            .version = "0.6.0",
             .provides_capabilities = &.{"engine.render.3d/1"},
             .required_capabilities = &.{ "engine.graphics.device/1", "engine.camera/1" },
         },

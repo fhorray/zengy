@@ -29,7 +29,8 @@ const input_sdl3 = @import("input_sdl3");
 const camera = @import("camera");
 const render_3d = @import("render_3d");
 
-const capture = graphics_sdlgpu.capture;
+const testing_sdk = @import("testing_sdk");
+const capture = testing_sdk.render_regression;
 
 const SKY_HDR_BYTES = @embedFile("assets/sky.hdr");
 
@@ -49,6 +50,8 @@ const PbrDemoState = struct {
     in_vol_room: bool = false,
     /// Entity moved by the `nudge` scenarios (the alpha-masked panel, a shadow caster), and its home position.
     nudge_entity: engine.EntityHandle,
+    /// The shadowed spot light and the two point lights; `light_radius` scenarios resize their sources.
+    local_lights: [3]engine.EntityHandle,
     /// The sky HDRI and an identical copy at another address; `hdri_swap` scenarios switch between them to force a
     /// re-upload without changing the picture.
     hdri_main: []const [4]f32,
@@ -121,7 +124,29 @@ const Scenario = struct {
     /// Part of the normal-offset sweep: compared with `golden_of` by luma and high-frequency energy instead of
     /// pixel difference, because the offset moves shadow edges on purpose.
     bias_gate: bool = false,
+    /// Grazing-sun acne study: sun direction, cascade depth-bias floor (metres) and the light's own depth bias.
+    sun_dir: [3]f32 = DEFAULT_SUN_DIR,
+    bias_floor: f32 = 0.055,
+    sun_bias: f32 = 0.005,
+    acne_check: AcneCheck = .none,
+    /// Source radius (metres) given to the spot and point lights; 0 keeps their defaults.
+    light_radius: f32 = 0,
+    /// Sun illuminance override (lux); 0 keeps the sky preset's value. A dim sun lets local-light shadows show.
+    sun_lux: f32 = 0,
 };
+
+/// Expectation on the floor's fine-grained contrast relative to the `acne_ref` golden.
+const AcneCheck = enum {
+    none,
+    /// Acne must be visible: the scene has to be able to produce the artefact the other checks guard against.
+    expect_acne,
+    /// Acne must be gone (within 5% of the reference) without shifting the floor's mean luma by more than 1%.
+    expect_clean,
+};
+
+const DEFAULT_SUN_DIR = [3]f32{ -0.45, -0.75, -0.45 };
+/// Sun low over the horizon: surfaces face it at a grazing angle, which is where shadow acne appears.
+const GRAZING_SUN_DIR = [3]f32{ -0.9, -0.16, -0.4 };
 
 const SCENARIOS = [_]Scenario{
     .{ .name = "gallery_default" },
@@ -165,6 +190,16 @@ const SCENARIOS = [_]Scenario{
     .{ .name = "materials_nudge", .pose = .materials, .nudge = true },
     .{ .name = "materials_nudge_cache", .pose = .materials, .nudge = true, .shadow_cache = true, .golden_of = "materials_nudge" },
     .{ .name = "gallery_hdri_swap_sliced", .hdri_swap = true, .sliced_ibl = true, .golden_of = "gallery_default" },
+    // Acne study (grazing sun, floor in the lower 40% of the frame). `acne_ref` keeps the conservative bias floor; the
+    // others remove the depth bias entirely so acne shows, then add normal offset at growing strength (bias x 50
+    // texels). hf_floor is the fine-grained contrast of the floor, luma_floor its mean brightness.
+    .{ .name = "acne_ref", .sun_dir = GRAZING_SUN_DIR },
+    .{ .name = "acne_raw", .sun_dir = GRAZING_SUN_DIR, .bias_floor = 0.0, .sun_bias = 0.0, .acne_check = .expect_acne, .golden_of = "acne_ref" },
+    .{ .name = "acne_n_005", .sun_dir = GRAZING_SUN_DIR, .bias_floor = 0.0, .sun_bias = 0.0, .shadow_normal_offset = true, .normal_bias = 0.005, .golden_of = "acne_ref" },
+    .{ .name = "acne_n_010", .sun_dir = GRAZING_SUN_DIR, .bias_floor = 0.0, .sun_bias = 0.0, .shadow_normal_offset = true, .normal_bias = 0.01, .golden_of = "acne_ref" },
+    .{ .name = "acne_n_020", .sun_dir = GRAZING_SUN_DIR, .bias_floor = 0.0, .sun_bias = 0.0, .shadow_normal_offset = true, .normal_bias = 0.02, .golden_of = "acne_ref" },
+    .{ .name = "acne_n_050", .sun_dir = GRAZING_SUN_DIR, .bias_floor = 0.0, .sun_bias = 0.0, .shadow_normal_offset = true, .normal_bias = 0.05, .acne_check = .expect_clean, .golden_of = "acne_ref" },
+    .{ .name = "acne_n_100", .sun_dir = GRAZING_SUN_DIR, .bias_floor = 0.0, .sun_bias = 0.0, .shadow_normal_offset = true, .normal_bias = 0.1, .acne_check = .expect_clean, .golden_of = "acne_ref" },
     // Normal-offset sweep (strength = normal_bias * 50 texels). Gated entries must keep the frame's mean luma within
     // 2% and its high-frequency energy within 15% of the plain render; the larger values are informational.
     .{ .name = "bias_sweep_005", .shadow_normal_offset = true, .normal_bias = 0.005, .bias_gate = true, .golden_of = "gallery_default" },
@@ -172,6 +207,9 @@ const SCENARIOS = [_]Scenario{
     .{ .name = "bias_sweep_080", .shadow_normal_offset = true, .normal_bias = 0.08, .golden_of = "gallery_default" },
     .{ .name = "bias_sweep_300", .shadow_normal_offset = true, .normal_bias = 0.3, .golden_of = "gallery_default" },
     .{ .name = "gallery_pcss", .shadow_pcss = true },
+    // Local-light PCSS in the dark room with large light sources: the penumbra comes from each light's radius.
+    .{ .name = "local_soft_off", .light_radius = 0.6, .sun_lux = 600, .fog = false },
+    .{ .name = "local_pcss", .light_radius = 0.6, .sun_lux = 600, .fog = false, .shadow_pcss = true },
 };
 
 const CaptureStage = enum { warmup, wait_final, hold, wait_stable, wait_hdr };
@@ -203,6 +241,9 @@ const CaptureRunner = struct {
     speckle: u64 = 0,
     contrast: f32 = 0,
     hf_energy: f64 = 0,
+    /// Fine-grained contrast and mean luma of the lower 40% of the frame (the floor in the gallery pose).
+    hf_floor: f64 = 0,
+    luma_floor: f64 = 0,
     /// Frame-time samples of the running scenario (CPU frame delta, trend only, never a pass/fail gate).
     dt_sum: f64 = 0,
     dt_max: f64 = 0,
@@ -242,6 +283,12 @@ const CaptureRunner = struct {
         self.speckle = capture.speckleCount(rgb, img.width, img.height, SPECKLE_MARGIN);
         self.contrast = try capture.contrastSpread(self.allocator, rgb);
         self.hf_energy = capture.highFrequencyEnergy(rgb, img.width, img.height);
+        const floor_y = img.height * 3 / 5;
+        self.hf_floor = capture.highFrequencyEnergyRect(rgb, img.width, img.height, 0, floor_y, img.width, img.height);
+        self.luma_floor = capture.meanLumaRect(rgb, img.width, img.height, 0, floor_y, img.width, img.height);
+        if (std.mem.startsWith(u8, sc.name, "acne_")) {
+            std.debug.print("[capture] {s}: hf_floor={d:.4} luma_floor={d:.3}\n", .{ sc.name, self.hf_floor, self.luma_floor });
+        }
         if (self.final_rgb) |old| self.allocator.free(old);
         self.final_rgb = rgb;
         self.final_w = img.width;
@@ -269,7 +316,7 @@ const CaptureRunner = struct {
         if (diff.max_delta > sc.max_delta) {
             self.fail(sc.name, "max channel delta {d} exceeds {d} (localised artefact such as a ghost)", .{ diff.max_delta, sc.max_delta });
         }
-        const sweep = sc.bias_gate or std.mem.startsWith(u8, sc.name, "bias_sweep");
+        const sweep = sc.bias_gate or std.mem.startsWith(u8, sc.name, "bias_sweep") or std.mem.startsWith(u8, sc.name, "acne_n_") or sc.acne_check != .none;
         if (frac > MAX_DIFF_FRACTION and !sweep) {
             self.fail(sc.name, "{d:.3}% of pixels differ from the golden (limit {d:.3}%)", .{ frac * 100.0, MAX_DIFF_FRACTION * 100.0 });
             const diff_img = try capture.diffImageRgb8(self.allocator, rgb, golden.rgb, PIXEL_THRESHOLD);
@@ -298,8 +345,8 @@ const CaptureRunner = struct {
 
         const text = try std.fmt.allocPrint(
             self.allocator,
-            "name={s}\nwidth={d}\nheight={d}\nnan={d}\ninf={d}\nmean_luma={d:.4}\np50_luma={d:.4}\np95_luma={d:.4}\nspeckle={d}\ncontrast={d:.2}\nhf_energy={d:.4}\n",
-            .{ sc.name, img.width, img.height, stats.nan_count, stats.inf_count, stats.mean_luma, stats.p50_luma, stats.p95_luma, self.speckle, self.contrast, self.hf_energy },
+            "name={s}\nwidth={d}\nheight={d}\nnan={d}\ninf={d}\nmean_luma={d:.4}\np50_luma={d:.4}\np95_luma={d:.4}\nspeckle={d}\ncontrast={d:.2}\nhf_energy={d:.4}\nhf_floor={d:.4}\nluma_floor={d:.4}\n",
+            .{ sc.name, img.width, img.height, stats.nan_count, stats.inf_count, stats.mean_luma, stats.p50_luma, stats.p95_luma, self.speckle, self.contrast, self.hf_energy, self.hf_floor, self.luma_floor },
         );
         defer self.allocator.free(text);
         try self.writeFile(self.out_dir, sc.name, ".stats.txt", text);
@@ -334,6 +381,24 @@ const CaptureRunner = struct {
             if (g > 0 and @abs(@as(f64, stats.mean_luma) - g) / g > 0.25) {
                 self.fail(sc.name, "mean luma {d:.3} is more than 25% away from the golden {d:.3}", .{ stats.mean_luma, g });
             }
+        }
+        if (sc.acne_check != .none) {
+            const ref_hf = capture.statValue(golden_text, "hf_floor") orelse 0;
+            const ref_luma = capture.statValue(golden_text, "luma_floor") orelse 0;
+            if (ref_hf > 0) switch (sc.acne_check) {
+                .expect_acne => if (self.hf_floor < ref_hf * 1.25) {
+                    self.fail(sc.name, "floor contrast {d:.3} is not at least 25% above the reference {d:.3}: the scene no longer produces acne", .{ self.hf_floor, ref_hf });
+                },
+                .expect_clean => {
+                    if (self.hf_floor > ref_hf * 1.05) {
+                        self.fail(sc.name, "acne remains: floor contrast {d:.3} is more than 5% above the reference {d:.3}", .{ self.hf_floor, ref_hf });
+                    }
+                    if (@abs(self.luma_floor - ref_luma) / @max(ref_luma, 1.0) > 0.01) {
+                        self.fail(sc.name, "floor luma {d:.2} moved more than 1% from {d:.2} (shadow thinning)", .{ self.luma_floor, ref_luma });
+                    }
+                },
+                .none => {},
+            };
         }
         if (capture.statValue(golden_text, "hf_energy")) |g| {
             std.debug.print("[capture] {s}: hf_energy={d:.4} (golden {d:.4})\n", .{ sc.name, self.hf_energy, g });
@@ -391,6 +456,15 @@ fn resetFreeCamera(ctx: *engine.SystemContext, st: *PbrDemoState) void {
     if (ctx.world.get(st.cam_entity, camera.FreeCamera)) |fc| fc.state.initialized = false;
 }
 
+/// Gives the spot and point lights the source radius `radius` (0 restores their defaults).
+fn applyLightRadius(ctx: *engine.SystemContext, st: *PbrDemoState, radius: f32) void {
+    const default_radius: f32 = 0.05;
+    const r = if (radius > 0) radius else default_radius;
+    if (ctx.world.get(st.local_lights[0], render_3d.pbr.SpotLight)) |sl| sl.radius = r;
+    if (ctx.world.get(st.local_lights[1], render_3d.pbr.PointLight)) |pl| pl.radius = r;
+    if (ctx.world.get(st.local_lights[2], render_3d.pbr.PointLight)) |pl| pl.radius = r;
+}
+
 /// Camera pose of a scenario; `dx`/`dz` shift the eye (and a third of it the target) for the shake scenarios.
 fn scenarioPose(pose: Pose, dx: f32, dz: f32) camera.CameraPose {
     const base: [2][3]f32 = switch (pose) {
@@ -416,12 +490,15 @@ fn applyScenario(
     fog.volumetric.temporal = sc.temporal;
     fog.volumetric.half_resolution = sc.vol_half;
     sun.shadow_normal_bias = sc.normal_bias;
+    sun.direction = sc.sun_dir;
+    sun.shadow_depth_bias = sc.sun_bias;
     pp.quality.shadows = .{
         .normal_offset = sc.shadow_normal_offset,
         .prioritize_local_lights = sc.shadow_prioritize,
         .static_cache = sc.shadow_cache,
         .adaptive_atlas = sc.shadow_adaptive,
         .pcss = sc.shadow_pcss,
+        .depth_bias_floor_m = sc.bias_floor,
     };
     fog.enabled = sc.fog;
     fog.volumetric.enabled = sc.fog;
@@ -433,6 +510,7 @@ fn applyScenario(
     pp.quality.ibl_rebuild_budget = if (sc.sliced_ibl) .sliced else .unlimited;
     sun.shadows_enabled = sc.shadows;
     if (sky) |s_env| applySkyPreset(s_env, sun, sc.sky_preset);
+    if (sc.sun_lux > 0) sun.illuminance_lux = sc.sun_lux;
 }
 
 /// Advances the capture state machine by one frame. A capture requested in frame N is recorded while frame N
@@ -467,6 +545,7 @@ fn stepCapture(
                     sky_env.hdri_pixels = if (sc.hdri_swap) st.hdri_alt else st.hdri_main;
                 }
                 if (ctx.world.get(st.nudge_entity, render_3d.Transform3D)) |tr| tr.position[0] = NUDGE_HOME_X;
+                applyLightRadius(ctx, st, sc.light_radius);
                 cr.dt_sum = 0;
                 cr.dt_max = 0;
                 cr.dt_frames = 0;
@@ -1053,6 +1132,7 @@ pub fn main(init: std.process.Init) !void {
         .cam_entity = cam_e,
         .sun_entity = sun_e,
         .nudge_entity = leaf_e,
+        .local_lights = .{ spot_e, pl1, pl2 },
         .hdri_main = hdri.pixels,
         .hdri_alt = hdri_alt,
         .capture = capture_runner,

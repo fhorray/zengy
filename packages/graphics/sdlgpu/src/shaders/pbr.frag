@@ -16,17 +16,19 @@ layout(set = 2, binding = 7) uniform sampler2DShadow u_local_shadow_tex;
 layout(set = 2, binding = 8) uniform sampler2D u_ao_tex;
 layout(set = 2, binding = 9) uniform sampler2D u_emissive_tex;
 layout(set = 2, binding = 10) uniform sampler2D u_shadow_raw; // same depth as u_shadow_tex, read without comparison (PCSS blocker search)
+layout(set = 2, binding = 11) uniform sampler2D u_local_shadow_raw; // same for the local shadow atlas
 
 struct GpuPointLight {
     vec4 pos_range;  // xyz=pos, w=range
     vec4 col_radius; // rgb=color*scale, w=shadow_tile (-1 = none)
+    vec4 shadow_params; // x=light source radius in metres (PCSS)
 };
 
 struct GpuSpotLight {
     vec4 pos_range;     // xyz=pos, w=range
     vec4 dir_cos_inner; // xyz=dir, w=cos_inner
     vec4 col_cos_outer; // rgb=color*scale, w=cos_outer
-    vec4 shadow_params; // x=shadow_tile (-1=none), y=bias, z=0, w=0
+    vec4 shadow_params; // x=shadow_tile (-1=none), y=bias, z=light source radius in metres (PCSS), w=0
 };
 
 struct GpuRectLight {
@@ -44,24 +46,25 @@ struct GpuReflectionProbe {
     vec4 ground_pad; // rgb=ground_tint
 };
 
-layout(std430, set = 2, binding = 11) readonly buffer ClusterLightsBuffer {
+layout(std430, set = 2, binding = 12) readonly buffer ClusterLightsBuffer {
     GpuPointLight c_points[256];
     GpuSpotLight c_spots[256];
     GpuRectLight c_rects[64];
     GpuReflectionProbe c_probes[32];
 };
 
-layout(std430, set = 2, binding = 12) readonly buffer ClusterGridBuffer {
+layout(std430, set = 2, binding = 13) readonly buffer ClusterGridBuffer {
     uvec4 clusters[];
 };
 
-layout(std430, set = 2, binding = 13) readonly buffer ClusterIndicesBuffer {
+layout(std430, set = 2, binding = 14) readonly buffer ClusterIndicesBuffer {
     uint cluster_indices[];
 };
 
-layout(std430, set = 2, binding = 14) readonly buffer LocalShadowBuffer {
+layout(std430, set = 2, binding = 15) readonly buffer LocalShadowBuffer {
     mat4 local_shadow_vp[16];
     vec4 local_atlas_rect[16]; // x, y, w, h in [0,1]
+    vec4 local_shadow_info[16]; // x = tan(half fov), y = near, z = far
 };
 
 layout(std140, set = 3, binding = 0) uniform PbrFragUniforms {
@@ -87,7 +90,7 @@ layout(std140, set = 3, binding = 0) uniform PbrFragUniforms {
     vec4 cascade_depth_ranges; // 4 cascade depth ranges in metres
     vec4 cluster_factors;    // x=z_scale, y=z_bias, z=clustered_on, w=0
     vec4 probe_volumetric;   // x=probe_count, y=pcss_on, z=vol_fog_on, w=vol_scattering
-    vec4 cascade_info;       // x=number of cascades rendered this frame (0..4), y=PCSS light size (tangent of half-angle)
+    vec4 cascade_info;       // x=number of cascades rendered this frame (0..4), y=PCSS light size (tangent of half-angle), z=minimum depth bias in metres, w=1 for blocker-search PCSS on local lights
 };
 
 layout(location = 0) out vec4 frag_color;
@@ -184,7 +187,7 @@ float sampleCascadePCF(int c_idx, vec3 N, vec3 L, float rot, float view_depth) {
     uv = mix(q_min, q_max, uv);
     float slope = 1.0 - max(dot(N, L), 0.0);
     float depth_range = max(cascade_depth_ranges[c_idx], 1.0);
-    float bias_m = max(0.055, mat_flags.z * 8.0) * (1.0 + slope * 3.5) * (1.0 + float(c_idx) * 0.65);
+    float bias_m = max(cascade_info.z, mat_flags.z * 8.0) * (1.0 + slope * 3.5) * (1.0 + float(c_idx) * 0.65);
     float bias = bias_m / depth_range;
     vec2 texel = 1.0 / vec2(textureSize(u_shadow_tex, 0));
     float pcss_boost = (probe_volumetric.y > 0.5) ? (1.0 + clamp(view_depth / 30.0, 0.0, 1.5)) : 1.0;
@@ -255,7 +258,12 @@ float sampleShadowCSM(vec3 N, vec3 L, float view_depth) {
     return mix(lit, 1.0, fade);
 }
 
-float sampleLocalTile(int tile_idx, vec3 world_pos, float bias, float rot) {
+// View-space distance of a perspective shadow depth value (near/far from local_shadow_info).
+float localLinearDepth(float z, float near_d, float far_d) {
+    return near_d * far_d / max(far_d - z * (far_d - near_d), 1e-4);
+}
+
+float sampleLocalTile(int tile_idx, vec3 world_pos, float bias, float rot, float light_size) {
     if (tile_idx < 0 || tile_idx >= 16) return 1.0;
     vec4 lp = local_shadow_vp[tile_idx] * vec4(world_pos, 1.0);
     if (lp.w <= 0.001) return 1.0;
@@ -267,17 +275,42 @@ float sampleLocalTile(int tile_idx, vec3 world_pos, float bias, float rot) {
     vec4 rect = local_atlas_rect[tile_idx];
     vec2 suv = rect.xy + uv * rect.zw;
     vec2 texel = 1.0 / vec2(textureSize(u_local_shadow_tex, 0));
+    // Filter radius follows the tile's share of the atlas, so large and small tiles blur the same angle.
+    float radius_texels = 1.6 * (rect.z / 0.25);
+    int taps = 6;
+    if (cascade_info.w > 0.5 && light_size > 0.0) {
+        // PCSS: the blocker search finds how far the occluders are, and the penumbra follows from the light size.
+        vec4 info = local_shadow_info[tile_idx];
+        float tile_px = rect.z * float(textureSize(u_local_shadow_tex, 0).x);
+        float d_r = localLinearDepth(proj.z, info.y, info.z);
+        float texel_world = max(2.0 * d_r * info.x / tile_px, 1e-5);
+        float search = clamp(light_size * (d_r - info.y) / max(d_r, 0.01) / texel_world, 2.0, 10.0);
+        float blocker_sum = 0.0;
+        float blocker_n = 0.0;
+        for (int i = 0; i < 12; ++i) {
+            vec2 o = vogelDisk(i, 12, rot) * search * texel;
+            vec2 cuv = clamp(suv + o, rect.xy + texel, rect.xy + rect.zw - texel);
+            float r = textureLod(u_local_shadow_raw, cuv, 0.0).r;
+            if (r < proj.z - bias) {
+                blocker_sum += localLinearDepth(r, info.y, info.z);
+                blocker_n += 1.0;
+            }
+        }
+        if (blocker_n < 0.5) return 1.0;
+        float d_b = blocker_sum / blocker_n;
+        radius_texels = clamp((d_r - d_b) * light_size / max(d_b, 0.01) / texel_world, 1.0, 12.0);
+        taps = 16;
+    }
     float s = 0.0;
-    for (int i = 0; i < 6; ++i) {
-        // Filter radius follows the tile's share of the atlas, so large and small tiles blur the same angle.
-        vec2 o = vogelDisk(i, 6, rot) * 1.6 * (rect.z / 0.25) * texel;
+    for (int i = 0; i < taps; ++i) {
+        vec2 o = vogelDisk(i, taps, rot) * radius_texels * texel;
         vec2 cuv = clamp(suv + o, rect.xy + texel, rect.xy + rect.zw - texel);
         s += texture(u_local_shadow_tex, vec3(cuv, proj.z - bias));
     }
-    return s / 6.0;
+    return s / float(taps);
 }
 
-float samplePointShadow(int base_tile, vec3 light_pos, vec3 N, vec3 L, float rot) {
+float samplePointShadow(int base_tile, vec3 light_pos, vec3 N, vec3 L, float rot, float light_size) {
     if (base_tile < 0 || base_tile > 10) return 1.0;
     vec3 d = v_world_pos - light_pos;
     vec3 ad = abs(d);
@@ -291,7 +324,7 @@ float samplePointShadow(int base_tile, vec3 light_pos, vec3 N, vec3 L, float rot
     }
     float slope = 1.0 - max(dot(N, L), 0.0);
     float bias = 0.0015 + slope * 0.0045;
-    return sampleLocalTile(base_tile + face, v_world_pos, bias, rot);
+    return sampleLocalTile(base_tile + face, v_world_pos, bias, rot, light_size);
 }
 
 vec3 evalLight(vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness, vec3 L, vec3 radiance) {
@@ -384,7 +417,7 @@ void main() {
                 float att = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
                 att = (att * att) / (dist * dist + 1.0);
                 vec3 L = to_l / max(dist, 0.0001);
-                float vis = (pl.col_radius.w >= 0.0) ? samplePointShadow(int(pl.col_radius.w + 0.5), pl.pos_range.xyz, N, L, rot) : 1.0;
+                float vis = (pl.col_radius.w >= 0.0) ? samplePointShadow(int(pl.col_radius.w + 0.5), pl.pos_range.xyz, N, L, rot, pl.shadow_params.x) : 1.0;
                 Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, pl.col_radius.rgb * att) * vis;
             }
         }
@@ -404,7 +437,7 @@ void main() {
                 float att = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
                 att = (att * att) / (dist * dist + 1.0);
                 float spot_bias = 0.0012 + (1.0 - max(dot(N, L), 0.0)) * 0.004;
-                float vis = (sl.shadow_params.x >= 0.0) ? sampleLocalTile(int(sl.shadow_params.x + 0.5), v_world_pos, spot_bias, rot) : 1.0;
+                float vis = (sl.shadow_params.x >= 0.0) ? sampleLocalTile(int(sl.shadow_params.x + 0.5), v_world_pos, spot_bias, rot, sl.shadow_params.z) : 1.0;
                 Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, sl.col_cos_outer.rgb * att * cone) * vis;
             }
         }

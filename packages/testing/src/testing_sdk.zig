@@ -7,6 +7,8 @@
 const engine = @import("engine");
 pub const driver = @import("test_driver.zig");
 pub const capture = @import("capture.zig");
+/// PNG IO, image statistics and golden-image comparison for GPU render regression suites.
+pub const render_regression = @import("render_regression.zig");
 
 pub const TestDriver = driver.TestDriver;
 pub const Scenario = driver.Scenario;
@@ -56,7 +58,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.testing",
-            .version = "0.1.0",
+            .version = "0.2.0",
             .provides_capabilities = &.{ "engine.testing.driver/1", "engine.testing.capture/1" },
         },
         .build = buildModule,

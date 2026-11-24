@@ -1,30 +1,21 @@
-//! Frame capture, image statistics and image comparison for render regression tests (`graphics-sdlgpu`).
+//! GPU render regression helpers (`official.testing`): PNG IO, image statistics and image comparison.
 //!
-//! Pure Zig with no GPU or SDL dependency: the backend fills an `Image`, and everything here (PNG IO,
-//! statistics, comparison) is unit-tested headlessly.
+//! Provider-agnostic and pure Zig with no GPU or SDL dependency: a graphics provider fills a
+//! `graphics.CaptureImage`, and everything here is unit-tested headlessly. The harness in `docs/visual-regression-testing.md`
+//! uses it to compare rendered frames with golden images.
 //!
 //! PNG support is limited to what the harness needs: 8-bit RGB, non-interlaced, zlib-compressed via
 //! `std.compress.flate`. The reader handles every standard scanline filter and rejects other variants
 //! explicitly instead of guessing.
 
 const std = @import("std");
+const graphics = @import("graphics");
 
-/// A captured render target converted to linear-or-display float RGBA.
-/// `final` captures hold display values in `[0, 1]`; `hdr` captures hold scene-linear radiance.
-pub const Image = struct {
-    width: u32,
-    height: u32,
-    /// `width * height * 4` floats, row-major, top row first.
-    rgba: []f32,
+/// A captured render target (alias of the provider-agnostic `graphics.CaptureImage`).
+pub const Image = graphics.CaptureImage;
 
-    pub fn deinit(self: *Image, allocator: std.mem.Allocator) void {
-        allocator.free(self.rgba);
-        self.* = undefined;
-    }
-};
-
-/// Which render target a capture request reads back.
-pub const Target = enum { final, hdr, ssao };
+/// Which render target a capture request reads back (alias of `graphics.CaptureTarget`).
+pub const Target = graphics.CaptureTarget;
 
 // ---------------------------------------------------------------------------------------------------------
 // Conversions
@@ -285,17 +276,39 @@ pub fn hdrStats(allocator: std.mem.Allocator, img: Image) !HdrStats {
 /// Mean absolute Laplacian of the luma (0..255 scale) over the interior of the image: how much fine-grained
 /// contrast the frame has. Acne stripes, shadow noise and speckle raise it; blur lowers it.
 pub fn highFrequencyEnergy(rgb: []const u8, width: u32, height: u32) f64 {
-    if (width < 3 or height < 3) return 0;
+    return highFrequencyEnergyRect(rgb, width, height, 0, 0, width, height);
+}
+
+/// `highFrequencyEnergy` restricted to the rectangle `[x0, x1) x [y0, y1)`; the rectangle's border pixels only
+/// serve as neighbours.
+pub fn highFrequencyEnergyRect(rgb: []const u8, width: u32, height: u32, x0: u32, y0: u32, x1: u32, y1: u32) f64 {
+    const xs = @max(x0, 1);
+    const ys = @max(y0, 1);
+    const xe = @min(x1, width -| 1);
+    const ye = @min(y1, height -| 1);
+    if (xs >= xe or ys >= ye) return 0;
     const w: usize = width;
     var sum: f64 = 0;
-    for (1..height - 1) |y| {
-        for (1..w - 1) |x| {
+    for (ys..ye) |y| {
+        for (xs..xe) |x| {
             const here = lumaAt(rgb, y * w + x);
             const lap = 4.0 * here - lumaAt(rgb, y * w + x - 1) - lumaAt(rgb, y * w + x + 1) - lumaAt(rgb, (y - 1) * w + x) - lumaAt(rgb, (y + 1) * w + x);
             sum += @abs(lap);
         }
     }
-    return sum / @as(f64, @floatFromInt((w - 2) * (height - 2)));
+    return sum / @as(f64, @floatFromInt((xe - xs) * (ye - ys)));
+}
+
+/// Mean luma (0..255) over the rectangle `[x0, x1) x [y0, y1)`.
+pub fn meanLumaRect(rgb: []const u8, width: u32, height: u32, x0: u32, y0: u32, x1: u32, y1: u32) f64 {
+    const xe = @min(x1, width);
+    const ye = @min(y1, height);
+    if (x0 >= xe or y0 >= ye) return 0;
+    var sum: f64 = 0;
+    for (y0..ye) |y| {
+        for (x0..xe) |x| sum += lumaAt(rgb, y * @as(usize, width) + x);
+    }
+    return sum / @as(f64, @floatFromInt((xe - x0) * (ye - y0)));
 }
 
 fn lumaAt(rgb: []const u8, px: usize) f64 {

@@ -1,0 +1,13 @@
+name=local_pcss
+width=1280
+height=720
+nan=0
+inf=0
+mean_luma=0.8645
+p50_luma=0.1308
+p95_luma=3.3745
+speckle=0
+contrast=188.00
+hf_energy=2.9906
+hf_floor=2.4258
+luma_floor=117.0995

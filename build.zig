@@ -878,6 +878,7 @@ pub fn build(b: *std.Build) void {
     visual_pbr_mod.addImport("engine", engine_mod);
     visual_pbr_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_pbr_mod.addImport("graphics", graphics_mod);
+    visual_pbr_mod.addImport("testing_sdk", testing_sdk_mod);
     visual_pbr_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
     visual_pbr_mod.addImport("input", input_mod);
     visual_pbr_mod.addImport("input_sdl3", input_sdl3_mod);
@@ -1159,7 +1160,9 @@ pub fn build(b: *std.Build) void {
     addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/volumetric_lights.zig", target, optimize, false, &.{}, null);
     addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/shadow_cull.zig", target, optimize, false, &.{}, null);
     addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/shadow_plan.zig", target, optimize, false, &.{}, null);
-    addModuleTest(b, test_step, "packages/graphics/sdlgpu/src/capture.zig", target, optimize, false, &.{}, null);
+    addModuleTest(b, test_step, "packages/testing/src/render_regression.zig", target, optimize, false, &.{
+        .{ .name = "graphics", .mod = graphics_mod },
+    }, null);
 
     addModuleTest(b, test_step, "packages/render/text/tests/text_tests.zig", target, optimize, false, &.{
         .{ .name = "text", .mod = text_mod },

@@ -188,3 +188,22 @@ reviewed.
     rebuild, so this demo does not show a rebuild spike; the HDRI is small and the engine clamps long frames.
   - Still open: acne calibration (above), per-light penumbra size beyond the sun, and goldens that do not depend on the
     GPU (no software Vulkan driver on this machine).
+- **Acne calibration and local-light penumbra.**
+  - *Acne study:* the `acne_*` scenarios put the sun at a grazing angle and remove the depth bias entirely
+    (`ShadowQuality.depth_bias_floor_m = 0`, light bias 0), which produces visible stripes on the floor and walls
+    (`acne_raw`: floor fine-contrast 3.11 vs 2.23 for the conservative reference; the check requires at least +25%).
+    With the normal offset on, the floor contrast falls to 2.97 / 2.76 / 2.41 / 1.92 / 1.76 for strengths 0.005 / 0.01 /
+    0.02 / 0.05 / 0.1, while the floor's mean luma stays within 0.2% of the reference (115.8). 0.02 still leaves 8%
+    excess, 0.05 is clean, so `DirectionalLight.shadow_normal_bias` now defaults to 0.05 (it only acts when
+    `quality.shadows.normal_offset` is on). `acne_n_050` and `acne_n_100` are gated: contrast within 5% of the
+    reference, floor luma within 1%.
+  - *Local-light PCSS:* with `quality.shadows.pcss`, point and spot lights run a blocker search on the local atlas
+    (second, non-comparison view, per-tile projection data in the shadow SSBO) and take the penumbra from their own
+    `radius` (new on `SpotLight`; `PointLight` already had it). `local_soft_off` / `local_pcss` (large sources, dim
+    sun) own goldens and differ in about 400 pixels, so the path is engaged; the effect is subtle in this scene.
+  - *Capture package:* the PNG, statistics and comparison code moved from `graphics-sdlgpu` to
+    `packages/testing/src/render_regression.zig`; the image and target types are now `graphics.CaptureImage` and
+    `graphics.CaptureTarget`, so `graphics_sdlgpu.capture` no longer exists.
+  - *Still open:* GPU-independent goldens. A software Vulkan driver (Mesa lavapipe for Windows) was downloaded into
+    `.tmp/` (untracked) but running the demo against it was not permitted in this session, so no software-driver
+    goldens exist yet. `capture-check` / `capture-update` would need an ICD path option once one can be run.

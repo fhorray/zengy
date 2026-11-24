@@ -396,3 +396,20 @@ pub fn module() engine.Module {
         .stop = stopModule,
     };
 }
+
+/// Which render target a capture request reads back (`final` is the post-processed frame without 2D overlays).
+pub const CaptureTarget = enum { final, hdr, ssao };
+
+/// A captured render target as float RGBA. `final` captures hold display values in `[0, 1]`; `hdr` captures
+/// hold scene-linear radiance. Providers fill it; `official.testing` turns it into PNGs, statistics and diffs.
+pub const CaptureImage = struct {
+    width: u32,
+    height: u32,
+    /// `width * height * 4` floats, row-major, top row first. Owned by the image.
+    rgba: []f32,
+
+    pub fn deinit(self: *CaptureImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.rgba);
+        self.* = undefined;
+    }
+};
