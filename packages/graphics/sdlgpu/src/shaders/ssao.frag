@@ -74,28 +74,32 @@ void main() {
 
     float contact = 1.0;
     if (contact_params.w > 0.5 && dist_fade > 0.01) {
-        float step_len = sun_view_dir.w / max(contact_params.z, 4.0);
-        float occ_c = 0.0;
         vec3 ldir_v = normalize(sun_view_dir.xyz);
-        // Offset along surface normal and scale bias with view depth to prevent grazing-angle self-occlusion.
-        vec3 start_pos = pos + N * (0.025 + 0.004 * abs(pos.z));
-        float min_dz = 0.025 + 0.008 * abs(pos.z);
-        float jitter = hash12(gl_FragCoord.xy + vec2(17.0, 31.0));
-        for (int i = 1; i <= 16; ++i) {
-            if (float(i) > contact_params.z) break;
-            vec3 rp = start_pos + ldir_v * ((float(i) - 0.5 + jitter * 0.5) * step_len);
-            vec4 rclip = proj * vec4(rp, 1.0);
-            vec2 ruv = vec2(rclip.x / rclip.w * 0.5 + 0.5, 0.5 - rclip.y / rclip.w * 0.5);
-            if (ruv.x < 0.0 || ruv.x > 1.0 || ruv.y < 0.0 || ruv.y > 1.0) break;
-            float rd = texture(u_depth, ruv).r;
-            vec3 rvp = reconstructViewPos(ruv, rd);
-            float dz = rvp.z - rp.z;
-            if (dz > min_dz && dz < contact_params.y + 0.01 * abs(pos.z)) {
-                occ_c = 1.0;
-                break;
+        float ndotl_v = dot(N, ldir_v);
+        // Only march contact rays on surfaces facing the light to prevent grazing self-occlusion lines.
+        if (ndotl_v > 0.08) {
+            float step_len = sun_view_dir.w / max(contact_params.z, 4.0);
+            float occ_c = 0.0;
+            float slope_bias = (0.03 + 0.012 * abs(pos.z)) / max(ndotl_v, 0.25);
+            vec3 start_pos = pos + N * slope_bias;
+            float jitter = hash12(gl_FragCoord.xy + vec2(17.0, 31.0));
+            for (int i = 1; i <= 16; ++i) {
+                if (float(i) > contact_params.z) break;
+                vec3 rp = start_pos + ldir_v * ((float(i) - 0.5 + jitter * 0.5) * step_len);
+                vec4 rclip = proj * vec4(rp, 1.0);
+                vec2 ruv = vec2(rclip.x / rclip.w * 0.5 + 0.5, 0.5 - rclip.y / rclip.w * 0.5);
+                if (ruv.x < 0.0 || ruv.x > 1.0 || ruv.y < 0.0 || ruv.y > 1.0) break;
+                float rd = texture(u_depth, ruv).r;
+                vec3 rvp = reconstructViewPos(ruv, rd);
+                float dz = rvp.z - rp.z;
+                if (dz > slope_bias && dz < contact_params.y + slope_bias) {
+                    occ_c = 1.0;
+                    break;
+                }
             }
+            float fade_n = smoothstep(0.08, 0.28, ndotl_v);
+            contact = 1.0 - occ_c * contact_params.x * dist_fade * fade_n;
         }
-        contact = 1.0 - occ_c * contact_params.x * dist_fade;
     }
 
     frag_color = vec4(ao, contact, 1.0, 1.0);
