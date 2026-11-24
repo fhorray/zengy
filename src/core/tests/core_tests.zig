@@ -858,3 +858,48 @@ test "Query change filters require enableChangeTracking; pre-existing components
     defer q.deinit();
     try testing.expect(q.next() == null);
 }
+
+test "CommandBuffer.apply is atomic with respect to allocation failure" {
+    var fail_index: usize = 0;
+    var saw_failure = false;
+    var saw_success = false;
+    while (fail_index < 200) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var world = engine.World.init(failing.allocator(), .{ .index = 0, .generation = 1 });
+        defer world.deinit();
+        var events = engine.EventBus.init(testing.allocator, 8, .drop_newest);
+        defer events.deinit();
+        var cmds = engine.CommandBuffer.init(testing.allocator);
+        defer cmds.deinit();
+
+        const keep = try world.spawn();
+        try world.set(keep, Health, .{ .hp = 7 });
+        const victim = try world.spawn();
+        try world.set(victim, Health, .{ .hp = 9 });
+        const entities_before = world.entity_count;
+
+        const p1 = try cmds.spawn();
+        const p2 = try cmds.spawn();
+        try cmds.set(p1, Health, .{ .hp = 1 });
+        try cmds.set(p2, Shield, .{ .v = 2 });
+        try cmds.set(keep, Shield, .{ .v = 3 });
+        try cmds.despawn(victim);
+
+        failing.fail_index = failing.alloc_index + fail_index;
+        if (cmds.apply(&world, &events)) |_| {
+            saw_success = true;
+            try testing.expectEqual(entities_before + 2 - 1, world.entity_count);
+            try testing.expect(!world.isAlive(victim));
+            try testing.expectEqual(@as(i32, 3), world.getConst(keep, Shield).?.v);
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            saw_failure = true;
+            // Nothing visible happened: same entities, no new components, victim intact.
+            try testing.expectEqual(entities_before, world.entity_count);
+            try testing.expect(world.isAlive(victim));
+            try testing.expectEqual(@as(i32, 9), world.getConst(victim, Health).?.hp);
+            try testing.expect(!world.has(keep, Shield));
+        }
+    }
+    try testing.expect(saw_failure and saw_success);
+}

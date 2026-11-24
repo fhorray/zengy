@@ -177,27 +177,68 @@ pub const CommandBuffer = struct {
 
         defer self.clear();
 
+        // Transactional structure: every step that can run out of memory happens before the first
+        // visible mutation, so an OutOfMemory leaves the world exactly as it was (only newly
+        // registered component types remain, which is harmless).
+        //  1. register every component type the buffer introduces,
+        //  2. reserve the free list for despawns and for undoing step 3,
+        //  3. spawn all pending entities (undone on failure),
+        //  4. reserve component storage for every set,
+        //  5. run the remaining commands in order; they can no longer fail on allocation.
+        var despawn_count: usize = 0;
+        for (self.commands.items) |cmd| {
+            switch (cmd) {
+                .set_raw => |s| _ = try world.registerComponentDesc(.{
+                    .name = s.type_name,
+                    .size = s.bytes.len,
+                    .alignment = s.alignment,
+                }),
+                .despawn => despawn_count += 1,
+                else => {},
+            }
+        }
+        try world.reserveDespawns(despawn_count + self.pending_spawns);
+
         var spawned: std.ArrayList(EntityHandle) = .empty;
         try spawned.ensureTotalCapacity(self.arena.allocator(), self.pending_spawns);
+        errdefer for (spawned.items) |e| {
+            _ = world.despawn(e) catch unreachable; // free list reserved above
+        };
+        for (self.commands.items) |cmd| {
+            if (cmd == .spawn_empty) spawned.appendAssumeCapacity(try world.spawn());
+        }
+
+        const Need = struct { extra: usize, max_index: u32 };
+        var needs: std.AutoHashMapUnmanaged(ComponentTypeId, Need) = .empty;
+        defer needs.deinit(self.allocator);
+        for (self.commands.items) |cmd| {
+            switch (cmd) {
+                .set_raw => |s| {
+                    const target = resolveEntity(s.entity, spawned.items);
+                    if (!world.isAlive(target)) continue;
+                    const gop = try needs.getOrPut(self.allocator, s.type_id);
+                    if (!gop.found_existing) gop.value_ptr.* = .{ .extra = 0, .max_index = 0 };
+                    gop.value_ptr.extra += 1;
+                    gop.value_ptr.max_index = @max(gop.value_ptr.max_index, target.index);
+                },
+                else => {},
+            }
+        }
+        var need_it = needs.iterator();
+        while (need_it.next()) |entry| {
+            try world.reserveComponentSlots(entry.key_ptr.*, entry.value_ptr.extra, entry.value_ptr.max_index);
+        }
 
         for (self.commands.items) |cmd| {
             switch (cmd) {
-                .spawn_empty => {
-                    const real = try world.spawn();
-                    spawned.appendAssumeCapacity(real);
-                },
+                .spawn_empty => {}, // already spawned in step 3
                 .despawn => |e| {
                     _ = try world.despawn(resolveEntity(e, spawned.items));
                 },
                 .set_raw => |s| {
-                    const tid = try world.registerComponentDesc(.{
-                        .name = s.type_name,
-                        .size = s.bytes.len,
-                        .alignment = s.alignment,
-                    });
                     const target = resolveEntity(s.entity, spawned.items);
                     if (world.isAlive(target)) {
-                        try world.setRaw(target, tid, s.bytes);
+                        try world.setRaw(target, s.type_id, s.bytes);
                     }
                 },
                 .remove_raw => |r| {

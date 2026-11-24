@@ -438,6 +438,18 @@ pub const World = struct {
         pool.changed_ticks.items[pool.sparse.items[entity.index]] = self.tick;
     }
 
+    /// Pre-allocates room for `extra` more components of type `tid` on entities up to slot
+    /// `max_entity_index`, so subsequent `setRaw` calls for them cannot hit OutOfMemory.
+    pub fn reserveComponentSlots(self: *World, tid: ComponentTypeId, extra: usize, max_entity_index: u32) !void {
+        const pool = self.pools.get(tid) orelse return error.ComponentNotRegistered;
+        try pool.reserve(self.allocator, extra, max_entity_index);
+    }
+
+    /// Pre-allocates the free list so `n` future despawns cannot hit OutOfMemory.
+    pub fn reserveDespawns(self: *World, n: usize) !void {
+        try self.free_indices.ensureUnusedCapacity(self.allocator, n);
+    }
+
     pub fn spawn(self: *World) !EntityHandle {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
 
