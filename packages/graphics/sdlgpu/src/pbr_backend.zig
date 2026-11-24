@@ -724,7 +724,8 @@ pub const PbrGpuState = struct {
                     .{ .x = 0, .y = 0, .z = -1 }, .{ .x = 0, .y = 0, .z = 1 },
                     .{ .x = 0, .y = 1, .z = 0 },  .{ .x = 0, .y = 1, .z = 0 },
                 };
-                const p_proj = perspectiveMat(std.math.pi * 0.5, 1.0, 0.1, @max(pl.range, 1.0));
+                // Slightly >90 deg FOV (92 deg) provides an 8-texel overlap margin to eliminate 45-degree cubemap seams.
+                const p_proj = perspectiveMat(std.math.pi * 0.512, 1.0, 0.1, @max(pl.range, 1.0));
                 const eye = math3d.Vec3{ .x = pl.position[0], .y = pl.position[1], .z = pl.position[2] };
                 for (0..6) |f| {
                     const tidx = next_tile + f;
@@ -804,9 +805,10 @@ pub const PbrGpuState = struct {
             const lsh_pass = c.SDL_BeginGPURenderPass(cmd_buf, null, 0, &lsh_depth) orelse return error.SdlGpuFailure;
             c.SDL_BindGPUGraphicsPipeline(lsh_pass, self.shadow_pipeline);
             for (0..next_tile) |tidx| {
-                const tx: f32 = @floatFromInt(tidx % 4);
-                const ty: f32 = @floatFromInt(tidx / 4);
-                c.SDL_SetGPUViewport(lsh_pass, &.{ .x = tx * 512.0, .y = ty * 512.0, .w = 512.0, .h = 512.0, .min_depth = 0, .max_depth = 1 });
+                const tx: i32 = @intCast(tidx % 4);
+                const ty: i32 = @intCast(tidx / 4);
+                c.SDL_SetGPUViewport(lsh_pass, &.{ .x = @floatFromInt(tx * 512), .y = @floatFromInt(ty * 512), .w = 512.0, .h = 512.0, .min_depth = 0, .max_depth = 1 });
+                c.SDL_SetGPUScissor(lsh_pass, &.{ .x = tx * 512, .y = ty * 512, .w = 512, .h = 512 });
                 const lvp = math3d.Mat4{ .m = local_sh_data.shadow_vp[tidx] };
                 for (self.queued_draws.items) |qm| {
                     const gm = meshes.get(@bitCast(qm.mesh_asset)) orelse continue;
