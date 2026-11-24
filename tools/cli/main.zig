@@ -96,17 +96,20 @@ fn packageDir(name: []const u8) []const u8 {
 
 fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: OfficialPackageInfo) !void {
     const dir = packageDir(pkg.name);
+    // `mkdir -p` does not exist in cmd.exe (it creates a folder literally named "-p"), so the
+    // directory creation is spelled per shell.
+    const mk = if (builtin.os.tag == .windows) "(if not exist packages mkdir packages)" else "mkdir -p packages";
     const shell_cmd = if (pkg.third_party) |tp|
         try std.fmt.allocPrint(
             allocator,
-            "mkdir -p packages && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s} zigeng-main/packages/{s}",
-            .{ dir, packageDir(tp) },
+            "{s} && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s} zigeng-main/packages/{s}",
+            .{ mk, dir, packageDir(tp) },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "mkdir -p packages && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s}",
-            .{dir},
+            "{s} && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s}",
+            .{ mk, dir },
         );
     defer allocator.free(shell_cmd);
 
@@ -511,6 +514,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, cmd, "install") or std.mem.eql(u8, cmd, "i")) {
+        g_fork_path = init.environ_map.get("ZIGENG_FORK");
+        while (args_it.next()) |a| {
+            if (std.mem.startsWith(u8, a, "--fork=")) g_fork_path = a["--fork=".len..];
+        }
         try installFromGameToml(allocator, init.io);
         return;
     }

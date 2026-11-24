@@ -1,0 +1,2 @@
+# Plugins installed by `zigeng add` (step 1 of the test). Keep in sync with game.toml.
+../../packages/physics/jolt
