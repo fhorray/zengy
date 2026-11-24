@@ -18,12 +18,14 @@ fn measureTextSimple(txt: []const u8, scale: f32) struct { width: f32, height: f
     var max_w: f32 = 0;
     var cur_w: f32 = 0;
     var lines: f32 = 1;
+    // Count UTF-8 code points (continuation bytes 0b10xxxxxx add no width) so multi-byte
+    // characters are not measured as several glyphs.
     for (txt) |ch| {
         if (ch == '\n') {
             if (cur_w > max_w) max_w = cur_w;
             cur_w = 0;
             lines += 1;
-        } else {
+        } else if ((ch & 0xC0) != 0x80) {
             cur_w += adv;
         }
     }
@@ -1466,7 +1468,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.ui.core",
-            .version = "0.4.0",
+            .version = "0.4.1",
             .provides_capabilities = &.{"engine.ui.tree/1"},
             .required_capabilities = &.{"engine.graphics.device/1"},
         },

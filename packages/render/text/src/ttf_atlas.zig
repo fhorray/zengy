@@ -44,6 +44,9 @@ pub const FIRA_SANS_REGULAR: []const u8 = @embedFile("FiraSans-Regular.ttf");
 /// Embedded official Lucide Icons TTF bytes (ISC License).
 pub const LUCIDE_TTF: []const u8 = @embedFile("lucide.ttf");
 
+/// Line pitch as a multiple of the text height, shared by measurement and drawing.
+const line_spacing: f32 = 1.25;
+
 /// Baked proportional TTF glyph atlas for ASCII 32..126.
 pub const TtfAtlas = struct {
     allocator: std.mem.Allocator,
@@ -107,18 +110,20 @@ pub const TtfAtlas = struct {
         var max_w: f32 = 0;
         var cur_w: f32 = 0;
         var lines: f32 = 1;
-        for (text) |ch| {
-            if (ch == '\n') {
+        var i: usize = 0;
+        while (i < text.len) {
+            const cp = text_pkg.nextCodepoint(text, &i);
+            if (cp == '\n') {
                 if (cur_w > max_w) max_w = cur_w;
                 cur_w = 0;
                 lines += 1;
             } else {
-                const idx: usize = if (ch >= 32 and ch <= 126) ch - 32 else 0;
-                cur_w += self.chars[idx].xadvance * s;
+                cur_w += self.chars[text_pkg.atlasChar(cp) - 32].xadvance * s;
             }
         }
         if (cur_w > max_w) max_w = cur_w;
-        return .{ .width = max_w, .height = lines * target_px_h };
+        // Same line pitch (`line_spacing`) as emitTextQuads so measured and drawn heights agree.
+        return .{ .width = max_w, .height = target_px_h + (lines - 1) * target_px_h * line_spacing };
     }
 
     /// Emits proportional textured quads for `text` at target pixel height `target_px_h`.
@@ -138,15 +143,16 @@ pub const TtfAtlas = struct {
         const aw: f32 = @floatFromInt(self.width);
         const ah: f32 = @floatFromInt(self.height);
 
-        for (text) |ch| {
-            if (ch == '\n') {
+        var i: usize = 0;
+        while (i < text.len) {
+            const cp = text_pkg.nextCodepoint(text, &i);
+            if (cp == '\n') {
                 pen_x = x;
-                pen_y += target_px_h * 1.25;
+                pen_y += target_px_h * line_spacing;
                 continue;
             }
-            const idx: usize = if (ch >= 32 and ch <= 126) ch - 32 else 0;
-            const bc = self.chars[idx];
-            if (ch != ' ') {
+            const bc = self.chars[text_pkg.atlasChar(cp) - 32];
+            if (cp != ' ') {
                 const gw = @as(f32, @floatFromInt(bc.x1 - bc.x0)) * s;
                 const gh = @as(f32, @floatFromInt(bc.y1 - bc.y0)) * s;
                 if (gw > 0 and gh > 0) {

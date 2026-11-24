@@ -174,6 +174,37 @@ pub fn generateFontAtlasRgba8(allocator: std.mem.Allocator) ![]u8 {
 
 /// Returns normalized atlas UV coordinates for an ASCII character.
 /// Non-ASCII or control characters fall back to space (' ').
+/// Decodes the UTF-8 code point at `i.*` and advances `i.*` past it. A malformed byte yields
+/// U+FFFD and consumes exactly one byte, so a text run always makes progress and one code point is
+/// always one glyph (previously every byte of a multi-byte character became its own glyph).
+pub fn nextCodepoint(text: []const u8, i: *usize) u21 {
+    const len = std.unicode.utf8ByteSequenceLength(text[i.*]) catch {
+        i.* += 1;
+        return 0xFFFD;
+    };
+    if (i.* + len > text.len) {
+        i.* += 1;
+        return 0xFFFD;
+    }
+    const cp = std.unicode.utf8Decode(text[i.* .. i.* + len]) catch {
+        i.* += 1;
+        return 0xFFFD;
+    };
+    i.* += len;
+    return cp;
+}
+
+/// Maps a code point to the ASCII glyph used to draw it: printable ASCII as is, everything the
+/// atlas lacks as `?` (visible) instead of a blank.
+pub fn atlasChar(cp: u21) u8 {
+    return if (cp >= 32 and cp <= 126) @intCast(cp) else '?';
+}
+
+/// Vertical distance between consecutive lines at pixel `scale` (glyph height plus 2 px of leading).
+pub fn lineAdvance(scale: f32) f32 {
+    return @as(f32, @floatFromInt(GLYPH_H)) * scale + 2.0 * scale;
+}
+
 pub fn glyphUv(ch: u8) UvRect {
     const idx: u32 = if (ch >= 32 and ch <= 126) ch - 32 else 0;
     const col: u32 = idx % ATLAS_COLS;
@@ -199,8 +230,10 @@ pub fn measureText(text: []const u8, scale: f32) TextSize {
     var cur_w: f32 = 0;
     var lines: f32 = 1;
 
-    for (text) |ch| {
-        if (ch == '\n') {
+    var i: usize = 0;
+    while (i < text.len) {
+        const cp = nextCodepoint(text, &i);
+        if (cp == '\n') {
             if (cur_w > max_w) max_w = cur_w;
             cur_w = 0;
             lines += 1;
@@ -209,9 +242,10 @@ pub fn measureText(text: []const u8, scale: f32) TextSize {
         }
     }
     if (cur_w > max_w) max_w = cur_w;
+    // Same line pitch as emitTextQuads, so measured and drawn blocks have identical height.
     return .{
         .width = max_w,
-        .height = lines * line_h,
+        .height = lines * line_h + (lines - 1) * 2.0 * s,
     };
 }
 
@@ -251,14 +285,16 @@ pub fn emitTextQuads(
     var cx = x;
     var cy = y;
 
-    for (text) |ch| {
-        if (ch == '\n') {
+    var ti: usize = 0;
+    while (ti < text.len) {
+        const cp = nextCodepoint(text, &ti);
+        if (cp == '\n') {
             cx = x;
             cy += gh + 2.0 * s;
             continue;
         }
-        if (ch != ' ') {
-            const uv = glyphUv(ch);
+        if (cp != ' ') {
+            const uv = glyphUv(atlasChar(cp));
             try out_quads.append(allocator, .{
                 .x = cx,
                 .y = cy,
