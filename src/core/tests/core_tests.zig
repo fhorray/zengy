@@ -1038,3 +1038,76 @@ test "property: World matches a reference model under random structural operatio
         }
     }
 }
+
+fn migrateStatsV1ToV2(allocator: std.mem.Allocator, old: []const u8) anyerror![]u8 {
+    // v1 { hp: i32 } -> v2 { hp: i32, armor: f32 = 0.5 }
+    const out = try allocator.alloc(u8, 8);
+    @memcpy(out[0..4], old[0..4]);
+    const armor: f32 = 0.5;
+    @memcpy(out[4..8], std.mem.asBytes(&armor));
+    return out;
+}
+
+test "Schema v2: stable ids, portable encoding, and migration chain" {
+    var reg = engine.TypeRegistry.init(testing.allocator);
+    defer reg.deinit();
+
+    const v1 = try reg.registerSchema("game", "Stats", 1, .blittable, &.{.{ .name = "hp", .field_type = .i32_t }});
+    var old_bytes: [4]u8 = undefined;
+    try engine.TypeRegistry.setField(v1, &old_bytes, "hp", .{ .i32_t = 77 });
+
+    // Persist with only v1 known.
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(testing.allocator);
+    try engine.TypeRegistry.encodeComponent(testing.allocator, v1, &old_bytes, &file);
+    try testing.expectEqual(@as(usize, 24 + 4), file.items.len);
+
+    // The stable id does not depend on version, and the encoding has no host padding.
+    const v2 = try reg.registerSchema("game", "Stats", 2, .blittable, &.{
+        .{ .name = "hp", .field_type = .i32_t },
+        .{ .name = "armor", .field_type = .f32_t },
+    });
+    try testing.expectEqual(v1.stable_id, v2.stable_id);
+    try testing.expect(v1.schema_id != v2.schema_id);
+
+    // Without a migration, old data cannot be loaded.
+    try testing.expectError(error.MissingMigration, reg.decodeComponent(testing.allocator, file.items));
+    try reg.registerMigration("game", "Stats", 1, migrateStatsV1ToV2);
+
+    const dec = try reg.decodeComponent(testing.allocator, file.items);
+    defer testing.allocator.free(dec.bytes);
+    try testing.expectEqual(@as(u32, 2), dec.schema.version);
+    try testing.expectEqual(@as(i32, 77), (try engine.TypeRegistry.getField(dec.schema, dec.bytes, "hp")).i32_t);
+    try testing.expectEqual(@as(f32, 0.5), (try engine.TypeRegistry.getField(dec.schema, dec.bytes, "armor")).f32_t);
+    try testing.expectEqual(file.items.len, dec.consumed);
+
+    // Current-version roundtrip with vec fields and padding between fields.
+    const t = try reg.registerSchema("game", "Pose", 1, .blittable, &.{
+        .{ .name = "alive", .field_type = .bool_t },
+        .{ .name = "id", .field_type = .u64_t },
+        .{ .name = "pos", .field_type = .vec3_t },
+    });
+    const pose = try testing.allocator.alloc(u8, t.byte_size);
+    defer testing.allocator.free(pose);
+    @memset(pose, 0);
+    try engine.TypeRegistry.setField(t, pose, "alive", .{ .bool_t = true });
+    try engine.TypeRegistry.setField(t, pose, "id", .{ .u64_t = 0xDEADBEEF });
+    try engine.TypeRegistry.setField(t, pose, "pos", .{ .vec3_t = .{ 1, 2, 3 } });
+    var f2: std.ArrayList(u8) = .empty;
+    defer f2.deinit(testing.allocator);
+    try engine.TypeRegistry.encodeComponent(testing.allocator, t, pose, &f2);
+    try testing.expectEqual(@as(usize, 24 + 1 + 8 + 12), f2.items.len);
+    const d2 = try reg.decodeComponent(testing.allocator, f2.items);
+    defer testing.allocator.free(d2.bytes);
+    try testing.expectEqual(@as(u64, 0xDEADBEEF), (try engine.TypeRegistry.getField(d2.schema, d2.bytes, "id")).u64_t);
+    try testing.expectEqual([3]f32{ 1, 2, 3 }, (try engine.TypeRegistry.getField(d2.schema, d2.bytes, "pos")).vec3_t);
+
+    // Truncated / unknown / too-new inputs are rejected, never misread.
+    try testing.expectError(error.PayloadTruncated, reg.decodeComponent(testing.allocator, f2.items[0 .. f2.items.len - 1]));
+    var bad = try testing.allocator.dupe(u8, f2.items);
+    defer testing.allocator.free(bad);
+    std.mem.writeInt(u32, bad[16..20], 9, .little);
+    try testing.expectError(error.SchemaTooNew, reg.decodeComponent(testing.allocator, bad));
+    std.mem.writeInt(u128, bad[0..16], 12345, .little);
+    try testing.expectError(error.UnknownSchema, reg.decodeComponent(testing.allocator, bad));
+}

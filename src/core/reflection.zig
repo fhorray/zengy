@@ -70,8 +70,17 @@ pub const FieldDescriptor = struct {
 
 pub const SchemaId = u64;
 
+/// Version-independent 128-bit identity of a component type (`namespace.name`). Persisted data
+/// stores this plus a schema version, never a runtime index or a Zig type name hash.
+pub const StableTypeId = u128;
+
+/// Upgrades the raw bytes of version `v` into the layout of version `v + 1`.
+/// The returned buffer is owned by `allocator` (the registry frees it after use).
+pub const MigrationFn = *const fn (allocator: std.mem.Allocator, old_bytes: []const u8) anyerror![]u8;
+
 pub const ComponentSchema = struct {
     schema_id: SchemaId,
+    stable_id: StableTypeId,
     component_type_id: world_mod.ComponentTypeId,
     namespace: []const u8,
     name: []const u8,
@@ -85,6 +94,15 @@ pub const TypeRegistry = struct {
     allocator: std.mem.Allocator,
     schemas: std.AutoHashMapUnmanaged(SchemaId, ComponentSchema),
     name_to_schema: std.StringHashMapUnmanaged(SchemaId),
+    /// Latest registered version per stable type id.
+    latest_version: std.AutoHashMapUnmanaged(StableTypeId, u32) = .empty,
+    /// `(stable id, from version)` -> migration producing `from version + 1`.
+    migrations: std.AutoHashMapUnmanaged(MigrationKey, MigrationFn) = .empty,
+    /// Stable id -> `(namespace, name)` strings borrowed from the schema entries, so decoding can
+    /// find any registered version of a type.
+    stable_names: std.AutoHashMapUnmanaged(StableTypeId, SchemaId) = .empty,
+
+    const MigrationKey = struct { stable_id: StableTypeId, from_version: u32 };
 
     pub fn init(allocator: std.mem.Allocator) TypeRegistry {
         return .{
@@ -105,12 +123,28 @@ pub const TypeRegistry = struct {
             self.allocator.free(schema.fields);
         }
         self.schemas.deinit(self.allocator);
+        self.latest_version.deinit(self.allocator);
+        self.migrations.deinit(self.allocator);
+        self.stable_names.deinit(self.allocator);
 
         var name_it = self.name_to_schema.keyIterator();
         while (name_it.next()) |k| {
             self.allocator.free(k.*);
         }
         self.name_to_schema.deinit(self.allocator);
+    }
+
+    /// Computes the version-independent stable id of `namespace.name` (two independent 64-bit
+    /// hashes concatenated, making accidental collisions negligible).
+    pub fn computeStableId(namespace: []const u8, name: []const u8) StableTypeId {
+        var lo = std.hash.Wyhash.init(0x243f6a8885a308d3);
+        var hi = std.hash.Wyhash.init(0x13198a2e03707344);
+        inline for (.{ &lo, &hi }) |h| {
+            h.update(namespace);
+            h.update(".");
+            h.update(name);
+        }
+        return (@as(u128, hi.final()) << 64) | lo.final();
     }
 
     pub fn computeSchemaId(namespace: []const u8, name: []const u8, version: u32) SchemaId {
@@ -174,6 +208,7 @@ pub const TypeRegistry = struct {
 
         const schema = ComponentSchema{
             .schema_id = schema_id,
+            .stable_id = computeStableId(namespace, name),
             .component_type_id = world_mod.World.dynamicTypeId(full_name),
             .namespace = ns_copy,
             .name = name_copy,
@@ -185,7 +220,12 @@ pub const TypeRegistry = struct {
 
         try self.schemas.ensureUnusedCapacity(self.allocator, 1);
         try self.name_to_schema.ensureUnusedCapacity(self.allocator, 1);
+        try self.latest_version.ensureUnusedCapacity(self.allocator, 1);
+        try self.stable_names.ensureUnusedCapacity(self.allocator, 1);
 
+        const lv = self.latest_version.getOrPutAssumeCapacity(schema.stable_id);
+        if (!lv.found_existing or lv.value_ptr.* < version) lv.value_ptr.* = version;
+        self.stable_names.putAssumeCapacity(schema.stable_id, schema_id);
         self.schemas.putAssumeCapacity(schema_id, schema);
         if (self.name_to_schema.getPtr(full_name)) |existing_sid| {
             existing_sid.* = schema_id;
@@ -194,6 +234,123 @@ pub const TypeRegistry = struct {
             self.name_to_schema.putAssumeCapacity(full_name, schema_id);
         }
         return schema;
+    }
+
+    /// Registers the upgrade from `from_version` to `from_version + 1` of `namespace.name`.
+    pub fn registerMigration(self: *TypeRegistry, namespace: []const u8, name: []const u8, from_version: u32, func: MigrationFn) !void {
+        try self.migrations.put(self.allocator, .{ .stable_id = computeStableId(namespace, name), .from_version = from_version }, func);
+    }
+
+    /// Looks up the schema of a specific version of the type with `stable_id`.
+    pub fn getVersion(self: *const TypeRegistry, stable_id: StableTypeId, version: u32) ?ComponentSchema {
+        const any_sid = self.stable_names.get(stable_id) orelse return null;
+        const any = self.schemas.get(any_sid) orelse return null;
+        return self.schemas.get(computeSchemaId(any.namespace, any.name, version));
+    }
+
+    /// Size of the canonical (little-endian, unpadded) encoding of `schema`'s fields.
+    pub fn encodedPayloadSize(schema: ComponentSchema) usize {
+        var n: usize = 0;
+        for (schema.fields) |f| n += f.field_type.byteSize();
+        return n;
+    }
+
+    const header_size = 16 + 4 + 4;
+
+    /// Appends the portable encoding of one component: `stable_id (u128) | version (u32) |
+    /// payload_len (u32) | fields...` with every field little-endian and unpadded, so files are
+    /// independent of host layout, alignment, and Zig type names.
+    pub fn encodeComponent(allocator: std.mem.Allocator, schema: ComponentSchema, bytes: []const u8, out: *std.ArrayList(u8)) !void {
+        if (bytes.len < schema.byte_size) return error.BufferTooSmall;
+        const payload_len = encodedPayloadSize(schema);
+        try out.ensureUnusedCapacity(allocator, header_size + payload_len);
+        var hdr: [header_size]u8 = undefined;
+        std.mem.writeInt(u128, hdr[0..16], schema.stable_id, .little);
+        std.mem.writeInt(u32, hdr[16..20], schema.version, .little);
+        std.mem.writeInt(u32, hdr[20..24], @intCast(payload_len), .little);
+        out.appendSliceAssumeCapacity(&hdr);
+        for (schema.fields) |f| {
+            const slot = bytes[f.offset .. f.offset + f.field_type.byteSize()];
+            switch (f.field_type) {
+                .bool_t => out.appendAssumeCapacity(if (slot[0] != 0) 1 else 0),
+                .i32_t, .u32_t, .f32_t => out.appendSliceAssumeCapacity(&toLe(u32, slot)),
+                .i64_t, .u64_t, .f64_t => out.appendSliceAssumeCapacity(&toLe(u64, slot)),
+                .vec2_t, .vec3_t, .vec4_t => {
+                    var i: usize = 0;
+                    while (i < slot.len) : (i += 4) out.appendSliceAssumeCapacity(&toLe(u32, slot[i..][0..4]));
+                },
+            }
+        }
+    }
+
+    fn toLe(comptime T: type, slot: []const u8) [@sizeOf(T)]u8 {
+        var out: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &out, std.mem.readInt(T, slot[0..@sizeOf(T)], @import("builtin").cpu.arch.endian()), .little);
+        return out;
+    }
+
+    /// A decoded component upgraded to the latest registered schema version.
+    pub const Decoded = struct {
+        schema: ComponentSchema,
+        /// Component bytes in the host layout of `schema` (free with the decode allocator).
+        bytes: []u8,
+        /// Bytes consumed from the input.
+        consumed: usize,
+    };
+
+    /// Decodes one component written by `encodeComponent`, then applies registered migrations until
+    /// it reaches the latest version. Errors: `UnknownSchema`, `SchemaTooNew` (data is newer than
+    /// this build), `MissingMigration`, `PayloadTruncated`, `PayloadSizeMismatch`.
+    pub fn decodeComponent(self: *const TypeRegistry, allocator: std.mem.Allocator, data: []const u8) !Decoded {
+        if (data.len < header_size) return error.PayloadTruncated;
+        const stable_id = std.mem.readInt(u128, data[0..16], .little);
+        const version = std.mem.readInt(u32, data[16..20], .little);
+        const payload_len: usize = std.mem.readInt(u32, data[20..24], .little);
+        if (data.len < header_size + payload_len) return error.PayloadTruncated;
+        const payload = data[header_size .. header_size + payload_len];
+
+        const latest = self.latest_version.get(stable_id) orelse return error.UnknownSchema;
+        if (version > latest) return error.SchemaTooNew;
+        var schema = self.getVersion(stable_id, version) orelse return error.UnknownSchema;
+        if (payload.len != encodedPayloadSize(schema)) return error.PayloadSizeMismatch;
+
+        var bytes = try allocator.alloc(u8, schema.byte_size);
+        errdefer allocator.free(bytes);
+        @memset(bytes, 0);
+        var cursor: usize = 0;
+        for (schema.fields) |f| {
+            const sz = f.field_type.byteSize();
+            const dst = bytes[f.offset .. f.offset + sz];
+            const src = payload[cursor .. cursor + sz];
+            switch (f.field_type) {
+                .bool_t => dst[0] = if (src[0] != 0) 1 else 0,
+                .i32_t, .u32_t, .f32_t => fromLe(u32, dst, src),
+                .i64_t, .u64_t, .f64_t => fromLe(u64, dst, src),
+                .vec2_t, .vec3_t, .vec4_t => {
+                    var i: usize = 0;
+                    while (i < sz) : (i += 4) fromLe(u32, dst[i..][0..4], src[i..][0..4]);
+                },
+            }
+            cursor += sz;
+        }
+
+        var v = version;
+        while (v < latest) : (v += 1) {
+            const mig = self.migrations.get(.{ .stable_id = stable_id, .from_version = v }) orelse return error.MissingMigration;
+            const upgraded = try mig(allocator, bytes);
+            allocator.free(bytes);
+            bytes = upgraded;
+            schema = self.getVersion(stable_id, v + 1) orelse return error.UnknownSchema;
+            if (bytes.len != schema.byte_size) {
+                allocator.free(bytes);
+                return error.PayloadSizeMismatch;
+            }
+        }
+        return .{ .schema = schema, .bytes = bytes, .consumed = header_size + payload_len };
+    }
+
+    fn fromLe(comptime T: type, dst: []u8, src: []const u8) void {
+        std.mem.writeInt(T, dst[0..@sizeOf(T)], std.mem.readInt(T, src[0..@sizeOf(T)], .little), @import("builtin").cpu.arch.endian());
     }
 
     pub fn getByName(self: *const TypeRegistry, full_name: []const u8) ?ComponentSchema {
