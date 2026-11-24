@@ -461,6 +461,16 @@ pub const Scheduler = struct {
         ctx.world.advanceTick();
         try ctx.commands.apply(ctx.world, ctx.events);
         ctx.world.advanceTick();
+        // Removal events older than every system's last run can no longer be observed.
+        var oldest: u64 = std.math.maxInt(u64);
+        var any = false;
+        for (self.stages) |stage_systems| {
+            for (stage_systems.items) |sys| {
+                oldest = @min(oldest, sys.last_run_tick);
+                any = true;
+            }
+        }
+        if (any) ctx.world.pruneRemoved(oldest);
     }
 
     /// Executes exactly one `.fixed_update` tick deterministically (no accumulator)

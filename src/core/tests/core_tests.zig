@@ -1161,3 +1161,74 @@ test "World.setGuidNamespace partitions GUIDs and is rejected once entities exis
     try testing.expectEqual(@as(u64, 0xB), @as(u64, @truncate(gb >> 64)));
     try testing.expectError(error.WorldNotEmpty, a.setGuidNamespace(0xC));
 }
+
+test "handles from another World are rejected and generations keep the world tag" {
+    var a = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer a.deinit();
+    var b = engine.World.init(testing.allocator, .{ .index = 7, .generation = 1 });
+    defer b.deinit();
+    _ = try a.registerComponent(Health);
+    _ = try b.registerComponent(Health);
+
+    const ea = try a.spawn();
+    const eb = try b.spawn();
+    try a.set(ea, Health, .{ .hp = 1 });
+    try b.set(eb, Health, .{ .hp = 2 });
+    // Same slot index in both worlds, yet neither accepts the other's handle.
+    try testing.expectEqual(ea.index, eb.index);
+    try testing.expect(a.isAlive(ea) and b.isAlive(eb));
+    try testing.expect(!a.isAlive(eb));
+    try testing.expect(!b.isAlive(ea));
+    try testing.expect(a.getConst(eb, Health) == null);
+    try testing.expectError(error.InvalidEntity, b.set(ea, Health, .{}));
+
+    // Recycling bumps only the low 24 bits; the tag survives and stale handles stay dead.
+    _ = try b.despawn(eb);
+    const eb2 = try b.spawn();
+    try testing.expectEqual(eb.index, eb2.index);
+    try testing.expectEqual(eb.generation >> 24, eb2.generation >> 24);
+    try testing.expect(eb.generation != eb2.generation);
+    try testing.expect(!b.isAlive(eb));
+    try testing.expect(b.isAlive(eb2));
+    try testing.expectEqual(@as(u32, 7), eb2.generation >> 24);
+    // World 0 keeps untagged handles (binary compatible with existing data).
+    try testing.expectEqual(@as(u32, 0), ea.generation >> 24);
+}
+
+var removed_seen: u32 = 0;
+fn observeRemoved(ctx: *engine.SystemContext) !void {
+    var it = ctx.world.removedSince(Health);
+    while (it.next()) |_| removed_seen += 1;
+}
+
+test "removed-component events: remove, despawn, per-system visibility, and pruning" {
+    removed_seen = 0;
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.world.enableChangeTracking(Health);
+    try app.addSystem(.{ .name = "obs.removed", .stage = .update, .run = observeRemoved });
+
+    const a = try app.world.spawn();
+    const b = try app.world.spawn();
+    const c = try app.world.spawn();
+    for ([_]engine.EntityHandle{ a, b, c }) |e| try app.world.set(e, Health, .{});
+
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 0), removed_seen);
+
+    try testing.expect(try app.world.remove(a, Health)); // explicit removal
+    _ = try app.world.despawn(b); // despawn also reports
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 2), removed_seen);
+
+    // Already observed: not reported again, and the log gets pruned.
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 2), removed_seen);
+    const pool = app.world.pools.get(engine.World.comptimeTypeId(Health)).?;
+    try testing.expectEqual(@as(usize, 0), pool.removed_log.items.len);
+
+    // Removing something that was never there logs nothing.
+    try testing.expect(!(try app.world.remove(a, Health)));
+    try app.tick(1.0 / 60.0);
+    try testing.expectEqual(@as(u32, 2), removed_seen);
+}

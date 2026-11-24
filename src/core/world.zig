@@ -17,7 +17,10 @@
 //! - Pointers from `get`/`getRaw`/`Query` rows are valid only until the next structural
 //!   mutation (`spawn`, `despawn`, `set` of a new component, `remove`, `CommandBuffer.apply`);
 //!   never store them across stages. Mutable access marks tracked components as changed.
-//! - An `EntityHandle` does not encode its `World`: never pass handles between Worlds.
+//! - The top 8 bits of a handle's generation carry `WorldId.index & 0xFF`, so a handle from another
+//!   World is rejected by `isAlive`/`get`/`set` (worlds sharing those 8 bits cannot tell each other apart).
+//! - `removedSince(T)` reports removals/despawns of tracked components per system; the scheduler prunes
+//!   the log once every system has seen it.
 //! - `active_queries` tracks open iterators and rejects structural mutations (`spawn`,
 //!   `despawn`, `set`, `remove`) while a query is active; use `CommandBuffer` instead.
 
@@ -63,6 +66,12 @@ const ABSENT_INDEX: u32 = std.math.maxInt(u32);
 /// Largest component alignment supported by pool backing storage (bytes).
 pub const max_component_alignment: usize = 64;
 
+/// One logged component removal (see `World.removedSince`). `entity` is stale by now.
+pub const RemovedRecord = struct {
+    entity: EntityHandle,
+    tick: u64,
+};
+
 /// Schema metadata used to register and validate component pools (name, size, alignment, version).
 pub const ComponentDescriptor = struct {
     name: []const u8,
@@ -88,6 +97,8 @@ const ComponentPool = struct {
     tracked: bool = false,
     added_ticks: std.ArrayList(u64) = .empty,
     changed_ticks: std.ArrayList(u64) = .empty,
+    /// Components removed (or despawned) while tracked; consumed through `World.removedSince`.
+    removed_log: std.ArrayList(RemovedRecord) = .empty,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -123,6 +134,12 @@ const ComponentPool = struct {
         self.dense_bytes.deinit(allocator);
         self.added_ticks.deinit(allocator);
         self.changed_ticks.deinit(allocator);
+        self.removed_log.deinit(allocator);
+    }
+
+    /// Reserves room for one removal record so `remove` itself can never fail.
+    fn reserveRemoval(self: *ComponentPool, allocator: std.mem.Allocator) !void {
+        if (self.tracked) try self.removed_log.ensureUnusedCapacity(allocator, 1);
     }
 
     /// Starts tracking; components that already exist are stamped with tick 0 (never "new").
@@ -218,8 +235,11 @@ const ComponentPool = struct {
         self.sparse.items[entity.index] = new_dense;
     }
 
-    pub fn remove(self: *ComponentPool, entity: EntityHandle) bool {
+    /// Removes `entity`'s component. For tracked pools a record is logged at `tick`; callers must
+    /// have called `reserveRemoval` first.
+    pub fn remove(self: *ComponentPool, entity: EntityHandle, tick: u64) bool {
         if (!self.has(entity)) return false;
+        if (self.tracked) self.removed_log.appendAssumeCapacity(.{ .entity = entity, .tick = tick });
         const dense_idx = self.sparse.items[entity.index];
         const last_idx: u32 = @intCast(self.dense_entities.items.len - 1);
 
@@ -269,6 +289,10 @@ pub const World = struct {
     name_to_type: std.StringHashMapUnmanaged(ComponentTypeId),
     active_queries: u32,
     entity_count: usize,
+    /// High 8 bits of every generation this world hands out (`WorldId.index & 0xFF`), so a handle
+    /// minted by another world never validates here. World index 0 uses tag 0, which keeps its
+    /// handles identical to untagged ones. Worlds whose ids differ only above 8 bits share a tag.
+    gen_tag: u32,
     /// Monotonic change-detection clock; see `advanceTick`.
     tick: u64 = 1,
     /// Tick after which `.added`/`.changed` query filters match. The scheduler sets this to the
@@ -291,6 +315,7 @@ pub const World = struct {
             .name_to_type = .empty,
             .active_queries = 0,
             .entity_count = 0,
+            .gen_tag = (id.index & 0xFF) << 24,
         };
     }
 
@@ -465,6 +490,47 @@ pub const World = struct {
         try self.free_indices.ensureUnusedCapacity(self.allocator, n);
     }
 
+    /// Iterator over entities whose tracked component `T` was removed (or whose entity was
+    /// despawned) after the current query threshold. Yields stale handles: use them as ids only.
+    pub const RemovedIterator = struct {
+        records: []const RemovedRecord,
+        since: u64,
+        pos: usize = 0,
+
+        pub fn next(self: *RemovedIterator) ?EntityHandle {
+            while (self.pos < self.records.len) {
+                const r = self.records[self.pos];
+                self.pos += 1;
+                if (r.tick > self.since) return r.entity;
+            }
+            return null;
+        }
+    };
+
+    /// Removal events for `T` since the running system last ran (all unpruned events outside
+    /// systems). Requires `enableChangeTracking(T)`; untracked or unknown types yield nothing.
+    pub fn removedSince(self: *const World, comptime T: type) RemovedIterator {
+        const pool = self.pools.get(comptimeTypeId(T)) orelse return .{ .records = &.{}, .since = 0 };
+        return .{ .records = pool.removed_log.items, .since = self.query_since };
+    }
+
+    /// Drops removal records at or before `tick`. The scheduler calls this with the oldest
+    /// `last_run_tick` of all systems after each stage; call it yourself when driving a world
+    /// without a scheduler, otherwise logs of tracked pools grow without bound.
+    pub fn pruneRemoved(self: *World, tick: u64) void {
+        for (self.pool_list.items) |pool| {
+            if (!pool.tracked) continue;
+            var kept: usize = 0;
+            for (pool.removed_log.items) |r| {
+                if (r.tick > tick) {
+                    pool.removed_log.items[kept] = r;
+                    kept += 1;
+                }
+            }
+            pool.removed_log.shrinkRetainingCapacity(kept);
+        }
+    }
+
     pub fn spawn(self: *World) !EntityHandle {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
 
@@ -487,11 +553,11 @@ pub const World = struct {
         self.next_guid += 1;
         const idx: u32 = @intCast(self.generations.items.len);
         self.membership.appendNTimesAssumeCapacity(0, self.membership_words);
-        self.generations.appendAssumeCapacity(1);
+        self.generations.appendAssumeCapacity(self.gen_tag | 1);
         self.alive_flags.appendAssumeCapacity(true);
         self.guids.appendAssumeCapacity(guid);
         self.entity_count += 1;
-        return .{ .index = idx, .generation = 1 };
+        return .{ .index = idx, .generation = self.gen_tag | 1 };
     }
 
     pub fn despawn(self: *World, entity: EntityHandle) !bool {
@@ -500,23 +566,32 @@ pub const World = struct {
 
         try self.free_indices.ensureUnusedCapacity(self.allocator, 1);
 
-        // Visit only the pools that actually hold this entity.
+        // Visit only the pools that actually hold this entity. Reserve removal-log space in every
+        // tracked pool first so the mutation below cannot fail half-way.
         const row = self.membershipRow(entity.index);
+        for (row, 0..) |word, wi| {
+            var bits = word;
+            while (bits != 0) {
+                const bit = @ctz(bits);
+                bits &= bits - 1;
+                try self.pool_list.items[wi * 64 + bit].reserveRemoval(self.allocator);
+            }
+        }
         for (row, 0..) |*word, wi| {
             var bits = word.*;
             while (bits != 0) {
                 const bit = @ctz(bits);
                 bits &= bits - 1;
-                _ = self.pool_list.items[wi * 64 + bit].remove(entity);
+                _ = self.pool_list.items[wi * 64 + bit].remove(entity, self.tick);
             }
             word.* = 0;
         }
 
         self.alive_flags.items[entity.index] = false;
-        self.generations.items[entity.index] +%= 1;
-        if (self.generations.items[entity.index] == 0) {
-            self.generations.items[entity.index] = 1;
-        }
+        // Only the low 24 bits count; the world tag stays put.
+        var low = (self.generations.items[entity.index] +% 1) & 0x00FF_FFFF;
+        if (low == 0) low = 1;
+        self.generations.items[entity.index] = self.gen_tag | low;
         self.free_indices.appendAssumeCapacity(entity.index);
         self.entity_count -= 1;
         return true;
@@ -583,7 +658,7 @@ pub const World = struct {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
         if (!self.isAlive(entity)) return false;
         const pool = self.pools.get(comptimeTypeId(T)) orelse return false;
-        return self.removeFromPool(entity, pool);
+        return try self.removeFromPool(entity, pool);
     }
 
     /// Removes the component identified by `tid` from `entity`; returns whether it was present.
@@ -591,11 +666,12 @@ pub const World = struct {
         if (self.active_queries > 0) return error.MutationDuringActiveQuery;
         if (!self.isAlive(entity)) return false;
         const pool = self.pools.get(tid) orelse return false;
-        return self.removeFromPool(entity, pool);
+        return try self.removeFromPool(entity, pool);
     }
 
-    fn removeFromPool(self: *World, entity: EntityHandle, pool: *ComponentPool) bool {
-        if (!pool.remove(entity)) return false;
+    fn removeFromPool(self: *World, entity: EntityHandle, pool: *ComponentPool) !bool {
+        try pool.reserveRemoval(self.allocator);
+        if (!pool.remove(entity, self.tick)) return false;
         self.clearMember(entity.index, pool);
         return true;
     }
