@@ -920,27 +920,86 @@ pub const UiTree = struct {
         self.focused_node = null;
     }
 
-    /// Cycles keyboard focus (`Tab` / `Shift+Tab`) across visible, enabled, focusable nodes.
-    pub fn focusNext(self: *UiTree, reverse: bool) ?usize {
-        var candidates: [256]usize = undefined;
-        var count: usize = 0;
-        for (self.nodes.items, 0..) |n, idx| {
-            if (n.alive and n.style.visible and !n.disabled and n.focusable and count < candidates.len) {
-                candidates[count] = idx;
-                count += 1;
+    /// True when `idx` is alive and it and every ancestor is visible.
+    pub fn isEffectivelyVisible(self: *const UiTree, idx: usize) bool {
+        var cur: ?usize = idx;
+        while (cur) |i| {
+            if (i >= self.nodes.items.len) return false;
+            const n = &self.nodes.items[i];
+            if (!n.alive or !n.style.visible) return false;
+            cur = n.parent;
+        }
+        return true;
+    }
+
+    /// True when `idx` is `ancestor` or lies inside its subtree.
+    pub fn isInSubtree(self: *const UiTree, idx: usize, ancestor: usize) bool {
+        var cur: ?usize = idx;
+        while (cur) |i| {
+            if (i == ancestor) return true;
+            if (i >= self.nodes.items.len) return false;
+            cur = self.nodes.items[i].parent;
+        }
+        return false;
+    }
+
+    /// Returns the topmost visible root in `UiLayer.modal` (the focus scope while a modal is open).
+    pub fn activeModalRoot(self: *const UiTree) ?usize {
+        var i = self.roots.items.len;
+        while (i > 0) {
+            i -= 1;
+            const r = self.roots.items[i];
+            if (r < self.nodes.items.len) {
+                const n = &self.nodes.items[r];
+                if (n.alive and n.style.visible and n.style.layer == .modal) return r;
             }
+        }
+        return null;
+    }
+
+    fn isFocusCandidate(self: *const UiTree, idx: usize, modal: ?usize) bool {
+        const n = &self.nodes.items[idx];
+        if (!n.alive or n.disabled or !n.focusable or !self.isEffectivelyVisible(idx)) return false;
+        if (modal) |m| return self.isInSubtree(idx, m);
+        return true;
+    }
+
+    /// Drops focus when the focused node was destroyed, hidden (itself or via an ancestor such as a
+    /// closed popover), or sits outside the active modal, so keyboard input never reaches
+    /// invisible or blocked widgets.
+    pub fn sanitizeFocus(self: *UiTree) void {
+        const f = self.focused_node orelse return;
+        const modal = self.activeModalRoot();
+        const valid = f < self.nodes.items.len and self.nodes.items[f].alive and
+            self.isEffectivelyVisible(f) and (modal == null or self.isInSubtree(f, modal.?));
+        if (!valid) self.setFocus(null, false);
+    }
+
+    /// Returns `idx` or its nearest ancestor that is focusable, if any.
+    pub fn focusableAncestorOrSelf(self: *const UiTree, idx: usize) ?usize {
+        var cur: ?usize = idx;
+        while (cur) |i| {
+            if (i >= self.nodes.items.len) return null;
+            const n = &self.nodes.items[i];
+            if (n.alive and n.focusable and !n.disabled) return i;
+            cur = n.parent;
+        }
+        return null;
+    }
+
+    /// Moves keyboard focus to the next (or previous) focusable node in tree order, wrapping at the
+    /// ends. Hidden nodes (including children of hidden ancestors) are skipped, and while a modal
+    /// is open focus is confined to it. Any number of focusable nodes is supported.
+    pub fn focusNext(self: *UiTree, reverse: bool) ?usize {
+        const modal = self.activeModalRoot();
+        var count: usize = 0;
+        var cur_pos: ?usize = null;
+        for (self.nodes.items, 0..) |_, idx| {
+            if (!self.isFocusCandidate(idx, modal)) continue;
+            if (self.focused_node == idx) cur_pos = count;
+            count += 1;
         }
         if (count == 0) return null;
-
-        var cur_pos: ?usize = null;
-        if (self.focused_node) |f| {
-            for (candidates[0..count], 0..) |c, ci| {
-                if (c == f) {
-                    cur_pos = ci;
-                    break;
-                }
-            }
-        }
 
         const next_pos: usize = if (cur_pos) |cp| blk: {
             if (reverse) {
@@ -950,9 +1009,16 @@ pub const UiTree = struct {
             }
         } else (if (reverse) count - 1 else 0);
 
-        const target = candidates[next_pos];
-        self.setFocus(target, true);
-        return target;
+        var pos: usize = 0;
+        for (self.nodes.items, 0..) |_, idx| {
+            if (!self.isFocusCandidate(idx, modal)) continue;
+            if (pos == next_pos) {
+                self.setFocus(idx, true);
+                return idx;
+            }
+            pos += 1;
+        }
+        return null;
     }
 
     /// Scrolls the nearest scrollable ancestor containing `(px, py)`.
@@ -1400,7 +1466,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.ui.core",
-            .version = "0.3.0",
+            .version = "0.4.0",
             .provides_capabilities = &.{"engine.ui.tree/1"},
             .required_capabilities = &.{"engine.graphics.device/1"},
         },

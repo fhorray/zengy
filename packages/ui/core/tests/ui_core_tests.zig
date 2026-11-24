@@ -195,3 +195,54 @@ test "UiTree text editing moves, inserts, and deletes whole UTF-8 code points" {
     try testing.expect(!(try tree.handleTextInput("\xff\xfe")));
     try testing.expectEqualStrings("aéñ", tree.nodes.items[tb].text);
 }
+
+test "UiTree focus: skips hidden subtrees, traps Tab inside a modal, sanitizes stale focus, and handles many nodes" {
+    var tree = ui_core.UiTree.init(testing.allocator);
+    defer tree.deinit();
+
+    const page = try tree.createNode(null, .{ .id = "page", .kind = .panel });
+    const b1 = try tree.createNode(page, .{ .id = "b1", .kind = .button });
+    const hidden_panel = try tree.createNode(page, .{ .id = "hp", .kind = .panel });
+    const hidden_btn = try tree.createNode(hidden_panel, .{ .id = "hb", .kind = .button });
+    const b2 = try tree.createNode(page, .{ .id = "b2", .kind = .button });
+    tree.nodes.items[hidden_panel].style.visible = false;
+
+    // Child of a hidden ancestor is not reachable by Tab even though its own flag is visible.
+    try testing.expect(!tree.isEffectivelyVisible(hidden_btn));
+    try testing.expectEqual(@as(?usize, b1), tree.focusNext(false));
+    try testing.expectEqual(@as(?usize, b2), tree.focusNext(false));
+    try testing.expectEqual(@as(?usize, b1), tree.focusNext(false));
+
+    // Focus on a node whose ancestor gets hidden is dropped by sanitizeFocus.
+    tree.nodes.items[hidden_panel].style.visible = true;
+    tree.setFocus(hidden_btn, true);
+    tree.nodes.items[hidden_panel].style.visible = false;
+    tree.sanitizeFocus();
+    try testing.expect(tree.focused_node == null);
+    try testing.expect(!tree.nodes.items[hidden_btn].focused);
+
+    // Modal traps Tab: only its descendants are candidates, and outside focus is cleared.
+    const modal = try tree.createNode(null, .{ .id = "m", .kind = .panel, .style = .{ .layer = .modal } });
+    const m1 = try tree.createNode(modal, .{ .id = "m1", .kind = .button });
+    const m2 = try tree.createNode(modal, .{ .id = "m2", .kind = .button });
+    tree.setFocus(b1, true);
+    tree.sanitizeFocus();
+    try testing.expect(tree.focused_node == null);
+    try testing.expectEqual(@as(?usize, m1), tree.focusNext(false));
+    try testing.expectEqual(@as(?usize, m2), tree.focusNext(false));
+    try testing.expectEqual(@as(?usize, m1), tree.focusNext(false));
+    try testing.expectEqual(@as(?usize, m2), tree.focusNext(true)); // reverse wraps within the modal
+    tree.nodes.items[modal].style.visible = false;
+    try testing.expectEqual(@as(?usize, b1), tree.focusNext(false)); // modal closed: back to page
+
+    // More than 256 focusable nodes: every one is reachable.
+    var tree2 = ui_core.UiTree.init(testing.allocator);
+    defer tree2.deinit();
+    const root = try tree2.createNode(null, .{ .id = "r", .kind = .panel });
+    for (0..400) |_| _ = try tree2.createNode(root, .{ .id = "", .kind = .button });
+    var visited: usize = 0;
+    var last: ?usize = null;
+    while (visited < 400) : (visited += 1) last = tree2.focusNext(false);
+    try testing.expectEqual(@as(?usize, 400), last); // 400th button is node index 400 (root is 0)
+    try testing.expectEqual(@as(?usize, 1), tree2.focusNext(false)); // wraps
+}

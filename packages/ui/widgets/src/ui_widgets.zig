@@ -259,6 +259,12 @@ pub const WidgetManager = struct {
         dt_ms: f32,
     ) !void {
         self.event_queue.clear();
+        // Never keep keyboard focus on destroyed, hidden, or modal-blocked nodes.
+        if (tree.focused_node) |pf| {
+            const before = pf;
+            tree.sanitizeFocus();
+            if (tree.focused_node == null) try self.clearFocusedEditState(tree, before);
+        }
         // Caret blinking is driven by real elapsed time, not by how often frames run.
         tree.frame_dt_s = if (std.math.isFinite(dt_ms)) std.math.clamp(dt_ms / 1000.0, 0.0, 0.25) else 0.0;
 
@@ -325,7 +331,9 @@ pub const WidgetManager = struct {
             const prev_focus = tree.focused_node;
             if (hit_opt) |h_idx| {
                 if (!tree.nodes.items[h_idx].disabled) {
-                    tree.setFocus(h_idx, false);
+                    // Focus the nearest focusable (or widget-bound) ancestor; clicking plain
+                    // chrome blurs the current focus instead of focusing a decorative node.
+                    tree.setFocus(self.focusTargetFor(tree, h_idx), false);
                 }
                 if (prev_focus != null and prev_focus != h_idx) {
                     try self.clearFocusedEditState(tree, prev_focus.?);
@@ -334,7 +342,9 @@ pub const WidgetManager = struct {
                     try self.onPointerDown(tree, hid, input);
                 }
             } else if (prev_focus) |pf| {
+                // Click on empty space: commit pending edits and release focus.
                 try self.clearFocusedEditState(tree, pf);
+                tree.setFocus(null, false);
             }
         }
 
@@ -419,6 +429,24 @@ pub const WidgetManager = struct {
                 else => {},
             }
         }
+    }
+
+    /// Nearest ancestor-or-self of `idx` that can take focus: a focusable node or one with a widget
+    /// binding (sliders and similar `.custom` nodes are bound but not flagged focusable).
+    fn focusTargetFor(self: *WidgetManager, tree: *ui_core.UiTree, idx: usize) ?usize {
+        var cur: ?usize = idx;
+        while (cur) |i| {
+            if (i >= tree.nodes.items.len) return null;
+            const n = &tree.nodes.items[i];
+            if (n.alive and !n.disabled) {
+                if (n.focusable) return i;
+                if (tree.idOf(i)) |nid| {
+                    if (self.findByNode(nid) != null) return i;
+                }
+            }
+            cur = n.parent;
+        }
+        return null;
     }
 
     fn clearFocusedEditState(self: *WidgetManager, tree: *ui_core.UiTree, node_idx: usize) !void {
@@ -1348,7 +1376,7 @@ pub fn module() engine.Module {
     return .{
         .descriptor = .{
             .id = "official.ui.widgets",
-            .version = "0.2.0",
+            .version = "0.2.1",
             .provides_capabilities = &.{"engine.ui.widgets/1"},
             .required_capabilities = &.{"engine.ui.tree/1"},
         },

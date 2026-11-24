@@ -218,3 +218,49 @@ test "NumberInput confirms by Tab with a final event, rejects non-finite text, a
     try mgr.processFrameWithDt(tree, input, null, 300, 200, 100.0);
     try testing.expectApproxEqAbs(@as(f32, 0.2), tree.caret_phase, 0.001);
 }
+
+test "clicking empty space or plain chrome blurs the focused text input" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    try app.registerModule(window.module());
+    try app.registerModule(graphics.module());
+    try app.registerModule(ui_core.module());
+    try app.registerModule(ui_widgets.module());
+    try app.initialize();
+    const tree = app.resources.get(ui_core.UiTree).?;
+    const mgr = app.resources.get(ui_widgets.WidgetManager).?;
+    const input = @as(*window.InputService, @ptrCast(@alignCast(@constCast((try app.services.getService("engine.input", 1)).api_ptr))));
+
+    const root = try tree.createNode(null, .{ .id = "root", .kind = .panel, .style = .{ .width = 300, .height = 300 } });
+    const tb = try tree.createNode(root, .{ .id = "tb", .kind = .textbox, .style = .{ .height = 24 } });
+    const chrome = try tree.createNode(root, .{ .id = "chrome", .kind = .panel, .pickable = true, .style = .{ .height = 40 } });
+    tree.layoutTree(300, 300);
+
+    const click = struct {
+        fn at(i: *window.InputService, m: *ui_widgets.WidgetManager, t: *ui_core.UiTree, x: f32, y: f32) !void {
+            i.beginFrame();
+            i.injectMouseMove(x, y);
+            i.injectMouseButton(.left, true);
+            try m.processFrame(t, i, null, 300, 300);
+            i.beginFrame();
+            i.injectMouseButton(.left, false);
+            try m.processFrame(t, i, null, 300, 300);
+        }
+    }.at;
+
+    const tb_r = tree.nodes.items[tb].layout;
+    try click(input, mgr, tree, tb_r.x + 2, tb_r.y + 2);
+    try testing.expectEqual(@as(?usize, tb), tree.focused_node);
+
+    // Plain (non-focusable, unbound) chrome must blur instead of taking focus.
+    const ch_r = tree.nodes.items[chrome].layout;
+    try click(input, mgr, tree, ch_r.x + 2, ch_r.y + 2);
+    try testing.expect(tree.focused_node == null);
+    try testing.expect(!tree.nodes.items[tb].focused);
+
+    // Refocus, then click far outside every node.
+    try click(input, mgr, tree, tb_r.x + 2, tb_r.y + 2);
+    try testing.expectEqual(@as(?usize, tb), tree.focused_node);
+    try click(input, mgr, tree, 299, 299);
+    try testing.expect(tree.focused_node == null);
+}
