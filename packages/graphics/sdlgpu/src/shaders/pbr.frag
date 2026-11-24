@@ -234,7 +234,7 @@ float sampleLocalTile(int tile_idx, vec3 world_pos, float bias, float rot) {
     if (lp.w <= 0.001) return 1.0;
     vec3 proj = lp.xyz / lp.w;
     vec2 uv = vec2(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
-    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99 || proj.z < 0.0 || proj.z > 1.0) {
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || proj.z < 0.0 || proj.z > 1.0) {
         return 1.0;
     }
     vec4 rect = local_atlas_rect[tile_idx];
