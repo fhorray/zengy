@@ -1247,10 +1247,10 @@ pub const PbrGpuState = struct {
             const ptr = c.SDL_MapGPUTransferBuffer(self.device, tb, false) orelse return error.SdlGpuFailure;
             const dst: [*]f16 = @ptrCast(@alignCast(ptr));
             for (0..px_count) |k| {
-                dst[k * 4 + 0] = @floatCast(hp[k][0]);
-                dst[k * 4 + 1] = @floatCast(hp[k][1]);
-                dst[k * 4 + 2] = @floatCast(hp[k][2]);
-                dst[k * 4 + 3] = @floatCast(hp[k][3]);
+                dst[k * 4 + 0] = clampToF16(hp[k][0]);
+                dst[k * 4 + 1] = clampToF16(hp[k][1]);
+                dst[k * 4 + 2] = clampToF16(hp[k][2]);
+                dst[k * 4 + 3] = clampToF16(hp[k][3]);
             }
             c.SDL_UnmapGPUTransferBuffer(self.device, tb);
             const cmd_h = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return error.SdlGpuFailure;
@@ -1301,10 +1301,10 @@ pub const PbrGpuState = struct {
             const dst: [*]f16 = @ptrCast(@alignCast(ptr));
             for (0..px_count) |k| {
                 const px = mips[lvl][k];
-                dst[k * 4 + 0] = @floatCast(px[0]);
-                dst[k * 4 + 1] = @floatCast(px[1]);
-                dst[k * 4 + 2] = @floatCast(px[2]);
-                dst[k * 4 + 3] = @floatCast(px[3]);
+                dst[k * 4 + 0] = clampToF16(px[0]);
+                dst[k * 4 + 1] = clampToF16(px[1]);
+                dst[k * 4 + 2] = clampToF16(px[2]);
+                dst[k * 4 + 3] = clampToF16(px[3]);
             }
             c.SDL_UnmapGPUTransferBuffer(self.device, tb);
 
@@ -1408,6 +1408,11 @@ fn perspectiveMat(fov_rad: f32, aspect: f32, near: f32, far: f32) math3d.Mat4 {
         0,          0, far / fn_,                   -1,
         0,          0, (near * far) / fn_,          0,
     } };
+}
+
+fn clampToF16(v: f32) f16 {
+    if (!std.math.isFinite(v)) return 0.0;
+    return @floatCast(std.math.clamp(v, -65000.0, 65000.0));
 }
 
 fn orthoMat(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) math3d.Mat4 {

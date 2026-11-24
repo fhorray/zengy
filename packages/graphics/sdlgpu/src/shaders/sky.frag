@@ -31,7 +31,7 @@ void main() {
         float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5;
         float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
         vec3 col = textureLod(u_sky_hdri, vec2(u, v), 0.0).rgb * exp2(sun_col_intensity.w);
-        frag_color = vec4(max(col, vec3(0.0)), 1.0);
+        frag_color = vec4(clamp(col, vec3(0.0), vec3(65000.0)), 1.0);
         return;
     }
 
