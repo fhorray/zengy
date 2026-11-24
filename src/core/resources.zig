@@ -16,6 +16,8 @@ pub fn typeId(comptime T: type) u64 {
 const ResourceEntry = struct {
     ptr: *anyopaque,
     destroy_fn: *const fn (*anyopaque, std.mem.Allocator) void,
+    /// `@typeName` of the stored type, used to detect hash collisions between distinct types.
+    name: []const u8,
 };
 
 fn deinitResourceIfSupported(comptime T: type, typed: *T) void {
@@ -28,6 +30,9 @@ fn deinitResourceIfSupported(comptime T: type, typed: *T) void {
 pub const ResourceRegistry = struct {
     allocator: std.mem.Allocator,
     entries: std.AutoHashMapUnmanaged(u64, ResourceEntry),
+    /// Type keys in insertion order; resources are destroyed in reverse so later resources
+    /// (which may reference earlier ones) go first, deterministically.
+    order: std.ArrayList(u64) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) ResourceRegistry {
         return .{
@@ -37,15 +42,21 @@ pub const ResourceRegistry = struct {
     }
 
     pub fn deinit(self: *ResourceRegistry) void {
-        var it = self.entries.valueIterator();
-        while (it.next()) |entry| {
-            entry.destroy_fn(entry.ptr, self.allocator);
+        var i = self.order.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.entries.get(self.order.items[i])) |entry| entry.destroy_fn(entry.ptr, self.allocator);
         }
+        self.order.deinit(self.allocator);
         self.entries.deinit(self.allocator);
     }
 
     /// Inserts or overwrites a resource of type `T`.
     /// If `T` defines `pub fn deinit(*T) void`, it is invoked on overwrite, `remove()`, and `deinit()`.
+    ///
+    /// Ownership: on success the registry owns `value`. On error (`OutOfMemory` or
+    /// `error.ResourceTypeCollision`) `value` was NOT consumed and stays with the caller, so the
+    /// caller must still release it. Overwriting runs the old value's `deinit` first.
     pub fn insert(self: *ResourceRegistry, comptime T: type, value: T) !void {
         const key = typeId(T);
         const Destroy = struct {
@@ -57,6 +68,7 @@ pub const ResourceRegistry = struct {
         };
 
         if (self.entries.getPtr(key)) |existing| {
+            if (!std.mem.eql(u8, existing.name, @typeName(T))) return error.ResourceTypeCollision;
             const typed: *T = @ptrCast(@alignCast(existing.ptr));
             deinitResourceIfSupported(T, typed);
             typed.* = value;
@@ -68,21 +80,28 @@ pub const ResourceRegistry = struct {
         errdefer self.allocator.destroy(ptr);
         ptr.* = value;
 
-        try self.entries.put(self.allocator, key, .{
+        // Reserve both containers first so a failure leaves them consistent with each other.
+        try self.order.ensureUnusedCapacity(self.allocator, 1);
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        self.entries.putAssumeCapacity(key, .{
             .ptr = ptr,
             .destroy_fn = Destroy.call,
+            .name = @typeName(T),
         });
+        self.order.appendAssumeCapacity(key);
     }
 
     /// Returns a mutable pointer to resource `T`, or `null` if not registered.
     pub fn get(self: *ResourceRegistry, comptime T: type) ?*T {
         const entry = self.entries.get(typeId(T)) orelse return null;
+        if (!std.mem.eql(u8, entry.name, @typeName(T))) return null;
         return @ptrCast(@alignCast(entry.ptr));
     }
 
     /// Returns an immutable pointer to resource `T`, or `null` if not registered.
     pub fn getConst(self: *const ResourceRegistry, comptime T: type) ?*const T {
         const entry = self.entries.get(typeId(T)) orelse return null;
+        if (!std.mem.eql(u8, entry.name, @typeName(T))) return null;
         return @ptrCast(@alignCast(entry.ptr));
     }
 
@@ -94,6 +113,7 @@ pub const ResourceRegistry = struct {
     /// Removes and destroys resource `T`, returning `false` if it was not present.
     pub fn remove(self: *ResourceRegistry, comptime T: type) bool {
         const kv = self.entries.fetchRemove(typeId(T)) orelse return false;
+        if (std.mem.indexOfScalar(u64, self.order.items, kv.key)) |pos| _ = self.order.orderedRemove(pos);
         kv.value.destroy_fn(kv.value.ptr, self.allocator);
         return true;
     }

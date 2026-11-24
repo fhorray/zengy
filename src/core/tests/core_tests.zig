@@ -903,3 +903,39 @@ test "CommandBuffer.apply is atomic with respect to allocation failure" {
     }
     try testing.expect(saw_failure and saw_success);
 }
+
+var res_destroy_log: [4]u8 = undefined;
+var res_destroy_len: usize = 0;
+const ResA = struct {
+    v: u8 = 0,
+    pub fn deinit(self: *ResA) void {
+        res_destroy_log[res_destroy_len] = 'A' + self.v;
+        res_destroy_len += 1;
+    }
+};
+const ResB = struct {
+    v: u8 = 0,
+    pub fn deinit(self: *ResB) void {
+        res_destroy_log[res_destroy_len] = 'a' + self.v;
+        res_destroy_len += 1;
+    }
+};
+
+test "ResourceRegistry destroys in reverse insertion order, overwrite runs deinit, remove keeps order consistent" {
+    res_destroy_len = 0;
+    {
+        var reg = engine.ResourceRegistry.init(testing.allocator);
+        defer reg.deinit();
+        try reg.insert(ResA, .{ .v = 0 });
+        try reg.insert(ResB, .{ .v = 0 });
+        try reg.insert(ResA, .{ .v = 1 }); // overwrite: old A deinit runs immediately
+        try testing.expectEqual(@as(usize, 1), res_destroy_len);
+        try testing.expectEqual(@as(u8, 1), reg.get(ResA).?.v);
+        try testing.expectEqual(@as(usize, 2), reg.order.items.len);
+    }
+    // deinit: B (inserted last) before A.
+    try testing.expectEqual(@as(usize, 3), res_destroy_len);
+    try testing.expectEqual(@as(u8, 'A'), res_destroy_log[0]);
+    try testing.expectEqual(@as(u8, 'a'), res_destroy_log[1]);
+    try testing.expectEqual(@as(u8, 'B'), res_destroy_log[2]);
+}
