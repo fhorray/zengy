@@ -85,11 +85,39 @@ pub const Sh9Irradiance = struct {
     }
 };
 
+/// Coarse distance moments for one directional probe sector. Populate using
+/// unbiased geometry rays; uninitialized moments keep the legacy behavior.
+pub const ProbeVisibilityMoments = struct {
+    mean_distance: f32 = 0.0,
+    mean_distance_squared: f32 = 0.0,
+    valid: bool = false,
+
+    pub fn weight(self: ProbeVisibilityMoments, distance: f32) f32 {
+        if (!self.valid) return 1.0;
+        if (!std.math.isFinite(distance) or !std.math.isFinite(self.mean_distance) or
+            !std.math.isFinite(self.mean_distance_squared) or self.mean_distance < 0.0) return 0.0;
+        const delta = @max(distance - self.mean_distance - 0.02, 0.0);
+        if (delta <= 0.0) return 1.0;
+        const variance = @max(self.mean_distance_squared - self.mean_distance * self.mean_distance, 1e-5);
+        const p = variance / (variance + delta * delta);
+        return p * p * p;
+    }
+};
+
+/// Sector order: +X, -X, +Y, -Y, +Z, -Z.
+pub fn probeVisibilitySector(direction: [3]f32) usize {
+    var axis: usize = 0;
+    if (@abs(direction[1]) > @abs(direction[axis])) axis = 1;
+    if (@abs(direction[2]) > @abs(direction[axis])) axis = 2;
+    return axis * 2 + @as(usize, if (direction[axis] >= 0.0) 0 else 1);
+}
+
 /// Single irradiance probe inside a 3D `IrradianceProbeVolume`.
 pub const IrradianceProbe = struct {
     sh: Sh9Irradiance = .{},
     validity: f32 = 1.0,
     relocation_offset: [3]f32 = .{ 0, 0, 0 },
+    visibility: [6]ProbeVisibilityMoments = @splat(.{}),
 };
 
 /// 3D grid of irradiance probes with normal-aware, validity-weighted trilinear sampling.
@@ -180,10 +208,15 @@ pub const IrradianceProbeVolume = struct {
             const w = tri_w * p.validity * norm_w;
             if (w <= 1e-6) continue;
 
+            const sector = probeVisibilitySector(.{ -dx, -dy, -dz });
+            const vis = p.visibility[sector].weight(dlen);
             const irr = p.sh.evaluate(normal);
-            sum_rgb[0] += irr[0] * w;
-            sum_rgb[1] += irr[1] * w;
-            sum_rgb[2] += irr[2] * w;
+            // Normalize geometric weights, but do not normalize away occlusion.
+            // This conservative reference can darken partial coverage; a full DDGI
+            // implementation must track coverage and fallback confidence separately.
+            sum_rgb[0] += irr[0] * w * vis;
+            sum_rgb[1] += irr[1] * w * vis;
+            sum_rgb[2] += irr[2] * w * vis;
             sum_w += w;
         }
 

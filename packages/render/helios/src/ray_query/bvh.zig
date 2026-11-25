@@ -81,16 +81,22 @@ fn triCentroid(t: BvhTriangle) [3]f32 {
 }
 
 fn intersectAabb(ray: Ray, inv_dir: [3]f32, bmin: [3]f32, bmax: [3]f32, cur_t_max: f32) ?f32 {
+    if (!(ray.t_min <= cur_t_max)) return null;
     var tmin = ray.t_min;
     var tmax = cur_t_max;
     inline for (0..3) |i| {
-        const t1 = (bmin[i] - ray.origin[i]) * inv_dir[i];
-        const t2 = (bmax[i] - ray.origin[i]) * inv_dir[i];
-        const lo = @min(t1, t2);
-        const hi = @max(t1, t2);
-        tmin = @max(tmin, lo);
-        tmax = @min(tmax, hi);
-        if (tmin > tmax) return null;
+        if (!std.math.isFinite(ray.origin[i]) or !std.math.isFinite(ray.direction[i])) return null;
+        if (ray.direction[i] == 0.0) {
+            if (ray.origin[i] < bmin[i] or ray.origin[i] > bmax[i]) return null;
+        } else {
+            const t1 = if (std.math.isFinite(inv_dir[i])) (bmin[i] - ray.origin[i]) * inv_dir[i] else (bmin[i] - ray.origin[i]) / ray.direction[i];
+            const t2 = if (std.math.isFinite(inv_dir[i])) (bmax[i] - ray.origin[i]) * inv_dir[i] else (bmax[i] - ray.origin[i]) / ray.direction[i];
+            const lo = @min(t1, t2);
+            const hi = @max(t1, t2);
+            tmin = @max(tmin, lo);
+            tmax = @min(tmax, hi);
+            if (tmin > tmax) return null;
+        }
     }
     return tmin;
 }
@@ -155,7 +161,17 @@ pub const Bvh = struct {
         self.nodes.clearRetainingCapacity();
         self.triangles.clearRetainingCapacity();
         if (tris.len == 0) return;
+        errdefer {
+            self.nodes.clearRetainingCapacity();
+            self.triangles.clearRetainingCapacity();
+        }
 
+        if (tris.len > std.math.maxInt(u32) / 2) return error.TooManyTriangles;
+        for (tris) |tri| {
+            for ([_][3]f32{ tri.v0, tri.v1, tri.v2 }) |vertex| {
+                for (vertex) |coordinate| if (!std.math.isFinite(coordinate)) return error.InvalidTriangle;
+            }
+        }
         try self.triangles.appendSlice(self.allocator, tris);
         try self.nodes.append(self.allocator, .{
             .aabb_min = .{ 0, 0, 0 },
@@ -164,7 +180,7 @@ pub const Bvh = struct {
             .prim_count = @intCast(tris.len),
         });
         self.updateBounds(0);
-        try self.subdivide(0);
+        try self.subdivide(0, 0);
     }
 
     fn updateBounds(self: *Bvh, node_idx: u32) void {
@@ -184,9 +200,9 @@ pub const Bvh = struct {
         node.aabb_max = bmax;
     }
 
-    fn subdivide(self: *Bvh, node_idx: u32) !void {
+    fn subdivide(self: *Bvh, node_idx: u32, depth: usize) !void {
         const prim_count = self.nodes.items[node_idx].prim_count;
-        if (prim_count <= 2) return;
+        if (prim_count <= 2 or depth >= MAX_STACK - 2) return;
 
         const first = self.nodes.items[node_idx].left_or_first;
         const bmin = self.nodes.items[node_idx].aabb_min;
@@ -212,8 +228,12 @@ pub const Bvh = struct {
             }
         }
 
-        const left_count = i - first;
-        if (left_count == 0 or left_count == prim_count) return;
+        var left_count = i - first;
+        if (left_count == 0 or left_count == prim_count) {
+            // Identical centroids still form a balanced tree. Avoid an unbounded leaf.
+            left_count = @as(usize, prim_count) / 2;
+            i = @as(usize, first) + left_count;
+        }
 
         const left_idx: u32 = @intCast(self.nodes.items.len);
         const right_idx: u32 = left_idx + 1;
@@ -235,8 +255,8 @@ pub const Bvh = struct {
 
         self.updateBounds(left_idx);
         self.updateBounds(right_idx);
-        try self.subdivide(left_idx);
-        try self.subdivide(right_idx);
+        try self.subdivide(left_idx, depth + 1);
+        try self.subdivide(right_idx, depth + 1);
     }
 
     /// Bounded iterative closest-hit ray query.
@@ -245,9 +265,9 @@ pub const Bvh = struct {
         if (self.nodes.items.len == 0) return .{};
 
         const inv_dir = [3]f32{
-            if (@abs(ray.direction[0]) > 1e-8) 1.0 / ray.direction[0] else 1e30,
-            if (@abs(ray.direction[1]) > 1e-8) 1.0 / ray.direction[1] else 1e30,
-            if (@abs(ray.direction[2]) > 1e-8) 1.0 / ray.direction[2] else 1e30,
+            if (ray.direction[0] != 0.0) 1.0 / ray.direction[0] else 0.0,
+            if (ray.direction[1] != 0.0) 1.0 / ray.direction[1] else 0.0,
+            if (ray.direction[2] != 0.0) 1.0 / ray.direction[2] else 0.0,
         };
 
         var best = RayHit{ .t = ray.t_max };
@@ -313,9 +333,9 @@ pub const Bvh = struct {
         if (self.nodes.items.len == 0) return false;
 
         const inv_dir = [3]f32{
-            if (@abs(ray.direction[0]) > 1e-8) 1.0 / ray.direction[0] else 1e30,
-            if (@abs(ray.direction[1]) > 1e-8) 1.0 / ray.direction[1] else 1e30,
-            if (@abs(ray.direction[2]) > 1e-8) 1.0 / ray.direction[2] else 1e30,
+            if (ray.direction[0] != 0.0) 1.0 / ray.direction[0] else 0.0,
+            if (ray.direction[1] != 0.0) 1.0 / ray.direction[1] else 0.0,
+            if (ray.direction[2] != 0.0) 1.0 / ray.direction[2] else 0.0,
         };
 
         var stack: [MAX_STACK]u32 = undefined;

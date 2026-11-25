@@ -30,7 +30,11 @@ pub const AliasTable = struct {
             return .{ .allocator = allocator, .entries = &.{}, .total_weight = 0.0 };
         }
         var sum: f32 = 0.0;
-        for (weights) |w| sum += @max(w, 0.0);
+        // Normalize against the largest finite weight before accumulation.
+        // Prevents overflow when many high-intensity lights contribute.
+        var peak: f32 = 0;
+        for (weights) |w| if (std.math.isFinite(w)) { peak = @max(peak, w); };
+        for (weights) |w| if (std.math.isFinite(w) and peak > 0) { sum += @max(w, 0) / peak; };
 
         const entries = try allocator.alloc(AliasEntry, weights.len);
         errdefer allocator.free(entries);
@@ -52,7 +56,7 @@ pub const AliasTable = struct {
         defer large.deinit(allocator);
 
         for (weights, 0..) |w, i| {
-            const nw = @max(w, 0.0);
+            const nw = if (std.math.isFinite(w) and peak > 0) @max(w, 0.0) / peak else 0;
             const p = nw / sum;
             entries[i] = .{ .prob = 1.0, .alias = @intCast(i), .pdf = p };
             scaled[i] = p * n_f;
@@ -81,7 +85,7 @@ pub const AliasTable = struct {
         return .{
             .allocator = allocator,
             .entries = entries,
-            .total_weight = sum,
+            .total_weight = if (sum <= std.math.floatMax(f32) / @max(peak, 1e-30)) sum * peak else std.math.floatMax(f32),
         };
     }
 
@@ -94,19 +98,21 @@ pub const AliasTable = struct {
     pub fn sample(self: *const AliasTable, u_idx: f32, u_coin: f32) struct { index: u32, pdf: f32 } {
         if (self.entries.len == 0) return .{ .index = 0, .pdf = 0.0 };
         const n: f32 = @floatFromInt(self.entries.len);
-        const col: u32 = @min(@as(u32, @intFromFloat(@max(0.0, u_idx) * n)), @as(u32, @intCast(self.entries.len - 1)));
-        const chosen = if (u_coin < self.entries[col].prob) col else self.entries[col].alias;
+        const safe_u = if (std.math.isFinite(u_idx)) std.math.clamp(u_idx, 0, 0.99999994) else 0;
+        const col: u32 = @min(@as(u32, @intFromFloat(safe_u * n)), @as(u32, @intCast(self.entries.len - 1)));
+        const safe_coin = if (std.math.isFinite(u_coin)) std.math.clamp(u_coin, 0, 0.99999994) else 0;
+        const chosen = if (safe_coin < self.entries[col].prob) col else self.entries[col].alias;
         return .{ .index = chosen, .pdf = self.entries[chosen].pdf };
     }
 };
 
 /// Multiple Importance Sampling (MIS) power heuristic (`beta = 2`).
 pub fn misPowerHeuristic(pdf_a: f32, pdf_b: f32) f32 {
-    const a2 = pdf_a * pdf_a;
-    const b2 = pdf_b * pdf_b;
-    const denom = a2 + b2;
-    if (denom <= 1e-12) return 0.0;
-    return a2 / denom;
+    if (!std.math.isFinite(pdf_a) or !std.math.isFinite(pdf_b) or pdf_a <= 0) return 0;
+    const scale = @max(pdf_a, @max(pdf_b, 0));
+    const a = pdf_a / scale;
+    const b = @max(pdf_b, 0) / scale;
+    return a*a / (a*a + b*b);
 }
 
 /// ReSTIR DI weighted reservoir storing a single resampled light candidate.
@@ -119,9 +125,14 @@ pub const Reservoir = struct {
 
     /// Streams candidate `light_idx` with weight `w` (`target_pdf / source_pdf`) using uniform `xi` in `[0, 1)`.
     pub fn update(self: *Reservoir, light_idx: u32, target_pdf: f32, weight: f32, xi: f32) bool {
-        self.weight_sum += @max(weight, 0.0);
+        if (self.sample_count == std.math.maxInt(u32)) return false;
+        if (!std.math.isFinite(weight) or !std.math.isFinite(target_pdf) or weight < 0 or target_pdf < 0 or !std.math.isFinite(xi)) return false;
+        const w = if (target_pdf > 0) weight else 0;
+        if (w > std.math.floatMax(f32) - self.weight_sum) return false;
+        self.weight_sum += w;
         self.sample_count += 1;
-        if (self.weight_sum > 1e-12 and xi * self.weight_sum < weight) {
+        const u = if (std.math.isFinite(xi)) std.math.clamp(xi, 0, 0.99999994) else 1;
+        if (w > 0 and self.weight_sum > 0 and u < w / self.weight_sum) {
             self.light_index = light_idx;
             self.target_pdf = target_pdf;
             return true;
@@ -134,14 +145,16 @@ pub const Reservoir = struct {
         if (self.sample_count == 0 or self.target_pdf <= 1e-12) {
             self.unbiased_weight = 0.0;
         } else {
-            self.unbiased_weight = (self.weight_sum / @as(f32, @floatFromInt(self.sample_count))) / self.target_pdf;
+            const value = @as(f64, self.weight_sum) / @as(f64, @floatFromInt(self.sample_count)) / @as(f64, self.target_pdf);
+            self.unbiased_weight = if (std.math.isFinite(value) and value >= 0 and value <= std.math.floatMax(f32)) @floatCast(value) else 0;
         }
     }
 
     /// Merges another reservoir `other` (temporal or spatial reuse) evaluated at `new_target_pdf`.
     pub fn merge(self: *Reservoir, other: Reservoir, new_target_pdf: f32, xi: f32) bool {
-        if (other.sample_count == 0) return false;
+        if (other.sample_count == 0 or other.sample_count > std.math.maxInt(u32) - self.sample_count or !std.math.isFinite(new_target_pdf) or new_target_pdf < 0 or !std.math.isFinite(other.unbiased_weight) or other.unbiased_weight < 0 or !std.math.isFinite(xi)) return false;
         const w = new_target_pdf * other.unbiased_weight * @as(f32, @floatFromInt(other.sample_count));
+        if (!std.math.isFinite(w) or w < 0 or w > std.math.floatMax(f32) - self.weight_sum) return false;
         const prev_m = self.sample_count;
         const accepted = self.update(other.light_index, new_target_pdf, w, xi);
         self.sample_count = prev_m + other.sample_count;

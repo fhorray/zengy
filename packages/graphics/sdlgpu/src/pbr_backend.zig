@@ -205,6 +205,7 @@ const ClusterLightsBuffer = extern struct {
     spots: [256]GpuSpotLight = @splat(.{}),
     rects: [64]GpuRectLight = @splat(.{}),
     probes: [32]GpuReflectionProbe = @splat(.{}),
+    gi: pbr.DynamicGiGrid = .{},
 };
 
 const LocalShadowBuffer = extern struct {
@@ -242,12 +243,14 @@ fn hdriSampleHash(pixels: ?[]const [4]f32) u64 {
 
 const HistParams = extern struct {
     range_params: [4]f32,
+    metering_params: [4]f32,
 };
 
 const AdaptParams = extern struct {
     ev_bounds: [4]f32,
     speed_dt: [4]f32,
     hist_range: [4]f32,
+    physical_params: [4]f32,
 };
 
 const BloomParams = extern struct {
@@ -260,6 +263,7 @@ const PostFxParams = extern struct {
     grade_tint_look: [4]f32,
     vignette_params: [4]f32,
     vignette_extra: [4]f32,
+    local_exposure: [4]f32,
 };
 
 /// One entry of the lit-pass submission order, with the sort keys computed once per frame.
@@ -358,6 +362,13 @@ pub const PbrGpuState = struct {
     shadow_texture: *c.SDL_GPUTexture,
     local_shadow_texture: *c.SDL_GPUTexture,
     exposure_texture: *c.SDL_GPUTexture,
+    exposure_history_valid: bool = false,
+    exposure_frame: u32 = 0,
+    exposure_camera_key: u64 = 0,
+    exposure_physical_mode: bool = false,
+    exposure_scale_log2: f32 = 0.0,
+    exposure_history_epoch: u64 = 0,
+    exposure_prev_camera: [3]f32 = .{ 0, 0, 0 },
     flat_normal_texture: *c.SDL_GPUTexture,
     black_texture: *c.SDL_GPUTexture,
     brdf_lut_texture: *c.SDL_GPUTexture,
@@ -374,6 +385,9 @@ pub const PbrGpuState = struct {
     last_hdri_rot: f32 = 0.0,
     last_sun_size: f32 = 0.0,
     last_sun_disk: pbr.SunDisk = .none,
+    last_analytic_sun: bool = false,
+    last_hdri_width: u32 = 0,
+    last_hdri_height: u32 = 0,
     shadow_sampler: *c.SDL_GPUSampler,
     /// Material textures: repeat addressing so UVs past [0, 1] tile instead of smearing the edge texel.
     material_sampler: *c.SDL_GPUSampler,
@@ -410,6 +424,8 @@ pub const PbrGpuState = struct {
     vol_history_h: u32 = 0,
     vol_history_read: u8 = 0,
     vol_history_valid: bool = false,
+    vol_history_camera_key: u64 = 0,
+    vol_history_epoch: u64 = 0,
     vol_prev_view_proj: [16]f32 = @splat(0),
     vol_prev_cam: [3]f32 = .{ 0, 0, 0 },
     /// Hash of the fog parameters and light slots the temporal history was built with.
@@ -444,6 +460,7 @@ pub const PbrGpuState = struct {
     capture_result: ?graphics.CaptureImage = null,
     /// Reused across frames so cluster construction does not allocate in steady state.
     cluster_scratch: cluster.ClusterScratch = .{},
+    cluster_lights_scratch: ClusterLightsBuffer = .{},
     /// Lit-pass submission order, rebuilt every frame; reused to avoid per-frame allocation.
     draw_order: std.ArrayList(DrawOrderEntry) = .empty,
     /// Last reported dropped-reference count, to log budget overflow on change only.
@@ -1101,6 +1118,14 @@ pub const PbrGpuState = struct {
         try self.ensureHdrTargets(tex_w, tex_h);
         const hdr_tex = self.hdr_texture.?;
         const pp = self.frame_data.post_process;
+        const physical_cfg = pp.auto_exposure.physical;
+        const pre_log2: f32 = if (physical_cfg.enabled and std.math.isFinite(physical_cfg.pre_exposure_stops))
+            std.math.clamp(physical_cfg.pre_exposure_stops, -12.0, 12.0)
+        else 0.0;
+        const pre_gain = @exp2(pre_log2);
+        const fog = self.frame_data.fog;
+        const volumetric_active = fog.enabled and fog.volumetric.enabled and
+            (fog.density > 0.0 or (!fog.volumetric.physical_scattering and fog.volumetric.scattering > 0.0));
 
         const sun_dir: [3]f32 = if (self.frame_data.directional_lights.len > 0)
             .{ -self.frame_data.directional_lights[0].direction[0], -self.frame_data.directional_lights[0].direction[1], -self.frame_data.directional_lights[0].direction[2] }
@@ -1115,13 +1140,19 @@ pub const PbrGpuState = struct {
         else
             1.0;
 
+        if (self.profiler) |prof| prof.beginFrame(perfNowNs());
+        var pass_t0: u64 = perfNowNs();
         // 0. Rebuild equirectangular IBL + SH9 when sun, sky, or HDRI changes
         const sky_cfg = self.frame_data.sky;
         const hdri_ptr: usize = if (sky_cfg.hdri_pixels) |px| @intFromPtr(px.ptr) else 0;
         const hdri_hash = hdriSampleHash(sky_cfg.hdri_pixels);
         const dsun = @abs(sun_dir[0] - self.last_sun_dir[0]) + @abs(sun_dir[1] - self.last_sun_dir[1]) + @abs(sun_dir[2] - self.last_sun_dir[2]);
         const sun_moved_enough = (sky_cfg.kind == .procedural) and (dsun > 0.15 or !std.mem.eql(f32, &self.last_sun_col, &sun_col) or @abs(sun_int - self.last_sun_int) > 0.15);
+        const analytic_sun = self.frame_data.directional_lights.len > 0 and !pp.quality.sun_in_ibl_diffuse;
         const sky_changed = !self.ibl_initialized or
+            self.last_analytic_sun != analytic_sun or
+            self.last_hdri_width != sky_cfg.hdri_width or
+            self.last_hdri_height != sky_cfg.hdri_height or
             sun_moved_enough or
             self.last_sky_kind != sky_cfg.kind or
             !std.mem.eql(f32, &self.last_sky_tint, &sky_cfg.sky_tint) or
@@ -1138,7 +1169,10 @@ pub const PbrGpuState = struct {
         if (sky_changed) {
             // The very first build is always synchronous: there is no previous environment to keep showing.
             const first_build = !self.ibl_initialized;
-            try self.startIblJob(sun_dir, sun_col, sun_int, hdri_ptr, hdri_hash);
+            self.startIblJob(sun_dir, sun_col, sun_int, hdri_ptr, hdri_hash) catch |err| {
+                self.ibl_initialized = false;
+                return err;
+            };
             if (first_build) try self.advanceIblJob(.unlimited);
             self.last_sun_dir = sun_dir;
             self.last_sun_col = sun_col;
@@ -1155,11 +1189,16 @@ pub const PbrGpuState = struct {
             self.last_hdri_rot = sky_cfg.hdri_rotation_rad;
             self.last_sun_size = sky_cfg.sun_size;
             self.last_sun_disk = sky_cfg.sun_disk;
+            self.last_analytic_sun = analytic_sun;
+            self.last_hdri_width = sky_cfg.hdri_width;
+            self.last_hdri_height = sky_cfg.hdri_height;
             self.ibl_initialized = true;
         }
         try self.advanceIblJob(pp.quality.ibl_rebuild_budget);
-        if (self.profiler) |prof| prof.beginFrame(perfNowNs());
-        var pass_t0: u64 = perfNowNs();
+        // CPU preparation time only; not a GPU timestamp.
+        const ibl_end = perfNowNs();
+        if (self.profiler) |prof| prof.recordPass("IBL preparation (CPU)", .forward_plus, ibl_end -| pass_t0);
+        pass_t0 = ibl_end;
 
         // 1. 4-Cascade Exponential Directional Shadow Map Atlas Pass (2x2 quadrants of 1024x1024)
         var light_vps: [4]math3d.Mat4 = @splat(math3d.Mat4.identity());
@@ -1212,8 +1251,13 @@ pub const PbrGpuState = struct {
             var cascade_miss: [4]bool = @splat(true);
             var any_miss = false;
             for (0..active_cascades) |ci| {
-                const key = self.shadowMapKey(meshes, light_vps[ci], sun_layers, &.{ @floatFromInt(ci), cascade_count });
-                cascade_miss[ci] = !self.dir_cascade_cache[ci].hit(key, cache_on);
+                if (cache_on) {
+                    const key = self.shadowMapKey(meshes, light_vps[ci], sun_layers, &.{ @floatFromInt(ci), cascade_count });
+                    cascade_miss[ci] = !self.dir_cascade_cache[ci].hit(key, true);
+                } else {
+                    self.dir_cascade_cache[ci].invalidate();
+                    cascade_miss[ci] = true;
+                }
                 any_miss = any_miss or cascade_miss[ci];
             }
             for (active_cascades..4) |ci| self.dir_cascade_cache[ci].invalidate();
@@ -1251,9 +1295,9 @@ pub const PbrGpuState = struct {
         }
 
         // 1.2 Local Shadow Atlas (4x4 tiles of 512x512) + Clustered Forward+ Light/Probe Buffers
-        const cl_lights = try self.allocator.create(ClusterLightsBuffer);
-        defer self.allocator.destroy(cl_lights);
+        const cl_lights = &self.cluster_lights_scratch;
         cl_lights.* = .{};
+        cl_lights.gi = self.frame_data.dynamic_gi;
         var local_sh_data = LocalShadowBuffer{};
         const pt_count = @min(self.frame_data.point_lights.len, 256);
         const sp_count = @min(self.frame_data.spot_lights.len, 256);
@@ -1367,8 +1411,13 @@ pub const PbrGpuState = struct {
         var tile_miss: [shadow_plan.MAX_TILES]bool = @splat(true);
         var any_tile_miss = false;
         for (0..next_tile) |tidx| {
-            const key = self.shadowMapKey(meshes, .{ .m = local_sh_data.shadow_vp[tidx] }, tile_layers[tidx], &local_sh_data.atlas_rect[tidx]);
-            tile_miss[tidx] = !self.local_tile_cache[tidx].hit(key, shadow_q.static_cache);
+            if (shadow_q.static_cache) {
+                const key = self.shadowMapKey(meshes, .{ .m = local_sh_data.shadow_vp[tidx] }, tile_layers[tidx], &local_sh_data.atlas_rect[tidx]);
+                tile_miss[tidx] = !self.local_tile_cache[tidx].hit(key, true);
+            } else {
+                self.local_tile_cache[tidx].invalidate();
+                tile_miss[tidx] = true;
+            }
             any_tile_miss = any_tile_miss or tile_miss[tidx];
         }
         for (next_tile..shadow_plan.MAX_TILES) |tidx| self.local_tile_cache[tidx].invalidate();
@@ -1504,7 +1553,7 @@ pub const PbrGpuState = struct {
                 .params = .{ pp.ssao.radius, pp.ssao.bias, pp.ssao.intensity, if (pp.ssao.enabled) 1.0 else 0.0 },
                 .sun_view_dir = .{ sun_view[0], sun_view[1], sun_view[2], pp.contact_shadows.length },
                 .contact_params = .{ pp.contact_shadows.opacity, pp.contact_shadows.thickness, @floatFromInt(pp.contact_shadows.sample_count), if (pp.contact_shadows.enabled) 1.0 else 0.0 },
-                .fade_range = .{ pp.contact_shadows.distance_fade * 0.5, pp.contact_shadows.distance_fade, 0, 0 },
+                .fade_range = .{ pp.contact_shadows.distance_fade * 0.5, pp.contact_shadows.distance_fade, if (pp.ssao.horizon_based) 1.0 else 0.0, 0 },
             };
             c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &ssao_u, @sizeOf(SsaoParams));
             c.SDL_DrawGPUPrimitives(ssao_pass, 3, 1, 0, 0);
@@ -1565,7 +1614,7 @@ pub const PbrGpuState = struct {
                     @floatFromInt(@backingInt(sky.sun_disk)),
                 },
                 .sun_col_intensity = .{ sun_col[0], sun_col[1], sun_col[2], if (sky.kind == .hdri) sky.hdri_exposure_ev else sun_int },
-                .hdri_rotation = .{ sky.hdri_rotation_rad / (2.0 * std.math.pi), 0, 0, 0 },
+                .hdri_rotation = .{ sky.hdri_rotation_rad / (2.0 * std.math.pi), pre_gain, 0, 0 },
             };
             const sky_samplers = [_]c.SDL_GPUTextureSamplerBinding{.{ .texture = self.hdri_sky_texture orelse self.black_texture, .sampler = self.ibl_sampler }};
             c.SDL_BindGPUFragmentSamplers(sky_pass, 0, &sky_samplers, 1);
@@ -1631,10 +1680,11 @@ pub const PbrGpuState = struct {
             sh_arr[1][3] = 1.0 / @as(f32, @floatFromInt(tex_w));
             sh_arr[2][3] = 1.0 / @as(f32, @floatFromInt(tex_h));
             sh_arr[3][3] = if (pp.contact_shadows.enabled) 1.0 else 0.0;
+            sh_arr[4][3] = if (pp.quality.specular_aa) 1.0 else 0.0;
             const ssao_tex = if (pp.ssao.enabled or pp.contact_shadows.enabled) (self.ssao_blur_texture orelse white_tex) else white_tex;
             // 1 = distance-widened filter, 2 = blocker-search PCSS (needs the quality switch as well).
             const pcss_on: f32 = if (has_dir and self.frame_data.directional_lights[0].pcss_enabled) (if (shadow_q.pcss) 2.0 else 1.0) else 0.0;
-            const vol_on: f32 = if (self.frame_data.fog.volumetric.enabled) 1.0 else 0.0;
+            const vol_on: f32 = if (volumetric_active) 1.0 else 0.0;
 
             const pbr_ssbos = [_]*c.SDL_GPUBuffer{
                 self.cluster_lights_buffer,
@@ -1719,7 +1769,7 @@ pub const PbrGpuState = struct {
                     .cascade_depth_ranges = cascade_depth_ranges,
                     .cluster_factors = .{ built_clusters.factors.z_scale, built_clusters.factors.z_bias, 1.0, if (mat.alpha_mode == .mask) mat.alpha_cutoff else -1.0 },
                     .probe_volumetric = .{ @floatFromInt(pr_count), pcss_on, vol_on, self.frame_data.fog.volumetric.scattering },
-                    .layer_info = .{ @floatFromInt(qm.layers & pbr.ALL_LAYERS), @floatFromInt(sun_layers & pbr.ALL_LAYERS), 0, 0 },
+                    .layer_info = .{ @floatFromInt(qm.layers & pbr.ALL_LAYERS), @floatFromInt(sun_layers & pbr.ALL_LAYERS), pre_gain, if (pp.quality.area_light_quadrature) 1.0 else 0.0 },
                     .cascade_info = .{ cascade_count, if (has_dir) self.frame_data.directional_lights[0].pcss_light_size else 0.03, shadow_q.depth_bias_floor_m, if (shadow_q.pcss) 1.0 else 0.0 },
                 };
                 c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &fu, @sizeOf(PbrFragUniforms));
@@ -1750,7 +1800,7 @@ pub const PbrGpuState = struct {
             pass_t0 = pass_t1;
         }
         // 3.5 Volumetric Fog & God Rays (additive ray-marched scattering into HDR target)
-        if (self.frame_data.fog.enabled and self.frame_data.fog.volumetric.enabled) {
+        if (volumetric_active) {
             // Ray-march at half resolution by default; the composite pass upsamples depth-aware (~4x fewer marched pixels).
             const vol_half = self.frame_data.fog.volumetric.half_resolution;
             const vol_w: u32 = if (vol_half) @max(tex_w / 2, 1) else tex_w;
@@ -1834,7 +1884,7 @@ pub const PbrGpuState = struct {
                 .local_vp = local_sh_data.shadow_vp,
                 .local_rect = local_sh_data.atlas_rect,
                 .point_shadow = vf_pt_shadow,
-                .cascade_info = .{ cascade_count, jitter_offset, 0, 0 },
+                .cascade_info = .{ cascade_count, jitter_offset, @floatFromInt(std.math.clamp(vol_cfg.raymarch_steps, 8, 128)), if (vol_cfg.physical_scattering) 1.0 else 0.0 },
             };
             const vf_samplers = [_]c.SDL_GPUTextureSamplerBinding{
                 .{ .texture = depth_tex, .sampler = nearest_sampler },
@@ -1863,10 +1913,15 @@ pub const PbrGpuState = struct {
                 key_hasher.update(std.mem.asBytes(&vfp.spot_col_on));
                 key_hasher.update(std.mem.asBytes(&vfp.point_pos));
                 key_hasher.update(std.mem.asBytes(&vfp.point_col));
+                key_hasher.update(std.mem.asBytes(&vfp.point_shadow));
+                key_hasher.update(std.mem.asBytes(&vfp.spot_shadow));
+                key_hasher.update(std.mem.asBytes(&vfp.cam_fwd_maxd[3]));
+                key_hasher.update(std.mem.asBytes(&vfp.cascade_info[2]));
+                key_hasher.update(std.mem.asBytes(&vfp.cascade_info[3]));
                 const light_key = key_hasher.final();
                 const fog_unchanged = light_key == self.vol_light_key;
                 self.vol_light_key = light_key;
-                const usable = self.vol_history_valid and fog_unchanged and volumetric_lights.historyUsable(self.vol_prev_cam, self.vol_prev_fwd, cam_now, fwd_now);
+                const usable = self.vol_history_valid and self.vol_history_camera_key == self.frame_data.camera_key and self.vol_history_epoch == pp.auto_exposure.history_epoch and fog_unchanged and volumetric_lights.historyUsable(self.vol_prev_cam, self.vol_prev_fwd, cam_now, fwd_now);
                 const read_idx: usize = self.vol_history_read;
                 const write_idx: usize = 1 - read_idx;
                 const res_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
@@ -1896,6 +1951,8 @@ pub const PbrGpuState = struct {
                 vol_final = self.vol_history[write_idx].?;
                 self.vol_history_read = @intCast(write_idx);
                 self.vol_history_valid = true;
+                self.vol_history_camera_key = self.frame_data.camera_key;
+                self.vol_history_epoch = pp.auto_exposure.history_epoch;
                 self.vol_prev_view_proj = self.frame_data.view_proj;
                 self.vol_prev_cam = cam_now;
                 self.vol_prev_fwd = fwd_now;
@@ -1907,7 +1964,7 @@ pub const PbrGpuState = struct {
             // Pass 0 multiplies by T; pass 1 adds the upsampled in-scatter plus the ambient fog colour (1 - T) * C.
             const vc_base = VolCompositeParams{
                 .inv_view_proj = invertMat4(self.frame_data.view_proj),
-                .cam_pos = .{ self.frame_data.camera_position[0], self.frame_data.camera_position[1], self.frame_data.camera_position[2], 0 },
+                .cam_pos = .{ self.frame_data.camera_position[0], self.frame_data.camera_position[1], self.frame_data.camera_position[2], pre_gain },
                 .vol_size_dist = .{ @floatFromInt(vol_w), @floatFromInt(vol_h), self.frame_data.fog.volumetric.max_distance, 0 },
                 .fog_color_density = .{ self.frame_data.fog.color[0], self.frame_data.fog.color[1], self.frame_data.fog.color[2], self.frame_data.fog.density },
             };
@@ -1941,10 +1998,32 @@ pub const PbrGpuState = struct {
             pass_t0 = pass_t1;
         }
         // 4. Compute Auto-Exposure (Histogram -> EV100 Adaptation)
-        const min_log2: f32 = -8.0;
-        const max_log2: f32 = 8.0;
-        const log2_range = max_log2 - min_log2;
-        if (pp.auto_exposure.enabled) {
+        const exposure = pp.auto_exposure;
+        const physical = exposure.physical;
+        const scale_log2 = physical.scaleLog2();
+        const hist_a = if (std.math.isFinite(exposure.histogram_min_log2)) std.math.clamp(exposure.histogram_min_log2, -32.0, 32.0) else -12.0;
+        const hist_b = if (std.math.isFinite(exposure.histogram_max_log2)) std.math.clamp(exposure.histogram_max_log2, -32.0, 32.0) else 12.0;
+        const min_log2 = @min(hist_a, hist_b);
+        const log2_range = @max(@abs(hist_b - hist_a), 0.25);
+        if (exposure.enabled) {
+            const stride = std.math.clamp(exposure.metering_stride, 1, 16);
+            const meter_w = @max((tex_w + stride - 1) / stride, 1);
+            const meter_h = @max((tex_h + stride - 1) / stride, 1);
+            const cam = self.frame_data.camera_position;
+            const dx = cam[0] - self.exposure_prev_camera[0];
+            const dy = cam[1] - self.exposure_prev_camera[1];
+            const dz = cam[2] - self.exposure_prev_camera[2];
+            const reset = !self.exposure_history_valid or exposure.reset_history or
+                self.exposure_camera_key != self.frame_data.camera_key or
+                self.exposure_history_epoch != exposure.history_epoch or
+                self.exposure_physical_mode != physical.enabled or
+                (physical.enabled and self.exposure_scale_log2 != scale_log2) or
+                dx * dx + dy * dy + dz * dz > 400.0;
+            self.exposure_history_valid = false; // Only commit validity after both passes are recorded.
+            const frame_phase: f32 = @floatFromInt(self.exposure_frame % 256);
+            const phase_x: f32 = if (stride == 1) 0.5 else @mod(frame_phase * 0.754877666 + 0.5, 1.0);
+            const phase_y: f32 = if (stride == 1) 0.5 else @mod(frame_phase * 0.569840296 + 0.5, 1.0);
+            const center_weight: f32 = if (std.math.isFinite(exposure.metering_center_weight)) std.math.clamp(exposure.metering_center_weight, 0.0, 1.0) else 0.0;
             const hist_rw_bufs = [_]c.SDL_GPUStorageBufferReadWriteBinding{.{ .buffer = self.histogram_buffer, .cycle = false }};
             const c_pass = c.SDL_BeginGPUComputePass(
                 cmd_buf,
@@ -1956,9 +2035,12 @@ pub const PbrGpuState = struct {
             c.SDL_BindGPUComputePipeline(c_pass, self.hist_pipeline);
             const hist_samplers = [_]c.SDL_GPUTextureSamplerBinding{.{ .texture = hdr_tex, .sampler = linear_sampler }};
             c.SDL_BindGPUComputeSamplers(c_pass, 0, &hist_samplers, 1);
-            const hp = HistParams{ .range_params = .{ min_log2, 1.0 / log2_range, @floatFromInt(tex_w), @floatFromInt(tex_h) } };
+            const hp = HistParams{
+                .range_params = .{ min_log2 + pre_log2, 1.0 / log2_range, @floatFromInt(meter_w), @floatFromInt(meter_h) },
+                .metering_params = .{ center_weight, phase_x, phase_y, @floatFromInt(@max(@as(u64, 1), @min(@as(u64, 8), @as(u64, std.math.maxInt(u32)) / (@as(u64, meter_w) * meter_h)))) },
+            };
             c.SDL_PushGPUComputeUniformData(cmd_buf, 0, &hp, @sizeOf(HistParams));
-            c.SDL_DispatchGPUCompute(c_pass, (tex_w + 15) / 16, (tex_h + 15) / 16, 1);
+            c.SDL_DispatchGPUCompute(c_pass, (meter_w + 15) / 16, (meter_h + 15) / 16, 1);
             c.SDL_EndGPUComputePass(c_pass);
 
             const exp_rw_tex = [_]c.SDL_GPUStorageTextureReadWriteBinding{.{ .texture = self.exposure_texture, .mip_level = 0, .layer = 0, .cycle = false }};
@@ -1972,13 +2054,23 @@ pub const PbrGpuState = struct {
             ) orelse return error.SdlGpuFailure;
             c.SDL_BindGPUComputePipeline(a_pass, self.adapt_pipeline);
             const ap = AdaptParams{
-                .ev_bounds = .{ pp.auto_exposure.min_ev100, pp.auto_exposure.max_ev100, pp.auto_exposure.low_percent, pp.auto_exposure.high_percent },
-                .speed_dt = .{ pp.auto_exposure.speed_brighten, pp.auto_exposure.speed_darken, std.math.clamp(self.frame_data.dt, 1.0 / 10000.0, 0.1), pp.auto_exposure.compensation_ev },
-                .hist_range = .{ min_log2, log2_range, 1.0, 0.0 },
+                .ev_bounds = .{ if (physical.enabled) physical.min_ev100 else exposure.min_ev100, if (physical.enabled) physical.max_ev100 else exposure.max_ev100, exposure.low_percent, exposure.high_percent },
+                .speed_dt = .{ pp.auto_exposure.speed_brighten, pp.auto_exposure.speed_darken, if (std.math.isFinite(self.frame_data.dt)) std.math.clamp(self.frame_data.dt, 0.0, 0.1) else 0.0, pp.auto_exposure.compensation_ev },
+                .hist_range = .{ min_log2, log2_range, if (reset) 2.0 else 1.0, exposure.hybrid_transition_stops },
+                .physical_params = .{ if (physical.enabled) 1.0 else 0.0, scale_log2, physical.manualEv100(), 0.0 },
             };
             c.SDL_PushGPUComputeUniformData(cmd_buf, 0, &ap, @sizeOf(AdaptParams));
             c.SDL_DispatchGPUCompute(a_pass, 1, 1, 1);
             c.SDL_EndGPUComputePass(a_pass);
+            self.exposure_history_valid = true;
+            self.exposure_prev_camera = cam;
+            self.exposure_camera_key = self.frame_data.camera_key;
+            self.exposure_physical_mode = physical.enabled;
+            self.exposure_scale_log2 = scale_log2;
+            self.exposure_history_epoch = exposure.history_epoch;
+            self.exposure_frame +%= 1;
+        } else {
+            self.exposure_history_valid = false;
         }
 
         // 5. Bloom Downsample + Additive Upsample
@@ -2000,7 +2092,7 @@ pub const PbrGpuState = struct {
                 c.SDL_BindGPUGraphicsPipeline(bp, self.bloom_down_pipeline);
                 const bd_samplers = [_]c.SDL_GPUTextureSamplerBinding{.{ .texture = src_t, .sampler = linear_sampler }};
                 c.SDL_BindGPUFragmentSamplers(bp, 0, &bd_samplers, 1);
-                const bp_u = BloomParams{ .p = .{ 1.0 / src_w, 1.0 / src_h, pp.bloom.threshold, if (i == 0) 1.0 else 0.0 } };
+                const bp_u = BloomParams{ .p = .{ 1.0 / src_w, 1.0 / src_h, pp.bloom.threshold * pre_gain, if (i == 0) 1.0 else 0.0 } };
                 c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &bp_u, @sizeOf(BloomParams));
                 c.SDL_DrawGPUPrimitives(bp, 3, 1, 0, 0);
                 c.SDL_EndGPURenderPass(bp);
@@ -2054,12 +2146,16 @@ pub const PbrGpuState = struct {
                 .{ .texture = self.exposure_texture, .sampler = nearest_sampler },
             };
             c.SDL_BindGPUFragmentSamplers(pf_pass, 0, &pf_samplers, pf_samplers.len);
+            const camera_ev_bias: f32 = if (physical.enabled)
+                @log2(@as(f32, 1.2)) - scale_log2 + (if (exposure.enabled) @as(f32, 0.0) else physical.manualEv100())
+            else 0.0;
             const pf_u = PostFxParams{
                 .bloom_tint_int = .{ pp.bloom.tint[0], pp.bloom.tint[1], pp.bloom.tint[2], if (pp.bloom.enabled) pp.bloom.intensity else 0.0 },
-                .grade_params = .{ pp.color_adjustments.exposure_ev, pp.color_adjustments.contrast, pp.color_adjustments.saturation, @floatFromInt(@backingInt(pp.tonemap_mode)) },
+                .grade_params = .{ pp.color_adjustments.exposure_ev + camera_ev_bias + pre_log2, pp.color_adjustments.contrast, pp.color_adjustments.saturation, @floatFromInt(@backingInt(pp.tonemap_mode)) },
                 .grade_tint_look = .{ pp.color_adjustments.filter_tint[0], pp.color_adjustments.filter_tint[1], pp.color_adjustments.filter_tint[2], if (pp.tonemap_look == .punchy) 1.0 else 0.0 },
                 .vignette_params = .{ pp.vignette.color[0], pp.vignette.color[1], pp.vignette.color[2], if (pp.vignette.enabled) pp.vignette.intensity else 0.0 },
-                .vignette_extra = .{ pp.vignette.smoothness, if (pp.auto_exposure.enabled) 1.0 else 0.0, if (pp.anti_aliasing == .fxaa) 1.0 else 0.0, 0.0 },
+                .vignette_extra = .{ pp.vignette.smoothness, if (pp.auto_exposure.enabled) 1.0 else 0.0, if (pp.anti_aliasing == .fxaa) 1.0 else 0.0, pre_gain },
+                .local_exposure = .{ physical.local_exposure_strength, physical.local_exposure_radius, physical.local_exposure_max_stops, 0 },
             };
             c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &pf_u, @sizeOf(PostFxParams));
             c.SDL_DrawGPUPrimitives(pf_pass, 3, 1, 0, 0);
@@ -2231,6 +2327,7 @@ pub const PbrGpuState = struct {
         while (self.ibl_job != null) {
             self.stepIblJob(budget) catch |err| {
                 self.cancelIblJob();
+                self.ibl_initialized = false; // Retry instead of accepting an incomplete environment.
                 return err;
             };
             if (budget == .sliced) return;

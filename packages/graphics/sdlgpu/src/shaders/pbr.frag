@@ -46,11 +46,21 @@ struct GpuReflectionProbe {
     vec4 ground_pad; // rgb=ground_tint, w=diffuse scale
 };
 
+
+struct DynamicGiProbe {
+    vec4 lobes[6];
+    vec4 moments[6];
+    vec4 offset_validity;
+};
+
 layout(std430, set = 2, binding = 12) readonly buffer ClusterLightsBuffer {
     GpuPointLight c_points[256];
     GpuSpotLight c_spots[256];
     GpuRectLight c_rects[64];
     GpuReflectionProbe c_probes[32];
+    vec4 gi_origin_enabled;
+    vec4 gi_spacing;
+    DynamicGiProbe c_gi[64];
 };
 
 layout(std430, set = 2, binding = 13) readonly buffer ClusterGridBuffer {
@@ -337,16 +347,68 @@ float samplePointShadow(int base_tile, vec3 light_pos, vec3 N, vec3 L, float rot
 vec3 evalLight(vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness, vec3 L, vec3 radiance, float spec_scale) {
     float NdotL = max(dot(N, L), 0.0);
     if (NdotL <= 0.0) return vec3(0.0);
-    vec3 H = normalize(V + L);
+    vec3 half_vector = V + L;
+    vec3 H = half_vector * inversesqrt(max(dot(half_vector, half_vector), 1e-12));
+    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
+    if (spec_scale <= 0.0) return kD * albedo / PI * radiance * NdotL;
     float NDF = distributionGGX(N, H, roughness);
     float G = geometrySmith(N, V, L, roughness);
-    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
     vec3 spec = (NDF * G * F) / max(4.0 * max(dot(N, V), 0.0) * NdotL, 0.0001);
-    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
     return (kD * albedo / PI + spec * spec_scale) * radiance * NdotL;
 }
 
-vec3 evalRectLight(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness) {
+
+// Six-lobe diffuse irradiance and directional visibility; grid is updated by CPU ray queries.
+int giSector(vec3 d) {
+    vec3 a = abs(d);
+    if (a.x >= a.y && a.x >= a.z) return d.x >= 0.0 ? 0 : 1;
+    if (a.y >= a.z) return d.y >= 0.0 ? 2 : 3;
+    return d.z >= 0.0 ? 4 : 5;
+}
+vec4 sampleDynamicGi(vec3 p, vec3 n) {
+    if (gi_origin_enabled.w <= 0.0 || any(isnan(gi_origin_enabled)) || any(isinf(gi_origin_enabled))) return vec4(0.0);
+    if (gi_spacing.w > 0.0 && !layersOverlap(gi_spacing.w, layer_info.x)) return vec4(0.0);
+    if (any(isnan(p)) || any(isinf(p)) || any(isnan(n)) || any(isinf(n)) || any(lessThanEqual(gi_spacing.xyz, vec3(0.01))) || any(isnan(gi_spacing.xyz)) || any(isinf(gi_spacing.xyz))) return vec4(0.0);
+    float nlen2 = dot(n,n);
+    if (nlen2 <= 1e-12) return vec4(0.0);
+    vec3 n2 = n*n / nlen2;
+    vec3 q = (p - gi_origin_enabled.xyz) / gi_spacing.xyz;
+    if (any(lessThan(q, vec3(-0.05))) || any(greaterThan(q, vec3(3.05)))) return vec4(0.0);
+    q = clamp(q, vec3(0.0), vec3(3.0));
+    ivec3 base = min(ivec3(floor(q)), ivec3(2));
+    vec3 f = q - vec3(base);
+    vec3 sum_rgb = vec3(0.0);
+    float sum_w = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        ivec3 o = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        ivec3 c = base + o;
+        int idx = c.x + 4*c.y + 16*c.z;
+        vec3 w3 = mix(1.0-f, f, vec3(o));
+        float w = w3.x*w3.y*w3.z*c_gi[idx].offset_validity.w;
+        if (w <= 0.00001) continue;
+        vec3 pos = gi_origin_enabled.xyz + vec3(c)*gi_spacing.xyz + c_gi[idx].offset_validity.xyz;
+        vec3 delta = p - pos;
+        float dist = length(delta);
+        int s = giSector(delta);
+        vec4 moment = c_gi[idx].moments[s];
+        float mean = c_gi[idx].lobes[s].w;
+        float variance = max(moment.x - mean*mean, 0.0025);
+        float excess = max(dist - mean - 0.05, 0.0);
+        float vis = variance / (variance + excess*excess);
+        if (moment.y <= 0.0) continue;
+        vis = vis*vis*vis;
+        vec3 radiance = c_gi[idx].lobes[n.x >= 0.0 ? 0 : 1].rgb*n2.x
+                      + c_gi[idx].lobes[n.y >= 0.0 ? 2 : 3].rgb*n2.y
+                      + c_gi[idx].lobes[n.z >= 0.0 ? 4 : 5].rgb*n2.z;
+        sum_rgb += radiance*w*vis;
+        sum_w += w;
+    }
+    // Keep occluded samples dark, while fading to the legacy fallback for uninitialized probes.
+    return vec4(sum_rgb/max(sum_w, 0.00001), clamp(sum_w, 0.0, 1.0));
+}
+
+vec3 evalRectLightLegacy(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness) {
     vec3 to_p = v_world_pos - rl.pos_range.xyz;
     float plane_d = dot(to_p, rl.dir_two.xyz);
     if (plane_d <= 0.0 && rl.dir_two.w < 0.5) return vec3(0.0);
@@ -367,6 +429,39 @@ vec3 evalRectLight(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float 
     return evalLight(N, V, F0, albedo, metallic, roughness, L, rl.col_pad.rgb * att * facing, 1.0);
 }
 
+vec3 evalRectLightQuadrature(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness) {
+    vec3 to_p = v_world_pos - rl.pos_range.xyz;
+    float plane_d = dot(to_p, rl.dir_two.xyz);
+    if (plane_d <= 0.0 && rl.dir_two.w < 0.5) return vec3(0.0);
+    // Tensor-product 2x2 Gauss-Legendre quadrature over the finite emitter.
+    // Flux is split equally, retaining the legacy far-field scale.
+    vec3 sum_rgb = vec3(0.0);
+    const float node = 0.57735026919;
+    float range = max(rl.pos_range.w, 0.001);
+    for (int i = 0; i < 4; ++i) {
+        float sx = (i & 1) == 0 ? -node : node;
+        float sy = (i & 2) == 0 ? -node : node;
+        vec3 sample_pos = rl.pos_range.xyz + rl.right_hx.xyz * (sx * rl.right_hx.w)
+                        + rl.up_hy.xyz * (sy * rl.up_hy.w);
+        vec3 delta = sample_pos - v_world_pos;
+        float dist = length(delta);
+        if (dist >= range || dist < 0.0001) continue;
+        vec3 L = delta / dist;
+        float r = dist / range;
+        float att = 1.0 - r*r*r*r;
+        att = att*att/(dist*dist + 1.0);
+        float facing = dot(-L, rl.dir_two.xyz);
+        facing = rl.dir_two.w > 0.5 ? abs(facing) : max(facing, 0.0);
+        sum_rgb += evalLight(N, V, F0, albedo, metallic, roughness, L, rl.col_pad.rgb * (att * facing * 0.25), 1.0);
+    }
+    return sum_rgb;
+}
+
+vec3 evalRectLight(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness) {
+    if (layer_info.w > 0.5) return evalRectLightQuadrature(rl,N,V,F0,albedo,metallic,roughness);
+    return evalRectLightLegacy(rl,N,V,F0,albedo,metallic,roughness);
+}
+
 void main() {
     vec4 tex_albedo = texture(u_base_color_tex, v_uv);
     vec4 albedo_a = vec4(tex_albedo.rgb * base_color.rgb, tex_albedo.a * base_color.a);
@@ -376,7 +471,7 @@ void main() {
 
     vec3 emissive_rgb = emissive_weight.rgb * texture(u_emissive_tex, v_uv).rgb;
     if (mat_flags.x > 0.5) {
-        frag_color = vec4(albedo_a.rgb + emissive_rgb, albedo_a.a);
+        frag_color = vec4((albedo_a.rgb + emissive_rgb) * layer_info.z, albedo_a.a);
         return;
     }
 
@@ -391,6 +486,14 @@ void main() {
     vec3 V = normalize(camera_pos_fog.xyz - v_world_pos);
     if (mat_flags.y > 0.0) {
         N = perturbNormal(N, V, v_uv);
+    }
+    // Geometric specular AA: filter perceptual roughness in the GGX alpha-squared domain.
+    if (sh_coeffs[4].w > 0.5) {
+        vec3 nx = dFdx(N);
+        vec3 ny = dFdy(N);
+        float variance = min(0.15, 0.5 * (dot(nx,nx) + dot(ny,ny)));
+        float r2 = roughness * roughness;
+        roughness = pow(clamp(r2*r2 + variance, 0.0000041, 1.0), 0.25);
     }
     vec3 F0 = mix(vec3(0.16 * mat_params.z * mat_params.z), albedo_a.rgb, metallic);
     float view_depth = max(dot(v_world_pos - camera_pos_fog.xyz, normalize(camera_fwd_overlap.xyz)), 0.0);
@@ -427,6 +530,7 @@ void main() {
                 // a point light paints on a wall it sits close to.
                 att = (att * att) / (dist * dist + 1.0 + pl.shadow_params.x * pl.shadow_params.x);
                 vec3 L = to_l / max(dist, 0.0001);
+                if (dot(N, L) <= 0.0) continue;
                 float vis = (pl.col_radius.w >= 0.0) ? samplePointShadow(int(pl.col_radius.w + 0.5), pl.pos_range.xyz, N, L, rot, pl.shadow_params.x) : 1.0;
                 Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, pl.col_radius.rgb * att, pl.shadow_params.z) * vis;
             }
@@ -447,6 +551,7 @@ void main() {
                 float cone = clamp((theta - sl.col_cos_outer.w) / eps, 0.0, 1.0);
                 float att = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
                 att = (att * att) / (dist * dist + 1.0);
+                if (cone <= 0.0 || dot(N, L) <= 0.0) continue;
                 float spot_bias = 0.0012 + (1.0 - max(dot(N, L), 0.0)) * 0.004;
                 float vis = (sl.shadow_params.x >= 0.0) ? sampleLocalTile(int(sl.shadow_params.x + 0.5), v_world_pos, spot_bias, rot, sl.shadow_params.z) : 1.0;
                 Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, sl.col_cos_outer.rgb * att * cone, 1.0) * vis;
@@ -499,6 +604,8 @@ void main() {
         }
     }
 
+    vec4 dynamic_gi = sampleDynamicGi(v_world_pos + N * 0.03, N);
+    diffuse_ibl = mix(diffuse_ibl, dynamic_gi.rgb * albedo_a.rgb, dynamic_gi.a);
     vec2 brdf = texture(u_brdf_lut, vec2(NdotV, roughness)).rg;
     vec3 FssEss = F0 * brdf.x + brdf.y;
     float Ess = brdf.x + brdf.y;
@@ -521,5 +628,5 @@ void main() {
         color = mix(color, fog_color_start.rgb, clamp(fog_f, 0.0, 1.0));
     }
 
-    frag_color = vec4(color, albedo_a.a);
+    frag_color = vec4(color * layer_info.z, albedo_a.a);
 }

@@ -541,3 +541,15 @@ test "Phase D MaterialShaderRegistry hot-reload transactions, PickingTarget, Sel
     const mem = prism.editor_api.estimateViewMemoryBytes(1920, 1080, true, true, true, true);
     try testing.expect(mem.totalBytes() > 40 * 1024 * 1024);
 }
+
+test "lighting hardening: probe directional visibility moments" {
+    const near = prism.baked_gi.ProbeVisibilityMoments{
+        .mean_distance = 1, .mean_distance_squared = 1, .valid = true,
+    };
+    try testing.expectApproxEqAbs(@as(f32, 1), near.weight(0.5), 1e-5);
+    try testing.expect(near.weight(2) < 0.01);
+    try testing.expectEqual(@as(usize, 0), prism.baked_gi.probeVisibilitySector(.{ 1, 0, 0 }));
+    try testing.expectEqual(@as(usize, 1), prism.baked_gi.probeVisibilitySector(.{ -1, 0, 0 }));
+    const unknown = prism.baked_gi.ProbeVisibilityMoments{};
+    try testing.expectEqual(@as(f32, 1), unknown.weight(10));
+}

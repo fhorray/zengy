@@ -269,6 +269,10 @@ pub const VolumetricFogConfig = struct {
     anisotropy: f32 = 0.6,
     scattering: f32 = 0.04,
     max_distance: f32 = 80.0,
+    /// Ray-march budget per pixel, clamped to 8..128 by the backend.
+    raymarch_steps: u32 = 64,
+    /// Treat scattering as a single-scattering albedo fraction of extinction.
+    physical_scattering: bool = false,
     /// Ray-march at half resolution and upsample depth-aware (about 4x fewer marched pixels).
     /// Off by default: full resolution keeps thin shafts sharp; opt in on GPUs where the cost matters.
     half_resolution: bool = false,
@@ -290,20 +294,62 @@ pub const FogSettings = struct {
     volumetric: VolumetricFogConfig = .{},
 };
 
+/// Opt-in physical camera model; scale converts one existing scene RGB luminance
+/// unit to cd/m². It does not recalibrate light emitters or the GI transport.
+pub const PhysicalExposureSettings = struct {
+    enabled: bool = false,
+    luminance_scale: f32 = 1.0,
+    /// Internal scene buffer gain in stops; zero leaves storage unchanged.
+    pre_exposure_stops: f32 = 0.0,
+    /// Optional bounded spatial metering after global exposure; 0 disables it.
+    local_exposure_strength: f32 = 0.0,
+    local_exposure_radius: f32 = 0.05,
+    local_exposure_max_stops: f32 = 1.0,
+    aperture: f32 = 4.0,
+    shutter_seconds: f32 = 1.0 / 60.0,
+    iso: f32 = 100.0,
+    min_ev100: f32 = -6.0,
+    max_ev100: f32 = 20.0,
+
+    pub fn scaleLog2(self: PhysicalExposureSettings) f32 {
+        const scale = if (std.math.isFinite(self.luminance_scale)) std.math.clamp(self.luminance_scale, 1e-6, 1e6) else 1.0;
+        return @log2(scale);
+    }
+
+    pub fn manualEv100(self: PhysicalExposureSettings) f32 {
+        const aperture = if (std.math.isFinite(self.aperture)) std.math.clamp(self.aperture, 0.5, 64.0) else 4.0;
+        const shutter = if (std.math.isFinite(self.shutter_seconds)) std.math.clamp(self.shutter_seconds, 1e-6, 60.0) else 1.0 / 60.0;
+        const iso = if (std.math.isFinite(self.iso)) std.math.clamp(self.iso, 1.0, 204800.0) else 100.0;
+        return @log2(aperture * aperture / shutter * 100.0 / iso);
+    }
+};
+
 /// Histogram-based automatic camera exposure settings.
 pub const AutoExposureSettings = struct {
+    physical: PhysicalExposureSettings = .{},
+    history_epoch: u64 = 0,
     enabled: bool = false,
     min_ev100: f32 = -4.0,
     max_ev100: f32 = 8.0,
     low_percent: f32 = 0.10,
     high_percent: f32 = 0.90,
-    /// Adaptation rate (1/s) while the image is getting brighter, i.e. the exposure gain rises (moving into the
+    /// Adaptation speed (stops/s in hybrid mode, 1/s in legacy mode) while exposure gain rises (moving into the
     /// dark). Human eyes adapt to darkness slowly, so this is the smaller default.
     speed_brighten: f32 = 1.0,
-    /// Adaptation rate (1/s) while the image is getting darker, i.e. the exposure gain falls (moving into light).
+    /// Adaptation speed (stops/s in hybrid mode, 1/s in legacy mode) while exposure gain falls (moving into light).
     speed_darken: f32 = 3.0,
     compensation_ev: f32 = 0.0,
     metering_mask_tex: u64 = 0,
+    /// One sample per stride x stride pixels; 1 restores full-resolution metering.
+    metering_stride: u32 = 4,
+    histogram_min_log2: f32 = -12.0,
+    histogram_max_log2: f32 = 12.0,
+    /// 0 = uniform histogram; 1 = strong center weighting.
+    metering_center_weight: f32 = 0.0,
+    /// 0 preserves exponential adaptation (rates in 1/s). Positive values use stops/s.
+    hybrid_transition_stops: f32 = 0.0,
+    /// Set for a single frame on a camera cut; do not leave enabled every frame.
+    reset_history: bool = false,
 };
 
 /// HDR bloom settings.
@@ -348,6 +394,8 @@ pub const VignetteSettings = struct {
 
 /// Screen-space ambient occlusion settings.
 pub const SsaoSettings = struct {
+    /// Horizon-direction AO alternative to legacy hemisphere sampling.
+    horizon_based: bool = false,
     enabled: bool = false,
     radius: f32 = 0.5,
     intensity: f32 = 1.0,
@@ -428,6 +476,9 @@ pub const ShadowQuality = struct {
 
 /// Quality and cost switches that do not change what the scene means, only how the backend renders it.
 pub const RenderQuality = struct {
+    /// Four finite emitter samples instead of the legacy closest-point approximation.
+    area_light_quadrature: bool = false,
+    specular_aa: bool = false,
     /// Reuse the depth prepass (written for SSAO and contact shadows) as the depth buffer of the lit pass, so
     /// opaque fragments are shaded once. Only takes effect while the prepass runs. Off by default until the
     /// capture suite shows identical silhouettes on the target GPUs.
@@ -513,7 +564,24 @@ pub const ExtractedRectLight = struct {
 };
 
 /// Per-frame extracted PBR lighting, environment, and post-processing view.
+/// CPU/GPU layout shared with Helios' dynamic six-lobe probe grid.
+pub const DynamicGiProbe = extern struct {
+    lobes: [6][4]f32 = @splat(.{ 0, 0, 0, 0 }),
+    moments: [6][4]f32 = @splat(.{ 0, 0, 0, 0 }),
+    offset_validity: [4]f32 = .{ 0, 0, 0, 0 },
+};
+pub const DynamicGiGrid = extern struct {
+    origin_enabled: [4]f32 = .{ 0, 0, 0, 0 },
+    spacing: [4]f32 = .{ 1, 1, 1, 0 },
+    probes: [64]DynamicGiProbe = @splat(.{}),
+};
+comptime {
+    if (@sizeOf(DynamicGiProbe) != 208 or @sizeOf(DynamicGiGrid) != 13344) @compileError("Dynamic GI GPU layout mismatch");
+}
+
 pub const ExtractedPbrFrame = struct {
+    dynamic_gi: DynamicGiGrid = .{},
+    camera_key: u64 = 0,
     camera_position: [3]f32 = .{ 0, 0, 0 },
     camera_forward: [3]f32 = .{ 0, 0, -1 },
     view_matrix: [16]f32 = .{

@@ -237,13 +237,19 @@ const PrismShowcaseState = struct {
         .edge_fade = 1.6,
     },
     gi_vol: prism.baked_gi.IrradianceProbeVolume,
-    gi_bvh: helios.ray_query.Bvh,
     gi_materials: std.ArrayList(helios.indirect_rt.SurfaceMaterial) = .empty,
     gi_emitters: std.ArrayList(helios.gi_solver.DirectPointEmitter) = .empty,
     gi_vpls: std.ArrayList(helios.gi_solver.VirtualPointLight) = .empty,
     gi_vpl_slots: std.ArrayList(VplSlot) = .empty,
     gi_stats: helios.gi_solver.GiSolveStats = .{},
     gi_dirty: bool = true,
+    dynamic_gi_enabled: bool = false,
+    advanced_lighting_enabled: bool = false,
+    dynamic_grid: helios.dynamic_gi.Grid = .{},
+    dynamic_revision: u64 = 0,
+    dynamic_sky_preset: ?u8 = null,
+    dynamic_cursor: usize = 0,
+    gi_geometry_dirty: bool = false,
     /// A GI re-solve is waiting (an object is being dragged). While the drag lasts the solve runs at most every
     /// `GI_DRAG_INTERVAL` seconds and at reduced quality; once the object has been still for `GI_SETTLE_SECONDS`
     /// one full-quality solve runs.
@@ -273,7 +279,6 @@ const PrismShowcaseState = struct {
     pub fn deinit(self: *PrismShowcaseState) void {
         self.spawned.deinit(self.app.allocator);
         self.gi_vol.deinit();
-        self.gi_bvh.deinit();
         self.gi_materials.deinit(self.app.allocator);
         self.gi_emitters.deinit(self.app.allocator);
         self.gi_vpls.deinit(self.app.allocator);
@@ -297,7 +302,10 @@ fn rebuildGiBvhFromEntities(st: *PrismShowcaseState) !void {
             [3]f32{ tf.scale[0] * 0.5, tf.scale[1] * 0.5, tf.scale[2] * 0.5 };
         try helios.gi_solver.appendBoxTriangles(allocator, &gi_tris, tf.position, half_ext, @intCast(oi));
     }
-    try st.gi_bvh.build(gi_tris.items);
+    const gi_service = st.app.resources.get(helios.HeliosService) orelse return error.MissingHeliosService;
+    try gi_service.runtime.replaceGeometry(gi_tris.items, st.gi_materials.items);
+    st.gi_geometry_dirty = false;
+    if (st.app.resources.get(helios.HeliosService)) |svc| svc.cache.invalidateAll();
 }
 
 /// Points the bounce-light slots at the freshly solved `st.gi_vpls`: existing slots are reused in order, extra lights
@@ -377,16 +385,74 @@ fn updateVplFade(st: *PrismShowcaseState, dt: f32) void {
     }
 }
 
+// Dynamic probes replace the diffuse fallback; VPLs are disabled in this mode.
+fn updateDynamicGi(st: *PrismShowcaseState) !void {
+    if (!st.dynamic_gi_enabled) return;
+    const service = st.app.resources.get(helios.HeliosService) orelse return;
+    const target = st.app.resources.get(render_3d.pbr.DynamicGiGrid) orelse return;
+    if (service.settings.tier == .off) {
+        target.origin_enabled[3] = 0;
+        st.dynamic_grid.origin_enabled[3] = 0;
+        return;
+    }
+    // Do not spend the ray budget on a stale geometry snapshot while a drag is pending.
+    if (st.gi_geometry_dirty) return;
+    if (st.dynamic_revision != service.runtime.geometry_revision or st.dynamic_sky_preset == null or st.dynamic_sky_preset.? != st.sky_preset or st.dynamic_grid.origin_enabled[3] == 0) {
+        st.dynamic_grid = .{};
+        if (st.scene_index == 5) {
+            st.dynamic_grid.origin_enabled = .{ -2.86, 0.13, -4.86, 1 };
+            st.dynamic_grid.spacing = .{ 1.9067, 1.2, 1.9067, 2 };
+        } else {
+            st.dynamic_grid.origin_enabled = .{ -8, 0.5, -8, 1 };
+            st.dynamic_grid.spacing = .{ 5.3333, 1.8, 5.3333, 0 };
+        }
+        st.dynamic_revision = service.runtime.geometry_revision;
+        st.dynamic_sky_preset = st.sky_preset;
+        st.dynamic_cursor = 0;
+    }
+    var sun: ?helios.gi_solver.DirectSunEmitter = null;
+    if (st.app.world.getConst(st.sun_entity, render_3d.pbr.DirectionalLight)) |light| {
+        sun = .{ .direction = light.direction, .color = light.color, .illuminance_lux = light.illuminance_lux };
+    }
+    var settings = helios.dynamic_gi.Settings{
+        .probes_per_frame = switch (service.settings.tier) { .off => 0, .low => 1, .medium => 2, .high => 4 },
+        .rays_per_probe = switch (service.settings.tier) { .off, .low => 24, .medium => 48, .high => 64 },
+        .hysteresis = if (st.gi_move_age < GI_SETTLE_SECONDS) 0.35 else 0.85,
+    };
+    if (st.app.resources.getConst(render_3d.pbr.SkyEnvironment)) |sky| {
+        if (sky.kind == .solid_color) {
+            settings.sky_radiance = sky.solid_color;
+        } else {
+            settings.sky_gradient = .{ .zenith = sky.sky_tint, .horizon = sky.horizon_tint, .ground = sky.ground_albedo };
+        }
+    }
+    _ = helios.dynamic_gi.update(&st.dynamic_grid, &service.runtime.bvh, service.runtime.materials.items, st.gi_emitters.items, sun, settings, &st.dynamic_cursor, service.frame_index);
+    target.origin_enabled = st.dynamic_grid.origin_enabled;
+    target.spacing = st.dynamic_grid.spacing;
+    for (&target.probes, &st.dynamic_grid.probes) |*dst, *src| {
+        dst.lobes = src.lobes;
+        dst.moments = src.moments;
+        dst.offset_validity = src.offset_validity;
+    }
+}
+
 fn rebuildHeliosGi(st: *PrismShowcaseState) !void {
     const allocator = st.app.allocator;
     // Bounce lights are not despawned here: they are retargeted below and fade (see `updateVplFade`), so a change in
     // visibility (a closing door, a moved cube) never turns the room's light off or on in a single frame.
-    st.gi_vpls.clearRetainingCapacity();
-
     const hsvc = st.app.resources.get(helios.HeliosService) orelse return;
     var cfg = helios.gi_solver.configForTier(hsvc.settings.tier);
     if (cfg.max_vpls == 0) {
+        st.gi_stats = try hsvc.runtime.solve(&.{}, null, cfg);
+        st.gi_vpls.clearRetainingCapacity();
+        try retargetVplSlots(st);
+        st.gi_dirty = false;
+        return;
+    }
+    if (st.gi_geometry_dirty) try rebuildGiBvhFromEntities(st);
+    if (st.dynamic_gi_enabled) {
         st.gi_stats = .{};
+        st.gi_vpls.clearRetainingCapacity();
         try retargetVplSlots(st);
         st.gi_dirty = false;
         return;
@@ -415,15 +481,11 @@ fn rebuildHeliosGi(st: *PrismShowcaseState) !void {
         }
     }
 
-    st.gi_stats = try helios.gi_solver.solveInstantRadiosity(
-        allocator,
-        &st.gi_bvh,
-        st.gi_materials.items,
-        st.gi_emitters.items,
-        sun_opt,
-        cfg,
-        &st.gi_vpls,
-    );
+    st.gi_stats = try hsvc.runtime.solve(st.gi_emitters.items, sun_opt, cfg);
+    const result = hsvc.runtime.result();
+    try st.gi_vpls.ensureTotalCapacity(allocator, result.len);
+    st.gi_vpls.clearRetainingCapacity();
+    st.gi_vpls.appendSliceAssumeCapacity(result);
 
     try retargetVplSlots(st);
     st.gi_dirty = false;
@@ -533,10 +595,16 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         fg.density = sc.fog_density;
         fg.color = .{ sc.horizon_tint[0] * 0.65, sc.horizon_tint[1] * 0.65, sc.horizon_tint[2] * 0.65 };
         fg.volumetric.enabled = sc.volumetric_enabled;
+        fg.volumetric.physical_scattering = st.advanced_lighting_enabled;
     }
     if (st.app.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| {
         pp.ssao.enabled = sc.ssao_enabled;
+        pp.ssao.horizon_based = st.advanced_lighting_enabled;
+        pp.auto_exposure.history_epoch +%= 1;
         pp.bloom.enabled = sc.bloom_enabled;
+        pp.quality.area_light_quadrature = st.advanced_lighting_enabled;
+        pp.quality.specular_aa = st.advanced_lighting_enabled;
+        pp.auto_exposure.physical.local_exposure_strength = if (st.advanced_lighting_enabled) 0.35 else 0.0;
     }
     if (st.app.world.get(st.sun_entity, render_3d.pbr.DirectionalLight)) |sun| {
         sun.direction = sc.sun_dir;
@@ -588,7 +656,10 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
             [3]f32{ obj.scale[0] * 0.5, obj.scale[1] * 0.5, obj.scale[2] * 0.5 };
         try helios.gi_solver.appendBoxTriangles(allocator, &gi_tris, obj.pos, half_ext, @intCast(oi));
     }
-    try st.gi_bvh.build(gi_tris.items);
+    const gi_service = st.app.resources.get(helios.HeliosService) orelse return error.MissingHeliosService;
+    try gi_service.runtime.replaceGeometry(gi_tris.items, st.gi_materials.items);
+    st.gi_geometry_dirty = false;
+    if (st.app.resources.get(helios.HeliosService)) |svc| svc.cache.invalidateAll();
     st.spawned_obj_count = sc.objects.len;
     // Default selection to the interactive pedestal cube in Scene 06 (index 9) or the last prop object.
     st.selected_obj = if (idx == 5 and sc.objects.len > 9) 9 else if (sc.objects.len > 1) sc.objects.len - 1 else 0;
@@ -838,8 +909,10 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
                                     cam_pose.forward[1] + right_v[1] * (ndc_x * aspect * tan_half) + up_v[1] * (ndc_y * tan_half),
                                     cam_pose.forward[2] + right_v[2] * (ndc_x * aspect * tan_half) + up_v[2] * (ndc_y * tan_half),
                                 });
+                                if (st.gi_geometry_dirty) try rebuildGiBvhFromEntities(st);
                                 var qst = helios.ray_query.QueryStats{};
-                                const hit = st.gi_bvh.traceClosest(.{ .origin = cam_pose.position, .direction = rdir, .t_min = 0.05, .t_max = 120.0 }, &qst);
+                                const gi_service = st.app.resources.get(helios.HeliosService) orelse return error.MissingHeliosService;
+                                const hit = gi_service.runtime.bvh.traceClosest(.{ .origin = cam_pose.position, .direction = rdir, .t_min = 0.05, .t_max = 120.0 }, &qst);
                                 if (hit.hit and hit.instance_id > 0 and hit.instance_id < st.spawned_obj_count) {
                                     st.selected_obj = hit.instance_id;
                                     st.obj_edit_highlight = 1.0;
@@ -926,7 +999,7 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
                 }
                 if (moved) {
                     st.obj_edit_highlight = 0.6;
-                    try rebuildGiBvhFromEntities(st);
+                    st.gi_geometry_dirty = true;
                     // The solve itself is deferred and throttled (see `gi_pending`): running it on every frame of a
                     // drag made moving objects stutter.
                     st.gi_pending = true;
@@ -980,6 +1053,7 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
         try rebuildHeliosGi(st);
     }
     updateVplFade(st, @floatCast(ctx.dt));
+    try updateDynamicGi(st);
 
     // Optional automated screenshot capture (`ZENGY_PRISM_CAPTURE=<dir>`) to visually verify GI OFF vs HIGH.
     if (st.capture_dir) |cdir| {
@@ -1116,7 +1190,7 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
 
     // In Scene 06 (Dark Room Sunbeam), keep SkyEnvironment static (zero per-frame IBL rebuilds / flicker)
     // and only update AmbientLight + trigger Helios GI visibility re-solve when crossing the doorway.
-    if (st.scene_index == 5 and st.sky_preset == 0) {
+    if (st.scene_index == 5 and st.sky_preset == 0 and !st.dynamic_gi_enabled) {
         const p = cam_pose.position;
         const dx = @max(@abs(p[0]) - 3.1, 0.0);
         const dy = @max(@max(-0.2 - p[1], p[1] - 3.9), 0.0);
@@ -1428,7 +1502,10 @@ pub fn main(init: std.process.Init) !void {
         std.Io.Dir.cwd().createDirPath(init.io, d) catch {};
     }
 
+    try app.resources.insert(render_3d.pbr.DynamicGiGrid, .{});
     try app.resources.insert(PrismShowcaseState, .{
+        .dynamic_gi_enabled = std.mem.eql(u8, init.environ_map.get("ZENGY_DYNAMIC_GI") orelse "0", "1"),
+        .advanced_lighting_enabled = std.mem.eql(u8, init.environ_map.get("ZENGY_ADVANCED_LIGHTING") orelse "0", "1"),
         .app = &app,
         .gfx = gfx,
         .rt = rt,
@@ -1437,7 +1514,6 @@ pub fn main(init: std.process.Init) !void {
         .view_id = view_id,
         .assets = assets,
         .gi_vol = gi_vol,
-        .gi_bvh = helios.ray_query.Bvh.init(allocator),
         .capture_dir = cap_dir,
         .capture_io = init.io,
     });

@@ -12,6 +12,7 @@ layout(std140, set = 3, binding = 0) uniform PostFxParams {
     vec4 grade_tint_look;  // xyz=filter_tint, w=agx_punchy (0/1)
     vec4 vignette_params;  // xyz=color, w=intensity (0=off)
     vec4 vignette_extra;   // x=smoothness, y=use_auto_exp
+    vec4 local_exposure;   // x=strength, y=radius, z=max correction (stops)
 };
 
 layout(location = 0) out vec4 frag_color;
@@ -107,6 +108,7 @@ void main() {
     // FXAA-style edge filter on gamma-encoded luminance, before tonemapping. Linear HDR luminance lets
     // highlights dominate the edge test, so the edge decision uses a perceptual proxy instead.
     // `vignette_extra.z` is the anti-aliasing switch (AntiAliasingMode: 0 = none, 1 = fxaa).
+    if (vignette_extra.z > 0.5) {
     vec2 texel = 1.0 / vec2(textureSize(u_hdr, 0));
     vec3 nw = textureLod(u_hdr, uv + vec2(-1.0, -1.0) * texel, 0.0).rgb;
     vec3 ne = textureLod(u_hdr, uv + vec2( 1.0, -1.0) * texel, 0.0).rgb;
@@ -114,33 +116,59 @@ void main() {
     vec3 se = textureLod(u_hdr, uv + vec2( 1.0,  1.0) * texel, 0.0).rgb;
     const vec3 LUMA_W = vec3(0.299, 0.587, 0.114);
     const vec3 PERCEPTUAL_GAMMA = vec3(1.0 / 2.2);
-    float l_m = dot(pow(max(hdr, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
-    float l_nw = dot(pow(max(nw, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
-    float l_ne = dot(pow(max(ne, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
-    float l_sw = dot(pow(max(sw, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
-    float l_se = dot(pow(max(se, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float inverse_pre_gain = 1.0 / max(vignette_extra.w, 1e-6);
+    float l_m = dot(pow(max(hdr * inverse_pre_gain, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float l_nw = dot(pow(max(nw * inverse_pre_gain, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float l_ne = dot(pow(max(ne * inverse_pre_gain, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float l_sw = dot(pow(max(sw * inverse_pre_gain, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+    float l_se = dot(pow(max(se * inverse_pre_gain, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
     float l_min = min(l_m, min(min(l_nw, l_ne), min(l_sw, l_se)));
     float l_max = max(l_m, max(max(l_nw, l_ne), max(l_sw, l_se)));
     // Early exit: flat neighbourhoods have no edge to filter, so the refinement taps are skipped.
-    if (vignette_extra.z > 0.5 && (l_max - l_min) > max(0.0312, 0.125 * l_max)) {
+    if ((l_max - l_min) > max(0.0312, 0.125 * l_max)) {
         vec2 aa_dir = vec2(-((l_nw + l_ne) - (l_sw + l_se)), (l_nw + l_sw) - (l_ne + l_se));
         float dir_reduce = max((l_nw + l_ne + l_sw + l_se) * 0.03125, 1.0 / 128.0);
         float rcp_dir = 1.0 / (min(abs(aa_dir.x), abs(aa_dir.y)) + dir_reduce);
         aa_dir = clamp(aa_dir * rcp_dir, vec2(-4.0), vec2(4.0)) * texel;
         vec3 aa_a = 0.5 * (textureLod(u_hdr, uv + aa_dir * (1.0 / 3.0 - 0.5), 0.0).rgb + textureLod(u_hdr, uv + aa_dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
         vec3 aa_b = aa_a * 0.5 + 0.25 * (textureLod(u_hdr, uv + aa_dir * -0.5, 0.0).rgb + textureLod(u_hdr, uv + aa_dir * 0.5, 0.0).rgb);
-        float l_b = dot(pow(max(aa_b, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
+        float l_b = dot(pow(max(aa_b * inverse_pre_gain, 0.0), PERCEPTUAL_GAMMA), LUMA_W);
         hdr = (l_b < l_min || l_b > l_max) ? aa_a : aa_b;
     }
 
-    vec3 bloom = texture(u_bloom, uv).rgb;
+    }
+    vec3 hdr_before_bloom = hdr;
+    vec3 bloom = bloom_tint_int.w > 0.0 ? texture(u_bloom, uv).rgb : vec3(0.0);
     hdr += bloom * bloom_tint_int.rgb * bloom_tint_int.w;
 
     float ev = grade_params.x;
     if (vignette_extra.y > 0.5) {
-        ev += texelFetch(u_exposure, ivec2(0, 0), 0).r;
+        float adapted = texelFetch(u_exposure, ivec2(0, 0), 0).r;
+        if (!isnan(adapted) && !isinf(adapted)) ev += adapted;
     }
     vec3 col = hdr * exp2(-ev);
+    // Small bounded, edge-aware neighborhood meter. Global exposure remains the reference.
+    if (local_exposure.x > 0.0 && local_exposure.z > 0.0) {
+        const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
+        float gain = exp2(-ev);
+        float center_log = log2(max(dot(max(hdr_before_bloom, vec3(0.0))*gain, lw), 1e-5));
+        float sum_log = center_log;
+        float sum_w = 1.0;
+        float radius = clamp(local_exposure.y, 0.001, 0.15);
+        vec2 aspect = vec2(1.0, float(textureSize(u_hdr,0).x)/float(textureSize(u_hdr,0).y));
+        const vec2 dirs[8] = vec2[8](vec2(1,0),vec2(0.70710678),vec2(0,1),vec2(-0.70710678,0.70710678),vec2(-1,0),vec2(-0.70710678),vec2(0,-1),vec2(0.70710678,-0.70710678));
+        for (int i=0; i<8; ++i) {
+            vec2 offset = dirs[i]*radius*aspect;
+            vec3 rgb = max(textureLod(u_hdr, clamp(uv+offset, vec2(0.0),vec2(1.0)), 0.0).rgb, vec3(0.0))*gain;
+            float l = log2(max(dot(rgb,lw),1e-5));
+            float w = exp(-abs(l-center_log)*0.75);
+            sum_log += l*w;
+            sum_w += w;
+        }
+        float bound = clamp(local_exposure.z,0.0,2.0);
+        float correction = clamp(log2(0.18)-sum_log/sum_w,-bound,bound);
+        col *= exp2(correction*clamp(local_exposure.x,0.0,1.0));
+    }
 
     int mode = int(grade_params.w + 0.5);
     if (mode == 1) {
