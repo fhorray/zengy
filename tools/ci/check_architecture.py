@@ -5,14 +5,18 @@ Checks, without modifying any file:
   * core (`src/`) does not import packages/apps/tools/examples through build wiring or relative paths;
   * packages do not depend on apps, tools, examples, projects, benchmarks or tests;
   * apps and tools do not import each other's sources;
-  * no production module dependency cycles;
+  * no production module dependency cycles, and no package/core module can reach a forbidden layer indirectly;
+  * apps do not import other apps (`apps/<a>` never imports `apps/<b>`);
+  * every shipped module root lives in a directory listed in build.zig.zon `.paths`;
+  * every public `b.addModule` module is classified in packages/README.md and installable ones match the CLI catalog;
   * every `b.path("....zig")` root and every `addModuleTest("....zig")` root in build.zig and build/*.zig exists;
   * every CLI catalog entry (OFFICIAL_PACKAGES / packageDir) resolves to an existing file.
 
 Limits: only `const x = b.addModule/createModule(...)` roots and `x.addImport("n", y)` edges are
 resolved (build.zig and build/*.zig are read together, so local aliases must keep one name).
-Imports of locally defined third-party modules (translate-c, dependencies) are treated as external;
-imports of names never defined in the build files are printed as "unclassified". Neither fails the run. Test modules
+Imports of locally defined third-party modules (translate-c, dependencies) are treated as external.
+Imports the guard cannot resolve (for example an alias of a module) are reported as errors, so the
+graph is never silently incomplete. Test modules
 (passed to addModuleTest) are not part of the production graph and may import any layer.
 
 Usage: check_architecture.py [repo_root]    |    check_architecture.py --self-test
@@ -30,6 +34,12 @@ FORBIDDEN = {
     "apps": {"tools", "examples", "projects", "benchmarks", "tests"},
     "tools": {"apps", "examples", "projects", "benchmarks", "tests"},
 }
+
+
+def app_of(path):
+    """`apps/<name>` for application paths, else the top-level directory."""
+    parts = path.split("/")
+    return "/".join(parts[:2]) if parts[0] == "apps" and len(parts) > 1 else parts[0]
 
 
 def layer_of(path):
@@ -50,6 +60,15 @@ def read_build(root):
 def parse_build(text):
     mods = {}
     known = set(re.findall(r"^\s*const (\w+_mod) = ", text, re.M))
+    aliases = dict(re.findall(r"^\s*const (\w+_mod) = (\w+_mod);", text, re.M))
+
+    def canon(name):
+        for _ in range(8):
+            if name not in aliases:
+                break
+            name = aliases[name]
+        return name
+
     for m in re.finditer(r"const (\w+) = b\.(?:addModule|createModule)\((?:\"\w+\", )?\.\{(.*?)\n    \}\);", text, re.S):
         r = re.search(r'root_source_file = b\.path\("([^"]+)"\)', m.group(2))
         if r:
@@ -57,6 +76,7 @@ def parse_build(text):
     edges, unclassified = [], []
     for m in re.finditer(r'(\w+)\.addImport\("(\w+)", (\w+)\);', text):
         src, _, dst = m.groups()
+        src, dst = canon(src), canon(dst)
         if src in mods and dst in mods:
             edges.append((src, dst))
         elif (src in mods or dst in mods) and not (src in known and dst in known):
@@ -114,6 +134,58 @@ def check_sources(root, errors):
                             errors.append(f"{rel}:{i}: '{layer}' source imports '{target}' (layer '{tl or 'outside repo'}')")
 
 
+SHIPPED_LAYERS = {"src", "packages", "apps", "third_party"}
+
+
+def check_paths(root, mods, errors):
+    """Shipped module roots must be inside a directory listed in build.zig.zon `.paths`."""
+    zp = os.path.join(root, "build.zig.zon")
+    if not os.path.isfile(zp):
+        return
+    text = open(zp, encoding="utf-8").read()
+    m = re.search(r"\.paths\s*=\s*\.\{(.*?)\}", text, re.S)
+    if not m:
+        return
+    paths = set(re.findall(r'"([^"]+)"', m.group(1)))
+    for name, path in sorted(mods.items()):
+        top = path.split("/", 1)[0]
+        if top in SHIPPED_LAYERS and top not in paths:
+            errors.append(f"build.zig.zon: module '{name}' root '{path}' is in '{top}', which is missing from .paths")
+
+
+CLASSES = {"sdk", "installable", "source", "internal"}
+PLUGIN_ONLY_CATALOG = {"physics-jolt", "physics-rapier"}
+
+
+def check_classification(root, build_text, errors):
+    """Every public `b.addModule` module needs a class row in packages/README.md."""
+    rp = os.path.join(root, "packages/README.md")
+    if not os.path.isfile(rp):
+        return
+    readme = open(rp, encoding="utf-8").read()
+    if "## Module classification" not in readme:
+        return
+    rows = {}
+    for m in re.finditer(r"^\| `(\w+)` \| (\w+) \| (?:`([\w-]+)`)? ?\|$", readme, re.M):
+        rows[m.group(1)] = (m.group(2), m.group(3))
+    catalog = set()
+    cp = os.path.join(root, "tools/cli/catalog.zig")
+    if os.path.isfile(cp):
+        catalog = set(re.findall(r'\.name = "([\w-]+)", \.entry', open(cp, encoding="utf-8").read()))
+    for name in sorted(set(re.findall(r'b\.addModule\("(\w+)"', build_text))):
+        if name not in rows:
+            errors.append(f"packages/README.md: public module '{name}' has no row in 'Module classification'")
+            continue
+        cls, cat = rows[name]
+        if cls not in CLASSES:
+            errors.append(f"packages/README.md: module '{name}' has unknown class '{cls}'")
+        if cls == "installable" and cat not in catalog:
+            errors.append(f"packages/README.md: installable module '{name}' has no CLI catalog entry '{cat}'")
+    listed = {cat for cls, cat in rows.values() if cls == "installable"}
+    for entry in sorted(catalog - listed - PLUGIN_ONLY_CATALOG):
+        errors.append(f"tools/cli/catalog.zig: entry '{entry}' is not an installable module in packages/README.md")
+
+
 def check_catalog(root, errors):
     p = os.path.join(root, "tools/cli/catalog.zig")
     if not os.path.isfile(p):
@@ -141,6 +213,35 @@ def check(root):
             la, lb = layer_of(mods[a]), layer_of(mods[b])
             if la in FORBIDDEN and lb in FORBIDDEN[la]:
                 errors.append(f"build: {la} module '{a}' ({mods[a]}) imports {lb} module '{b}' ({mods[b]})")
+        for u in unclassified:
+            errors.append(f"build: unclassified dependency the guard cannot resolve: {u}")
+        graph = {}
+        for a, b in edges:
+            graph.setdefault(a, []).append(b)
+        for a in mods:
+            la = layer_of(mods[a])
+            if la not in FORBIDDEN:
+                continue
+            seen, queue = {a: None}, [a]
+            while queue:
+                cur = queue.pop(0)
+                for nxt in graph.get(cur, []):
+                    if nxt in seen:
+                        continue
+                    seen[nxt] = cur
+                    queue.append(nxt)
+                    lb = layer_of(mods[nxt])
+                    if lb in FORBIDDEN[la] and nxt not in graph.get(a, []):
+                        chain, n = [], nxt
+                        while n is not None:
+                            chain.append(n)
+                            n = seen[n]
+                        errors.append(f"build: {la} module '{a}' reaches {lb} module '{nxt}' indirectly: " + " -> ".join(reversed(chain)))
+            for b in graph.get(a, []):
+                if la == "apps" and layer_of(mods[b]) == "apps" and app_of(mods[a]) != app_of(mods[b]):
+                    errors.append(f"build: application module '{a}' ({mods[a]}) imports another application's module '{b}' ({mods[b]})")
+        check_paths(root, mods, errors)
+        check_classification(root, text, errors)
         cyc = find_cycle(mods, edges)
         if cyc:
             errors.append("build: module dependency cycle: " + " -> ".join(cyc))
@@ -168,22 +269,39 @@ def self_test():
 
     base = {"src/engine.zig": "", "packages/pkg/src/pkg.zig": "", "apps/ed/src/app.zig": "",
             "apps/ed/tests/int_tests.zig": '@import("../../../packages/pkg/src/pkg.zig")'}
+    pkg2 = 'const pkg2_mod = b.createModule(.{\n        .root_source_file = b.path("packages/pkg2/src/p.zig"),\n    });\n'
+    app2 = 'const app2_mod = b.createModule(.{\n        .root_source_file = b.path("apps/other/src/o.zig"),\n    });\n'
+    more = {"packages/pkg2/src/p.zig": "", "apps/other/src/o.zig": ""}
+    zon = lambda paths: 'pub const x = .{ .paths = .{ ' + ", ".join(f'"{p}"' for p in paths) + ' } };\n'
+    readme = lambda rows: "## Module classification\n\n| Module | Class | Catalog name |\n|---|---|---|\n" + "".join(rows)
+    row = lambda m, c, n="": f"| `{m}` | {c} | {('`' + n + '`') if n else ''} |\n"
+    catalog = '.{ .name = "pkg", .entry = "src/pkg.zig", .summary = "x" },\n'
+    full = dict(base, **more)
     cases = [
-        ("valid graph and legitimate app integration test", dict(base, **{"build.zig": build()}), False),
-        ("package imports application", dict(base, **{"build.zig": build('pkg_mod.addImport("app", app_mod);\n')}), True),
-        ("core imports package", dict(base, **{"build.zig": build('engine_mod.addImport("pkg", pkg_mod);\n')}), True),
-        ("missing build root", dict(base, **{"build.zig": build('const x = b.path("apps/gone/main.zig");\n')}), True),
-        ("package source escapes into apps", dict(base, **{"build.zig": build(), "packages/pkg/src/pkg.zig": '@import("../../../apps/ed/src/app.zig")'}), True),
-        ("split build layout: package imports application", dict(base, **{"build.zig": "", "build/modules.zig": build('pkg_mod.addImport("app", app_mod);\n')}), True),
-        ("split build layout: valid", dict(base, **{"build.zig": "", "build/modules.zig": build()}), False),
-        ("external third-party import is not a violation", dict(base, **{"build.zig": build('const c_mod = b.createModule(.{});\npkg_mod.addImport("c", c_mod);\n')}), False),
-        ("missing test root", dict(base, **{"build.zig": build('addModuleTest(b, test_step, "apps/gone/tests/x_tests.zig", target)\n')}), True),
-        ("dependency cycle", dict(base, **{"build.zig": build('pkg_mod.addImport("x", app_mod);\n')}), True),
+        ("valid graph and legitimate app integration test", dict(base, **{"build.zig": build()}), False, ""),
+        ("package imports application", dict(base, **{"build.zig": build('pkg_mod.addImport("app", app_mod);\n')}), True, "imports apps module"),
+        ("core imports package", dict(base, **{"build.zig": build('engine_mod.addImport("pkg", pkg_mod);\n')}), True, "src module"),
+        ("missing build root", dict(base, **{"build.zig": build('const x = b.path("apps/gone/main.zig");\n')}), True, "does not exist"),
+        ("package source escapes into apps", dict(base, **{"build.zig": build(), "packages/pkg/src/pkg.zig": '@import("../../../apps/ed/src/app.zig")'}), True, "source imports"),
+        ("split build layout: package imports application", dict(base, **{"build.zig": "", "build/modules.zig": build('pkg_mod.addImport("app", app_mod);\n')}), True, "imports apps module"),
+        ("split build layout: valid", dict(base, **{"build.zig": "", "build/modules.zig": build()}), False, ""),
+        ("external third-party import is not a violation", dict(base, **{"build.zig": build('const c_mod = b.createModule(.{});\npkg_mod.addImport("c", c_mod);\n')}), False, ""),
+        ("missing test root", dict(base, **{"build.zig": build('addModuleTest(b, test_step, "apps/gone/tests/x_tests.zig", target)\n')}), True, "does not exist"),
+        ("cycle between two packages", dict(full, **{"build.zig": build(pkg2 + 'pkg_mod.addImport("b", pkg2_mod);\npkg2_mod.addImport("a", pkg_mod);\n')}), True, "cycle"),
+        ("unresolvable dependency is an error", dict(base, **{"build.zig": build('pkg_mod.addImport("x", mystery_mod);\n')}), True, "unclassified"),
+        ("alias of a module is resolved", dict(base, **{"build.zig": build('const alias_mod = app_mod;\npkg_mod.addImport("a", alias_mod);\n')}), True, "imports apps module"),
+        ("indirect package to application dependency", dict(full, **{"build.zig": build(pkg2 + 'pkg_mod.addImport("b", pkg2_mod);\npkg2_mod.addImport("app", app_mod);\n')}), True, "indirectly"),
+        ("application imports another application", dict(full, **{"build.zig": build(app2 + 'app2_mod.addImport("ed", app_mod);\n')}), True, "another application"),
+        ("shipped module outside .paths", dict(base, **{"build.zig": build(), "build.zig.zon": zon(["src", "packages"])}), True, ".paths"),
+        ("module roots all in .paths", dict(base, **{"build.zig": build(), "build.zig.zon": zon(["src", "packages", "apps"])}), False, ""),
+        ("public module without classification row", dict(base, **{"build.zig": build().replace("createModule", "addModule", 0) + 'const m_mod = b.addModule("m", .{\n        .root_source_file = b.path("src/engine.zig"),\n    });\n', "packages/README.md": readme([row("engine", "sdk")]), "tools/cli/catalog.zig": ""}), True, "no row"),
+        ("installable module without catalog entry", dict(base, **{"build.zig": build(), "packages/README.md": readme([row("engine", "sdk"), row("pkg", "installable", "pkg")]), "tools/cli/catalog.zig": ""}), True, "no CLI catalog entry"),
+        ("classified module matching catalog", dict(base, **{"build.zig": build(), "packages/README.md": readme([row("engine", "sdk"), row("pkg", "installable", "pkg")]), "tools/cli/catalog.zig": catalog}), False, ""),
     ]
     failed = 0
-    for name, files, expect_fail in cases:
+    for name, files, expect_fail, needle in cases:
         errs, _ = check(make(files))
-        ok = bool(errs) == expect_fail
+        ok = bool(errs) == expect_fail and (not needle or any(needle in e for e in errs))
         failed += not ok
         print(("PASS " if ok else "FAIL ") + name + ("" if ok else f" -> {errs}"))
     return 1 if failed else 0

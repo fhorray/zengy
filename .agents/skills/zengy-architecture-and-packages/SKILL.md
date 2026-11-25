@@ -25,6 +25,8 @@ description: >-
 
 Packages must never import `apps/`, `tools/`, `examples/` or tests. See `docs/adr/ADR-008-application-package-boundaries.md`; `tools/ci/check_architecture.py` enforces it.
 
+Every public `b.addModule` module must have a class row (`sdk`, `installable`, `source`, `internal`) in the "Module classification" table of `packages/README.md`; `installable` rows must match an entry in `tools/cli/catalog.zig`. Adding a package means updating the build, that table, and (if installable) the catalog; the guard enforces it.
+
 ## Package Directory Layout vs Public Names
 
 Related packages are grouped under category subdirectories in `packages/`, while public CLI names remain flat and hyphenated:

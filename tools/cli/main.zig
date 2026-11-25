@@ -76,16 +76,19 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, cmd, "add")) {
         install.g_fork_path = init.environ_map.get("ZENGY_FORK");
+        if (init.environ_map.get("ZENGY_REF")) |r| install.g_ref = r;
         var pkg_spec: ?[]const u8 = null;
         while (args_it.next()) |a| {
             if (std.mem.startsWith(u8, a, "--fork=")) {
                 install.g_fork_path = a["--fork=".len..];
+            } else if (std.mem.startsWith(u8, a, "--ref=")) {
+                install.g_ref = a["--ref=".len..];
             } else if (pkg_spec == null) {
                 pkg_spec = a;
             }
         }
         const spec = pkg_spec orelse {
-            std.debug.print("Usage: zengy add [--fork=<zengy-checkout>] <package | owner/repo[@tag] | github-url | ./local-path>\n", .{});
+            std.debug.print("Usage: zengy add [--fork=<zengy-checkout>] [--ref=<branch>] <package | owner/repo[@tag] | github-url | ./local-path>\n", .{});
             return;
         };
         try install.installPluginSpec(allocator, init.io, spec);

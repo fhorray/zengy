@@ -28,6 +28,16 @@ Concrete changes:
 - `build.zig` was split into `build/modules.zig`, `examples.zig`, `tools.zig`, `apps.zig` and `tests.zig`; the target and step names are unchanged.
 - The CLI source was split into `catalog.zig`, `process.zig`, `project.zig` and `install.zig`; `ui-widgets` and `ui-plume` are now installable catalog entries.
 
+## Breaking changes
+- `editor-shell` is no longer a package: removed from `zengy add`, from the public Zig modules and from `packages/`.
+- Editor shell identifiers changed: module `official.tools.editor_shell` is now `app.editor.shell`; capability `engine.tools.editor_shell/1` is now `editor.shell/1`.
+- Remote edits enter undo history only after `remote_adapter.attach(&app)`.
+- `packages/sdl3` moved to `third_party/sdl3`. A `zengy` CLI from before this change installs `packages/sdl3` from the `main` archive and will not find it once `main` has the new layout; update the CLI. `zengy add` takes `--ref=<branch>` (or `ZENGY_REF`) to choose the archive and `--fork=<checkout>` to install from a local checkout.
+- `tools/runtime` is now `apps/runtime/src`; the `zengy-runtime` binary is unchanged.
+
+## Source archive policy
+`build.zig.zon` `.paths` ships the SDK and its applications: `build`, `include`, `src`, `packages`, `third_party`, `apps`. `examples/`, `tools/`, `benchmarks/`, `tests/` and `projects/` are development-only and are not in the archive, so steps that need them (`run-*`, `cli`, `run-bench`, golden image checks) work only in a full checkout; declaring them is harmless because the build graph is lazy. The architecture guard fails if a shipped module root lives in a directory missing from `.paths`.
+
 ## Alternatives considered
 - Keep all tooling as packages: leaves reverse dependencies and ships product policy as public API.
 - Move reusable tooling (remote, gizmos, testing, file watching) into apps: these are application-independent capabilities and stay packages.

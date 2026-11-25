@@ -11,13 +11,15 @@ Related packages are grouped by category; the public package name used by `zengy
 | Category | Directories |
 |---|---|
 | `physics/` | `core` (contract), `jolt`, `rapier` |
-| `ui/` | `core`, `markup` |
+| `ui/` | `core`, `markup`, `widgets`, `plume` |
 | `window/` | `core`, `sdl3` |
 | `graphics/` | `core`, `sdlgpu` |
 | `scripting/` | `host`, `lua`, `python` |
 | `render/` | `2d`, `3d`, `text` |
+| `audio/` | `core`, `sdl3`, `zaudio` |
+| `input/` | `core`, `haptics`, `sdl3` |
 | `formats/`, `tooling/` | format adapters and file watcher |
-| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `testing`, `default-plugins` |
+| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `state`, `camera`, `testing`, `default-plugins` |
 
 ## Package Catalog
 
@@ -57,3 +59,56 @@ Related packages are grouped by category; the public package name used by `zengy
 
 - SDL3 SDK files (headers, import library, `zengy.toml` runtime fetch) live in [`third_party/sdl3/`](../third_party/sdl3/README.md), not here. `zengy add` of an SDL3 provider installs them into `./third_party/sdl3/`.
 - The editor shell moved to `apps/editor` (see [ADR-008](../docs/adr/ADR-008-application-package-boundaries.md)); it is no longer installable with `zengy add`.
+
+## Module classification
+
+Every Zig module declared with `b.addModule(...)` in `build/` has exactly one class. `tools/ci/check_architecture.py` fails when a module is missing here or an `installable` module has no matching CLI catalog entry.
+
+- `sdk`: the engine core module.
+- `installable`: a package users add with `zengy add <catalog name>`.
+- `source`: a public Zig module that needs a third-party Zig/C dependency declared in `build.zig.zon`, so it is used from the repository (or the Zig package) and is not offered by `zengy add`.
+- `internal`: an implementation detail of another package; not a supported import.
+
+Application-local modules (`editor_shell`, the editor `remote_adapter`, the runtime) are not SDK modules and are not listed. Third-party dependencies (`z_toml`, `lookout`, `yyjson`, `lua_c`, `zaudio`, `sdl3_win64`, PocketPy, SDL3 headers) are declared in `build.zig.zon` or under `third_party/`.
+
+| Module | Class | Catalog name |
+|---|---|---|
+| `engine` | sdk | |
+| `window` | installable | `window` |
+| `window_sdl3` | installable | `window-sdl3` |
+| `graphics` | installable | `graphics` |
+| `graphics_sdlgpu` | installable | `graphics-sdlgpu` |
+| `gpu_resources` | internal | |
+| `ui_core` | installable | `ui-core` |
+| `ui_markup` | installable | `ui-markup` |
+| `ui_widgets` | installable | `ui-widgets` |
+| `ui_plume` | installable | `ui-plume` |
+| `scripting_host` | installable | `scripting-host` |
+| `scripting_lua` | installable | `scripting-lua` |
+| `scripting_python` | installable | `scripting-python` |
+| `assets` | installable | `assets` |
+| `scene` | installable | `scene` |
+| `prefab` | installable | `prefab` |
+| `physics` | installable | `physics` |
+| `toml_format` | source | |
+| `json_format` | source | |
+| `file_watcher` | source | |
+| `testing_sdk` | installable | `testing` |
+| `default_plugins` | installable | `default-plugins` |
+| `input` | installable | `input` |
+| `input_haptics` | installable | `input-haptics` |
+| `input_sdl3` | installable | `input-sdl3` |
+| `camera` | installable | `camera` |
+| `state` | installable | `state` |
+| `audio` | installable | `audio` |
+| `audio_sdl3` | installable | `audio-sdl3` |
+| `audio_zaudio` | source | |
+| `render_2d` | installable | `render-2d` |
+| `render_3d` | installable | `render-3d` |
+| `text` | installable | `text` |
+| `gizmos` | installable | `gizmos` |
+| `shapes` | installable | `shapes` |
+| `dev_tools` | installable | `dev-tools` |
+| `picking` | installable | `picking` |
+| `remote` | installable | `remote` |
+| `log` | installable | `log` |

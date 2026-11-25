@@ -1,4 +1,5 @@
 //! Example executables and their `run-*` steps (headless, C ABI plugin, playground, visual demos, capture harness).
+//! Examples owned by an application (for example `apps/editor/examples/visual-inspector`) are registered here too.
 
 const std = @import("std");
 const Modules = @import("modules.zig").Modules;

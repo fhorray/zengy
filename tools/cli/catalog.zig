@@ -39,6 +39,9 @@ pub const OFFICIAL_PACKAGES = [_]OfficialPackageInfo{
     .{ .name = "scripting-host", .entry = "src/scripting_host.zig", .summary = "Language-agnostic scripting host & bridge" },
     .{ .name = "scripting-lua", .entry = "src/scripting_lua.zig", .summary = "Embedded Lua 5.4 runtime" },
     .{ .name = "scripting-python", .entry = "src/scripting_python.zig", .summary = "Embedded PocketPy (Python) runtime" },
+    .{ .name = "state", .entry = "src/state.zig", .summary = "Typed state machines & run conditions" },
+    .{ .name = "audio", .entry = "src/audio.zig", .summary = "Agnostic audio playback contract, ECS players & spatial listener" },
+    .{ .name = "audio-sdl3", .entry = "src/audio_sdl3.zig", .summary = "SDL3 audio playback provider", .third_party = "sdl3" },
     .{ .name = "assets", .entry = "src/assets.zig", .summary = "URI-cached asset registry" },
     .{ .name = "testing", .entry = "src/testing_sdk.zig", .summary = "Deterministic TestDriver & CaptureService" },
     .{ .name = "default-plugins", .entry = "src/default_plugins.zig", .summary = "Curated bundle of official modules" },
@@ -75,6 +78,8 @@ pub fn packageDir(name: []const u8) []const u8 {
         .{ "render-2d", "render/2d" },
         .{ "render-3d", "render/3d" },
         .{ "text", "render/text" },
+        .{ "audio", "audio/core" },
+        .{ "audio-sdl3", "audio/sdl3" },
         .{ "testing", "testing" },
     };
     for (dirs) |e| {

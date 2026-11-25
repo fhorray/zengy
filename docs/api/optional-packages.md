@@ -78,7 +78,7 @@ All packages under `packages/` are optional `engine.Module` implementations that
 
 ## 10. Editor Shell (`app.editor.shell` — `apps/editor/src/shell.zig`)
 
-Owned by the editor application, not an installable package. Attach `apps/editor/src/remote_adapter.zig` to route `official.remote` edits and panel listing through it.
+Owned by the editor application, not an installable package (see the classification table in `packages/README.md`). Attach `apps/editor/src/remote_adapter.zig` to route `official.remote` edits and panel listing through it.
 
 - **Requires:** `engine.ui.tree/1`
 - **Provides:** `editor.shell/1` (`EditorShellService`)

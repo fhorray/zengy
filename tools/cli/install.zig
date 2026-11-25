@@ -15,8 +15,32 @@ const cwdFileExists = @import("process.zig").cwdFileExists;
 const runArgvIn = @import("process.zig").runArgvIn;
 const writeFileRelative = @import("project.zig").writeFileRelative;
 
-pub fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: OfficialPackageInfo) !void {
-    const dir = packageDir(pkg.name);
+/// Git ref (branch name) whose archive official packages are downloaded from (`--ref=<branch>` or `ZENGY_REF`).
+/// The directory layout of that ref must match this CLI (`packages/<dir>`, `third_party/<name>`).
+pub var g_ref: []const u8 = "main";
+
+/// Copies the directory tree `src_root` into `dst_root` (created on demand), preserving relative paths.
+fn copyTree(allocator: std.mem.Allocator, io: std.Io, src_root: []const u8, dst_root: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, dst_root);
+    var src = try std.Io.Dir.cwd().openDir(io, src_root, .{ .iterate = true });
+    defer src.close(io);
+    var dst = try std.Io.Dir.cwd().openDir(io, dst_root, .{});
+    defer dst.close(io);
+    var walker = try src.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| switch (entry.kind) {
+        .directory => try dst.createDirPath(io, entry.path),
+        .file => {
+            if (std.fs.path.dirname(entry.path)) |d| try dst.createDirPath(io, d);
+            try entry.dir.copyFile(entry.basename, dst, entry.path, io, .{});
+        },
+        else => {},
+    };
+}
+
+fn downloadOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: OfficialPackageInfo, dir: []const u8) !void {
+    const root = try archiveRoot(allocator, g_ref);
+    defer allocator.free(root);
     // `mkdir -p` does not exist in cmd.exe (it creates a folder literally named "-p"), so the
     // directory creation is spelled per shell.
     const mk = if (builtin.os.tag == .windows)
@@ -26,14 +50,14 @@ pub fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Off
     const shell_cmd = if (pkg.third_party) |tp|
         try std.fmt.allocPrint(
             allocator,
-            "{s} && curl -sL https://github.com/fhorray/zengy/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zengy-main/packages/{s} zengy-main/third_party/{s}",
-            .{ mk, dir, tp },
+            "{s} && curl -sL https://github.com/fhorray/zengy/archive/{s}.tar.gz | tar -xz --strip-components=1 -C . {s}/packages/{s} {s}/third_party/{s}",
+            .{ mk, g_ref, root, dir, root, tp },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "{s} && curl -sL https://github.com/fhorray/zengy/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zengy-main/packages/{s}",
-            .{ mk, dir },
+            "{s} && curl -sL https://github.com/fhorray/zengy/archive/{s}.tar.gz | tar -xz --strip-components=1 -C . {s}/packages/{s}",
+            .{ mk, g_ref, root, dir },
         );
     defer allocator.free(shell_cmd);
 
@@ -53,7 +77,44 @@ pub fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Off
         },
         else => return error.PackageDownloadFailed,
     }
+}
 
+
+/// Installs `packages/<dir>` (and `third_party/<name>`) from a local zengy checkout.
+fn installFromCheckout(allocator: std.mem.Allocator, io: std.Io, fork: []const u8, dir: []const u8, third_party: ?[]const u8) !void {
+    const src = try std.fmt.allocPrint(allocator, "{s}/packages/{s}", .{ fork, dir });
+    defer allocator.free(src);
+    const dst = try std.fmt.allocPrint(allocator, "packages/{s}", .{dir});
+    defer allocator.free(dst);
+    try copyTree(allocator, io, src, dst);
+    if (third_party) |tp| {
+        const tp_src = try std.fmt.allocPrint(allocator, "{s}/third_party/{s}", .{ fork, tp });
+        defer allocator.free(tp_src);
+        const tp_dst = try std.fmt.allocPrint(allocator, "third_party/{s}", .{tp});
+        defer allocator.free(tp_dst);
+        try copyTree(allocator, io, tp_src, tp_dst);
+    }
+}
+
+/// Top-level folder GitHub uses inside `archive/<ref>.tar.gz` (`/` becomes `-`; a leading `v` before a digit is dropped).
+fn archiveRoot(allocator: std.mem.Allocator, ref: []const u8) ![]u8 {
+    const trimmed = if (ref.len > 1 and ref[0] == 'v' and std.ascii.isDigit(ref[1])) ref[1..] else ref;
+    const out = try std.fmt.allocPrint(allocator, "zengy-{s}", .{trimmed});
+    std.mem.replaceScalar(u8, out, '/', '-');
+    return out;
+}
+
+/// Installs an official package either from the local checkout (`--fork`) or from the `g_ref` archive.
+pub fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: OfficialPackageInfo) !void {
+    const dir = packageDir(pkg.name);
+    if (g_fork_path) |fork| {
+        installFromCheckout(allocator, io, fork, dir, pkg.third_party) catch |err| {
+            std.debug.print("Failed to install '{s}' from checkout '{s}': {s}\n", .{ pkg.name, fork, @errorName(err) });
+            return error.PackageDownloadFailed;
+        };
+    } else {
+        try downloadOfficialPackage(allocator, io, pkg, dir);
+    }
     std.debug.print("Installed official package into ./packages/{s}/\n", .{dir});
     if (pkg.third_party) |tp| {
         std.debug.print("Installed required dependency into ./third_party/{s}/\n", .{tp});
