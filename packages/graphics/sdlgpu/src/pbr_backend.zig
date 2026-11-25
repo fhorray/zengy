@@ -2859,7 +2859,7 @@ fn createMeshPbrPipeline(
         }),
         .target_info = std.mem.zeroInit(c.SDL_GPUGraphicsPipelineTargetInfo, .{
             .color_target_descriptions = &targets,
-            .num_color_targets = if (transport) 4 else 1,
+            .num_color_targets = @as(c_uint, if (transport) 4 else 1),
             .depth_stencil_format = depth_fmt,
             .has_depth_stencil_target = true,
         }),
@@ -3029,7 +3029,7 @@ fn safeClamp(v: f32, lo: f32, hi: f32, fallback: f32) f32 {
     return if (std.math.isFinite(v)) std.math.clamp(v,lo,hi) else fallback;
 }
 const ScreenPipelines = struct {
-    opaque: *c.SDL_GPUGraphicsPipeline,
+    @"opaque": *c.SDL_GPUGraphicsPipeline,
     double_sided: *c.SDL_GPUGraphicsPipeline,
     blend: *c.SDL_GPUGraphicsPipeline,
     reuse: *c.SDL_GPUGraphicsPipeline,
@@ -3042,8 +3042,8 @@ const ScreenPipelines = struct {
         const fs = try createShaderEx(device,diag,c.SDL_GPU_SHADERSTAGE_FRAGMENT,PBR_SCREEN_SPV,14,4,1);
         defer c.SDL_ReleaseGPUShader(device,fs);
         const format=c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
-        const opaque=try createMeshPbrPipeline(device,vs,fs,format,depth_format,false,false,false,true);
-        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,opaque);
+        const @"opaque"=try createMeshPbrPipeline(device,vs,fs,format,depth_format,false,false,false,true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,@"opaque");
         const ds=try createMeshPbrPipeline(device,vs,fs,format,depth_format,true,false,false,true);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,ds);
         const blend=try createMeshPbrPipeline(device,vs,fs,format,depth_format,true,true,false,true);
@@ -3059,15 +3059,15 @@ const ScreenPipelines = struct {
         const resolve=try createFullscreenPipeline(device,full_vs,full_fs,format,false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,resolve);
         const reduce=try createComputePipeline(device,HIZ_REDUCE_SPV,1,0,1,1);
-        return .{.opaque=opaque,.double_sided=ds,.blend=blend,.reuse=reuse,.reuse_ds=reuse_ds,.resolve=resolve,.reduce=reduce};
+        return .{.@"opaque"=@"opaque",.double_sided=ds,.blend=blend,.reuse=reuse,.reuse_ds=reuse_ds,.resolve=resolve,.reduce=reduce};
     }
     fn select(self: ScreenPipelines, blend: bool, double_sided: bool, reuse: bool) *c.SDL_GPUGraphicsPipeline {
         if (blend) return self.blend;
         if (double_sided) return if (reuse) self.reuse_ds else self.double_sided;
-        return if (reuse) self.reuse else self.opaque;
+        return if (reuse) self.reuse else self.@"opaque";
     }
     fn deinit(self: *ScreenPipelines, device: *c.SDL_GPUDevice) void {
-        for ([_]*c.SDL_GPUGraphicsPipeline{self.opaque,self.double_sided,self.blend,self.reuse,self.reuse_ds,self.resolve}) |p| c.SDL_ReleaseGPUGraphicsPipeline(device,p);
+        for ([_]*c.SDL_GPUGraphicsPipeline{self.@"opaque",self.double_sided,self.blend,self.reuse,self.reuse_ds,self.resolve}) |p| c.SDL_ReleaseGPUGraphicsPipeline(device,p);
         c.SDL_ReleaseGPUComputePipeline(device,self.reduce);
     }
 };

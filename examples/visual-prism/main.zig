@@ -408,7 +408,7 @@ fn updateDynamicGi(st: *PrismShowcaseState) !void {
     const service = st.app.resources.get(helios.HeliosService) orelse return;
     const target = st.app.resources.get(render_3d.pbr.DynamicGiGrid) orelse return;
     if (service.settings.tier == .off) {
-        if(st.app.resources.get(render_3d.pbr.GpuGiInput)) |input| input.enabled=false;
+        if(st.app.resources.get(render_3d.pbr.GpuGiInput)) |gpu_input| gpu_input.enabled=false;
         st.gpu_last_sky=null;
         target.origin_enabled[3] = 0;
         st.dynamic_grid.origin_enabled[3] = 0;
@@ -416,7 +416,7 @@ fn updateDynamicGi(st: *PrismShowcaseState) !void {
     }
     // Do not spend the ray budget on a stale geometry snapshot while a drag is pending.
     if (st.gi_geometry_dirty) {
-        if(st.app.resources.get(render_3d.pbr.GpuGiInput)) |input| input.enabled=false;
+        if(st.app.resources.get(render_3d.pbr.GpuGiInput)) |gpu_input| gpu_input.enabled=false;
         return;
     }
     if (st.dynamic_scene == null or st.dynamic_scene.? != st.scene_index or st.dynamic_sky_preset == null or st.dynamic_sky_preset.? != st.sky_preset or st.dynamic_grid.origin_enabled[3] == 0) {
@@ -1611,12 +1611,12 @@ fn refreshGiEmitters(st: *PrismShowcaseState) !void {
 }
 
 fn publishGpuGi(st:*PrismShowcaseState,service:*helios.HeliosService,target:*render_3d.pbr.DynamicGiGrid,settings:*const helios.dynamic_gi.Settings) !void {
-    const input=st.app.resources.get(render_3d.pbr.GpuGiInput) orelse return error.MissingGpuGiInput;
+    const gpu_input=st.app.resources.get(render_3d.pbr.GpuGiInput) orelse return error.MissingGpuGiInput;
     const allocator=st.app.allocator;
     const revision=service.runtime.geometry_revision;
     if(st.gpu_geometry_revision==null or st.gpu_geometry_revision.?!=revision){
         // Reallocation invalidates previously borrowed slices, even on a later failure.
-        input.*=.{};
+        gpu_input.*=.{};
         // Reserve every array before publishing any borrowed slice.
         try st.gpu_nodes.ensureTotalCapacity(allocator,service.runtime.bvh.nodes.items.len);
         try st.gpu_triangles.ensureTotalCapacity(allocator,service.runtime.bvh.triangles.items.len);
@@ -1630,5 +1630,5 @@ fn publishGpuGi(st:*PrismShowcaseState,service:*helios.HeliosService,target:*ren
     if(st.gpu_last_sky==null or st.gpu_last_sky.?!=st.sky_preset){st.gpu_last_sky=st.sky_preset;st.gpu_grid_epoch+%=1;}
     // Reset the CPU seed only; the backend keeps the updated probes on GPU between frames.
     target.origin_enabled=st.dynamic_grid.origin_enabled;target.spacing=st.dynamic_grid.spacing;
-    input.*=.{.enabled=true,.geometry_revision=revision,.grid_epoch=st.gpu_grid_epoch,.nodes=st.gpu_nodes.items,.triangles=st.gpu_triangles.items,.materials=st.gpu_materials.items,.rays_per_probe=settings.rays_per_probe,.probes_per_frame=settings.probes_per_frame};
+    gpu_input.*=.{.enabled=true,.geometry_revision=revision,.grid_epoch=st.gpu_grid_epoch,.nodes=st.gpu_nodes.items,.triangles=st.gpu_triangles.items,.materials=st.gpu_materials.items,.rays_per_probe=settings.rays_per_probe,.probes_per_frame=settings.probes_per_frame};
 }
