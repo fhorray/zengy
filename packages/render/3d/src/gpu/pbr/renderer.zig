@@ -629,6 +629,77 @@ pub const PbrRenderer = struct {
         return offset;
     }
 
+    /// Casters (queued draws plus shadow-only casters) that share a layer with `layers`. With `mask_only`, only
+    /// alpha-masked draws count, because only those write per-draw mask parameters.
+    fn countCasters(self: *const PbrRenderer, layers: u32, mask_only: bool) usize {
+        var n: usize = 0;
+        for (self.queued_draws.items) |qm| {
+            if (!pbr.layersOverlap(layers, qm.layers)) continue;
+            if (mask_only and qm.material.alpha_mode != .mask) continue;
+            n += 1;
+        }
+        if (mask_only) return n;
+        for (self.shadow_casters.items) |sc| {
+            if (pbr.layersOverlap(layers, sc.layers)) n += 1;
+        }
+        return n;
+    }
+
+    const DrawBudget = struct { shadow: usize = 0, mask: usize = 0 };
+
+    /// Upper bound of the depth-only draws this frame will record, from what will really be rendered: the active
+    /// cascades, the shadowed local-light tiles and the optional depth prepass, each limited to the casters that
+    /// share a layer with the light. Frustum culling only lowers the real count, so this stays a safe reservation
+    /// without sizing for every caster in every possible pass.
+    fn shadowDrawBudget(self: *const PbrRenderer, cascades: usize, sun_layers: u32, splan: *const shadow_plan.Plan, pt_count: usize, sp_count: usize, prepass: bool) DrawBudget {
+        var budget: DrawBudget = .{};
+        // Layer masks repeat across lights, so remember the most recent counts instead of rescanning every draw.
+        var memo_layers: [8]u32 = undefined;
+        var memo_all: [8]usize = undefined;
+        var memo_mask: [8]usize = undefined;
+        var memo_len: usize = 0;
+        const Counter = struct {
+            fn get(me: *const PbrRenderer, layers: u32, ml: *[8]u32, ma: *[8]usize, mm: *[8]usize, len: *usize) struct { all: usize, mask: usize } {
+                const key = layers & pbr.ALL_LAYERS;
+                for (0..len.*) |i| if (ml[i] == key) return .{ .all = ma[i], .mask = mm[i] };
+                const all = me.countCasters(key, false);
+                const mask = me.countCasters(key, true);
+                if (len.* < 8) {
+                    ml[len.*] = key;
+                    ma[len.*] = all;
+                    mm[len.*] = mask;
+                    len.* += 1;
+                }
+                return .{ .all = all, .mask = mask };
+            }
+        };
+        if (prepass) {
+            for (self.queued_draws.items) |qm| {
+                if (qm.material.alpha_mode == .blend) continue;
+                budget.shadow += 1;
+                if (qm.material.alpha_mode == .mask) budget.mask += 1;
+            }
+        }
+        if (cascades > 0) {
+            const c = Counter.get(self, sun_layers, &memo_layers, &memo_all, &memo_mask, &memo_len);
+            budget.shadow += cascades * c.all;
+            budget.mask += cascades * c.mask;
+        }
+        for (0..pt_count) |i| {
+            if (splan.point[i].first_tile < 0) continue;
+            const c = Counter.get(self, self.frame_data.point_lights[i].layers, &memo_layers, &memo_all, &memo_mask, &memo_len);
+            budget.shadow += 6 * c.all;
+            budget.mask += 6 * c.mask;
+        }
+        for (0..sp_count) |i| {
+            if (splan.spot[i].first_tile < 0) continue;
+            const c = Counter.get(self, self.frame_data.spot_lights[i].layers, &memo_layers, &memo_all, &memo_mask, &memo_len);
+            budget.shadow += c.all;
+            budget.mask += c.mask;
+        }
+        return budget;
+    }
+
     fn flushScratch(self: *PbrRenderer, g: *Gpu, db: *DrawBuffer, list: *std.ArrayList(u8), lay: gpu.BindGroupLayoutHandle, bind_size: u64, label: []const u8) !void {
         if (list.items.len == 0) return;
         try self.ensureDrawBuffer(g, db, lay, bind_size, list.items.len, label);
@@ -881,9 +952,20 @@ pub const PbrRenderer = struct {
         // Uniform storage for the depth-only passes must exist while recording (bind groups are created up front).
         const shadow_slot = gpu_objects.slotSize(device, 64);
         const mask_slot = gpu_objects.slotSize(device, @sizeOf(layout.ShadowMaskParams));
-        const max_shadow_draws = (self.queued_draws.items.len + self.shadow_casters.items.len + 1) * (4 + shadow_plan.MAX_TILES + 2) + 64;
-        try self.ensureDrawBuffer(g, &self.shadow_vs, g.l_vs_shadow, 64, max_shadow_draws * shadow_slot, "shadow vs uniforms");
-        try self.ensureDrawBuffer(g, &self.mask_params, g.l_mask_params, @sizeOf(layout.ShadowMaskParams), max_shadow_draws * mask_slot, "shadow mask uniforms");
+        // Reserve for the passes that will really run (see `shadowDrawBudget`), not for every caster in every pass.
+        const pt_count = @min(self.frame_data.point_lights.len, 256);
+        const sp_count = @min(self.frame_data.spot_lights.len, 256);
+        const splan = shadow_plan.plan(
+            self.frame_data.point_lights[0..pt_count],
+            self.frame_data.spot_lights[0..sp_count],
+            self.frame_data.camera_position,
+            .{ .prioritize = pp.quality.shadows.prioritize_local_lights, .adaptive = pp.quality.shadows.adaptive_atlas },
+        );
+        const budget_cascades: usize = if (dirs.len > 0 and dirs[0].shadows_enabled) @min(dirs[0].cascade_count, 4) else 0;
+        const budget_sun_layers: u32 = if (dirs.len > 0) dirs[0].layers else pbr.ALL_LAYERS;
+        const budget = self.shadowDrawBudget(budget_cascades, budget_sun_layers, &splan, pt_count, sp_count, pp.ssao.enabled or pp.contact_shadows.enabled);
+        try self.ensureDrawBuffer(g, &self.shadow_vs, g.l_vs_shadow, 64, (budget.shadow + 16) * shadow_slot, "shadow vs uniforms");
+        try self.ensureDrawBuffer(g, &self.mask_params, g.l_mask_params, @sizeOf(layout.ShadowMaskParams), (budget.mask + 16) * mask_slot, "shadow mask uniforms");
 
         // 1. Four-cascade directional shadow atlas (2x2 quadrants).
         var light_vps: [4]math3d.Mat4 = @splat(math3d.Mat4.identity());
@@ -971,14 +1053,6 @@ pub const PbrRenderer = struct {
         cl_lights.gi = self.frame_data.dynamic_gi;
         const local_sh = self.local_shadow;
         local_sh.* = .{};
-        const pt_count = @min(self.frame_data.point_lights.len, 256);
-        const sp_count = @min(self.frame_data.spot_lights.len, 256);
-        const splan = shadow_plan.plan(
-            self.frame_data.point_lights[0..pt_count],
-            self.frame_data.spot_lights[0..sp_count],
-            self.frame_data.camera_position,
-            .{ .prioritize = shadow_q.prioritize_local_lights, .adaptive = shadow_q.adaptive_atlas },
-        );
         const next_tile: u32 = splan.tile_count;
         var tile_layers: [shadow_plan.MAX_TILES]u32 = @splat(pbr.ALL_LAYERS);
         const atlas_f: f32 = @floatFromInt(shadow_plan.ATLAS);
@@ -1406,6 +1480,8 @@ pub const PbrRenderer = struct {
 
         // Upload everything written this frame, now that recording is complete.
         try ring.flush();
+        // Recorded passes already reference these buffers, so exceeding the reservation is an error, never a regrow.
+        if (self.shadow_scratch.items.len > self.shadow_vs.capacity or self.mask_scratch.items.len > self.mask_params.capacity) return error.ShadowDrawBudgetExceeded;
         try self.flushScratch(g, &self.shadow_vs, &self.shadow_scratch, g.l_vs_shadow, 64, "shadow vs uniforms");
         try self.flushScratch(g, &self.mask_params, &self.mask_scratch, g.l_mask_params, @sizeOf(layout.ShadowMaskParams), "shadow mask uniforms");
         self.rendered_this_frame = true;

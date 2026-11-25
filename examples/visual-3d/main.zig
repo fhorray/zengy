@@ -83,7 +83,7 @@ fn render3DSystem(ctx: *engine.SystemContext) !void {
         try gpu_3d.queueMeshDraw(st.app, mesh_handle, draw.mvp_matrix.m, draw.color, tex);
     }
 
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main() !void {

@@ -35,7 +35,7 @@ test "GraphicsDeviceService surface lifecycle, present, and device-lost error" {
         .{ .clear = .{ .r = 0.1, .g = 0.1, .b = 0.12 } },
         .{ .rect = .{ .x = 10, .y = 10, .width = 100, .height = 40, .color = .{ .r = 0.2, .g = 0.6, .b = 0.9 } } },
     });
-    try gfx.present(rt);
+    _ = try gfx.present(rt);
     try testing.expectEqual(@as(?u64, 1), gfx.presentedFrames(rt));
 
     try testing.expect(gfx.resizeSurface(rt, 1280, 720));
@@ -70,10 +70,11 @@ test "GraphicsDeviceService delegates lifecycle and DrawCommands to BackendVTabl
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.destroyed += 1;
         }
-        fn onPresent(ctx: *anyopaque, _: graphics.RenderTargetHandle, cmds: []const graphics.DrawCommand) !void {
+        fn onPresent(ctx: *anyopaque, _: graphics.RenderTargetHandle, cmds: []const graphics.DrawCommand) !graphics.PresentResult {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.presented += 1;
             self.last_cmd_count = cmds.len;
+            return .presented;
         }
     };
 
@@ -100,7 +101,7 @@ test "GraphicsDeviceService delegates lifecycle and DrawCommands to BackendVTabl
         .{ .clear = .{ .r = 0.1, .g = 0.1, .b = 0.1 } },
         .{ .rect = .{ .x = 0, .y = 0, .width = 50, .height = 50, .color = .{ .r = 1, .g = 0, .b = 0 } } },
     });
-    try svc.present(rt);
+    _ = try svc.present(rt);
 
     try testing.expectEqual(@as(usize, 1), mock.presented);
     try testing.expectEqual(@as(usize, 2), mock.last_cmd_count);
@@ -108,4 +109,30 @@ test "GraphicsDeviceService delegates lifecycle and DrawCommands to BackendVTabl
 
     try testing.expect(svc.destroySurface(rt));
     try testing.expectEqual(@as(usize, 1), mock.destroyed);
+}
+
+test "skipped presents are reported and not counted as presented frames" {
+    const SkipBackend = struct {
+        skip: bool = false,
+        fn onPresent(ctx: *anyopaque, _: graphics.RenderTargetHandle, _: []const graphics.DrawCommand) !graphics.PresentResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return if (self.skip) .skipped else .presented;
+        }
+    };
+    var backend_state = SkipBackend{};
+    const vtable = graphics.BackendVTable{ .on_present = SkipBackend.onPresent };
+    var svc = graphics.GraphicsDeviceService.initWithBackend(testing.allocator, &vtable, &backend_state, .{});
+    defer svc.deinit();
+    const rt = try svc.createSurface(1, 64, 64);
+
+    try svc.beginFrame(rt);
+    try testing.expectEqual(graphics.PresentResult.presented, try svc.present(rt));
+    backend_state.skip = true; // e.g. the window was minimized
+    try svc.beginFrame(rt);
+    try testing.expectEqual(graphics.PresentResult.skipped, try svc.present(rt));
+    try svc.beginFrame(rt);
+    try testing.expectEqual(graphics.PresentResult.skipped, try svc.present(rt));
+
+    try testing.expectEqual(@as(?u64, 1), svc.presentedFrames(rt));
+    try testing.expectEqual(@as(?u64, 2), svc.skippedFrames(rt));
 }

@@ -55,15 +55,20 @@ const RenderTargetSlot = struct {
     frame_open: bool,
     submitted_commands: usize,
     presented_frames: u64,
+    skipped_frames: u64 = 0,
 };
 
 /// Optional backend hooks for native GPU providers (e.g., `official.graphics.wgpu`).
 /// When `backend` is null, `GraphicsDeviceService` operates in headless software mode.
+/// Outcome of presenting a frame. `skipped` means no frame reached the screen (for example the window is minimized
+/// or the surface had no image to acquire); it is not an error and must not be counted as a presented frame.
+pub const PresentResult = enum { presented, skipped };
+
 pub const BackendVTable = struct {
     on_create_surface: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, window_handle: u64, width: u32, height: u32) anyerror!void = null,
     on_resize_surface: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, width: u32, height: u32) void = null,
     on_destroy_surface: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle) void = null,
-    on_present: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, commands: []const DrawCommand) anyerror!void = null,
+    on_present: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, commands: []const DrawCommand) anyerror!PresentResult = null,
 };
 
 pub const GraphicsDeviceService = struct {
@@ -238,17 +243,31 @@ pub const GraphicsDeviceService = struct {
         slot.submitted_commands += cmds.len;
     }
 
-    pub fn present(self: *GraphicsDeviceService, handle: RenderTargetHandle) !void {
+    /// Presents the open frame. Only `.presented` frames are counted by `presentedFrames`; `.skipped` ones by `skippedFrames`.
+    pub fn present(self: *GraphicsDeviceService, handle: RenderTargetHandle) !PresentResult {
         if (!self.device_available) return error.DeviceUnavailable;
         const slot = self.getSlotMut(handle) orelse return error.InvalidSurfaceHandle;
         if (!slot.frame_open) return error.FrameNotStarted;
         defer slot.frame_open = false;
+        var result: PresentResult = .presented;
         if (self.backend) |vt| {
             if (vt.on_present) |cb| {
-                try cb(self.backend_ctx.?, handle, self.last_frame_commands.items);
+                result = try cb(self.backend_ctx.?, handle, self.last_frame_commands.items);
             }
         }
-        slot.presented_frames += 1;
+        switch (result) {
+            .presented => slot.presented_frames += 1,
+            .skipped => slot.skipped_frames += 1,
+        }
+        return result;
+    }
+
+    /// Frames the provider dropped without presenting (minimized window, nothing to acquire).
+    pub fn skippedFrames(self: *const GraphicsDeviceService, handle: RenderTargetHandle) ?u64 {
+        if (handle.index >= self.targets.items.len) return null;
+        const slot = &self.targets.items[handle.index];
+        if (!slot.alive or slot.generation != handle.generation) return null;
+        return slot.skipped_frames;
     }
 
     pub fn presentedFrames(self: *const GraphicsDeviceService, handle: RenderTargetHandle) ?u64 {

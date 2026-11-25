@@ -172,7 +172,7 @@ fn renderOverlay(ctx: *engine.SystemContext) !void {
         .{ .text = .{ .x = 16, .y = 38, .content = st.hud_line2[0..st.hud_line2_len], .color = .{ .r = 0.95, .g = 0.97, .b = 1.0, .a = 1.0 } } },
         .{ .text = .{ .x = 16, .y = 60, .content = st.hud_line3[0..st.remote_preview_len + 8], .color = .{ .r = 0.85, .g = 0.90, .b = 1.0, .a = 0.95 } } },
     });
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 fn spawnShape(

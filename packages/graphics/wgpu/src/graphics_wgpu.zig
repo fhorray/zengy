@@ -214,19 +214,19 @@ fn writePpm(allocator: std.mem.Allocator, path: [*:0]const u8, image: graphics.C
     if (fwrite(pixels.ptr, 1, pixels.len, file) != pixels.len) return error.CaptureWriteFailed;
 }
 
-fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []const graphics.DrawCommand) !void {
+fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []const graphics.DrawCommand) !graphics.PresentResult {
     const state = stateOf(raw);
     if (state.surface == null or !same(handle, state.surface.?)) return error.InvalidSurfaceHandle;
 
     var width: u32 = 0;
     var height: u32 = 0;
-    if (zwgpu_drawable_size(state.bridge, &width, &height) == 0) return; // minimized: skip the frame
+    if (zwgpu_drawable_size(state.bridge, &width, &height) == 0) return .skipped; // minimized: skip the frame
     const dpi_scale: f32 = if (window_sdl3.pixelSize(state.app)) |px| (if (px.dpi_scale > 0.0) px.dpi_scale else 1.0) else 1.0;
     const acquired = state.device.beginWindowFrame(&width, &height) catch |err| {
         if (isFatal(err)) state.service.setDeviceAvailable(false);
         return err;
     };
-    if (!acquired) return;
+    if (!acquired) return .skipped;
     defer state.device.discardWindowFrame();
     var submitted = false;
     defer {
@@ -308,6 +308,7 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
             }
         }
     }
+    return .presented;
 }
 
 const backend: graphics.BackendVTable = .{

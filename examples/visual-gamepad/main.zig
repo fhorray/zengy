@@ -320,7 +320,7 @@ fn renderGamepadDemo(ctx: *engine.SystemContext) !void {
         }
     }
 
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main() !void {

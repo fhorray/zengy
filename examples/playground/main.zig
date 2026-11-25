@@ -127,7 +127,7 @@ pub fn main() !void {
         ui_cmds.clearRetainingCapacity();
         try ui_tree.paint(allocator, &ui_cmds);
         try gfx.submitDrawCommands(rt, ui_cmds.items);
-        try gfx.present(rt);
+        _ = try gfx.present(rt);
     }
 
     const r3d = app.resources.get(render_3d.Render3DService).?;

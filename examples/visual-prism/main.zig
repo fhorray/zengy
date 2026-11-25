@@ -1408,7 +1408,7 @@ fn renderOverlay(ctx: *engine.SystemContext) !void {
         .{ .text = .{ .x = 16, .y = 82, .content = st.hud4[0..st.hud4_len], .color = .{ .r = 0.65, .g = 0.90, .b = 1.0, .a = 1.0 } } },
         .{ .text = .{ .x = 16, .y = 104, .content = st.hud5[0..st.hud5_len], .color = .{ .r = 0.96, .g = 0.80, .b = 1.0, .a = 1.0 } } },
     });
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main(init: std.process.Init) !void {

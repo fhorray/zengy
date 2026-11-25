@@ -53,7 +53,7 @@ fn renderFrameSystem(ctx: *engine.SystemContext) !void {
         } },
     });
 
-    try rs.gfx.present(rs.rt);
+    _ = try rs.gfx.present(rs.rt);
 }
 
 pub fn main() !void {

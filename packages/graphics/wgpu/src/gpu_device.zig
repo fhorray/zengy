@@ -1403,6 +1403,12 @@ fn poll(ctx: *anyopaque, wait: bool) void {
     c.wgpuInstanceProcessEvents(self.instance);
 }
 
+extern fn SDL_GetTicksNS() u64;
+
+fn nowNs(_: *anyopaque) u64 {
+    return SDL_GetTicksNS();
+}
+
 pub const vtable: gpu.GpuDevice.VTable = .{
     .capabilities = getCapabilities,
     .create_buffer = createBuffer,
@@ -1434,4 +1440,5 @@ pub const vtable: gpu.GpuDevice.VTable = .{
     .poll_readback = pollReadback,
     .cancel_readback = cancelReadback,
     .poll = poll,
+    .now_ns = nowNs,
 };

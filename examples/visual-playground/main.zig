@@ -207,7 +207,7 @@ fn renderPlaygroundSystem(ctx: *engine.SystemContext) !void {
     // Paint UI overlay on top of the 2D scene.
     try st.tree.paint(st.allocator, &st.cmds);
     try st.gfx.submitDrawCommands(st.rt, st.cmds.items);
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main() !void {

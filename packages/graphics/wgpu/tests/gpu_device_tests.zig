@@ -503,3 +503,26 @@ test "device releases leftover resources on deinit" {
     _ = try h.g.createSampler(.{});
     h.deinit();
 }
+
+test "blocking readback enforces a wall-clock deadline and leaves the device usable" {
+    var h = try Harness.init(std.testing.allocator);
+    defer h.deinit();
+    const source_buffer = try h.g.createBuffer(.{ .size = 16, .usage = .{ .copy_src = true, .copy_dst = true } });
+    defer h.g.destroyBuffer(source_buffer);
+    const buffer = try h.g.createBuffer(.{ .size = 16, .usage = .{ .map_read = true, .copy_dst = true } });
+    defer h.g.destroyBuffer(buffer);
+    const source: [16]u8 = @splat(9);
+    try h.g.writeBuffer(source_buffer, 0, &source);
+    var rec = gpu.CommandRecorder.init(std.testing.allocator);
+    defer rec.deinit();
+    try rec.copyBufferToBuffer(source_buffer, 0, buffer, 0, 16);
+    try h.g.submit(rec.slice());
+
+    // A zero deadline either times out immediately or the mapping was already complete; nothing else is acceptable.
+    var result: [16]u8 = undefined;
+    h.g.readBufferTimeout(buffer, 0, &result, 0) catch |err| try std.testing.expectEqual(error.ReadbackTimeout, err);
+
+    // The cancelled ticket must not block the buffer: a normal read right after succeeds.
+    try h.g.readBufferBlocking(buffer, 0, &result);
+    try std.testing.expectEqualSlices(u8, &source, &result);
+}

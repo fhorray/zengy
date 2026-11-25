@@ -170,7 +170,7 @@ fn renderDemoSystem(ctx: *engine.SystemContext) !void {
         try gpu_3d.queueMeshDraw(st.app, st.cube_mesh, mvp.m, col, tex);
     }
 
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main() !void {

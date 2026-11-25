@@ -94,7 +94,7 @@ test "provider presents Render2D output to a real swapchain" {
             .{ .clear = .{ .r = 0, .g = 0, .b = 1 } },
             .{ .rect = .{ .x = 20, .y = 20, .width = 60, .height = 40, .color = .{ .r = 1, .g = 0, .b = 0 } } },
         });
-        try service.present(target);
+        _ = try service.present(target);
     }
     try std.testing.expect(capture.captured);
 

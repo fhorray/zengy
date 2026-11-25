@@ -753,6 +753,8 @@ pub const GpuDevice = struct {
         cancel_readback: ?*const fn (ctx: *anyopaque, handle: ReadbackHandle) void = null,
         /// Drives provider callbacks. `wait` blocks until submitted work completes.
         poll: *const fn (ctx: *anyopaque, wait: bool) void,
+        /// Monotonic clock in nanoseconds, used for deadlines. Providers without one leave it null.
+        now_ns: ?*const fn (ctx: *anyopaque) u64 = null,
     };
 
     pub fn capabilities(self: GpuDevice) *const Capabilities {
@@ -847,16 +849,31 @@ pub const GpuDevice = struct {
         self.vtable.poll(self.ctx, wait);
     }
 
+    /// Deadline used by `readBufferBlocking`.
+    pub const default_readback_timeout_ns: u64 = 5 * 1_000_000_000;
+
     /// Blocking readback for tests and tools. Gameplay code must use `beginReadback`/`pollReadback`
-    /// so frames never stall on the GPU.
+    /// so frames never stall on the GPU. Fails with `error.ReadbackTimeout` after `default_readback_timeout_ns`.
     pub fn readBufferBlocking(self: GpuDevice, buffer: BufferHandle, offset: u64, out: []u8) !void {
+        return self.readBufferTimeout(buffer, offset, out, default_readback_timeout_ns);
+    }
+
+    /// Like `readBufferBlocking` with an explicit wall-clock deadline. The wait polls without blocking inside the
+    /// driver, so the deadline is honoured even if the GPU never finishes; the ticket is always cancelled on failure.
+    /// Providers without a clock fall back to a bounded number of polls.
+    pub fn readBufferTimeout(self: GpuDevice, buffer: BufferHandle, offset: u64, out: []u8, timeout_ns: u64) !void {
         const ticket = try self.beginReadback(buffer, offset, out.len);
         defer self.cancelReadback(ticket); // idempotent after successful polling
-        var spins: u32 = 0;
+        const clock = self.vtable.now_ns;
+        const start: u64 = if (clock) |now| now(self.ctx) else 0;
+        var spins: u64 = 0;
         while (!try self.pollReadback(ticket, out)) {
-            self.poll(true);
+            self.poll(false);
             spins += 1;
-            if (spins > 100_000) return error.ReadbackTimeout;
+            if (clock) |now| {
+                if (now(self.ctx) -| start >= timeout_ns) return error.ReadbackTimeout;
+            } else if (spins > 50_000_000) return error.ReadbackTimeout;
+            if (spins % 64 == 0) std.Thread.yield() catch {};
         }
     }
 };

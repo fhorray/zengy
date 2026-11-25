@@ -61,7 +61,7 @@ fn render(ctx: *engine.SystemContext) !void {
         .{ .rect = .{ .x = 700, .y = 260, .width = 220, .height = 120, .color = color(0.9, 0.3, 0.3, 0.85) } },
         .{ .rect = .{ .x = 760, .y = 300, .width = 220, .height = 120, .color = color(0.3, 0.5, 0.95, 0.6) } },
     });
-    try state.gfx.present(state.target);
+    _ = try state.gfx.present(state.target);
 }
 
 fn checkerPixels() [4 * 4 * 4]u8 {

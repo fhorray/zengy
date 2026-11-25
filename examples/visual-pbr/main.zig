@@ -846,7 +846,7 @@ fn renderPbrOverlay(ctx: *engine.SystemContext) !void {
         .{ .text = .{ .x = 18, .y = 18, .content = st.hud1[0..st.hud1_len], .color = .{ .r = 0.96, .g = 0.98, .b = 1.0, .a = 1.0 } } },
         .{ .text = .{ .x = 18, .y = 42, .content = st.hud2[0..st.hud2_len], .color = .{ .r = 0.78, .g = 0.88, .b = 0.98, .a = 1.0 } } },
     });
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main(init: std.process.Init) !void {

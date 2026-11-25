@@ -164,7 +164,7 @@ fn galleryRender(ctx: *engine.SystemContext) !void {
     try st.tree.paint(st.app.allocator, &st.cmds);
     try st.gfx.beginFrame(st.rt);
     try st.gfx.submitDrawCommands(st.rt, st.cmds.items);
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main() !void {

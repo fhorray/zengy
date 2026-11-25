@@ -79,7 +79,7 @@ fn uiRenderSystem(ctx: *engine.SystemContext) !void {
 
     try st.gfx.beginFrame(st.rt);
     try st.gfx.submitDrawCommands(st.rt, st.cmds.items);
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main() !void {

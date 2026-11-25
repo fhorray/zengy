@@ -411,7 +411,7 @@ fn renderOverlay(ctx: *engine.SystemContext) !void {
     try st.gfx.submitDrawCommands(st.rt, &.{
         .{ .text = .{ .x = 18, .y = 18, .content = st.hud[0..st.hud_len], .color = .{ .r = 0.95, .g = 0.98, .b = 1.0, .a = 1.0 } } },
     });
-    try st.gfx.present(st.rt);
+    _ = try st.gfx.present(st.rt);
 }
 
 pub fn main(init: std.process.Init) !void {

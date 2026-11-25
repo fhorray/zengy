@@ -362,3 +362,49 @@ test "gpu pass timings arrive asynchronously through the sink" {
     try std.testing.expect(collector.shadow_seen);
     try std.testing.expect(collector.last_frame_ns >= 16_666_666 and collector.last_frame_ns <= 16_666_667);
 }
+
+test "shadow draw reservation follows the passes that really run" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    var cube = try render_3d.gltf.createCubeMesh(std.testing.allocator, 1.0);
+    defer cube.deinit();
+    const mesh = try f.r3d.createMesh(f.g, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    const backend = f.renderer.vtable();
+    const count = 600;
+
+    // Sun shadows only: four cascades, no local tiles, no depth prepass, no masked materials.
+    var data = sceneFrame(.{ 0, 4, 12.0 }, 1.0);
+    data.directional_lights = &.{.{ .direction = .{ -0.3, -1.0, -0.2 }, .color = .{ 1, 1, 1 }, .illuminance_lux = 10_000, .shadows_enabled = true, .shadow_depth_bias = 0.005, .shadow_normal_bias = 0.05, .cascade_count = 4 }};
+    data.post_process.bloom.enabled = false;
+    try backend.beginPbrFrame(backend.ctx, &data);
+    for (0..count) |i| {
+        const x: f32 = @as(f32, @floatFromInt(i % 30)) - 15.0;
+        const z: f32 = @as(f32, @floatFromInt(i / 30)) - 10.0;
+        const model = math3d.Mat4.translation(x, 0, z);
+        const mvp = math3d.Mat4.mul(math3d.Mat4{ .m = data.view_proj }, model);
+        try backend.submitLitMesh(backend.ctx, @bitCast(mesh), model.m, mvp.m, .{ .base_color = .{ 0.7, 0.7, 0.7, 1 } }, .{ 1, 1, 1, 1 });
+    }
+    std.testing.allocator.free(try f.renderFrame(64, 64, .rgba8_unorm));
+
+    // The old reservation was (draws + 1) * (4 + 16 tiles + 2) slots of one uniform-offset step each.
+    const slot: u64 = @max(f.g.capabilities().limits.min_uniform_buffer_offset_alignment, 64);
+    const old_reservation: u64 = (count + 1) * 22 * slot;
+    const shadow_capacity = f.renderer.shadow_vs.capacity;
+    const mask_capacity = f.renderer.mask_params.capacity;
+    std.debug.print("\n[pbr] shadow reservation {d} B (old {d} B), mask {d} B\n", .{ shadow_capacity, old_reservation, mask_capacity });
+    try std.testing.expect(shadow_capacity >= count * 4 * slot); // four cascades must fit
+    try std.testing.expect(shadow_capacity < old_reservation / 3 * 2); // power-of-two growth rounds up
+    try std.testing.expect(mask_capacity <= 64 * 1024); // nothing is alpha masked
+
+    // Every kind of depth-only pass at once must still fit: cascades, a shadowed spot light, prepass, masked draws.
+    var busy = data;
+    busy.post_process.ssao.enabled = true;
+    busy.spot_lights = &.{.{ .position = .{ 0, 6, 0 }, .direction = .{ 0, -1, 0 }, .color = .{ 1, 1, 1 }, .intensity_lumens = 2000, .range = 20, .inner_angle_rad = 0.3, .outer_angle_rad = 0.6, .shadows_enabled = true }};
+    try backend.beginPbrFrame(backend.ctx, &busy);
+    for (0..40) |i| {
+        const model = math3d.Mat4.translation(@as(f32, @floatFromInt(i)) - 20.0, 0, 0);
+        const mvp = math3d.Mat4.mul(math3d.Mat4{ .m = busy.view_proj }, model);
+        try backend.submitLitMesh(backend.ctx, @bitCast(mesh), model.m, mvp.m, .{ .base_color = .{ 0.7, 0.7, 0.7, 1 }, .alpha_mode = .mask, .alpha_cutoff = 0.5 }, .{ 1, 1, 1, 1 });
+    }
+    std.testing.allocator.free(try f.renderFrame(64, 64, .rgba8_unorm)); // would fail with ShadowDrawBudgetExceeded
+}
