@@ -7,6 +7,8 @@ on:
       - 'tools/wgpu/**'
       - 'examples/visual-wgpu/**'
       - 'packages/window/sdl3/**'
+      - 'packages/render/2d/**'
+      - 'packages/graphics/core/**'
       - 'build.zig'
       - '.github/workflows/wgpu-foundation.yml'
   pull_request:
@@ -15,6 +17,8 @@ on:
       - 'tools/wgpu/**'
       - 'examples/visual-wgpu/**'
       - 'packages/window/sdl3/**'
+      - 'packages/render/2d/**'
+      - 'packages/graphics/core/**'
       - 'build.zig'
       - '.github/workflows/wgpu-foundation.yml'
 permissions:
@@ -29,10 +33,6 @@ jobs:
           python-version: '3.12'
       - name: Test shader candidate transformations
         run: python -m unittest discover -s tools/wgpu -p 'test_*.py' -v
-      - name: Test clipped geometry
-        run: |
-          cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined packages/graphics/wgpu/src/geometry.c packages/graphics/wgpu/tests/geometry_test.c -o /tmp/wgpu-geometry
-          /tmp/wgpu-geometry
   native-build:
     runs-on: windows-latest
     steps:
@@ -50,3 +50,8 @@ jobs:
         run: |
           $root = (Resolve-Path .deps/wgpu-native).Path
           zig build build-visual-wgpu "-Dwgpu-root=$root" -Doptimize=ReleaseSafe
+      - name: GPU conformance tests (skipped when the runner has no adapter)
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path .deps/wgpu-native).Path
+          zig build test-wgpu-gpu "-Dwgpu-root=$root"

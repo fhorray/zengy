@@ -21,6 +21,7 @@ extern fn zwgpu_set_validation_capture(g: *anyopaque, enabled: c_int) void;
 extern fn zwgpu_take_validation(g: *anyopaque, out: [*]u8, capacity: usize, flush: c_int) c_int;
 extern fn zwgpu_swapchain_acquire(g: *anyopaque, view: *?*anyopaque, width: *u32, height: *u32) c_int;
 extern fn zwgpu_swapchain_present(g: *anyopaque, present: c_int) c_int;
+extern fn zwgpu_frame_texture(g: *anyopaque, width: *u32, height: *u32) ?*anyopaque;
 extern fn zwgpu_error() [*:0]const u8;
 
 /// Non-optional native view pointer (translate-c types handles as optional pointers).
@@ -258,8 +259,7 @@ fn nativeFormat(f: gpu.TextureFormat) c.WGPUTextureFormat {
 }
 
 fn fromNativeFormat(raw: u32) ?gpu.TextureFormat {
-    inline for (@typeInfo(gpu.TextureFormat).@"enum".fields) |field| {
-        const value: gpu.TextureFormat = @enumFromInt(field.value);
+    for (std.enums.values(gpu.TextureFormat)) |value| {
         if (@as(u32, @intCast(nativeFormat(value))) == raw) return value;
     }
     return null;
@@ -1235,6 +1235,21 @@ fn submit(ctx: *anyopaque, commands: []const gpu.Command) anyerror!void {
                 const dst_info = try texelCopy(self, d.dst);
                 const ext = extent(d.extent);
                 c.wgpuCommandEncoderCopyTextureToTexture(encoder, &src_info, &dst_info, &ext);
+            },
+            .copy_swapchain_to_buffer => |d| {
+                if (state.render != null or state.compute != null) return error.PassMismatch;
+                const dst = self.buffers.get(d.dst) orelse return error.InvalidHandle;
+                var w: u32 = 0;
+                var h: u32 = 0;
+                // No acquired frame means no pass drew to the swapchain yet: there is nothing to capture.
+                const raw = zwgpu_frame_texture(self.bridge, &w, &h) orelse return error.InvalidDescriptor;
+                var src_info = std.mem.zeroes(c.WGPUTexelCopyTextureInfo);
+                src_info.texture = @ptrCast(raw);
+                src_info.aspect = c.WGPUTextureAspect_All;
+                const bytes_per_texel = (self.surfaceFormat() orelse return error.InvalidDescriptor).bytesPerTexel();
+                var dst_info: c.WGPUTexelCopyBufferInfo = .{ .layout = bufferLayout(d.layout, w * bytes_per_texel, h, 1), .buffer = dst.raw };
+                const ext: c.WGPUExtent3D = .{ .width = w, .height = h, .depthOrArrayLayers = 1 };
+                c.wgpuCommandEncoderCopyTextureToBuffer(encoder, &src_info, &dst_info, &ext);
             },
             .clear_buffer => |d| {
                 if (state.render != null or state.compute != null) return error.PassMismatch;

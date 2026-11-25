@@ -544,6 +544,10 @@ pub const Command = union(enum) {
     copy_texture_to_buffer: struct { src: TextureCopyLocation, dst: BufferHandle, layout: BufferLayout, extent: Extent3D },
     copy_buffer_to_texture: struct { src: BufferHandle, layout: BufferLayout, dst: TextureCopyLocation, extent: Extent3D },
     copy_texture_to_texture: struct { src: TextureCopyLocation, dst: TextureCopyLocation, extent: Extent3D },
+    /// Copies the whole current swapchain frame (as drawn by the passes recorded before this command) into
+    /// `dst`. Used by capture tooling and window tests. Fails if no pass drew to the swapchain this frame.
+    /// Pixels are in the surface format (see `FrameTarget.color_format`).
+    copy_swapchain_to_buffer: struct { dst: BufferHandle, layout: BufferLayout = .{} },
     clear_buffer: struct { buffer: BufferHandle, offset: u64 = 0, size: u64 = 0 },
     resolve_query_set: struct { query_set: QuerySetHandle, first: u32, count: u32, dst: BufferHandle, dst_offset: u64 },
     push_debug_group: []const u8,
@@ -683,6 +687,11 @@ pub const CommandRecorder = struct {
     pub fn copyTextureToTexture(self: *CommandRecorder, src: TextureCopyLocation, dst: TextureCopyLocation, extent: Extent3D) !void {
         if (self.open_render_pass or self.open_compute_pass) return error.PassAlreadyOpen;
         try self.push(.{ .copy_texture_to_texture = .{ .src = src, .dst = dst, .extent = extent } });
+    }
+
+    pub fn copySwapchainToBuffer(self: *CommandRecorder, dst: BufferHandle, layout: BufferLayout) !void {
+        if (self.open_render_pass or self.open_compute_pass) return error.PassAlreadyOpen;
+        try self.push(.{ .copy_swapchain_to_buffer = .{ .dst = dst, .layout = layout } });
     }
 
     pub fn clearBuffer(self: *CommandRecorder, buffer: BufferHandle, offset: u64, size: u64) !void {

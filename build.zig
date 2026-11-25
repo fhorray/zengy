@@ -616,6 +616,17 @@ pub fn build(b: *std.Build) void {
     render_2d_mod.addImport("scene", scene_mod);
     render_2d_mod.addImport("camera", camera_mod);
 
+    // GPU executor for draw commands and sprite quads. Needs only the neutral graphics contract + text atlases.
+    const draw_2d_mod = b.addModule("draw_2d", .{
+        .root_source_file = b.path("packages/render/2d/src/draw_2d.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    draw_2d_mod.addImport("engine", engine_mod);
+    draw_2d_mod.addImport("graphics", graphics_mod);
+    draw_2d_mod.addImport("text", text_mod);
+
     const gpu_resources_mod = b.addModule("gpu_resources", .{
         .root_source_file = b.path("packages/graphics/sdlgpu/src/gpu_resources.zig"),
         .target = target,
@@ -669,7 +680,7 @@ pub fn build(b: *std.Build) void {
         wgpu_gpu_mod.addIncludePath(wgpu_include);
         wgpu_gpu_mod.addLibraryPath(wgpu_lib);
         wgpu_gpu_mod.addCSourceFiles(.{
-            .files = &.{ "packages/graphics/wgpu/src/bridge.c", "packages/graphics/wgpu/src/geometry.c" },
+            .files = &.{"packages/graphics/wgpu/src/bridge.c"},
             .flags = &.{"-std=c11"},
         });
         wgpu_gpu_mod.linkSystemLibrary("wgpu_native", .{ .preferred_link_mode = .dynamic });
@@ -687,13 +698,17 @@ pub fn build(b: *std.Build) void {
 
         // Real-GPU conformance tests. Kept out of the default `test` step, which must run without a GPU.
         const gpu_test_mod = b.createModule(.{
-            .root_source_file = b.path("packages/graphics/wgpu/tests/gpu_device_tests.zig"),
+            .root_source_file = b.path("packages/graphics/wgpu/tests/all_gpu_tests.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
         gpu_test_mod.addImport("graphics", graphics_mod);
         gpu_test_mod.addImport("wgpu_gpu", wgpu_gpu_mod);
+        gpu_test_mod.addImport("draw_2d", draw_2d_mod);
+        gpu_test_mod.addImport("engine", engine_mod);
+        gpu_test_mod.addImport("window_sdl3", window_sdl3_mod);
+        gpu_test_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
         const gpu_tests = b.addTest(.{ .root_module = gpu_test_mod });
         const gpu_test_step = b.step("test-wgpu-gpu", "Run wgpu GpuDevice conformance tests on a real adapter");
         // On Windows the loader needs SDL3.dll and wgpu_native.dll beside the executable, so run an
@@ -724,6 +739,7 @@ pub fn build(b: *std.Build) void {
         visual_wgpu_mod.addImport("window_sdl3", window_sdl3_mod);
         visual_wgpu_mod.addImport("graphics", graphics_mod);
         visual_wgpu_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+        visual_wgpu_mod.addImport("draw_2d", draw_2d_mod);
         const visual_wgpu_exe = b.addExecutable(.{ .name = "visual-wgpu", .root_module = visual_wgpu_mod });
         const install_wgpu = b.addInstallArtifact(visual_wgpu_exe, .{});
         const build_wgpu_step = b.step("build-visual-wgpu", "Build the native wgpu migration demo");
@@ -1320,6 +1336,7 @@ pub fn build(b: *std.Build) void {
 
     // Backend-neutral GPU contract: handle pools, command recorder and format helpers.
     addModuleTest(b, test_step, "packages/graphics/core/src/gpu.zig", target, optimize, false, &.{}, null);
+    addModuleTest(b, test_step, "packages/graphics/core/src/frame.zig", target, optimize, false, &.{}, null);
 
     addModuleTest(b, test_step, "packages/graphics/core/tests/graphics_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
@@ -1500,6 +1517,12 @@ pub fn build(b: *std.Build) void {
     }, null);
 
     addModuleTest(b, test_step, "packages/render/text/tests/text_tests.zig", target, optimize, false, &.{
+        .{ .name = "text", .mod = text_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/render/2d/src/draw_2d.zig", target, optimize, true, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "text", .mod = text_mod },
     }, null);
 
