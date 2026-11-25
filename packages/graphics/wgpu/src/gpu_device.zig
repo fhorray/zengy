@@ -523,6 +523,7 @@ fn detectCapabilities(adapter: c.WGPUAdapter, device: c.WGPUDevice, queue: c.WGP
             .max_vertex_buffers = l.maxVertexBuffers,
             .max_buffer_size = l.maxBufferSize,
             .max_color_attachments = l.maxColorAttachments,
+            .max_color_attachment_bytes_per_sample = l.maxColorAttachmentBytesPerSample,
             .max_sampled_textures_per_shader_stage = l.maxSampledTexturesPerShaderStage,
             .max_storage_buffers_per_shader_stage = l.maxStorageBuffersPerShaderStage,
             .max_storage_textures_per_shader_stage = l.maxStorageTexturesPerShaderStage,

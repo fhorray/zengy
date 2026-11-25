@@ -422,6 +422,8 @@ pub const Limits = struct {
     max_vertex_buffers: u32 = 0,
     max_buffer_size: u64 = 0,
     max_color_attachments: u32 = 0,
+    /// Total bytes of all colour attachments of one pipeline per sample (the WebGPU default limit is 32).
+    max_color_attachment_bytes_per_sample: u32 = 0,
     max_sampled_textures_per_shader_stage: u32 = 0,
     max_storage_buffers_per_shader_stage: u32 = 0,
     max_storage_textures_per_shader_stage: u32 = 0,

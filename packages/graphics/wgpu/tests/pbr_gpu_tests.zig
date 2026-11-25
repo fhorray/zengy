@@ -263,3 +263,44 @@ test "volumetric fog changes the scene for ray march, temporal resolve and froxe
         try std.testing.expect(changed > last.len / 4 / 4);
     }
 }
+
+test "screen transport traces the Hi-Z pyramid and changes indirect lighting" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const limits = f.g.capabilities().limits;
+    if (limits.max_color_attachments < 4 or limits.max_color_attachment_bytes_per_sample < 40) return error.SkipZigTest;
+    var cube = try render_3d.gltf.createCubeMesh(std.testing.allocator, 1.0);
+    defer cube.deinit();
+    const mesh = try f.r3d.createMesh(f.g, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    const backend = f.renderer.vtable();
+    // A smooth floor and a bright box above it: the floor has something to reflect and to receive bounce from.
+    const floor_model = math3d.Mat4.mul(math3d.Mat4.translation(0, -0.5, 0), math3d.Mat4.scale(8, 0.1, 8));
+    const box_model = math3d.Mat4.translation(0, 0.4, 0);
+
+    var off = sceneFrame(.{ 0, 2.5, 5.0 }, 1.0);
+    off.directional_lights = &sun;
+    off.post_process.bloom.enabled = false;
+    var on = off;
+    on.post_process.quality.screen_transport = .{ .ssr_strength = 1.0, .ssgi_strength = 0.6 };
+
+    var results: [2][]u8 = undefined;
+    for ([_]*const pbr.ExtractedPbrFrame{ &off, &on }, 0..) |data, i| {
+        try backend.beginPbrFrame(backend.ctx, data);
+        const floor_mvp = math3d.Mat4.mul(math3d.Mat4{ .m = data.view_proj }, floor_model);
+        const box_mvp = math3d.Mat4.mul(math3d.Mat4{ .m = data.view_proj }, box_model);
+        try backend.submitLitMesh(backend.ctx, @bitCast(mesh), floor_model.m, floor_mvp.m, .{ .base_color = .{ 0.8, 0.8, 0.8, 1 }, .roughness = 0.05 }, .{ 1, 1, 1, 1 });
+        try backend.submitLitMesh(backend.ctx, @bitCast(mesh), box_model.m, box_mvp.m, .{ .base_color = .{ 0.9, 0.2, 0.1, 1 }, .roughness = 0.6, .emissive = .{ 2, 0.4, 0.2, 1 } }, .{ 1, 1, 1, 1 });
+        results[i] = try f.renderFrame(96, 96, .rgba8_unorm);
+    }
+    defer for (results) |r| std.testing.allocator.free(r);
+    try std.testing.expect(f.renderer.screen != null);
+    var differing: usize = 0;
+    var i: usize = 0;
+    while (i < results[0].len) : (i += 4) {
+        if (!std.mem.eql(u8, results[0][i .. i + 3], results[1][i .. i + 3])) differing += 1;
+    }
+    std.debug.print("\n[pbr] screen transport: {d}/{d} pixels differ\n", .{ differing, results[0].len / 4 });
+    // The smooth floor reflects the box, so a visible share of pixels must change, and the frame must stay plausible.
+    try std.testing.expect(differing > 200);
+    try std.testing.expect(luma(px(results[1], 96, 48, 48)) > 5);
+}

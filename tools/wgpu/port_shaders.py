@@ -51,6 +51,7 @@ def remap_identity(group: int, binding: int):
 # Shaders that keep the legacy numbering (their vertex stage already occupies group 1).
 REMAPS = {
     'pbr.frag': remap_pbr,
+    'pbr_screen.frag': remap_pbr,
     'pbr.vert': remap_identity,
     'shadow.vert': remap_identity,
     'shadow.frag': remap_identity,
@@ -65,18 +66,31 @@ SKIP = {'auto_exposure_hist.comp', 'textured.vert', 'textured.frag', 'pos_color.
         'mesh_unlit.vert', 'mesh_unlit.frag', 'gizmo.vert', 'gizmo.frag'}
 
 
-def port_one(repo: Path, src: Path, naga: str) -> tuple[str, list]:
-    text, bindings = cs.split_samplers(cs.replace_nan_checks(src.read_text(encoding='utf-8')))
+# Extra outputs built from an existing GLSL file with preprocessor defines (the legacy build compiled these with -D).
+VARIANTS = {'pbr_screen.frag': ('pbr.frag', ['ZENGY_SCREEN_TRANSPORT'])}
+
+
+def with_defines(source: str, defines: list[str]) -> str:
+    """Inserts `#define` lines right after the `#version` directive."""
+    head, _, rest = source.partition('\n')
+    return head + '\n' + ''.join(f'#define {d}\n' for d in defines) + rest
+
+
+def port_one(repo: Path, src: Path, naga: str, defines: list[str] | None = None, name: str | None = None) -> tuple[str, list]:
+    source = src.read_text(encoding='utf-8')
+    if defines:
+        source = with_defines(source, defines)
+    text, bindings = cs.split_samplers(cs.replace_nan_checks(source))
     with tempfile.TemporaryDirectory() as tmp:
-        glsl = Path(tmp) / src.name
+        glsl = Path(tmp) / (name or src.name)
         glsl.write_text(text, encoding='utf-8')
-        wgsl = Path(tmp) / (src.name + '.wgsl')
+        wgsl = Path(tmp) / ((name or src.name) + '.wgsl')
         for command in ([naga, '--input-kind', 'glsl', '--shader-stage', STAGE[src.suffix], str(glsl), str(wgsl)], [naga, str(wgsl)]):
             result = subprocess.run(command, text=True, capture_output=True, timeout=120)
             if result.returncode:
                 raise RuntimeError((result.stdout + '\n' + result.stderr).strip())
         out = wgsl.read_text(encoding='utf-8')
-    remap = REMAPS.get(src.name, remap_fullscreen)
+    remap = REMAPS.get(name or src.name, remap_fullscreen)
     used = []
 
     def sub(match):
@@ -92,7 +106,7 @@ def port_one(repo: Path, src: Path, naga: str) -> tuple[str, list]:
     slots = [(g, b) for _, _, g, b in used]
     if len(slots) != len(set(slots)):
         raise RuntimeError(f'{src.name}: bind group remap collided: {sorted(slots)}')
-    header = f'// Ported from {src.name} (GLSL) with Naga 27.0.0; bind groups remapped by tools/wgpu/port_shaders.py.\n'
+    header = f'// Ported from {name or src.name} (GLSL) with Naga 27.0.0; bind groups remapped by tools/wgpu/port_shaders.py.\n'
     return header + out, used
 
 
@@ -121,6 +135,19 @@ def main() -> int:
         except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
             failures += 1
             print('FAILED', src.name, str(exc)[:300].replace('\x1b', ''))
+    for variant, (origin, defines) in VARIANTS.items():
+        if args.only and variant not in args.only:
+            continue
+        stem, suffix = variant.rsplit('.', 1)
+        out_name = stem + SUFFIX['.' + suffix] + '.wgsl'
+        try:
+            text, used = port_one(repo, repo / SRC / origin, args.naga, defines, variant)
+            (out_dir / out_name).write_text(text, encoding='utf-8', newline='\n')
+            report[out_name] = [{'from': [a, b], 'to': [c, d]} for a, b, c, d in used]
+            print('ported', variant, '->', out_name)
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            failures += 1
+            print('FAILED', variant, str(exc)[:300].replace('\x1b', ''))
     (out_dir / 'bindings.json').write_text(json.dumps(report, indent=1), encoding='utf-8', newline='\n')
     return 1 if failures else 0
 

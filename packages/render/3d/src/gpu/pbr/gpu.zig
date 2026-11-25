@@ -12,6 +12,7 @@ const graphics = @import("graphics");
 const render_3d = @import("render_3d");
 const layout = @import("layout.zig");
 const util = @import("util.zig");
+const screen_transport = @import("screen_transport.zig");
 
 const gpu = graphics.gpu;
 const cluster = render_3d.cluster;
@@ -34,6 +35,9 @@ const sh = struct {
     const bloom_down_fs = @embedFile("../shaders/bloom_downsample_fs.wgsl");
     const bloom_up_fs = @embedFile("../shaders/bloom_upsample_fs.wgsl");
     const postfx_fs = @embedFile("../shaders/postfx_fs.wgsl");
+    const pbr_screen_fs = @embedFile("../shaders/pbr_screen_fs.wgsl");
+    const screen_transport_fs = @embedFile("../shaders/screen_transport_fs.wgsl");
+    const hiz_reduce_cs = @embedFile("../shaders/hiz_reduce_cs.wgsl");
     const volumetric_fog_fs = @embedFile("../shaders/volumetric_fog_fs.wgsl");
     const volumetric_resolve_fs = @embedFile("../shaders/volumetric_resolve_fs.wgsl");
     const volumetric_composite_fs = @embedFile("../shaders/volumetric_composite_fs.wgsl");
@@ -184,6 +188,9 @@ pub const Gpu = struct {
     /// Volumetric fog pipelines, created on first use.
     volumetric_gpu: ?Volumetric = null,
 
+    /// Screen-space transport pipelines, created on first use.
+    screen_gpu: ?Screen = null,
+
     /// Automatic exposure compute pipelines, created on first use.
     exposure_gpu: ?Exposure = null,
 
@@ -194,6 +201,25 @@ pub const Gpu = struct {
     postfx_format: ?gpu.TextureFormat = null,
 
     pub const Image = struct { texture: gpu.TextureHandle, view: gpu.TextureViewHandle };
+
+    /// Colour bytes per sample of the transport lit pass: HDR (8) + surface rgba32f (16) + diffuse (8) + specular (8).
+    pub const screen_color_bytes: u32 = 40;
+
+    /// Lit-pass variants that also write the screen-transport metadata, plus the Hi-Z reduce and resolve passes.
+    pub const Screen = struct {
+        pbr_opaque: gpu.RenderPipelineHandle,
+        pbr_double_sided: gpu.RenderPipelineHandle,
+        pbr_blend: gpu.RenderPipelineHandle,
+        pbr_reuse: gpu.RenderPipelineHandle,
+        pbr_reuse_double_sided: gpu.RenderPipelineHandle,
+        resolve: gpu.RenderPipelineHandle,
+        reduce: gpu.ComputePipelineHandle,
+        l_resolve: gpu.BindGroupLayoutHandle,
+        l_reduce_depth: gpu.BindGroupLayoutHandle,
+        l_reduce_bounds: gpu.BindGroupLayoutHandle,
+        g_u_resolve: gpu.BindGroupHandle,
+        g_u_reduce: gpu.BindGroupHandle,
+    };
 
     /// Ray-marched (or froxel) volumetric fog, temporal resolve and physically based composite.
     pub const Volumetric = struct {
@@ -387,11 +413,11 @@ pub const Gpu = struct {
 
         // --- lit pass pipelines
         const pbr_pl = try self.newPipelineLayout(&.{ self.l_material, self.l_vs_pbr, self.l_frame, self.l_fs_pbr });
-        self.pbr_opaque = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, false, false, false);
-        self.pbr_double_sided = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, false, false);
-        self.pbr_blend = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, true, false);
-        self.pbr_reuse = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, false, false, true);
-        self.pbr_reuse_double_sided = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, false, true);
+        self.pbr_opaque = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, false, false, false, false);
+        self.pbr_double_sided = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, false, false, false);
+        self.pbr_blend = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, true, false, false);
+        self.pbr_reuse = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, false, false, true, false);
+        self.pbr_reuse_double_sided = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, false, true, false);
 
         // --- depth-only pipelines
         const shadow_pl = try self.newPipelineLayout(&.{ self.l_empty, self.l_vs_shadow });
@@ -464,7 +490,10 @@ pub const Gpu = struct {
         });
     }
 
-    fn pbrPipeline(self: *Gpu, pl: gpu.PipelineLayoutHandle, vs: gpu.ShaderModuleHandle, fs: gpu.ShaderModuleHandle, double_sided: bool, alpha_blend: bool, depth_equal_ok: bool) !gpu.RenderPipelineHandle {
+    /// `transport` adds the three screen-transport metadata targets (never blended: a blended draw rewrites them as "no data").
+    fn pbrPipeline(self: *Gpu, pl: gpu.PipelineLayoutHandle, vs: gpu.ShaderModuleHandle, fs: gpu.ShaderModuleHandle, double_sided: bool, alpha_blend: bool, depth_equal_ok: bool, transport: bool) !gpu.RenderPipelineHandle {
+        const hdr_target: gpu.ColorTargetState = .{ .format = hdr_format, .blend = if (alpha_blend) gpu.BlendState.alpha_blend else null };
+        const targets = [_]gpu.ColorTargetState{ hdr_target, .{ .format = .rgba32_float }, .{ .format = hdr_format }, .{ .format = hdr_format } };
         return self.newRender(.{
             .label = "pbr",
             .layout = pl,
@@ -473,7 +502,7 @@ pub const Gpu = struct {
             .vertex_entry = "main",
             .fragment_entry = "main",
             .vertex_buffers = &mesh_vertex_buffers,
-            .color_targets = &.{.{ .format = hdr_format, .blend = if (alpha_blend) gpu.BlendState.alpha_blend else null }},
+            .color_targets = if (transport) &targets else targets[0..1],
             // Blended surfaces test depth but do not write it.
             .depth_stencil = .{ .format = depth_format, .depth_write = !alpha_blend, .depth_compare = if (depth_equal_ok) .less_equal else .less },
             .cull_mode = if (double_sided) .none else .back,
@@ -530,6 +559,51 @@ pub const Gpu = struct {
         self.histogram = try self.newBuffer(.{ .label = "exposure histogram", .size = 66 * 4, .usage = .{ .storage = true, .copy_dst = true } });
         const zeros = std.mem.zeroes([66 * 4]u8);
         try self.device.writeBuffer(self.histogram, 0, &zeros);
+    }
+
+    /// True when the adapter can hold the four colour attachments of the transport lit pass.
+    pub fn supportsScreenTransport(self: *const Gpu) bool {
+        const limits = self.device.capabilities().limits;
+        return limits.max_color_attachments >= 4 and limits.max_color_attachment_bytes_per_sample >= screen_color_bytes;
+    }
+
+    /// Builds the screen-transport pipelines the first time a view enables SSR/SSGI.
+    pub fn ensureScreen(self: *Gpu, ring_buffer: gpu.BufferHandle) !*const Screen {
+        if (self.screen_gpu) |*s| return s;
+        const f = frag;
+        const c = comp;
+        const pbr_vs = try self.newShader("pbr vs (transport)", sh.pbr_vs);
+        const pbr_fs = try self.newShader("pbr fs (transport)", sh.pbr_screen_fs);
+        const pbr_pl = try self.newPipelineLayout(&.{ self.l_material, self.l_vs_pbr, self.l_frame, self.l_fs_pbr });
+        const l_resolve = try self.newLayout(&.{
+            tex(0, .float, f),        samp(32, .filtering, f),
+            tex(1, .unfilterable, f), samp(33, .non_filtering, f),
+            tex(2, .unfilterable, f), samp(34, .non_filtering, f),
+            tex(3, .unfilterable, f), samp(35, .non_filtering, f),
+            tex(4, .unfilterable, f), samp(36, .non_filtering, f),
+            tex(5, .float, f),        samp(37, .filtering, f),
+            sbo(6, true, f),
+        });
+        const l_u_resolve = try self.newLayout(&.{ubo(0, @sizeOf(screen_transport.Params), f)});
+        const l_reduce_depth = try self.newLayout(&.{ tex(0, .unfilterable, c), samp(32, .non_filtering, c) });
+        const l_reduce_bounds = try self.newLayout(&.{sbo(0, false, c)});
+        const l_u_reduce = try self.newLayout(&.{ubo(0, @sizeOf(screen_transport.ReduceParams), c)});
+        const reduce_pl = try self.newPipelineLayout(&.{ l_reduce_depth, l_reduce_bounds, l_u_reduce });
+        self.screen_gpu = .{
+            .pbr_opaque = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, false, false, false, true),
+            .pbr_double_sided = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, false, false, true),
+            .pbr_blend = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, true, false, true),
+            .pbr_reuse = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, false, false, true, true),
+            .pbr_reuse_double_sided = try self.pbrPipeline(pbr_pl, pbr_vs, pbr_fs, true, false, true, true),
+            .resolve = try self.fullscreen("screen transport", sh.screen_transport_fs, &.{ l_resolve, l_u_resolve }, hdr_format, .none),
+            .reduce = try self.newCompute(.{ .label = "hiz reduce", .layout = reduce_pl, .shader = try self.newShader("hiz reduce", sh.hiz_reduce_cs), .entry = "main" }),
+            .l_resolve = l_resolve,
+            .l_reduce_depth = l_reduce_depth,
+            .l_reduce_bounds = l_reduce_bounds,
+            .g_u_resolve = try self.ringGroup(l_u_resolve, ring_buffer, @sizeOf(screen_transport.Params)),
+            .g_u_reduce = try self.ringGroup(l_u_reduce, ring_buffer, @sizeOf(screen_transport.ReduceParams)),
+        };
+        return &self.screen_gpu.?;
     }
 
     /// Builds the volumetric pipelines the first time fog is rendered.

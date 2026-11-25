@@ -14,6 +14,7 @@ const shadow_cull = @import("shadow_cull.zig");
 const shadow_plan = @import("shadow_plan.zig");
 const volumetric_lights = @import("volumetric_lights.zig");
 const gpu_gi = @import("gpu_gi.zig");
+const screen_transport = @import("screen_transport.zig");
 const gpu_objects = @import("gpu.zig");
 const frame_res = @import("frame_res.zig");
 const base = @import("../renderer.zig");
@@ -117,6 +118,12 @@ pub const PbrRenderer = struct {
     last_analytic_sun: bool = false,
     last_hdri_width: u32 = 0,
     last_hdri_height: u32 = 0,
+
+    // Screen-space transport: metadata targets, Hi-Z pyramid and the resolved HDR image.
+    screen: ?ScreenState = null,
+    screen_failed: bool = false,
+    /// Set per frame: the lit pass writes the transport metadata targets.
+    screen_on: bool = false,
 
     // Helios GPU GI: BVH snapshot, probe history and reservoirs.
     gi: gpu_gi.State = .{},
@@ -330,6 +337,7 @@ pub const PbrRenderer = struct {
             db.* = .{};
         }
         self.destroyTargets(device);
+        self.destroyScreen(device);
         self.gi.deinit(device);
         if (self.hdri_texture) |t| self.destroyTarget(device, t);
         self.hdri_texture = null;
@@ -690,6 +698,30 @@ pub const PbrRenderer = struct {
         else
             0.0;
         const pre_gain = @exp2(pre_log2);
+
+        // Screen-space transport needs the four-target lit pass and an adapter that can hold it.
+        const st_cfg = pp.quality.screen_transport;
+        const screen_requested = (st_cfg.ssr_strength > 0 or st_cfg.ssgi_strength > 0) and
+            (!self.frame_data.fog.enabled or self.frame_data.fog.volumetric.enabled);
+        if (!screen_requested) self.screen_failed = false;
+        self.screen_on = screen_requested and !self.screen_failed;
+        if (self.screen_on) {
+            if (!g.supportsScreenTransport()) {
+                self.screen_failed = true;
+                self.screen_on = false;
+                std.debug.print("[pbr] screen transport needs {d} colour bytes per sample; using the legacy indirect lighting\n", .{Gpu.screen_color_bytes});
+            } else if (self.ensureScreen(device, tex_w, tex_h)) |_| {
+                _ = g.ensureScreen(ring.buffer) catch |err| {
+                    self.screen_failed = true;
+                    self.screen_on = false;
+                    std.debug.print("[pbr] screen transport unavailable ({s}); using the legacy indirect lighting\n", .{@errorName(err)});
+                };
+            } else |err| {
+                self.screen_failed = true;
+                self.screen_on = false;
+                std.debug.print("[pbr] screen transport unavailable ({s}); using the legacy indirect lighting\n", .{@errorName(err)});
+            }
+        }
         const fog = self.frame_data.fog;
         const volumetric_active = fog.enabled and fog.volumetric.enabled and
             (fog.density > 0.0 or (!fog.volumetric.physical_scattering and fog.volumetric.scattering > 0.0));
@@ -1174,9 +1206,16 @@ pub const PbrRenderer = struct {
             .ssao_view = if (prepass_ran) blur_t.view else g.white.view,
         });
 
+        // 3.2 Screen-space transport replaces indirect lighting with traced reflections / diffuse bounces.
+        var scene = hdr;
+        if (self.screen_on) {
+            try self.screenResolve(input, g, hdr, depth_view, pre_gain);
+            scene = self.screen.?.resolved;
+        }
+
         // 3.5 Volumetric fog and god rays: scattering is composited onto the HDR scene.
         if (volumetric_active) {
-            try self.volumetricPass(input, g, hdr, depth_view, .{
+            try self.volumetricPass(input, g, scene, depth_view, .{
                 .light_vps = light_vps,
                 .cascade_splits = cascade_splits,
                 .cascade_count = cascade_count,
@@ -1190,12 +1229,12 @@ pub const PbrRenderer = struct {
         }
 
         // 4. Automatic exposure: luminance histogram, then adaptation into the 1x1 exposure texture.
-        try self.autoExposure(input, g, hdr, pre_log2);
+        try self.autoExposure(input, g, scene, pre_log2);
 
         // 5. Bloom: downsample chain, then additive upsample back to the first level.
         const bloom_view: gpu.TextureViewHandle = if (pp.bloom.enabled) blk: {
             for (0..layout.BLOOM_MIPS) |i| {
-                const src_view = if (i == 0) hdr.view else self.bloom[i - 1].?.view;
+                const src_view = if (i == 0) scene.view else self.bloom[i - 1].?.view;
                 const src_w: f32 = @floatFromInt(if (i == 0) tex_w else self.bloom[i - 1].?.width);
                 const src_h: f32 = @floatFromInt(if (i == 0) tex_h else self.bloom[i - 1].?.height);
                 const dst = self.bloom[i].?;
@@ -1232,7 +1271,7 @@ pub const PbrRenderer = struct {
             break :blk self.bloom[0].?.view;
         } else g.black.view;
 
-        input.offerCapture(.hdr, .{ .texture = hdr.texture, .format = hdr_format, .width = hdr.width, .height = hdr.height });
+        input.offerCapture(.hdr, .{ .texture = scene.texture, .format = hdr_format, .width = scene.width, .height = scene.height });
         if (prepass_ran) input.offerCapture(.ssao, .{ .texture = blur_t.texture, .format = ao_format, .width = blur_t.width, .height = blur_t.height });
 
         // 6. Post-process composite + tonemap into the frame target.
@@ -1251,8 +1290,8 @@ pub const PbrRenderer = struct {
                 .vignette_extra = .{ pp.vignette.smoothness, if (pp.auto_exposure.enabled) 1.0 else 0.0, if (pp.anti_aliasing == .fxaa) 1.0 else 0.0, pre_gain },
                 .local_exposure = .{ physical_cfg.local_exposure_strength, physical_cfg.local_exposure_radius, physical_cfg.local_exposure_max_stops, 0 },
             };
-            const group = try groups.get(frame_res.key(&.{ 0x9057, frame_res.bits(hdr.view), frame_res.bits(bloom_view), frame_res.bits(g.exposure.view) }), .{ .layout = g.l_post, .entries = &.{
-                .{ .binding = 0, .resource = .{ .texture_view = hdr.view } },
+            const group = try groups.get(frame_res.key(&.{ 0x9057, frame_res.bits(scene.view), frame_res.bits(bloom_view), frame_res.bits(g.exposure.view) }), .{ .layout = g.l_post, .entries = &.{
+                .{ .binding = 0, .resource = .{ .texture_view = scene.view } },
                 .{ .binding = 32, .resource = .{ .sampler = g.linear } },
                 .{ .binding = 1, .resource = .{ .texture_view = bloom_view } },
                 .{ .binding = 33, .resource = .{ .sampler = g.linear } },
@@ -1317,6 +1356,109 @@ pub const PbrRenderer = struct {
             .sky_ground = .{ ground[0], ground[1], ground[2], 0 },
             .cdf = cdf,
         };
+    }
+
+    const ScreenState = struct {
+        width: u32,
+        height: u32,
+        layout: screen_transport.Layout,
+        bounds: gpu.BufferHandle,
+        surface: Target,
+        diffuse: Target,
+        specular: Target,
+        resolved: Target,
+    };
+
+    fn destroyScreen(self: *PbrRenderer, device: gpu.GpuDevice) void {
+        if (self.screen) |s| {
+            device.destroyBuffer(s.bounds);
+            for ([_]Target{ s.surface, s.diffuse, s.specular, s.resolved }) |t| self.destroyTarget(device, t);
+        }
+        self.screen = null;
+    }
+
+    /// (Re)allocates the transport targets when the frame size changes; they exist only while a view uses them.
+    fn ensureScreen(self: *PbrRenderer, device: gpu.GpuDevice, w: u32, h: u32) !*ScreenState {
+        if (self.screen) |*s| if (s.width == w and s.height == h) return s;
+        self.destroyScreen(device);
+        const lay = try screen_transport.Layout.init(w, h);
+        const bounds = try device.createBuffer(.{ .label = "hiz bounds", .size = lay.bytes, .usage = .{ .storage = true } });
+        errdefer device.destroyBuffer(bounds);
+        const surface = try newTarget(device, w, h, .rgba32_float, "screen surface");
+        errdefer self.destroyTarget(device, surface);
+        const diffuse = try newTarget(device, w, h, hdr_format, "screen diffuse");
+        errdefer self.destroyTarget(device, diffuse);
+        const specular = try newTarget(device, w, h, hdr_format, "screen specular");
+        errdefer self.destroyTarget(device, specular);
+        const resolved = try newTarget(device, w, h, hdr_format, "screen resolved");
+        self.screen = .{ .width = w, .height = h, .layout = lay, .bounds = bounds, .surface = surface, .diffuse = diffuse, .specular = specular, .resolved = resolved };
+        return &self.screen.?;
+    }
+
+    /// Hi-Z reduction of the depth buffer, then the SSR/SSGI resolve into `resolved`.
+    fn screenResolve(self: *PbrRenderer, input: *frame.FrameInput, g: *Gpu, hdr: Target, depth_view: gpu.TextureViewHandle, pre_gain: f32) !void {
+        const rec = input.recorder;
+        const ring = &self.ring.?;
+        const groups = &self.groups.?;
+        const sc = &self.screen.?;
+        const ex = g.screen_gpu.?;
+        const cfg = self.frame_data.post_process.quality.screen_transport;
+
+        const depth_group = try groups.get(frame_res.key(&.{ 0x5c01, frame_res.bits(depth_view) }), .{ .layout = ex.l_reduce_depth, .entries = &.{
+            .{ .binding = 0, .resource = .{ .texture_view = depth_view } },
+            .{ .binding = 32, .resource = .{ .sampler = g.nearest } },
+        } });
+        const bounds_group = try groups.get(frame_res.key(&.{ 0x5c02, frame_res.bits(sc.bounds) }), .{ .layout = ex.l_reduce_bounds, .entries = &.{
+            .{ .binding = 0, .resource = .{ .buffer = .{ .buffer = sc.bounds } } },
+        } });
+        // One pass per pyramid level: each level reads the storage the previous pass wrote.
+        for (0..sc.layout.count) |i| {
+            const dst = sc.layout.levels[i];
+            try rec.beginComputePass(.{ .label = "hiz reduce" });
+            try rec.setComputePipeline(ex.reduce);
+            try rec.setBindGroup(0, depth_group, &.{});
+            try rec.setBindGroup(1, bounds_group, &.{});
+            try rec.setBindGroup(2, ex.g_u_reduce, &.{try ring.pushValue(sc.layout.reduceParams(i))});
+            try rec.dispatch((dst[1] + 15) / 16, (dst[2] + 15) / 16, 1);
+            try rec.endComputePass();
+        }
+
+        const res_group = try groups.get(frame_res.key(&.{ 0x5c03, frame_res.bits(hdr.view), frame_res.bits(depth_view), frame_res.bits(sc.surface.view), frame_res.bits(sc.diffuse.view), frame_res.bits(sc.specular.view), frame_res.bits(sc.bounds) }), .{ .layout = ex.l_resolve, .entries = &.{
+            .{ .binding = 0, .resource = .{ .texture_view = hdr.view } },
+            .{ .binding = 32, .resource = .{ .sampler = g.linear } },
+            .{ .binding = 1, .resource = .{ .texture_view = depth_view } },
+            .{ .binding = 33, .resource = .{ .sampler = g.nearest } },
+            .{ .binding = 2, .resource = .{ .texture_view = sc.surface.view } },
+            .{ .binding = 34, .resource = .{ .sampler = g.nearest } },
+            .{ .binding = 3, .resource = .{ .texture_view = sc.diffuse.view } },
+            .{ .binding = 35, .resource = .{ .sampler = g.nearest } },
+            .{ .binding = 4, .resource = .{ .texture_view = sc.specular.view } },
+            .{ .binding = 36, .resource = .{ .sampler = g.nearest } },
+            .{ .binding = 5, .resource = .{ .texture_view = g.brdf_lut.view } },
+            .{ .binding = 37, .resource = .{ .sampler = g.linear } },
+            .{ .binding = 6, .resource = .{ .buffer = .{ .buffer = sc.bounds } } },
+        } });
+        const cam = self.frame_data.camera_position;
+        const params = screen_transport.Params{
+            .view_proj = self.frame_data.view_proj,
+            .inv_view_proj = util.invertMat4(self.frame_data.view_proj),
+            .camera_gain = .{ cam[0], cam[1], cam[2], pre_gain },
+            .controls = .{ clampOr(cfg.ssr_strength, 0, 1, 0), clampOr(cfg.ssgi_strength, 0, 1, 0), clampOr(cfg.max_distance, 0.5, 100, 20), clampOr(cfg.thickness, 0.02, 2, 0.15) },
+            .levels = sc.layout.levels,
+            .budget = .{ sc.layout.count, std.math.clamp(cfg.max_iterations, 8, 128), std.math.clamp(cfg.diffuse_rays, 1, 4), 0 },
+        };
+        const attachments = [_]gpu.ColorAttachment{.{ .target = .{ .view = sc.resolved.view }, .load = .clear }};
+        try rec.beginRenderPass(.{ .label = "screen transport", .color_attachments = &attachments });
+        try rec.setRenderPipeline(ex.resolve);
+        try rec.setBindGroup(0, res_group, &.{});
+        try rec.setBindGroup(1, ex.g_u_resolve, &.{try ring.pushValue(params)});
+        try rec.draw(3, 1, 0, 0);
+        try rec.endRenderPass();
+    }
+
+    /// Clamps a user setting, mapping NaN/inf to `fallback`.
+    fn clampOr(value: f32, lo: f32, hi: f32, fallback: f32) f32 {
+        return if (std.math.isFinite(value)) std.math.clamp(value, lo, hi) else fallback;
     }
 
     const VolCtx = struct {
@@ -1803,10 +1945,21 @@ pub const PbrRenderer = struct {
             .{ .binding = 17, .resource = .{ .buffer = .{ .buffer = g.local_shadow_buf } } },
         } });
 
-        const hdr_attachments = [_]gpu.ColorAttachment{.{ .target = .{ .view = hdr.view }, .load = .load }};
+        // With screen transport the lit pass also writes surface/diffuse/specular metadata; they start as "no data".
+        var lit_attachments: [4]gpu.ColorAttachment = undefined;
+        lit_attachments[0] = .{ .target = .{ .view = hdr.view }, .load = .load };
+        var lit_attachment_count: usize = 1;
+        const transport: ?Gpu.Screen = if (self.screen_on) g.screen_gpu.? else null;
+        if (self.screen_on) {
+            const sc = self.screen.?;
+            lit_attachments[1] = .{ .target = .{ .view = sc.surface.view }, .load = .clear, .clear_value = .{ .r = 0, .g = 0, .b = -1, .a = 0 } };
+            lit_attachments[2] = .{ .target = .{ .view = sc.diffuse.view }, .load = .clear, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } };
+            lit_attachments[3] = .{ .target = .{ .view = sc.specular.view }, .load = .clear, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } };
+            lit_attachment_count = 4;
+        }
         try rec.beginRenderPass(.{
             .label = "pbr lit",
-            .color_attachments = &hdr_attachments,
+            .color_attachments = lit_attachments[0..lit_attachment_count],
             // Reusing the prepass depth relies on both passes producing identical depth (same MVP, invariant
             // position, same alpha-mask discard) and on the less-or-equal pipelines.
             .depth = .{ .view = depth_view, .depth_load = if (reuse_depth) .load else .clear },
@@ -1819,7 +1972,14 @@ pub const PbrRenderer = struct {
             const qm = self.queued_draws.items[entry.index];
             const mesh = self.base.meshes.get(@bitCast(qm.mesh_asset)) orelse continue;
             const mat = qm.material;
-            const want: gpu.RenderPipelineHandle = if (mat.alpha_mode == .blend)
+            const want: gpu.RenderPipelineHandle = if (transport) |t|
+                (if (mat.alpha_mode == .blend)
+                    t.pbr_blend
+                else if (mat.double_sided)
+                    (if (reuse_depth) t.pbr_reuse_double_sided else t.pbr_double_sided)
+                else
+                    (if (reuse_depth) t.pbr_reuse else t.pbr_opaque))
+            else if (mat.alpha_mode == .blend)
                 g.pbr_blend
             else if (mat.double_sided)
                 (if (reuse_depth) g.pbr_reuse_double_sided else g.pbr_double_sided)
