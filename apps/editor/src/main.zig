@@ -28,6 +28,7 @@ const gizmos = @import("gizmos");
 const shapes = @import("shapes");
 const dev_tools = @import("dev_tools");
 const picking = @import("picking");
+const scene = @import("scene");
 const document = @import("document");
 const editor_shell = @import("editor_shell");
 
@@ -96,7 +97,11 @@ fn overUi(pos: [2]f32, win: anytype) bool {
 fn spawnEntity(world: *engine.World, ref: render_3d.MeshRef, pos: [3]f32, half_ext: [3]f32) !engine.EntityHandle {
     const e = try world.spawn();
     errdefer _ = world.despawn(e) catch {};
-    try world.set(e, render_3d.Transform3D, .{ .position = pos });
+    const tf: render_3d.Transform3D = .{ .position = pos };
+    try world.set(e, render_3d.Transform3D, tf);
+    // Dual-write canonical scene locals so SceneSnapshot3D can capture editor entities.
+    try world.set(e, scene.incremental.LocalTransform3D, document.localFromTransform3D(tf));
+    try world.set(e, scene.incremental.GlobalTransform3D, .{});
     try world.set(e, render_3d.MeshRef, ref);
     try world.set(e, picking.Pickable3D, .{ .half_extents = half_ext });
     return e;
@@ -124,22 +129,30 @@ fn updateEditor(ctx: *engine.SystemContext) !void {
         }
     }
 
-    // Viewport picking. Clicks on panels must not pick through them.
-    var pick_pos = pos;
-    if (window_sdl3.pixelSize(st.app)) |px| {
-        pick_pos[0] *= px.dpi_scale;
-        pick_pos[1] *= px.dpi_scale;
+    // Viewport geometry shared by picking and the offscreen Scene View.
+    const dpi: f32 = if (window_sdl3.pixelSize(st.app)) |px| (if (px.dpi_scale > 0) px.dpi_scale else 1.0) else 1.0;
+    try ensureSceneView(st, win.w, win.h, dpi);
+    if (ctx.resources.get(camera.CameraService)) |cam_svc| {
+        cam_svc.setPrimaryTargetSize(st.scene_w, st.scene_h);
     }
+
+    // Picking is relative to the embedded Scene View, not the full window.
     const in_viewport = !overUi(pos, win);
+    const pick_pos = [2]f32{
+        (pos[0] - LEFT_W) * dpi,
+        (pos[1] - HEADER_H) * dpi,
+    };
+    // Keep pointer capture until release even if the cursor leaves the viewport.
+    const capturing = pick.pressed != null;
     _ = try pick.updatePointer(
         ctx.world,
         ctx.resources,
         ctx.events,
         pick_pos,
         motion.delta,
-        mouse.pressed(.left) and in_viewport,
+        (mouse.pressed(.left) and in_viewport) or (capturing and mouse.pressed(.left)),
         click and in_viewport,
-        mouse.justReleased(.left) and in_viewport,
+        mouse.justReleased(.left) and (in_viewport or capturing),
     );
     if (click and in_viewport) doc.select(focus.focused_entity);
     focus.setFocus(doc.selected);
@@ -257,17 +270,21 @@ fn text(st: *EditorState, x: f32, y: f32, content: []const u8, color: graphics.C
 }
 
 fn ensureSceneView(st: *EditorState, logical_w: f32, logical_h: f32, dpi: f32) !void {
-    const vw = @max(1, @as(u32, @intFromFloat(@floor((logical_w - LEFT_W - RIGHT_W) * dpi))));
-    const vh = @max(1, @as(u32, @intFromFloat(@floor((logical_h - HEADER_H - FOOTER_H) * dpi))));
+    // Clamp in float space before the u32 cast so a tiny/minimized window cannot underflow.
+    const available_w = @max(1.0, (logical_w - LEFT_W - RIGHT_W) * dpi);
+    const available_h = @max(1.0, (logical_h - HEADER_H - FOOTER_H) * dpi);
+    if (!std.math.isFinite(available_w) or !std.math.isFinite(available_h)) return;
+    const vw: u32 = @intFromFloat(@floor(available_w));
+    const vh: u32 = @intFromFloat(@floor(available_h));
     if (st.scene_tex) |id| {
         if (st.scene_w == vw and st.scene_h == vh) {
             st.gfx.scene_view = .{ .texture_id = id, .width = vw, .height = vh };
             return;
         }
-        st.gfx.destroyTexture(id);
-        st.scene_tex = null;
     }
+    // Create the replacement first so a failed allocate keeps the previous texture.
     const id = try graphics.createRenderTarget(st.app, vw, vh, .rgba8_unorm);
+    if (st.scene_tex) |old| st.gfx.destroyTexture(old);
     st.scene_tex = id;
     st.scene_w = vw;
     st.scene_h = vh;
@@ -366,6 +383,7 @@ pub fn main(init: std.process.Init) !void {
     try app.registerModule(shapes.module());
     try app.registerModule(dev_tools.module());
     try app.registerModule(picking.module());
+    try app.registerModule(scene.module());
     try app.registerModule(editor_shell.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{

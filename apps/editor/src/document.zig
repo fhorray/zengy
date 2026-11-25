@@ -4,6 +4,7 @@
 const std = @import("std");
 const engine = @import("engine");
 const render_3d = @import("render_3d");
+const scene = @import("scene");
 
 /// Maximum stored entity name length in bytes; longer names are truncated.
 pub const MAX_NAME_LEN = 32;
@@ -40,15 +41,28 @@ pub const FieldEdit = struct {
     new_value: engine.reflection.FieldValue,
 };
 
-/// One chronological authoring step. Transform and field edits share a single undo/redo stack.
-pub const HistoryEntry = union(enum) {
-    transform: TransformEdit,
-    field: FieldEdit,
+/// One chronological authoring step with unique before/after document state ids.
+pub const HistoryEntry = struct {
+    before_state_id: u64,
+    after_state_id: u64,
+    data: union(enum) {
+        transform: TransformEdit,
+        field: FieldEdit,
+    },
 };
 
 /// Returns true when both handles refer to the same live entity slot and generation.
 pub fn sameEntity(a: engine.EntityHandle, b: engine.EntityHandle) bool {
     return a.index == b.index and a.generation == b.generation;
+}
+
+/// Converts a legacy Euler `Transform3D` into a scene `LocalTransform3D` (YXZ intrinsic).
+pub fn localFromTransform3D(tf: render_3d.Transform3D) scene.incremental.LocalTransform3D {
+    return .{
+        .translation = tf.position,
+        .rotation = eulerYxzToQuat(tf.rotation_euler),
+        .scale = tf.scale,
+    };
 }
 
 /// Entities, selection and unified authoring history of one editor session.
@@ -58,10 +72,14 @@ pub const EditorDocument = struct {
     selected: ?engine.EntityHandle = null,
     undo_stack: std.ArrayList(HistoryEntry) = .empty,
     redo_stack: std.ArrayList(HistoryEntry) = .empty,
+    /// Unique identity of the current document contents (never reused).
+    state_id: u64 = 0,
+    /// `state_id` recorded by the last successful `markSaved`.
+    saved_state_id: u64 = 0,
+    /// Monotonic allocator for new state ids (starts at 1 so the empty doc is 0).
+    next_state_id: u64 = 1,
     /// When true, the document differs from the last successful save checkpoint.
     dirty: bool = false,
-    saved_revision: u64 = 0,
-    revision: u64 = 0,
 
     /// Creates an empty document.
     pub fn init(allocator: std.mem.Allocator) EditorDocument {
@@ -91,6 +109,7 @@ pub const EditorDocument = struct {
         @memcpy(entry.name_buf[0..n], name[0..n]);
         entry.name_len = @intCast(n);
         try self.entries.append(self.allocator, entry);
+        self.bumpStructuralState();
     }
 
     /// Returns the hierarchy index of `entity`, or null when it is not listed.
@@ -136,19 +155,27 @@ pub const EditorDocument = struct {
         }
         purge(self.allocator, &self.undo_stack, entity);
         purge(self.allocator, &self.redo_stack, entity);
+        self.bumpStructuralState();
         return true;
     }
 
-    /// Sets the entity's transform and records an undo step. Clears the redo history.
+    /// Sets the entity's transform and records an undo step. Clears the redo history only after success.
     pub fn setTransform(self: *EditorDocument, world: *engine.World, entity: engine.EntityHandle, after: render_3d.Transform3D) !void {
         if (self.indexOf(entity) == null) return error.EntityNotInDocument;
         if (!finiteTransform(after)) return error.InvalidTransform;
         const before = (world.getConst(entity, render_3d.Transform3D) orelse return error.MissingTransform).*;
         if (std.meta.eql(before, after)) return;
-        try self.preparePush();
+        try self.reserveForCommit();
         try world.set(entity, render_3d.Transform3D, after);
-        self.undo_stack.appendAssumeCapacity(.{ .transform = .{ .entity = entity, .before = before, .after = after } });
-        self.markEdited();
+        // Bridge: keep LocalTransform3D in sync so SceneSnapshot3D can capture editor entities.
+        if (world.getConst(entity, scene.incremental.LocalTransform3D) != null) {
+            world.set(entity, scene.incremental.LocalTransform3D, localFromTransform3D(after)) catch {};
+        }
+        self.commitAssumeCapacity(.{
+            .before_state_id = self.state_id,
+            .after_state_id = self.allocStateId(),
+            .data = .{ .transform = .{ .entity = entity, .before = before, .after = after } },
+        });
     }
 
     /// Edits a reflected field through the ECS mutation contract and records one history entry.
@@ -168,47 +195,56 @@ pub const EditorDocument = struct {
 
         const fname_copy = try self.allocator.dupe(u8, field_name);
         errdefer self.allocator.free(fname_copy);
-        try self.preparePush();
+        try self.reserveForCommit();
         try types.setReflectedField(world, entity, schema_id, field_name, new_value);
-        self.undo_stack.appendAssumeCapacity(.{ .field = .{
-            .entity = entity,
-            .type_id = schema.component_type_id,
-            .schema_id = schema_id,
-            .field_name = fname_copy,
-            .old_value = old_value,
-            .new_value = new_value,
-        } });
-        self.markEdited();
+        self.commitAssumeCapacity(.{
+            .before_state_id = self.state_id,
+            .after_state_id = self.allocStateId(),
+            .data = .{ .field = .{
+                .entity = entity,
+                .type_id = schema.component_type_id,
+                .schema_id = schema_id,
+                .field_name = fname_copy,
+                .old_value = old_value,
+                .new_value = new_value,
+            } },
+        });
     }
 
     /// Reverts the latest authoring edit. Returns false when nothing applicable remains.
     pub fn undo(self: *EditorDocument, world: *engine.World, types: ?*const engine.TypeRegistry) !bool {
         while (self.undo_stack.items.len > 0) {
-            try self.redo_stack.ensureUnusedCapacity(self.allocator, 1);
-            const edit = self.undo_stack.pop().?;
-            switch (edit) {
+            const edit = self.undo_stack.items[self.undo_stack.items.len - 1];
+            switch (edit.data) {
                 .transform => |t| {
                     if (self.indexOf(t.entity) == null or world.getConst(t.entity, render_3d.Transform3D) == null) {
-                        freeEntry(self.allocator, edit);
+                        freeEntry(self.allocator, self.undo_stack.pop().?);
                         continue;
                     }
+                    try self.redo_stack.ensureUnusedCapacity(self.allocator, 1);
                     try world.set(t.entity, render_3d.Transform3D, t.before);
-                    self.redo_stack.appendAssumeCapacity(edit);
-                    self.syncDirtyFromRevision();
+                    if (world.getConst(t.entity, scene.incremental.LocalTransform3D) != null) {
+                        world.set(t.entity, scene.incremental.LocalTransform3D, localFromTransform3D(t.before)) catch {};
+                    }
+                    const moved = self.undo_stack.pop().?;
+                    self.redo_stack.appendAssumeCapacity(moved);
+                    self.applyStateId(moved.before_state_id);
                     return true;
                 },
                 .field => |f| {
                     const reg = types orelse {
-                        freeEntry(self.allocator, edit);
+                        freeEntry(self.allocator, self.undo_stack.pop().?);
                         continue;
                     };
                     if (world.getRawConst(f.entity, f.type_id) == null) {
-                        freeEntry(self.allocator, edit);
+                        freeEntry(self.allocator, self.undo_stack.pop().?);
                         continue;
                     }
+                    try self.redo_stack.ensureUnusedCapacity(self.allocator, 1);
                     try reg.setReflectedField(world, f.entity, f.schema_id, f.field_name, f.old_value);
-                    self.redo_stack.appendAssumeCapacity(edit);
-                    self.syncDirtyFromRevision();
+                    const moved = self.undo_stack.pop().?;
+                    self.redo_stack.appendAssumeCapacity(moved);
+                    self.applyStateId(moved.before_state_id);
                     return true;
                 },
             }
@@ -219,31 +255,37 @@ pub const EditorDocument = struct {
     /// Re-applies the latest undone edit.
     pub fn redo(self: *EditorDocument, world: *engine.World, types: ?*const engine.TypeRegistry) !bool {
         while (self.redo_stack.items.len > 0) {
-            try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
-            const edit = self.redo_stack.pop().?;
-            switch (edit) {
+            const edit = self.redo_stack.items[self.redo_stack.items.len - 1];
+            switch (edit.data) {
                 .transform => |t| {
                     if (self.indexOf(t.entity) == null or world.getConst(t.entity, render_3d.Transform3D) == null) {
-                        freeEntry(self.allocator, edit);
+                        freeEntry(self.allocator, self.redo_stack.pop().?);
                         continue;
                     }
+                    try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
                     try world.set(t.entity, render_3d.Transform3D, t.after);
-                    self.undo_stack.appendAssumeCapacity(edit);
-                    self.markEdited();
+                    if (world.getConst(t.entity, scene.incremental.LocalTransform3D) != null) {
+                        world.set(t.entity, scene.incremental.LocalTransform3D, localFromTransform3D(t.after)) catch {};
+                    }
+                    const moved = self.redo_stack.pop().?;
+                    self.undo_stack.appendAssumeCapacity(moved);
+                    self.applyStateId(moved.after_state_id);
                     return true;
                 },
                 .field => |f| {
                     const reg = types orelse {
-                        freeEntry(self.allocator, edit);
+                        freeEntry(self.allocator, self.redo_stack.pop().?);
                         continue;
                     };
                     if (world.getRawConst(f.entity, f.type_id) == null) {
-                        freeEntry(self.allocator, edit);
+                        freeEntry(self.allocator, self.redo_stack.pop().?);
                         continue;
                     }
+                    try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
                     try reg.setReflectedField(world, f.entity, f.schema_id, f.field_name, f.new_value);
-                    self.undo_stack.appendAssumeCapacity(edit);
-                    self.markEdited();
+                    const moved = self.redo_stack.pop().?;
+                    self.undo_stack.appendAssumeCapacity(moved);
+                    self.applyStateId(moved.after_state_id);
                     return true;
                 },
             }
@@ -261,35 +303,47 @@ pub const EditorDocument = struct {
         return self.redo(world, null);
     }
 
-    /// Marks the current revision as saved (clears dirty).
+    /// Marks the current document state as saved (clears dirty).
     pub fn markSaved(self: *EditorDocument) void {
-        self.saved_revision = self.revision;
+        self.saved_state_id = self.state_id;
         self.dirty = false;
     }
 
-    fn preparePush(self: *EditorDocument) !void {
+    /// Reserves undo capacity for one upcoming commit without mutating history yet.
+    fn reserveForCommit(self: *EditorDocument) !void {
         try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
+    }
+
+    /// Drops the oldest undo entry if at capacity, clears redo, appends `entry`, and updates dirty.
+    fn commitAssumeCapacity(self: *EditorDocument, entry: HistoryEntry) void {
         if (self.undo_stack.items.len >= MAX_HISTORY) {
             const dropped = self.undo_stack.orderedRemove(0);
             freeEntry(self.allocator, dropped);
         }
         for (self.redo_stack.items) |e| freeEntry(self.allocator, e);
         self.redo_stack.clearRetainingCapacity();
+        self.undo_stack.appendAssumeCapacity(entry);
+        self.applyStateId(entry.after_state_id);
     }
 
-    fn markEdited(self: *EditorDocument) void {
-        self.revision += 1;
-        self.dirty = self.revision != self.saved_revision;
+    fn allocStateId(self: *EditorDocument) u64 {
+        const id = self.next_state_id;
+        self.next_state_id += 1;
+        return id;
     }
 
-    fn syncDirtyFromRevision(self: *EditorDocument) void {
-        if (self.revision > 0) self.revision -= 1;
-        self.dirty = self.revision != self.saved_revision;
+    fn applyStateId(self: *EditorDocument, id: u64) void {
+        self.state_id = id;
+        self.dirty = self.state_id != self.saved_state_id;
+    }
+
+    fn bumpStructuralState(self: *EditorDocument) void {
+        self.applyStateId(self.allocStateId());
     }
 };
 
 fn freeEntry(allocator: std.mem.Allocator, entry: HistoryEntry) void {
-    switch (entry) {
+    switch (entry.data) {
         .transform => {},
         .field => |f| allocator.free(f.field_name),
     }
@@ -298,7 +352,7 @@ fn freeEntry(allocator: std.mem.Allocator, entry: HistoryEntry) void {
 fn purge(allocator: std.mem.Allocator, stack: *std.ArrayList(HistoryEntry), entity: engine.EntityHandle) void {
     var i: usize = 0;
     while (i < stack.items.len) {
-        const matches = switch (stack.items[i]) {
+        const matches = switch (stack.items[i].data) {
             .transform => |t| sameEntity(t.entity, entity),
             .field => |f| sameEntity(f.entity, entity),
         };
@@ -319,4 +373,27 @@ fn finiteTransform(t: render_3d.Transform3D) bool {
 
 fn fieldValuesEqual(a: engine.reflection.FieldValue, b: engine.reflection.FieldValue) bool {
     return std.meta.eql(a, b);
+}
+
+fn quatMul(a: [4]f32, b: [4]f32) [4]f32 {
+    return .{
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    };
+}
+
+fn quatAxisAngle(axis: [3]f32, angle: f32) [4]f32 {
+    const half = angle * 0.5;
+    const s = @sin(half);
+    return .{ axis[0] * s, axis[1] * s, axis[2] * s, @cos(half) };
+}
+
+/// Intrinsic YXZ quaternion matching `Transform3D.toModelMatrix` (`Ry * Rx * Rz`).
+fn eulerYxzToQuat(euler: [3]f32) [4]f32 {
+    const qx = quatAxisAngle(.{ 1, 0, 0 }, euler[0]);
+    const qy = quatAxisAngle(.{ 0, 1, 0 }, euler[1]);
+    const qz = quatAxisAngle(.{ 0, 0, 1 }, euler[2]);
+    return quatMul(qy, quatMul(qx, qz));
 }

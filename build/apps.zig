@@ -90,6 +90,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     editor_mod.addImport("editor_shell", editor_shell_mod);
     editor_mod.addImport("ui_widgets", ui_widgets_mod);
     editor_mod.addImport("ui_plume", ui_plume_mod);
+    editor_mod.addImport("scene", scene_mod);
 
     const editor_exe = b.addExecutable(.{
         .name = "zengy-editor",

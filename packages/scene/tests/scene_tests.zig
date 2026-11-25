@@ -12,6 +12,27 @@ test {
     std.testing.refAllDecls(scene.codec);
 }
 
+test "SceneSnapshot3D restore rejects duplicate destination GUIDs" {
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+    try app.registerModule(scene.module());
+
+    const e = try app.world.spawn();
+    try app.world.set(e, scene.incremental.LocalTransform3D, .{});
+    try app.world.set(e, scene.incremental.GlobalTransform3D, .{});
+    const guid = app.world.getGuid(e).?;
+
+    var snap = scene.SceneSnapshot3D.init(testing.allocator);
+    defer snap.deinit();
+    try snap.records.append(testing.allocator, .{
+        .guid = guid,
+        .local = .{ .translation = .{ 1, 0, 0 } },
+    });
+    try testing.expectError(error.DuplicateGuid, snap.restore(&app.world));
+    try testing.expect(app.world.isAlive(e));
+    try testing.expectEqual(guid, app.world.getGuid(e).?);
+}
+
 test "SceneSnapshot3D capture/restore preserves LocalTransform3D and GUIDs" {
     var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
     defer app.deinit();

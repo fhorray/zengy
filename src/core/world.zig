@@ -630,6 +630,24 @@ pub const World = struct {
         return null;
     }
 
+    /// Assigns a non-zero persistent GUID to a live entity. Rejects GUID 0, collisions with
+    /// other live entities, and advances `next_guid` without wrapping past `maxInt(u128)`.
+    pub fn assignPersistentGuid(self: *World, entity: EntityHandle, guid: EntityGuid) !void {
+        try self.checkMutable();
+        if (!self.isAlive(entity)) return error.InvalidEntity;
+        if (guid == 0) return error.InvalidGuid;
+        if (self.findByGuid(guid)) |existing| {
+            if (existing.index != entity.index or existing.generation != entity.generation) {
+                return error.DuplicateGuid;
+            }
+            return;
+        }
+        self.guids.items[entity.index] = guid;
+        if (self.next_guid <= guid) {
+            self.next_guid = if (guid == std.math.maxInt(EntityGuid)) guid else guid + 1;
+        }
+    }
+
     pub fn set(self: *World, entity: EntityHandle, comptime T: type, value: T) !void {
         try self.checkMutable();
         if (!self.isAlive(entity)) return error.InvalidEntity;

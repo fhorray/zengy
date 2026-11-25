@@ -183,6 +183,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     addModuleTest(b, test_step, "apps/editor/tests/document_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "render_3d", .mod = render_3d_mod },
+        .{ .name = "scene", .mod = scene_mod },
         .{ .name = "document", .mod = mods.editor_document_mod },
     }, null);
 
@@ -194,6 +195,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .{ .name = "editor_shell", .mod = editor_shell_mod },
         .{ .name = "document", .mod = mods.editor_document_mod },
         .{ .name = "render_3d", .mod = render_3d_mod },
+        .{ .name = "scene", .mod = scene_mod },
     }, null);
 
     addModuleTest(b, test_step, "apps/editor/tests/panels_tests.zig", target, optimize, false, &.{
@@ -206,6 +208,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .{ .name = "document", .mod = mods.editor_document_mod },
         .{ .name = "panels", .mod = mods.editor_panels_mod },
         .{ .name = "render_3d", .mod = render_3d_mod },
+        .{ .name = "scene", .mod = scene_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/render/3d/tests/render_3d_tests.zig", target, optimize, false, &.{
@@ -266,6 +269,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .{ .name = "remote_adapter", .mod = editor_remote_adapter_mod },
         .{ .name = "document", .mod = mods.editor_document_mod },
         .{ .name = "render_3d", .mod = render_3d_mod },
+        .{ .name = "scene", .mod = scene_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/log/tests/log_tests.zig", target, optimize, false, &.{

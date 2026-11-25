@@ -285,6 +285,8 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
             try recorder.beginRenderPass(.{ .label = "scene-view-clear", .color_attachments = &attachments });
             try recorder.endRenderPass();
         }
+        // World pass owns HDR/SSAO capture points; forward them for the post-present path.
+        input.captured = world_input.captured;
         input.color_target = .swapchain;
         input.color_target_used = false;
         try state.service.renderers.runAfter(&input, sv.max_order);

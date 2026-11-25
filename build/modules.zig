@@ -444,6 +444,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     });
     editor_document_mod.addImport("engine", engine_mod);
     editor_document_mod.addImport("render_3d", render_3d_mod);
+    editor_document_mod.addImport("scene", scene_mod);
     // Shell routes authoring history through the document module.
     editor_shell_mod.addImport("document", editor_document_mod);
 

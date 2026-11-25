@@ -91,8 +91,34 @@ pub const SceneSnapshot3D = struct {
         return snap;
     }
 
+    /// Validates snapshot invariants without mutating `target_world`.
+    pub fn validate(self: *const SceneSnapshot3D, target_world: *const engine.World) !void {
+        var seen = std.AutoHashMapUnmanaged(engine.EntityGuid, void).empty;
+        defer seen.deinit(self.allocator);
+        try seen.ensureTotalCapacity(self.allocator, @intCast(self.records.items.len));
+
+        for (self.records.items) |rec| {
+            if (!finiteLocal(rec.local)) return error.InvalidTransform;
+            if (rec.guid == 0) return error.InvalidGuid;
+            if (rec.parent_guid) |p| {
+                if (p == 0 or p == rec.guid) return error.InvalidParent;
+            }
+            const gop = seen.getOrPutAssumeCapacity(rec.guid);
+            if (gop.found_existing) return error.DuplicateGuid;
+            if (target_world.findByGuid(rec.guid) != null) return error.DuplicateGuid;
+        }
+
+        for (self.records.items) |rec| {
+            const p_guid = rec.parent_guid orelse continue;
+            if (!seen.contains(p_guid)) return error.MissingParent;
+        }
+    }
+
     /// Restores entities with persistent GUIDs and `LocalTransform3D` + `Parent` links.
+    /// Validates first, then commits; on failure after any spawn, despawns every entity created
+    /// by this call so the destination world is left unchanged.
     pub fn restore(self: *const SceneSnapshot3D, target_world: *engine.World) !usize {
+        try self.validate(target_world);
         _ = try target_world.registerComponent(incremental.LocalTransform3D);
         _ = try target_world.registerComponent(incremental.GlobalTransform3D);
         _ = try target_world.registerComponent(Parent);
@@ -101,29 +127,47 @@ pub const SceneSnapshot3D = struct {
         defer guid_map.deinit(self.allocator);
         try guid_map.ensureTotalCapacity(self.allocator, @intCast(self.records.items.len));
 
+        var spawned: std.ArrayList(engine.EntityHandle) = .empty;
+        defer spawned.deinit(self.allocator);
+        errdefer {
+            var i = spawned.items.len;
+            while (i > 0) {
+                i -= 1;
+                _ = target_world.despawn(spawned.items[i]) catch {};
+            }
+        }
+
         for (self.records.items) |rec| {
             const e = try target_world.spawn();
-            if (rec.guid != 0) {
-                target_world.guids.items[e.index] = rec.guid;
-                if (target_world.next_guid <= rec.guid) target_world.next_guid = rec.guid + 1;
-                guid_map.putAssumeCapacity(rec.guid, e);
-            }
+            try spawned.append(self.allocator, e);
+            try target_world.assignPersistentGuid(e, rec.guid);
+            guid_map.putAssumeCapacity(rec.guid, e);
             try target_world.set(e, incremental.LocalTransform3D, rec.local);
             try target_world.set(e, incremental.GlobalTransform3D, .{});
         }
 
         for (self.records.items) |rec| {
             const p_guid = rec.parent_guid orelse continue;
-            const child_e = guid_map.get(rec.guid) orelse continue;
-            const parent_e = guid_map.get(p_guid) orelse continue;
-            if (!std.meta.eql(child_e, parent_e)) {
-                try target_world.set(child_e, Parent, .{ .entity = parent_e });
-            }
+            const child_e = guid_map.get(rec.guid).?;
+            const parent_e = guid_map.get(p_guid).?;
+            try target_world.set(child_e, Parent, .{ .entity = parent_e });
         }
         try graph.rebuildLinks(target_world);
         return self.records.items.len;
     }
 };
+
+fn finiteLocal(t: incremental.LocalTransform3D) bool {
+    inline for (.{ t.translation, t.scale }) |vec| {
+        inline for (vec) |v| {
+            if (!std.math.isFinite(v)) return false;
+        }
+    }
+    inline for (t.rotation) |v| {
+        if (!std.math.isFinite(v)) return false;
+    }
+    return true;
+}
 
 /// Portable scene snapshot that can be saved/restored across Worlds.
 pub const SceneSnapshot = struct {

@@ -175,3 +175,59 @@ test "history is bounded" {
     }
     try testing.expectEqual(@as(usize, document.MAX_HISTORY), doc.undo_stack.items.len);
 }
+
+test "dirty state survives undo then a different edit to the same revision depth" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    var doc = document.EditorDocument.init(testing.allocator);
+    defer doc.deinit();
+
+    const e = try spawnAt(&app, 0);
+    try doc.register(e, "E");
+    try doc.setTransform(&app.world, e, .{ .position = .{ 1, 0, 0 } });
+    try doc.setTransform(&app.world, e, .{ .position = .{ 2, 0, 0 } });
+    doc.markSaved();
+    try testing.expect(!doc.dirty);
+
+    try testing.expect(try doc.undo(&app.world, null));
+    try testing.expect(doc.dirty);
+    try doc.setTransform(&app.world, e, .{ .position = .{ 9, 0, 0 } });
+    try testing.expect(doc.dirty);
+    try testing.expect(doc.state_id != doc.saved_state_id);
+}
+
+test "failed setTransform does not clear redo" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    var doc = document.EditorDocument.init(testing.allocator);
+    defer doc.deinit();
+
+    const e = try spawnAt(&app, 0);
+    try doc.register(e, "E");
+    try doc.setTransform(&app.world, e, .{ .position = .{ 1, 0, 0 } });
+    try testing.expect(try doc.undo(&app.world, null));
+    try testing.expectEqual(@as(usize, 1), doc.redo_stack.items.len);
+
+    try testing.expectError(error.InvalidTransform, doc.setTransform(&app.world, e, .{
+        .position = .{ std.math.nan(f32), 0, 0 },
+    }));
+    try testing.expectEqual(@as(usize, 1), doc.redo_stack.items.len);
+    try testing.expect(try doc.redo(&app.world, null));
+    try testing.expectEqual(@as(f32, 1), app.world.getConst(e, render_3d.Transform3D).?.position[0]);
+}
+
+test "register and unregister mark the document dirty" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    var doc = document.EditorDocument.init(testing.allocator);
+    defer doc.deinit();
+    doc.markSaved();
+    try testing.expect(!doc.dirty);
+
+    const e = try spawnAt(&app, 0);
+    try doc.register(e, "E");
+    try testing.expect(doc.dirty);
+    doc.markSaved();
+    try testing.expect(doc.unregister(e));
+    try testing.expect(doc.dirty);
+}
