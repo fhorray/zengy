@@ -5,7 +5,8 @@
 // - `headless-ecs`: Phase 1 standalone 1000-entity simulation (`zig build run-headless`)
 // - `c_plugin`: Phase 3 pure C11 shared library plugin (`examples/c-plugin/plugin.c`)
 // - Optional packages: `window`, `graphics`, `ui_core`, `ui_markup`,
-//   `scripting_host`, `assets`, `scene`, `editor_shell`, `render_3d`
+//   `scripting_host`, `assets`, `scene`, `render_3d`
+// - Applications: `zengy-runtime` (`apps/runtime/src/main.zig`); the editor shell is an app-local module (`apps/editor`)
 // - `engine-cli`: Diagnostic CLI (`zig build run-cli`)
 // - `test`: Per-module test suites organized inside each module's `tests/` directory
 
@@ -153,8 +154,9 @@ pub fn build(b: *std.Build) void {
     });
     physics_mod.addImport("engine", engine_mod);
 
-    const editor_shell_mod = b.addModule("editor_shell", .{
-        .root_source_file = b.path("packages/editor-shell/src/editor_shell.zig"),
+    // Application-local (not a public SDK module): the editor shell lives in `apps/editor`.
+    const editor_shell_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/src/shell.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -397,9 +399,18 @@ pub fn build(b: *std.Build) void {
 
     remote_mod.addImport("engine", engine_mod);
     remote_mod.addImport("dev_tools", dev_tools_mod);
-    remote_mod.addImport("editor_shell", editor_shell_mod);
     remote_mod.addImport("picking", picking_mod);
     remote_mod.addImport("log", log_mod);
+
+    // Application-local bridge between `remote` and the editor shell (`apps/editor`).
+    const editor_remote_adapter_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/src/remote_adapter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    editor_remote_adapter_mod.addImport("engine", engine_mod);
+    editor_remote_adapter_mod.addImport("remote", remote_mod);
+    editor_remote_adapter_mod.addImport("editor_shell", editor_shell_mod);
 
     // Diagnostic CLI tool (`tools/cli`)
     const cli_mod = b.createModule(.{
@@ -1003,6 +1014,7 @@ pub fn build(b: *std.Build) void {
     visual_inspector_mod.addImport("picking", picking_mod);
     visual_inspector_mod.addImport("log", log_mod);
     visual_inspector_mod.addImport("remote", remote_mod);
+    visual_inspector_mod.addImport("remote_adapter", editor_remote_adapter_mod);
 
     const visual_inspector_exe = b.addExecutable(.{
         .name = "visual-inspector",
@@ -1035,9 +1047,9 @@ pub fn build(b: *std.Build) void {
     const capture_update_step = b.step("capture-update", "Re-render the visual-pbr scenarios and overwrite the golden images");
     capture_update_step.dependOn(&capture_update.step);
 
-    // Manifesto-driven visual runtime (`tools/runtime/main.zig`): reads game.toml in CWD.
+    // Manifesto-driven visual runtime (`apps/runtime/src/main.zig`): reads game.toml in CWD.
     const runtime_mod = b.createModule(.{
-        .root_source_file = b.path("tools/runtime/main.zig"),
+        .root_source_file = b.path("apps/runtime/src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1125,7 +1137,7 @@ pub fn build(b: *std.Build) void {
 
     const plugin_path_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/runtime/plugin_paths.zig"),
+            .root_source_file = b.path("apps/runtime/src/plugin_paths.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1138,7 +1150,7 @@ pub fn build(b: *std.Build) void {
 
     const hook_tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/runtime/hook_tracker.zig"),
+            .root_source_file = b.path("apps/runtime/src/hook_tracker.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1216,7 +1228,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "scene", .mod = scene_mod },
     }, null);
 
-    addModuleTest(b, test_step, "packages/editor-shell/tests/editor_shell_tests.zig", target, optimize, false, &.{
+    addModuleTest(b, test_step, "apps/editor/tests/shell_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
         .{ .name = "graphics", .mod = graphics_mod },
@@ -1265,10 +1277,21 @@ pub fn build(b: *std.Build) void {
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "ui_core", .mod = ui_core_mod },
         .{ .name = "dev_tools", .mod = dev_tools_mod },
-        .{ .name = "editor_shell", .mod = editor_shell_mod },
         .{ .name = "picking", .mod = picking_mod },
         .{ .name = "log", .mod = log_mod },
         .{ .name = "remote", .mod = remote_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "apps/editor/tests/remote_adapter_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "dev_tools", .mod = dev_tools_mod },
+        .{ .name = "picking", .mod = picking_mod },
+        .{ .name = "remote", .mod = remote_mod },
+        .{ .name = "editor_shell", .mod = editor_shell_mod },
+        .{ .name = "remote_adapter", .mod = editor_remote_adapter_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/log/tests/log_tests.zig", target, optimize, false, &.{

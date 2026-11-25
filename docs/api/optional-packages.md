@@ -76,7 +76,9 @@ All packages under `packages/` are optional `engine.Module` implementations that
 - **`official.input` (`packages/input/core/src/input.zig`):** `KeyInput`, `MouseInput`, `Gamepads` (sticks, triggers, buttons, DualSense `TouchpadFinger` tracking), and `InputMap` action bindings.
 - **`official.input.haptics` / `official.input.sdl3`:** `HapticService` for dual-motor rumble and DualSense adaptive triggers (`feedback`, `weapon`, `vibration`).
 
-## 10. Modular Editor Shell (`official.tools.editor_shell` — `packages/editor-shell/src/editor_shell.zig`)
+## 10. Editor Shell (`official.tools.editor_shell` — `apps/editor/src/shell.zig`)
+
+Owned by the editor application, not an installable package. Attach `apps/editor/src/remote_adapter.zig` to route `official.remote` edits and panel listing through it.
 
 - **Requires:** `engine.ui.tree/1`
 - **Provides:** `engine.tools.editor_shell/1` (`EditorShellService`)

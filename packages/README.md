@@ -17,7 +17,7 @@ Related packages are grouped by category; the public package name used by `zengy
 | `scripting/` | `host`, `lua`, `python` |
 | `render/` | `2d`, `3d`, `text` |
 | `formats/`, `tooling/` | format adapters and file watcher |
-| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `editor-shell`, `testing`, `default-plugins`, `sdl3` (third-party SDK) |
+| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `testing`, `default-plugins`, `sdl3` (third-party SDK) |
 
 ## Package Catalog
 
@@ -41,7 +41,6 @@ Related packages are grouped by category; the public package name used by `zengy
 | [`assets/`](assets/src/assets.zig) | `official.assets` | `engine.assets/1` | URI-cached asset registry, priority-ordered importers, and owner-scoped unload. |
 | [`scene/`](scene/src/scene.zig) | `official.scene` | `engine.scene.2d/1` | 2D transform hierarchy (`Transform2D`, `Parent`), O(N) `.post_update` propagation, scene graph v1 (`scene.graph`: child lists, `reparent`, despawn policies), and `SceneSnapshot`. |
 | [`prefab/`](prefab/src/prefab.zig) | `official.prefab` | `engine.prefab/1` | Portable `Prefab` entity trees (stable type ids, versioned encoded components), field overrides, atomic batch `instantiate`, and a `PrefabLibrary` resource. |
-| [`editor-shell/`](editor-shell/src/editor_shell.zig) | `official.tools.editor_shell` | `engine.tools.editor_shell/1` | Optional dockable panel registry, schema-driven inspector, and transactional undo/redo. |
 | [`render/3d/`](render/3d/src/render_3d.zig) | `official.render.3d` | `engine.render.3d/1` | 3D transform/mesh components (`Transform3D`, `MeshRef`) and `.render_extract` draw extraction (powered by `official.camera`). |
 | [`gizmos/`](gizmos/src/gizmos.zig) | `official.gizmos` | `engine.gizmos/1` | Immediate-mode 3D debug & editor gizmos (`line`, `ray`, `arrow`, `cuboid`, `axes`, `circle`, `sphere`, `grid`) with depth-tested and X-ray layers. |
 | [`shapes/`](shapes/src/shapes.zig) | `official.shapes` | `engine.shapes/1` | Procedural 3D mesh primitives (`Plane`, `Cuboid`, `Sphere`, `Capsule`, `Cylinder`, `Torus`, `Cone`) with UVs and tangents. |
@@ -53,3 +52,9 @@ Related packages are grouped by category; the public package name used by `zengy
 | [`formats/json/`](formats/json/src/json_format.zig) | `official.format.json` | `engine.format.json/1` | Dual JSON adapter (`std.json` for small configs, `yyjson` C11 for high-volume payloads). |
 | [`tooling/file-watcher/`](tooling/file-watcher/src/file_watcher.zig) | `official.tooling.file_watcher` | `engine.tooling.file_watcher/1` | Filesystem watching adapter over `lookout` for hot reload. |
 | [`testing/`](testing/src/testing_sdk.zig) | `official.testing` | `engine.testing.driver/1`, `engine.testing.capture/1` | Deterministic `TestDriver`, strict TOML `Scenario` runner, and offscreen RGBA8 `CaptureService`. |
+
+## Not packages
+
+- `sdl3/` is vendored SDK and provisioning infrastructure (headers, import library, `zengy.toml` runtime fetch), kept at this path for the build and CLI. It is not a feature package.
+- The editor shell moved to `apps/editor` (see [ADR-008](../docs/adr/ADR-008-application-package-boundaries.md)); it is no longer installable with `zengy add`.
+- `ui/plume` and `ui/widgets` are source packages that are not yet in the CLI catalog; install them by copying or vendoring the source.

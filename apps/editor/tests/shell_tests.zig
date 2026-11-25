@@ -1,4 +1,4 @@
-//! Modular Editor Shell Tests (`packages/editor-shell/tests/editor_shell_tests.zig`).
+//! Editor shell tests (`apps/editor/tests/shell_tests.zig`).
 //!
 //! Validates Phase 12 `official.tools.editor_shell`: default panel registration,
 //! schema-driven field inspection via `TypeRegistry`, and undo/redo transactions.

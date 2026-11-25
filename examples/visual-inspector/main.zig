@@ -33,6 +33,7 @@ const editor_shell = @import("editor_shell");
 const picking = @import("picking");
 const log = @import("log");
 const remote = @import("remote");
+const remote_adapter = @import("remote_adapter");
 
 pub const std_options: std.Options = .{
     .logFn = log.stdLogBridge,
@@ -268,6 +269,8 @@ pub fn main(init: std.process.Init) !void {
     try app.addSystem(.{ .name = "inspector.overlay", .stage = .render_extract, .run = renderOverlay });
 
     try app.initialize();
+    // Route remote edits through the editor shell history and expose its panels.
+    try remote_adapter.attach(&app);
     if (app.resources.get(gizmos.GizmoService)) |giz| {
         giz.config.line.width = 2.0;
         giz.config.xray_alpha = 0.95;

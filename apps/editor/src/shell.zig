@@ -1,4 +1,4 @@
-//! Optional Modular Editor Shell Package (`official.tools.editor_shell`).
+//! Editor shell (`official.tools.editor_shell`), owned by the editor application (`apps/editor`).
 //!
 //! Demonstrates Phase 12: editor tooling (panel registry, undo/redo command
 //! history, and schema-driven component inspector) built strictly as an optional
