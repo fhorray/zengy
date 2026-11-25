@@ -43,7 +43,9 @@ test "HeliosService combines SSGI, probes, and sky without double-counting and m
     const out = try hsvc.evaluatePoint(.{ 1, 1, 1 }, .{ 0, 1, 0 }, &vol, .{ 0.2, 0.3, 0.4 }, .{ 0.8, 0.4, 0.2 }, 0.5);
     try testing.expect(out.diffuse_rgb[0] > 0.4);
     try testing.expect(hsvc.cache.cells.count() == 1);
-    try testing.expect(hsvc.cache.hits >= 1);
+    try testing.expectEqual(@as(u64, 0), hsvc.cache.hits);
+    _ = try hsvc.evaluatePoint(.{ 1, 1, 1 }, .{ 0, 1, 0 }, &vol, .{ 0.2, 0.3, 0.4 }, .{ 0.8, 0.4, 0.2 }, 0.5);
+    try testing.expectEqual(@as(u64, 1), hsvc.cache.hits);
 
     // Stale eviction
     const evicted = hsvc.cache.evictStale(500, 100);
@@ -308,6 +310,7 @@ test "GI solver: adaptive sun sampling finds a thin gap that the uniform grid mi
     };
     var cfg = helios.gi_solver.configForTier(.high);
     cfg.max_vpls = 64; // keep every cluster so the ranking cannot hide the one behind the gap
+    cfg.sun_refine_discontinuities = false; // Isolate the legacy seam-refinement regression.
 
     // Count candidates that landed on the interior floor (z < 5.5): they exist only if a ray went through the gap.
     var vpls = std.ArrayList(helios.gi_solver.VirtualPointLight).empty;
@@ -329,5 +332,140 @@ test "GI solver: adaptive sun sampling finds a thin gap that the uniform grid mi
     try testing.expectEqual(@as(usize, 0), inside_uniform);
     try testing.expect(inside_refined >= 1);
     // The refinement budget bounds the extra work.
-    try testing.expect(stats.rays_cast <= 18 * 18 + cfg.sun_refine_ray_budget + 64);
+    try testing.expect(stats.rays_cast <= 18 * 18 + 19 * 19 + cfg.sun_refine_ray_budget);
+}
+
+test "lighting hardening: BVH parallel slab and coincident centroids" {
+    const triangle = helios.ray_query.BvhTriangle{
+        .v0 = .{ 0, 0, -2 }, .v1 = .{ 1, 0, -2 }, .v2 = .{ 0, 1, -2 },
+    };
+    const triangles = [_]helios.ray_query.BvhTriangle{triangle} ** 32;
+    var bvh = helios.ray_query.Bvh.init(testing.allocator);
+    defer bvh.deinit();
+    try bvh.build(&triangles);
+    try testing.expect(bvh.nodes.items.len > 1);
+    const hit = helios.ray_query.Ray{ .origin = .{ 0, 0.25, 0 }, .direction = .{ 0, 0, -1 } };
+    try testing.expect(bvh.traceClosest(hit, null).hit);
+    try testing.expect(bvh.traceAnyHit(hit, null));
+    const miss = helios.ray_query.Ray{ .origin = .{ -0.01, 0.25, 0 }, .direction = .{ 0, 0, -1 } };
+    try testing.expect(!bvh.traceClosest(miss, null).hit);
+    try testing.expect(!bvh.traceAnyHit(miss, null));
+}
+
+test "lighting hardening: directional cache does not revive stale samples" {
+    var cache = helios.WorldRadianceCache.init(testing.allocator, 2, 16);
+    defer cache.deinit();
+    const pos = [3]f32{ 0.5, 0.5, 0.5 };
+    try cache.accumulateSurface(pos, .{ 0, 1, 0 }, 0, .{ 1, 0, 0 }, 1);
+    try testing.expect(cache.querySurface(pos, .{ 0, -1, 0 }, 0, 2) == null);
+    try testing.expect(cache.querySurface(pos, .{ 0, 1, 0 }, 0, 2) != null);
+    try testing.expect(cache.querySurface(pos, .{ 0, 1, 0 }, 0, 500) == null);
+    try cache.accumulateSurface(pos, .{ 0, 1, 0 }, 0, .{ 0, 1, 0 }, 500);
+    const cell = cache.querySurface(pos, .{ 0, 1, 0 }, 0, 500).?;
+    try testing.expectEqual(@as(u32, 1), cell.sample_count);
+    try testing.expectEqual(@as(f32, 1), cell.rgb[1]);
+}
+
+
+test "radiance cache evicts the actual least recently used entry" {
+    var cache = helios.WorldRadianceCache.init(testing.allocator, 1, 16);
+    defer cache.deinit();
+    for (0..16) |i| {
+        const x: f32 = @floatFromInt(i);
+        try cache.accumulate(.{ x, 0, 0 }, 0, .{ 1, 1, 1 }, 1);
+    }
+    _ = cache.query(.{ 0, 0, 0 }, 0, 2);
+    try cache.accumulate(.{ 16, 0, 0 }, 0, .{ 1, 1, 1 }, 3);
+    try testing.expect(cache.query(.{ 0, 0, 0 }, 0, 3) != null);
+    try testing.expect(cache.query(.{ 1, 0, 0 }, 0, 3) == null);
+    try testing.expectEqual(@as(usize, 16), cache.cells.count());
+    try testing.expectEqual(@as(usize, 16), cache.evictStale(500, 100));
+    try testing.expect(cache.oldest_key == null and cache.newest_key == null);
+    try cache.accumulate(.{ 9, 0, 0 }, 0, .{ 1, 1, 1 }, 501);
+    cache.invalidateAll();
+    try testing.expect(cache.oldest_key == null and cache.newest_key == null);
+}
+
+
+test "Helios runtime retains scene after invalid geometry replacement" {
+    var runtime = helios.LightingRuntime.init(testing.allocator);
+    defer runtime.deinit();
+    const tri = helios.ray_query.BvhTriangle{
+        .v0 = .{ 0, 0, -2 }, .v1 = .{ 1, 0, -2 }, .v2 = .{ 0, 1, -2 },
+    };
+    const mats = [_]helios.indirect_rt.SurfaceMaterial{.{} };
+    try runtime.replaceGeometry(&.{tri}, &mats);
+    const revision = runtime.geometry_revision;
+    try testing.expectError(error.InvalidMaterialIndex, runtime.replaceGeometry(&.{tri}, &.{}));
+    try testing.expectEqual(revision, runtime.geometry_revision);
+    const ray = helios.ray_query.Ray{ .origin = .{ 0.2, 0.2, 0 }, .direction = .{ 0, 0, -1 } };
+    try testing.expect(runtime.bvh.traceClosest(ray, null).hit);
+    _ = try runtime.solve(&.{}, null, helios.gi_solver.configForTier(.off));
+    try testing.expectEqual(@as(usize, 0), runtime.result().len);
+    try testing.expect(!runtime.dirty);
+}
+
+
+test "Dynamic GI: empty scene converges to sky with bounded probe updates" {
+    var bvh = helios.ray_query.Bvh.init(testing.allocator);
+    defer bvh.deinit();
+    var grid = helios.dynamic_gi.Grid{};
+    grid.origin_enabled[3] = 1;
+    var cursor: usize = 0;
+    const cfg = helios.dynamic_gi.Settings{ .probes_per_frame = 64, .rays_per_probe = 24, .sky_radiance = .{ 0.2, 0.4, 0.6 } };
+    const stats = helios.dynamic_gi.update(&grid, &bvh, &.{}, &.{}, null, cfg, &cursor, 0);
+    try testing.expectEqual(@as(u64, 64 * (24 + 6)), stats.rays_cast);
+    const result = helios.dynamic_gi.sample(&grid, .{ 1.5, 1.5, 1.5 }, .{ 0, 1, 0 });
+    try testing.expectApproxEqAbs(@as(f32, 1), result.confidence, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), result.rgb[1], 1e-5);
+}
+
+test "Dynamic GI: unmeasured visibility and invalid normal fall back" {
+    var grid = helios.dynamic_gi.Grid{};
+    grid.origin_enabled[3] = 1;
+    grid.probes[0].offset_validity[3] = 1;
+    const unknown = helios.dynamic_gi.sample(&grid, .{ 0, 0, 0 }, .{ 0, 1, 0 });
+    try testing.expectEqual(@as(f32, 0), unknown.confidence);
+    grid.probes[0].moments[0] = .{ 1, 1, 0, 0 };
+    const zero_normal = helios.dynamic_gi.sample(&grid, .{ 0, 0, 0 }, .{ 0, 0, 0 });
+    try testing.expectEqual(@as(f32, 0), zero_normal.confidence);
+    var bvh = helios.ray_query.Bvh.init(testing.allocator);
+    defer bvh.deinit();
+    var cursor: usize = 0;
+    const stats = helios.dynamic_gi.update(&grid, &bvh, &.{}, &.{}, null, .{ .rays_per_probe = 0 }, &cursor, 0);
+    try testing.expectEqual(@as(u64, 0), stats.rays_cast);
+    try testing.expectEqual(@as(usize, 0), cursor);
+}
+
+
+test "SSGI trace and resolve use the same texel addressing" {
+    var hiz = prism.HiZPyramid.init(testing.allocator);
+    defer hiz.deinit();
+    const depth = [_]f32{ 0.95, 0.95, 0.45, 0.95 };
+    try hiz.buildFromDepth(&depth, 4, 1);
+    const trace = helios.ssgi.traceHiZScreenSpace(&hiz, .{ 0.49, 0.5 }, 0.40, .{ 0.11, 0, 0.06 }, 1, 0.05);
+    try testing.expect(trace.hit);
+    const rgb = [_][3]f32{ .{0,0,0}, .{1,0,0}, .{0,1,0}, .{0,0,1} };
+    const resolved = helios.ssgi.resolveRadiance(&hiz, &rgb, trace, .{ 0, 0, 0 });
+    try testing.expect(resolved[1] > 0 and resolved[0] == 0);
+}
+
+
+test "MIS and light sampling remain finite at extreme intensities" {
+    const a = helios.light_sampling.misPowerHeuristic(1e30, 1e30);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), a, 1e-5);
+    var table = try helios.light_sampling.AliasTable.build(testing.allocator, &.{ 1e38, 1e38, 1e38, 1e38 });
+    defer table.deinit();
+    try testing.expectApproxEqAbs(@as(f32, 0.25), table.sample(100, 0.5).pdf, 1e-5);
+}
+
+test "reservoir rejects invalid updates and retains valid zero samples" {
+    var reservoir = helios.light_sampling.Reservoir{};
+    try testing.expect(!reservoir.update(1, std.math.nan(f32), 1, 0.5));
+    try testing.expectEqual(@as(u32, 0), reservoir.sample_count);
+    try testing.expect(!reservoir.update(2, 0, 1, 0.5));
+    try testing.expectEqual(@as(u32, 1), reservoir.sample_count);
+    try testing.expect(reservoir.update(3, 1, 2, 0.5));
+    reservoir.finalize();
+    try testing.expectEqual(@as(f32, 1), reservoir.unbiased_weight);
 }

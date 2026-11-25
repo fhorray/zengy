@@ -32,7 +32,7 @@ void main() {
     float d = texture(u_depth, uv).r;
     float dist_here = sceneDistance(v_ndc, d, max_d, cam_pos.xyz);
     // Sky is not attenuated: its distance is the fog horizon, which would otherwise darken it entirely.
-    float T = (d >= 0.9999) ? 1.0 : exp(-fog_color_density.w * dist_here);
+    float T = (d >= 0.9999) ? 1.0 : exp(-max(fog_color_density.w, 0.0) * max(dist_here, 0.0));
 
     if (vol_size_dist.w < 0.5) {
         frag_color = vec4(vec3(T), 1.0);
@@ -71,5 +71,5 @@ void main() {
     // Only light actually scattered by the lights is added. A flat ambient fog colour here washes out the
     // whole frame, so the colour term is intentionally omitted.
     // Additive blend target: alpha stays zero so the HDR alpha is untouched.
-    frag_color = vec4(scatter, 0.0);
+    frag_color = vec4(scatter * cam_pos.w, 0.0);
 }

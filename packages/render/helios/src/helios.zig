@@ -16,6 +16,8 @@ pub const hw_rt = @import("ray_query/hw_rt.zig");
 pub const light_sampling = @import("ray_query/light_sampling.zig");
 pub const indirect_rt = @import("ray_query/indirect_rt.zig");
 pub const gi_solver = @import("ray_query/gi_solver.zig");
+pub const LightingRuntime = @import("runtime/lighting_runtime.zig").LightingRuntime;
+pub const dynamic_gi = @import("runtime/dynamic_gi.zig");
 pub const path_tracer = @import("reconstruction/path_tracer.zig");
 
 pub const HeliosQualityTier = contract.HeliosQualityTier;
@@ -32,6 +34,7 @@ pub const HeliosService = struct {
     allocator: std.mem.Allocator,
     settings: HeliosViewSettings = .{},
     cache: WorldRadianceCache,
+    runtime: LightingRuntime,
     frame_index: u64 = 0,
 
     /// Initializes `HeliosService`.
@@ -39,11 +42,13 @@ pub const HeliosService = struct {
         return .{
             .allocator = allocator,
             .cache = WorldRadianceCache.init(allocator, 2.5, 2048),
+            .runtime = LightingRuntime.init(allocator),
         };
     }
 
     /// Releases cache storage.
     pub fn deinit(self: *HeliosService) void {
+        self.runtime.deinit();
         self.cache.deinit();
     }
 
@@ -69,13 +74,19 @@ pub const HeliosService = struct {
             return .{ .diffuse_rgb = sky_ibl_rgb, .specular_rgb = sky_ibl_rgb };
         }
 
-        const probe_rgb: [3]f32 = if (probe_vol) |pv| pv.sampleIrradiance(world_pos, normal) else .{ 0, 0, 0 };
-        const probe_w: f32 = if (probe_vol != null and self.settings.allow_probe_fallback) 1.0 else 0.0;
+        const probe_enabled = probe_vol != null and self.settings.allow_probe_fallback;
+        const probe_rgb: [3]f32 = if (probe_enabled) probe_vol.?.sampleIrradiance(world_pos, normal) else .{ 0, 0, 0 };
+        const probe_w: f32 = if (probe_enabled) 1.0 else 0.0;
+        const confidence = if (std.math.isFinite(ssgi_confidence)) std.math.clamp(ssgi_confidence, 0, 1) else 0;
+        var screen_rgb = ssgi_rgb;
+        for (&screen_rgb, sky_ibl_rgb) |*channel, sky| {
+            if (!std.math.isFinite(channel.*) or channel.* < 0) channel.* = if (std.math.isFinite(sky)) @max(sky, 0) else 0;
+        }
 
         // Combine SSGI with probe/sky fallback, then blend with world-space radiance cache.
-        var combined = contract.combineIndirectDiffuse(ssgi_rgb, ssgi_confidence, probe_rgb, probe_w, sky_ibl_rgb);
-        try self.cache.accumulate(world_pos, 0, combined, self.frame_index);
-        if (self.cache.query(world_pos, 0, self.frame_index)) |cell| {
+        var combined = contract.combineIndirectDiffuse(screen_rgb, confidence, probe_rgb, probe_w, sky_ibl_rgb);
+        const fresh = combined;
+        if (self.cache.querySurface(world_pos, normal, 0, self.frame_index)) |cell| {
             const cw = cell.confidence * 0.5;
             combined = .{
                 combined[0] * (1.0 - cw) + cell.rgb[0] * cw,
@@ -84,10 +95,12 @@ pub const HeliosService = struct {
             };
         }
 
+        // Store the fresh estimate, not the already blended cache result.
+        try self.cache.accumulateSurface(world_pos, normal, 0, fresh, self.frame_index);
         return .{
             .diffuse_rgb = combined,
             .specular_rgb = sky_ibl_rgb,
-            .diffuse_confidence = @max(ssgi_confidence, probe_w * 0.5),
+            .diffuse_confidence = @max(confidence, probe_w * 0.5),
             .specular_confidence = 0.5,
             .ray_steps_used = self.settings.ssgi_max_steps,
         };

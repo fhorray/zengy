@@ -39,20 +39,58 @@ void main() {
 
     vec3 pos = reconstructViewPos(uv, d);
     vec2 texel = 1.0 / vec2(textureSize(u_depth, 0));
-    vec3 px = reconstructViewPos(uv + vec2(texel.x, 0.0), texture(u_depth, uv + vec2(texel.x, 0.0)).r);
-    vec3 py = reconstructViewPos(uv + vec2(0.0, texel.y), texture(u_depth, uv + vec2(0.0, texel.y)).r);
-    vec3 N = normalize(cross(py - pos, px - pos));
+    vec2 ux = clamp(uv + vec2(texel.x, 0), vec2(0), vec2(1));
+    vec2 lx = clamp(uv - vec2(texel.x, 0), vec2(0), vec2(1));
+    vec2 uy = clamp(uv + vec2(0, texel.y), vec2(0), vec2(1));
+    vec2 ly = clamp(uv - vec2(0, texel.y), vec2(0), vec2(1));
+    float dr = texture(u_depth, ux).r;
+    float dl = texture(u_depth, lx).r;
+    float dd = texture(u_depth, uy).r;
+    float du = texture(u_depth, ly).r;
+    vec3 right = reconstructViewPos(ux, dr) - pos;
+    vec3 left = pos - reconstructViewPos(lx, dl);
+    vec3 down = reconstructViewPos(uy, dd) - pos;
+    vec3 up = pos - reconstructViewPos(ly, du);
+    bool right_valid = dot(right,right) > 1e-12 && dr < 0.9999;
+    bool left_valid = dot(left,left) > 1e-12 && dl < 0.9999;
+    bool down_valid = dot(down,down) > 1e-12 && dd < 0.9999;
+    bool up_valid = dot(up,up) > 1e-12 && du < 0.9999;
+    vec3 dx = right_valid && (!left_valid || abs(right.z) < abs(left.z)) ? right : (left_valid ? left : vec3(0));
+    vec3 dy = down_valid && (!up_valid || abs(down.z) < abs(up.z)) ? down : (up_valid ? up : vec3(0));
+    vec3 nn = cross(dy, dx);
+    vec3 N = dot(nn,nn) > 1e-12 ? normalize(nn) : -pos * inversesqrt(max(dot(pos,pos),1e-12));
+    if (dot(N, -pos) < 0.0) N = -N;
 
     // Shared distance fade for AO and contact shadows, driven by ContactShadowSettings.distance_fade.
-    float dist_fade = 1.0 - smoothstep(fade_range.x, fade_range.y, abs(pos.z));
+    float dist_fade = 1.0 - smoothstep(max(fade_range.x, 0.0), max(fade_range.y, max(fade_range.x, 0.0) + 0.001), abs(pos.z));
     float ao = 1.0;
     if (params.w > 0.5 && dist_fade > 0.01) {
-        float radius = params.x;
-        float bias = params.y + 0.004 * abs(pos.z);
+        float radius = max(params.x, 0.001);
+        float bias = max(params.y, 0.0) + 0.004 * abs(pos.z);
         float occ = 0.0;
         float rot = hash12(gl_FragCoord.xy) * 6.2831853;
 
-        for (int i = 0; i < 12; ++i) {
+        if (fade_range.z > 0.5) {
+            // Four horizon directions, three samples each. Same tap budget as legacy SSAO.
+            vec2 radius_uv = abs(vec2(proj[0][0], proj[1][1])) * radius / max(abs(pos.z)*2.0,0.001);
+            for (int i=0; i<4; ++i) {
+                float ang = rot + float(i)*1.57079632679;
+                vec2 axis = vec2(cos(ang),sin(ang));
+                float horizon = 0.0;
+                for (int j=1; j<=3; ++j) {
+                    vec2 suv = uv + axis*radius_uv*(float(j)/3.0);
+                    if (any(lessThan(suv,vec2(0.0))) || any(greaterThan(suv,vec2(1.0)))) continue;
+                    float sd = texture(u_depth,suv).r;
+                    if (sd >= 0.9999) continue;
+                    vec3 delta = reconstructViewPos(suv,sd)-pos;
+                    float len = length(delta);
+                    if (len <= max(bias,0.0001) || len >= radius) continue;
+                    float falloff = 1.0-smoothstep(radius*0.25,radius,len);
+                    horizon = max(horizon,max(dot(N,delta/len)-bias/len,0.0)*falloff);
+                }
+                occ += horizon*3.0;
+            }
+        } else for (int i = 0; i < 12; ++i) {
             float fi = float(i);
             float ang = rot + fi * 2.3999632; // golden angle
             float r = sqrt((fi + 0.5) / 12.0) * radius;
@@ -63,10 +101,12 @@ void main() {
             vec3 sp = pos + dir * r;
 
             vec4 clip = proj * vec4(sp, 1.0);
+            if (clip.w <= 0.0001) continue;
             vec2 suv = vec2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
             if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) continue;
 
             float sd = texture(u_depth, suv).r;
+            if (sd >= 0.9999) continue;
             vec3 sample_vp = reconstructViewPos(suv, sd);
             float range_check = smoothstep(0.0, 1.0, radius / max(abs(pos.z - sample_vp.z), 0.001));
             occ += ((sample_vp.z >= sp.z + bias) ? 1.0 : 0.0) * range_check;
@@ -89,9 +129,11 @@ void main() {
                 if (float(i) > contact_params.z) break;
                 vec3 rp = start_pos + ldir_v * ((float(i) - 0.5 + jitter * 0.5) * step_len);
                 vec4 rclip = proj * vec4(rp, 1.0);
+                if (rclip.w <= 0.0001) break;
                 vec2 ruv = vec2(rclip.x / rclip.w * 0.5 + 0.5, 0.5 - rclip.y / rclip.w * 0.5);
                 if (ruv.x < 0.0 || ruv.x > 1.0 || ruv.y < 0.0 || ruv.y > 1.0) break;
                 float rd = texture(u_depth, ruv).r;
+                if (rd >= 0.9999) continue;
                 vec3 rvp = reconstructViewPos(ruv, rd);
                 float dz = rvp.z - rp.z;
                 if (dz > slope_bias && dz < contact_params.y + slope_bias) {

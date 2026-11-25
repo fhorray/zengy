@@ -20,7 +20,7 @@ const float PI = 3.14159265359;
 
 void main() {
     if (sky_horizon_mode.w > 0.5 && sky_horizon_mode.w < 1.5) {
-        frag_color = vec4(ground_solid.rgb, 1.0);
+        frag_color = vec4(ground_solid.rgb * hdri_rotation.y, 1.0);
         return;
     }
 
@@ -33,7 +33,7 @@ void main() {
         float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5 + hdri_rotation.x;
         float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
         vec3 col = textureLod(u_sky_hdri, vec2(u, v), 0.0).rgb * exp2(sun_col_intensity.w);
-        frag_color = vec4(clamp(col, vec3(0.0), vec3(65000.0)), 1.0);
+        frag_color = vec4(clamp(col * hdri_rotation.y, vec3(0.0), vec3(65000.0)), 1.0);
         return;
     }
 
@@ -60,5 +60,5 @@ void main() {
         sky += sun_col_intensity.rgb * (disc * sun_col_intensity.w * 4.0 + halo * sun_col_intensity.w);
     }
 
-    frag_color = vec4(max(sky, vec3(0.0)), 1.0);
+    frag_color = vec4(max(sky, vec3(0.0)) * hdri_rotation.y, 1.0);
 }

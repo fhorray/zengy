@@ -47,12 +47,16 @@ pub const GiSolveConfig = struct {
     max_bounces: u8 = 1,
     merge_radius: f32 = 1.65,
     normal_offset: f32 = 0.42,
+    /// Geometric ray origin bias, independent of the artistic VPL placement offset.
+    ray_origin_bias: f32 = 0.002,
     bounce_energy_scale: f32 = 0.65,
     vpl_range: f32 = 11.0,
     /// Deepest subdivision of a sun-grid cell next to a silhouette or seam (0 disables adaptive refinement). Each
     /// level halves the cell, so a 0.5 m cell reaches about 1.6 cm at depth 5. A uniform grid never samples a
     /// crack narrower than its pitch, which left sealed rooms with a thin sun beam and no bounce light.
     sun_refine_max_depth: u8 = 5,
+    /// Opt in to silhouette/depth/normal refinement beyond the legacy near-seam heuristic.
+    sun_refine_discontinuities: bool = false,
     /// Upper bound on extra rays spent on refinement per solve, so a busy scene cannot stall a frame.
     sun_refine_ray_budget: u32 = 12288,
     /// Optional camera/viewer position. When set, candidate VPLs that are completely occluded
@@ -205,9 +209,13 @@ const SunCell = struct {
 /// True when two sun rays hit different surfaces at a similar depth: the seam between touching meshes, where a
 /// crack can hide. Depth jumps (a silhouette against the far background, a ray that went through a gap) are not
 /// seams, so they do not trigger subdivision and the refinement budget goes where gaps can actually be.
-fn hitsDiffer(a: bvh_mod.RayHit, b: bvh_mod.RayHit) bool {
-    if (!a.hit or !b.hit) return false;
-    return a.instance_id != b.instance_id and @abs(a.t - b.t) < 1.0;
+fn hitsDiffer(a: bvh_mod.RayHit, b: bvh_mod.RayHit, cell_size: f32, extended: bool) bool {
+    if (a.hit != b.hit) return extended;
+    if (!a.hit) return false;
+    if (a.instance_id != b.instance_id and @abs(a.t - b.t) < 1.0) return true;
+    if (!extended) return false;
+    const depth_delta = @abs(a.t - b.t);
+    return depth_delta > @max(cell_size * 2.0, 0.05) or dot3(a.normal, b.normal) < 0.85;
 }
 
 /// Casts directional sun rays over a plane perpendicular to the sun and turns hits into bounce candidates.
@@ -249,7 +257,7 @@ const SunSampler = struct {
     }
 
     /// Adds the bounce candidate for `hit` (found by the ray through `u`/`v`) with `weight` of a coarse cell's flux.
-    fn deposit(self: *SunSampler, hit: bvh_mod.RayHit, u: f32, v: f32, weight: f32) void {
+    fn deposit(self: *SunSampler, hit: bvh_mod.RayHit, u: f32, v: f32, weight: f32) !void {
         if (!hit.hit) return;
         self.stats.primary_hits += 1;
         const s = self.sun;
@@ -267,15 +275,15 @@ const SunSampler = struct {
         const rgb = [3]f32{ s.color[0] * mat.albedo[0], s.color[1] * mat.albedo[1], s.color[2] * mat.albedo[2] };
         const max_c = @max(rgb[0], @max(rgb[1], rgb[2]));
         if (max_c < 0.03) return;
-        // A failed append only drops one candidate; the solver must not abort a frame over it.
-        addOrMergeVpl(self.allocator, self.raw_vpls, .{
+        // A failed append invalidates this solve; the runtime retains its last complete result.
+        try addOrMergeVpl(self.allocator, self.raw_vpls, .{
             .position = hit_p,
             .normal = n,
             .color = .{ rgb[0] / max_c, rgb[1] / max_c, rgb[2] / max_c },
             .lumens = self.flux_per_cell * weight * max_c * ndotl * 4.5,
             .range = config.vpl_range * 1.15,
             .bounce_depth = 1,
-        }, config.merge_radius * 1.1) catch {};
+        }, config.merge_radius * 1.1);
     }
 };
 
@@ -348,7 +356,13 @@ pub fn solveInstantRadiosity(
                         @mod(@as(f32, @floatFromInt(ri)) * 0.3819660 + 0.27, 1.0),
                         n,
                     );
-                    const ray2 = bvh_mod.Ray{ .origin = hit_p, .direction = b_dir, .t_min = 0.08, .t_max = em.range * 0.8 };
+                    const ray_bias = if (std.math.isFinite(config.ray_origin_bias)) std.math.clamp(config.ray_origin_bias, 0.0001, 0.05) else 0.002;
+                    const ray_origin = [3]f32{
+                        em.position[0] + dir[0] * hit.t + n[0] * ray_bias,
+                        em.position[1] + dir[1] * hit.t + n[1] * ray_bias,
+                        em.position[2] + dir[2] * hit.t + n[2] * ray_bias,
+                    };
+                    const ray2 = bvh_mod.Ray{ .origin = ray_origin, .direction = b_dir, .t_min = ray_bias, .t_max = em.range * 0.8 };
                     const hit2 = bvh.traceClosest(ray2, &qstats);
                     if (hit2.hit) {
                         stats.secondary_hits += 1;
@@ -356,9 +370,9 @@ pub fn solveInstantRadiosity(
                         var n2 = normalize3(hit2.normal);
                         if (dot3(n2, b_dir) > 0.0) n2 = .{ -n2[0], -n2[1], -n2[2] };
                         const hit_p2 = [3]f32{
-                            hit_p[0] + b_dir[0] * hit2.t + n2[0] * config.normal_offset,
-                            hit_p[1] + b_dir[1] * hit2.t + n2[1] * config.normal_offset,
-                            hit_p[2] + b_dir[2] * hit2.t + n2[2] * config.normal_offset,
+                            ray_origin[0] + b_dir[0] * hit2.t + n2[0] * config.normal_offset,
+                            ray_origin[1] + b_dir[1] * hit2.t + n2[1] * config.normal_offset,
+                            ray_origin[2] + b_dir[2] * hit2.t + n2[2] * config.normal_offset,
                         };
                         const rgb2 = [3]f32{
                             norm_col[0] * mat2.albedo[0],
@@ -460,25 +474,25 @@ pub fn solveInstantRadiosity(
                     // A cell is uniform when its centre and four corners show no seam between different surfaces.
                     var uniform = true;
                     for (cur.corners) |corner| {
-                        if (hitsDiffer(cur.center, corner)) uniform = false;
+                        if (hitsDiffer(cur.center, corner, cur.size, config.sun_refine_discontinuities)) uniform = false;
                     }
                     for (0..4) |k| {
-                        if (hitsDiffer(cur.corners[k], cur.corners[(k + 1) % 4])) uniform = false;
+                        if (hitsDiffer(cur.corners[k], cur.corners[([4]usize{ 1, 3, 0, 2 })[k]], cur.size, config.sun_refine_discontinuities)) uniform = false;
                     }
                     const can_split = !uniform and cur.depth < config.sun_refine_max_depth and refine_budget >= 8;
                     if (!can_split) {
                         if (uniform) {
-                            sampler.deposit(cur.center, cur.u, cur.v, weight);
+                            try sampler.deposit(cur.center, cur.u, cur.v, weight);
                         } else {
                             // A seam cell that cannot be split further: each sample carries a fifth of it, so a ray
                             // that slipped through a crack still contributes.
                             const hs = cur.size * 0.5;
                             const w5 = weight * 0.2;
-                            sampler.deposit(cur.center, cur.u, cur.v, w5);
-                            sampler.deposit(cur.corners[0], cur.u - hs, cur.v - hs, w5);
-                            sampler.deposit(cur.corners[1], cur.u + hs, cur.v - hs, w5);
-                            sampler.deposit(cur.corners[2], cur.u - hs, cur.v + hs, w5);
-                            sampler.deposit(cur.corners[3], cur.u + hs, cur.v + hs, w5);
+                            try sampler.deposit(cur.center, cur.u, cur.v, w5);
+                            try sampler.deposit(cur.corners[0], cur.u - hs, cur.v - hs, w5);
+                            try sampler.deposit(cur.corners[1], cur.u + hs, cur.v - hs, w5);
+                            try sampler.deposit(cur.corners[2], cur.u - hs, cur.v + hs, w5);
+                            try sampler.deposit(cur.corners[3], cur.u + hs, cur.v + hs, w5);
                         }
                         continue;
                     }

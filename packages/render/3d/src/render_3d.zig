@@ -377,6 +377,8 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
     const vw = primary.computed.view_from_world;
     const cam_fwd = math3d.Vec3.normalize(.{ .x = -vw[2], .y = -vw[6], .z = -vw[10] });
     svc.pbr_frame = .{
+        .camera_key = @bitCast(primary.entity),
+        .dynamic_gi = if (ctx.resources.getConst(pbr.DynamicGiGrid)) |grid| grid.* else .{},
         .camera_position = if (cam_pose) |cp| cp.position else .{ 0, 0, 0 },
         .camera_forward = .{ cam_fwd.x, cam_fwd.y, cam_fwd.z },
         .view_matrix = vw,
