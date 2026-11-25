@@ -64,7 +64,6 @@ const OFFICIAL_PACKAGES = [_]OfficialPackageInfo{
     .{ .name = "scripting-lua", .entry = "src/scripting_lua.zig", .summary = "Embedded Lua 5.4 runtime" },
     .{ .name = "scripting-python", .entry = "src/scripting_python.zig", .summary = "Embedded PocketPy (Python) runtime" },
     .{ .name = "assets", .entry = "src/assets.zig", .summary = "URI-cached asset registry" },
-    .{ .name = "editor-shell", .entry = "src/editor_shell.zig", .summary = "Dockable editor shell & undo/redo" },
     .{ .name = "testing", .entry = "src/testing_sdk.zig", .summary = "Deterministic TestDriver & CaptureService" },
     .{ .name = "default-plugins", .entry = "src/default_plugins.zig", .summary = "Curated bundle of official modules" },
 };
@@ -114,13 +113,13 @@ fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Officia
     const shell_cmd = if (pkg.third_party) |tp|
         try std.fmt.allocPrint(
             allocator,
-            "{s} && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s} zigeng-main/packages/{s}",
+            "{s} && curl -sL https://github.com/fhorray/zengy/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zengy-main/packages/{s} zengy-main/packages/{s}",
             .{ mk, dir, packageDir(tp) },
         )
     else
         try std.fmt.allocPrint(
             allocator,
-            "{s} && curl -sL https://github.com/fhorray/zigeng/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zigeng-main/packages/{s}",
+            "{s} && curl -sL https://github.com/fhorray/zengy/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zengy-main/packages/{s}",
             .{ mk, dir },
         );
     defer allocator.free(shell_cmd);
