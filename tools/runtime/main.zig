@@ -21,7 +21,8 @@ const engine = @import("engine");
 const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const graphics_wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
 const scene = @import("scene");
 const physics = @import("physics");
 const ui_core = @import("ui_core");
@@ -296,7 +297,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (!headless) {
         try app.registerModule(window_sdl3.module());
-        try app.registerModule(graphics_sdlgpu.module());
+        try app.registerModule(graphics_wgpu.module());
+        try app.registerModule(draw_2d.module());
         try app.registerModule(ui_core.module());
     }
     if (entry_script) |sp| {

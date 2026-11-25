@@ -127,6 +127,48 @@ fn scheduleCapture(state: *State, input: *frame.FrameInput) !void {
     cap.format = input.target.color_format;
 }
 
+/// Copies a renderer-offered intermediate texture (HDR scene, AO) into the capture buffer.
+fn scheduleIntermediateCapture(state: *State, input: *frame.FrameInput, source: frame.CaptureSource) !void {
+    const cap = &state.capture;
+    if (cap.scheduled) return;
+    const pitch = gpu.alignedBytesPerRow(source.width * source.format.bytesPerTexel());
+    const bytes = @as(u64, pitch) * source.height;
+    if (cap.buffer == null or cap.capacity < bytes) {
+        if (cap.buffer) |old| input.device.destroyBuffer(old);
+        cap.buffer = null;
+        cap.buffer = try input.device.createBuffer(.{ .label = "capture", .size = bytes, .usage = .{ .map_read = true, .copy_dst = true } });
+        cap.capacity = bytes;
+    }
+    try input.recorder.copyTextureToBuffer(.{ .texture = source.texture }, cap.buffer.?, .{ .bytes_per_row = pitch, .rows_per_image = source.height }, .{ .width = source.width, .height = source.height });
+    cap.scheduled = true;
+    cap.width = source.width;
+    cap.height = source.height;
+    cap.pitch = pitch;
+    cap.format = source.format;
+}
+
+fn halfToFloat(bits: u16) f32 {
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+
+/// Reads one channel of a texel, normalised to float, for the formats renderers can offer.
+fn readChannel(raw: []const u8, format: gpu.TextureFormat, texel: usize, channel: usize) f32 {
+    switch (format) {
+        .rgba16_float => {
+            const o = texel * 8 + channel * 2;
+            return halfToFloat(std.mem.readInt(u16, raw[o..][0..2], .little));
+        },
+        .r16_float => return if (channel == 0) halfToFloat(std.mem.readInt(u16, raw[texel * 2 ..][0..2], .little)) else 0,
+        .r32_float => return if (channel == 0) @bitCast(std.mem.readInt(u32, raw[texel * 4 ..][0..4], .little)) else 0,
+        .r8_unorm => return if (channel == 0) @as(f32, @floatFromInt(raw[texel])) / 255.0 else 0,
+        .bgra8_unorm, .bgra8_unorm_srgb => {
+            const order = [4]usize{ 2, 1, 0, 3 };
+            return @as(f32, @floatFromInt(raw[texel * 4 + order[channel]])) / 255.0;
+        },
+        else => return @as(f32, @floatFromInt(raw[texel * 4 + channel])) / 255.0,
+    }
+}
+
 /// Reads the copied frame back and converts it to float RGBA. Capture is a tool path, so this blocks.
 fn finishCapture(state: *State) !void {
     const cap = &state.capture;
@@ -140,17 +182,12 @@ fn finishCapture(state: *State) !void {
 
     const rgba = try state.allocator.alloc(f32, @as(usize, cap.width) * cap.height * 4);
     errdefer state.allocator.free(rgba);
-    const bgra = cap.format == .bgra8_unorm or cap.format == .bgra8_unorm_srgb;
+    const texel_bytes = cap.format.bytesPerTexel();
     for (0..cap.height) |y| {
+        const row = raw[y * cap.pitch ..][0 .. cap.width * texel_bytes];
         for (0..cap.width) |x| {
-            const src = y * cap.pitch + x * 4;
             const dst = (y * cap.width + x) * 4;
-            const r_index: usize = if (bgra) 2 else 0;
-            const b_index: usize = if (bgra) 0 else 2;
-            rgba[dst + 0] = @as(f32, @floatFromInt(raw[src + r_index])) / 255.0;
-            rgba[dst + 1] = @as(f32, @floatFromInt(raw[src + 1])) / 255.0;
-            rgba[dst + 2] = @as(f32, @floatFromInt(raw[src + b_index])) / 255.0;
-            rgba[dst + 3] = @as(f32, @floatFromInt(raw[src + 3])) / 255.0;
+            for (0..4) |c| rgba[dst + c] = readChannel(row, cap.format, x, c);
         }
     }
     if (cap.ready) |*old| old.deinit(state.allocator);
@@ -204,6 +241,11 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
     defer recorder.reset();
 
     var input: graphics.frame.FrameInput = .{
+        .requested_capture = switch (state.capture.request orelse .final) {
+            .hdr => .hdr,
+            .ssao => .ssao,
+            else => null,
+        },
         .device = device,
         .recorder = recorder,
         .textures = &state.service.textures,
@@ -220,7 +262,13 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
         try recorder.endRenderPass();
     }
     // A capture still pending here means nothing needed the pre-overlay point: take the whole frame.
-    if (state.capture.request != null) try scheduleCapture(state, &input);
+    if (state.capture.request) |request| switch (request) {
+        .hdr, .ssao => if (input.captured) |source| try scheduleIntermediateCapture(state, &input, source) else {
+            // No renderer owns the target this frame (e.g. no 3D scene): drop the request instead of hanging the caller.
+            state.capture.request = null;
+        },
+        else => try scheduleCapture(state, &input),
+    };
     try recorder.finish();
     const t2 = SDL_GetTicksNS();
     device.submit(recorder.slice()) catch |err| {
@@ -348,10 +396,9 @@ pub fn driverName(app: *engine.App) ?[]const u8 {
 }
 
 /// Asks the next presented frame to be read back. `final` excludes 2D overlays; `presented` includes them.
-/// Returns false for targets this provider cannot produce yet (`hdr`, `ssao` need the 3D renderer).
+/// `hdr` and `ssao` are produced by whichever renderer owns those targets; if none does, no image is produced.
 pub fn requestCapture(app: *engine.App, target: graphics.CaptureTarget) bool {
     const ref = app.resources.get(StateRef) orelse return false;
-    if (target == .hdr or target == .ssao) return false;
     ref.state.capture.request = target;
     return true;
 }

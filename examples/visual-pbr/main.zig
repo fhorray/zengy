@@ -23,7 +23,9 @@ const std = @import("std");
 const engine = @import("engine");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
+const gpu_3d = @import("gpu_3d");
 const input = @import("input");
 const input_sdl3 = @import("input_sdl3");
 const camera = @import("camera");
@@ -599,14 +601,14 @@ fn stepCapture(
                 resetFreeCamera(ctx, st);
             }
             if (cr.frames >= WARMUP_FRAMES) {
-                graphics_sdlgpu.requestCapture(st.app, .final);
+                _ = wgpu.requestCapture(st.app, .final);
                 cr.stage = .wait_final;
                 cr.frames = 0;
             }
         },
         .wait_final => {
             cr.frames += 1;
-            var img = graphics_sdlgpu.takeCapture(st.app) orelse {
+            var img = wgpu.takeCapture(st.app) orelse {
                 if (cr.frames > WAIT_LIMIT_FRAMES) {
                     cr.fail(sc.name, "no final capture after {d} frames", .{WAIT_LIMIT_FRAMES});
                     cr.scenario += 1;
@@ -626,10 +628,10 @@ fn stepCapture(
                 return;
             }
             if (sc.stability) {
-                graphics_sdlgpu.requestCapture(st.app, .final);
+                _ = wgpu.requestCapture(st.app, .final);
                 cr.stage = .wait_stable;
             } else {
-                graphics_sdlgpu.requestCapture(st.app, .hdr);
+                _ = wgpu.requestCapture(st.app, .hdr);
                 cr.stage = .wait_hdr;
             }
             cr.frames = 0;
@@ -637,14 +639,14 @@ fn stepCapture(
         .hold => {
             cr.frames += 1;
             if (cr.frames >= 3) {
-                graphics_sdlgpu.requestCapture(st.app, .hdr);
+                _ = wgpu.requestCapture(st.app, .hdr);
                 cr.stage = .wait_hdr;
                 cr.frames = 0;
             }
         },
         .wait_stable => {
             cr.frames += 1;
-            var img = graphics_sdlgpu.takeCapture(st.app) orelse {
+            var img = wgpu.takeCapture(st.app) orelse {
                 if (cr.frames > WAIT_LIMIT_FRAMES) {
                     cr.fail(sc.name, "no second capture after {d} frames", .{WAIT_LIMIT_FRAMES});
                     cr.scenario += 1;
@@ -664,13 +666,13 @@ fn stepCapture(
                     cr.fail(sc.name, "{d:.3}% of pixels change between consecutive frames (limit {d:.3}%)", .{ frac * 100.0, MAX_FLICKER_FRACTION * 100.0 });
                 }
             }
-            graphics_sdlgpu.requestCapture(st.app, .hdr);
+            _ = wgpu.requestCapture(st.app, .hdr);
             cr.stage = .wait_hdr;
             cr.frames = 0;
         },
         .wait_hdr => {
             cr.frames += 1;
-            var img = graphics_sdlgpu.takeCapture(st.app) orelse {
+            var img = wgpu.takeCapture(st.app) orelse {
                 if (cr.frames > WAIT_LIMIT_FRAMES) {
                     cr.fail(sc.name, "no HDR capture after {d} frames", .{WAIT_LIMIT_FRAMES});
                     cr.scenario += 1;
@@ -851,7 +853,9 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
+    try app.registerModule(gpu_3d.module());
     try app.registerModule(input.module());
     try app.registerModule(input_sdl3.module());
     try app.registerModule(camera.module());
@@ -876,11 +880,11 @@ pub fn main(init: std.process.Init) !void {
 
     var sphere = try createUvSphere(allocator, 0.55, 20, 32);
     defer sphere.deinit();
-    const gpu_sphere = try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(sphere.vertices), sphere.indices);
+    const gpu_sphere = try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(sphere.vertices), sphere.indices);
 
     var cube = try render_3d.gltf.createCubeMesh(allocator, 1.0);
     defer cube.deinit();
-    const gpu_cube = try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    const gpu_cube = try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(cube.vertices), cube.indices);
 
     // Single-quad mesh in the XY plane facing +Z; unlike a thin cube it has no back face behind its holes.
     const quad_verts = [_]render_3d.gltf.Vertex3D{
@@ -890,7 +894,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .x = -0.5, .y = 0.5, .z = 0, .nx = 0, .ny = 0, .nz = 1, .u = 0, .v = 0 },
     };
     const quad_indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
-    const gpu_quad = try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(&quad_verts), &quad_indices);
+    const gpu_quad = try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(&quad_verts), &quad_indices);
 
     // Camera with FreeCamera + PostProcessSettings (AutoExposure + Bloom + AgX).
     const cam_e = try app.world.spawn();
@@ -1035,7 +1039,7 @@ pub fn main(init: std.process.Init) !void {
             floor_pixels[idx + 3] = 255;
         }
     }
-    const floor_tex = try graphics_sdlgpu.createTextureSrgbRgba8(&app, 256, 256, &floor_pixels);
+    const floor_tex = try graphics.createTextureSrgbRgba8(&app, 256, 256, &floor_pixels);
 
     // Ground plane.
     const floor_mat = try mats.add(.{
@@ -1100,7 +1104,7 @@ pub fn main(init: std.process.Init) !void {
             leaf_pixels[idx + 3] = if (solid) 255 else 0;
         }
     }
-    const leaf_tex = try graphics_sdlgpu.createTextureSrgbRgba8(&app, 64, 64, &leaf_pixels);
+    const leaf_tex = try graphics.createTextureSrgbRgba8(&app, 64, 64, &leaf_pixels);
     const leaf_mat = try mats.add(.{
         .base_color = .{ 1.0, 1.0, 1.0, 1.0 },
         .base_color_tex = @bitCast(leaf_tex),

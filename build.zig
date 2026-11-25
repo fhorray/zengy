@@ -1112,7 +1112,9 @@ pub fn build(b: *std.Build) void {
     visual_pbr_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_pbr_mod.addImport("graphics", graphics_mod);
     visual_pbr_mod.addImport("testing_sdk", testing_sdk_mod);
-    visual_pbr_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_pbr_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_pbr_mod.addImport("draw_2d", draw_2d_mod);
+    visual_pbr_mod.addImport("gpu_3d", gpu_3d_mod);
     visual_pbr_mod.addImport("input", input_mod);
     visual_pbr_mod.addImport("input_sdl3", input_sdl3_mod);
     visual_pbr_mod.addImport("camera", camera_mod);
@@ -1124,6 +1126,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_pbr_mod,
     });
     b.installArtifact(visual_pbr_exe);
+    if (wgpu_missing) |fail| visual_pbr_exe.step.dependOn(&fail.step);
 
     const run_visual_pbr = b.addSystemCommand(&.{"zig-out/bin/visual-pbr.exe"});
     run_visual_pbr.setCwd(b.path("."));
@@ -1202,18 +1205,6 @@ pub fn build(b: *std.Build) void {
     const run_visual_inspector_step = b.step("run-visual-inspector", "Open the Visual Shapes, Picking & Profiler Showcase");
     run_visual_inspector_step.dependOn(&run_visual_inspector.step);
 
-    // Builds and installs only the examples already running on wgpu (plus runtime DLLs), without the SDL GPU ones.
-    const wgpu_examples_step = b.step("build-wgpu-examples", "Install the examples that run on the wgpu stack");
-    for ([_]*std.Build.Step.Compile{ visual_gpu_exe, visual_2d_exe, visual_plume_exe, visual_ui_exe, visual_pg_exe, visual_py_exe, visual_3d_exe, visual_camera_exe, visual_gamepad_exe, visual_audio_exe, visual_gizmos_exe, visual_inspector_exe }) |exe| {
-        wgpu_examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
-    }
-    if (wgpu_present and target.result.os.tag == .windows) {
-        wgpu_examples_step.dependOn(&b.addInstallBinFile(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib", "wgpu_native.dll" }) }, "wgpu_native.dll").step);
-        if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
-            wgpu_examples_step.dependOn(&b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll").step);
-        }
-    }
-
     // Visual Prism Stage 01+02 Showcase. Run with `zig build run-visual-prism`.
     const visual_prism_mod = b.createModule(.{
         .root_source_file = b.path("examples/visual-prism/main.zig"),
@@ -1224,7 +1215,9 @@ pub fn build(b: *std.Build) void {
     visual_prism_mod.addImport("engine", engine_mod);
     visual_prism_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_prism_mod.addImport("graphics", graphics_mod);
-    visual_prism_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_prism_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_prism_mod.addImport("draw_2d", draw_2d_mod);
+    visual_prism_mod.addImport("gpu_3d", gpu_3d_mod);
     visual_prism_mod.addImport("testing_sdk", testing_sdk_mod);
     visual_prism_mod.addAnonymousImport("sky_hdr", .{
         .root_source_file = b.path("examples/visual-pbr/assets/sky.hdr"),
@@ -1244,12 +1237,25 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_prism_mod,
     });
     b.installArtifact(visual_prism_exe);
+    if (wgpu_missing) |fail| visual_prism_exe.step.dependOn(&fail.step);
 
     const run_visual_prism = b.addSystemCommand(&.{"zig-out/bin/visual-prism.exe"});
     run_visual_prism.setCwd(b.path("."));
     run_visual_prism.step.dependOn(b.getInstallStep());
     const run_visual_prism_step = b.step("run-visual-prism", "Open the Visual Prism Stage 01+02 Showcase");
     run_visual_prism_step.dependOn(&run_visual_prism.step);
+
+    // Builds and installs only the examples already running on wgpu (plus runtime DLLs), without the SDL GPU ones.
+    const wgpu_examples_step = b.step("build-wgpu-examples", "Install the examples that run on the wgpu stack");
+    for ([_]*std.Build.Step.Compile{ visual_gpu_exe, visual_2d_exe, visual_plume_exe, visual_ui_exe, visual_pg_exe, visual_py_exe, visual_3d_exe, visual_camera_exe, visual_gamepad_exe, visual_audio_exe, visual_gizmos_exe, visual_inspector_exe, visual_pbr_exe, visual_prism_exe }) |exe| {
+        wgpu_examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+    if (wgpu_present and target.result.os.tag == .windows) {
+        wgpu_examples_step.dependOn(&b.addInstallBinFile(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib", "wgpu_native.dll" }) }, "wgpu_native.dll").step);
+        if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
+            wgpu_examples_step.dependOn(&b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll").step);
+        }
+    }
 
     // Render regression harness: renders the fixed scenarios of `visual-pbr` and compares them with
     // `tests/golden/visual-pbr` (`capture-check`) or rewrites those goldens (`capture-update`).
@@ -1281,7 +1287,8 @@ pub fn build(b: *std.Build) void {
     runtime_mod.addImport("window", window_mod);
     runtime_mod.addImport("window_sdl3", window_sdl3_mod);
     runtime_mod.addImport("graphics", graphics_mod);
-    runtime_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    runtime_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    runtime_mod.addImport("draw_2d", draw_2d_mod);
     runtime_mod.addImport("ui_core", ui_core_mod);
     runtime_mod.addImport("ui_markup", ui_markup_mod);
     runtime_mod.addImport("scripting_host", scripting_host_mod);
@@ -1296,6 +1303,7 @@ pub fn build(b: *std.Build) void {
         .root_module = runtime_mod,
     });
     b.installArtifact(runtime_exe);
+    if (wgpu_missing) |fail| runtime_exe.step.dependOn(&fail.step);
 
     // Microbenchmark suite (`benchmarks/main.zig`)
     const bench_mod = b.createModule(.{

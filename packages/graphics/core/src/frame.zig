@@ -33,6 +33,17 @@ pub const FrameTarget = struct {
     color_format: gpu.TextureFormat,
 };
 
+/// Intermediate render targets a renderer can expose for read-back (`GraphicsDeviceService` captures).
+pub const IntermediateCapture = enum { hdr, ssao };
+
+/// A texture a renderer offers for capture. It must have `copy_src` usage and stay alive until the frame is submitted.
+pub const CaptureSource = struct {
+    texture: gpu.TextureHandle,
+    format: gpu.TextureFormat,
+    width: u32,
+    height: u32,
+};
+
 /// Per-frame data passed to every renderer. Valid only for the duration of the `render` call.
 pub const FrameInput = struct {
     device: gpu.GpuDevice,
@@ -48,6 +59,15 @@ pub const FrameInput = struct {
     color_target: gpu.ColorTarget = .swapchain,
     /// Set once any pass wrote the color target this frame.
     color_target_used: bool = false,
+    /// Intermediate target the application asked to read back this frame, if any.
+    requested_capture: ?IntermediateCapture = null,
+    /// Filled by the renderer that owns the requested target (see `offerCapture`).
+    captured: ?CaptureSource = null,
+
+    /// Exposes `source` for read-back when `kind` was requested; a no-op otherwise, so renderers can call it unconditionally.
+    pub fn offerCapture(self: *FrameInput, kind: IntermediateCapture, source: CaptureSource) void {
+        if (self.requested_capture == kind) self.captured = source;
+    }
 
     /// Color attachment for the frame target: cleared by the first pass of the frame, loaded afterwards.
     pub fn colorAttachment(self: *FrameInput) gpu.ColorAttachment {

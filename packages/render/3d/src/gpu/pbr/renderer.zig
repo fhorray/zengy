@@ -13,6 +13,7 @@ const util = @import("util.zig");
 const shadow_cull = @import("shadow_cull.zig");
 const shadow_plan = @import("shadow_plan.zig");
 const volumetric_lights = @import("volumetric_lights.zig");
+const gpu_gi = @import("gpu_gi.zig");
 const gpu_objects = @import("gpu.zig");
 const frame_res = @import("frame_res.zig");
 const base = @import("../renderer.zig");
@@ -116,6 +117,9 @@ pub const PbrRenderer = struct {
     last_analytic_sun: bool = false,
     last_hdri_width: u32 = 0,
     last_hdri_height: u32 = 0,
+
+    // Helios GPU GI: BVH snapshot, probe history and reservoirs.
+    gi: gpu_gi.State = .{},
 
     // Volumetric fog targets and temporal history.
     vol_target: ?Target = null,
@@ -326,6 +330,7 @@ pub const PbrRenderer = struct {
             db.* = .{};
         }
         self.destroyTargets(device);
+        self.gi.deinit(device);
         if (self.hdri_texture) |t| self.destroyTarget(device, t);
         self.hdri_texture = null;
         if (self.ring) |*r| r.deinit();
@@ -1016,9 +1021,29 @@ pub const PbrRenderer = struct {
             if (built_clusters.dropped_refs > 0) std.debug.print("[pbr] cluster light references dropped: {d}\n", .{built_clusters.dropped_refs});
         }
 
+        // Helios GPU GI keeps the probe grid resident on the GPU, so the CPU upload must not overwrite it.
+        const gi_input = self.frame_data.gpu_gi;
+        const gi_requested = gi_input.enabled and cl_lights.gi.origin_enabled[3] > 0;
+        if (!gi_requested) {
+            self.gi.valid = false;
+            self.gi.failed = false;
+        }
+        var gi_active = gi_requested and !self.gi.failed;
+        if (gi_active) {
+            self.gi.prepare(g, self.ring.?.buffer, gi_input) catch |err| {
+                self.gi.failed = true;
+                self.gi.valid = false;
+                gi_active = false;
+                std.debug.print("[pbr] GPU GI unavailable ({s}); using the CPU grid or the IBL fallback\n", .{@errorName(err)});
+            };
+        }
+        const preserve_gi_grid = gi_active and self.gi.valid and self.gi.grid_epoch != null and self.gi.grid_epoch.? == gi_input.grid_epoch;
+        if (gi_active and !preserve_gi_grid) cl_lights.gi.probes = @splat(.{});
+
         // Light/cluster/shadow buffers are persistent storage buffers rewritten every frame.
         {
-            const lights_bytes = std.mem.asBytes(cl_lights);
+            // Only overwrite the light prefix when the probe cache is GPU-resident.
+            const lights_bytes = std.mem.asBytes(cl_lights)[0..if (preserve_gi_grid) @offsetOf(layout.ClusterLightsBuffer, "gi") else @sizeOf(layout.ClusterLightsBuffer)];
             const grid_bytes = std.mem.sliceAsBytes(built_clusters.entries);
             const idx_raw = std.mem.sliceAsBytes(built_clusters.indices);
             const idx_bytes = idx_raw[0..@min(idx_raw.len, 65536 * 4)];
@@ -1026,6 +1051,14 @@ pub const PbrRenderer = struct {
             if (grid_bytes.len > 0) try device.writeBuffer(g.cluster_grid, 0, grid_bytes);
             if (idx_bytes.len > 0) try device.writeBuffer(g.cluster_indices, 0, idx_bytes);
             try device.writeBuffer(g.local_shadow_buf, 0, std.mem.asBytes(local_sh));
+        }
+
+        if (gi_active) {
+            const params = self.giParams(cl_lights, pt_count, sun_dir, sun_col);
+            self.gi.dispatch(&self.groups.?, &self.ring.?, rec, g.cluster_lights, @offsetOf(layout.ClusterLightsBuffer, "gi"), gi_input, params) catch |err| {
+                self.gi.valid = false;
+                return err;
+            };
         }
 
         // 1.5 Depth prepass + SSAO + contact shadows + bilateral blur.
@@ -1199,6 +1232,9 @@ pub const PbrRenderer = struct {
             break :blk self.bloom[0].?.view;
         } else g.black.view;
 
+        input.offerCapture(.hdr, .{ .texture = hdr.texture, .format = hdr_format, .width = hdr.width, .height = hdr.height });
+        if (prepass_ran) input.offerCapture(.ssao, .{ .texture = blur_t.texture, .format = ao_format, .width = blur_t.width, .height = blur_t.height });
+
         // 6. Post-process composite + tonemap into the frame target.
         {
             const post_pipeline = try g.postfxFor(input.target.color_format);
@@ -1242,6 +1278,45 @@ pub const PbrRenderer = struct {
         try self.flushScratch(g, &self.mask_params, &self.mask_scratch, g.l_mask_params, @sizeOf(layout.ShadowMaskParams), "shadow mask uniforms");
         self.rendered_this_frame = true;
         self.base.pbr_rendered = true;
+    }
+
+    /// Light importance table and sky constants for the GI compute pass.
+    fn giParams(self: *PbrRenderer, lights: *const layout.ClusterLightsBuffer, count: usize, sun_dir: [3]f32, sun_color: [3]f32) gpu_gi.Params {
+        var cdf: [64][4]f32 = @splat(@splat(0));
+        var weights: [256]f64 = @splat(0);
+        var total: f64 = 0;
+        for (lights.points[0..count], 0..) |light, i| {
+            const rgb = light.col_radius;
+            const lum = @as(f64, rgb[0]) * 0.2126 + @as(f64, rgb[1]) * 0.7152 + @as(f64, rgb[2]) * 0.0722;
+            if (std.math.isFinite(lum) and lum > 0 and light.shadow_params[2] > 0) {
+                weights[i] = lum;
+                total += lum;
+            }
+        }
+        var cumulative: f64 = 0;
+        for (0..count) |i| {
+            cumulative += if (total > 0) weights[i] / total else 1.0 / @as(f64, @floatFromInt(count));
+            cdf[i / 4][i % 4] = if (i + 1 == count) 1.0 else @floatCast(@min(cumulative, 1));
+        }
+        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(lights.points[0..count]));
+        const sky = self.frame_data.sky;
+        const zenith = if (sky.kind == .solid_color) sky.solid_color else sky.sky_tint;
+        const horizon = if (sky.kind == .solid_color) sky.solid_color else sky.horizon_tint;
+        const ground = if (sky.kind == .solid_color) sky.solid_color else sky.ground_albedo;
+        const intensity: f32 = if (self.frame_data.directional_lights.len > 0) self.frame_data.directional_lights[0].illuminance_lux / 2500.0 else 0;
+        return .{
+            .counts = .{ 0, 0, 0, @intCast(count) },
+            .offsets = .{ 0, 0, 0, 0 },
+            .dispatch_info = .{ 0, 0, 0, 0 },
+            .light_key = .{ @truncate(hash), @truncate(hash >> 32), 0, 0 },
+            .config = .{ 16, 0.85, 0.4, 0 },
+            .sun_dir_int = .{ sun_dir[0], sun_dir[1], sun_dir[2], intensity },
+            .sun_color = .{ sun_color[0], sun_color[1], sun_color[2], 0 },
+            .sky_zenith = .{ zenith[0], zenith[1], zenith[2], 0 },
+            .sky_horizon = .{ horizon[0], horizon[1], horizon[2], 0 },
+            .sky_ground = .{ ground[0], ground[1], ground[2], 0 },
+            .cdf = cdf,
+        };
     }
 
     const VolCtx = struct {

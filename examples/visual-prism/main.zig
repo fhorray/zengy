@@ -28,7 +28,9 @@ const std = @import("std");
 const engine = @import("engine");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
+const gpu_3d = @import("gpu_3d");
 const input = @import("input");
 const input_sdl3 = @import("input_sdl3");
 const camera = @import("camera");
@@ -1108,7 +1110,7 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
     // Optional automated screenshot capture (`ZENGY_PRISM_CAPTURE=<dir>`) to visually verify GI OFF vs HIGH.
     if (st.capture_dir) |cdir| {
         if (st.capture_pending) {
-            if (graphics_sdlgpu.takeCapture(st.app)) |img_val| {
+            if (wgpu.takeCapture(st.app)) |img_val| {
                 var img = img_val;
                 defer img.deinit(st.app.allocator);
                 const rgb = try capture_mod.displayToRgb8(st.app.allocator, img);
@@ -1155,7 +1157,7 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
             }
             st.capture_wait += 1;
             if (st.capture_wait >= 60) {
-                graphics_sdlgpu.requestCapture(st.app, .final);
+                _ = wgpu.requestCapture(st.app, .final);
                 st.capture_pending = true;
             }
         }
@@ -1411,7 +1413,9 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
+    try app.registerModule(gpu_3d.module());
     try app.registerModule(input.module());
     try app.registerModule(input_sdl3.module());
     try app.registerModule(camera.module());
@@ -1492,13 +1496,13 @@ pub fn main(init: std.process.Init) !void {
             .{.vertices=m_torus.vertices,.indices=m_torus.indices},
             .{.vertices=m_cone.vertices,.indices=m_cone.indices},
         },
-        .plane = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_plane.vertices), m_plane.indices)),
-        .cuboid = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_cuboid.vertices), m_cuboid.indices)),
-        .sphere = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_sphere.vertices), m_sphere.indices)),
-        .capsule = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_capsule.vertices), m_capsule.indices)),
-        .cylinder = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_cyl.vertices), m_cyl.indices)),
-        .torus = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_torus.vertices), m_torus.indices)),
-        .cone = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_cone.vertices), m_cone.indices)),
+        .plane = @bitCast(try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(m_plane.vertices), m_plane.indices)),
+        .cuboid = @bitCast(try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(m_cuboid.vertices), m_cuboid.indices)),
+        .sphere = @bitCast(try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(m_sphere.vertices), m_sphere.indices)),
+        .capsule = @bitCast(try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(m_capsule.vertices), m_capsule.indices)),
+        .cylinder = @bitCast(try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(m_cyl.vertices), m_cyl.indices)),
+        .torus = @bitCast(try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(m_torus.vertices), m_torus.indices)),
+        .cone = @bitCast(try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(m_cone.vertices), m_cone.indices)),
     };
 
     const sun_e = try app.world.spawn();
