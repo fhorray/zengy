@@ -799,6 +799,11 @@ pub const PbrRenderer = struct {
         return self.mask_params.group.?;
     }
 
+    /// Bind group cache counters (entries, hit/creation rates, evictions, frames over budget).
+    pub fn bindGroupStats(self: *const PbrRenderer) frame_res.CacheStats {
+        return if (self.groups) |g| g.stats() else .{};
+    }
+
     /// Routes GPU pass timings (available two to three frames after recording) to `sink`; null disables reporting.
     pub fn setTimingSink(self: *PbrRenderer, sink: ?gpu_timing.Sink) void {
         self.timing_sink = sink;
@@ -1254,9 +1259,16 @@ pub const PbrRenderer = struct {
 
         if (gi_active) {
             const params = self.giParams(cl_lights, pt_count, sun_dir, sun_col);
+            const gi_mark = rec.mark();
             self.gi.dispatch(&self.groups.?, &self.ring.?, rec, g.cluster_lights, @offsetOf(layout.ClusterLightsBuffer, "gi"), gi_input, params) catch |err| {
+                // GPU GI is optional: drop its half-recorded commands, stop using it, and fall back to the CPU grid
+                // the frame already carries (the probes this frame zeroed or preserved are rewritten from it).
+                rec.rollbackTo(gi_mark);
+                self.gi.failed = true;
                 self.gi.valid = false;
-                return err;
+                std.debug.print("[pbr] GPU GI dispatch failed ({s}); using the CPU grid or the IBL fallback\n", .{@errorName(err)});
+                cl_lights.gi = self.frame_data.dynamic_gi;
+                try device.writeBuffer(g.cluster_lights, @offsetOf(layout.ClusterLightsBuffer, "gi"), std.mem.asBytes(&cl_lights.gi));
             };
         }
 
@@ -1634,6 +1646,14 @@ pub const PbrRenderer = struct {
         return if (std.math.isFinite(value)) std.math.clamp(value, lo, hi) else fallback;
     }
 
+    /// True when a caster with `layers` can shadow volumetric fog through any of the active `reaches`.
+    fn volumetricReaches(reaches: []const shadow_cull.Reach, sphere: shadow_cull.Sphere, layers: u32) bool {
+        for (reaches) |r| {
+            if (pbr.layersOverlap(r.layers, layers) and shadow_cull.sphereWithinReach(sphere, r)) return true;
+        }
+        return false;
+    }
+
     const VolCtx = struct {
         light_vps: [4]math3d.Mat4,
         cascade_splits: [4]f32,
@@ -1836,9 +1856,40 @@ pub const PbrRenderer = struct {
             key_hasher.update(std.mem.asBytes(&vfp.cascade_info[2]));
             key_hasher.update(std.mem.asBytes(&vfp.cascade_info[3]));
             key_hasher.update(std.mem.asBytes(&vfp.froxel_params));
+            // Only casters that can shadow the fog invalidate the history: a character far from every volumetric
+            // light, or outside the volume, must not reset the accumulation.
+            var reaches: [9]shadow_cull.Reach = undefined;
+            var reach_count: usize = 0;
+            if (vc.shadows_enabled > 0.5 and vf_sun_int > 0.0) {
+                // Sun shadows exist only inside the cascades, and fog is only marched up to `max_distance`.
+                const last_cascade = if (dirs.len > 0) dirs[0].cascade_bounds[@min(dirs[0].cascade_count, 4) -| 1] else 0.0;
+                const reach_radius = @min(vol_cfg.max_distance, last_cascade) * 1.25 + 8.0;
+                reaches[reach_count] = .{ .center = cam_now, .radius = reach_radius, .layers = if (dirs.len > 0) dirs[0].layers else pbr.ALL_LAYERS };
+                reach_count += 1;
+            }
+            for (self.vol_sp_fader.slots, 0..) |slot, i| {
+                if (!slot.active or slot.weight <= 0.0 or vf_sp_shadow[i][1] < 0.5) continue;
+                const sl = self.frame_data.spot_lights[slot.idx];
+                reaches[reach_count] = .{ .center = sl.position, .radius = sl.range, .layers = sl.layers };
+                reach_count += 1;
+            }
+            for (self.vol_pt_fader.slots, 0..) |slot, i| {
+                if (!slot.active or slot.weight <= 0.0 or vf_pt_shadow[i][1] < 0.5) continue;
+                const pl = self.frame_data.point_lights[slot.idx];
+                reaches[reach_count] = .{ .center = pl.position, .radius = pl.range, .layers = pl.layers };
+                reach_count += 1;
+            }
             var caster_hash = shadow_plan.CasterHasher.init(0x30b0_116a);
-            for (self.queued_draws.items) |draw| caster_hash.addDraw(draw);
-            for (self.shadow_casters.items) |caster| caster_hash.addCaster(caster);
+            for (self.queued_draws.items) |draw| {
+                const mesh = self.base.meshes.get(@bitCast(draw.mesh_asset)) orelse continue;
+                const sphere = shadow_cull.transformSphere(draw.model_matrix, mesh.bounds);
+                if (volumetricReaches(reaches[0..reach_count], sphere, draw.layers)) caster_hash.addDraw(draw);
+            }
+            for (self.shadow_casters.items) |caster| {
+                const mesh = self.base.meshes.get(@bitCast(caster.mesh_asset)) orelse continue;
+                const sphere = shadow_cull.transformSphere(caster.model_matrix, mesh.bounds);
+                if (volumetricReaches(reaches[0..reach_count], sphere, caster.layers)) caster_hash.addCaster(caster);
+            }
             const geometry_key = caster_hash.final();
             key_hasher.update(std.mem.asBytes(&geometry_key));
             const light_key = key_hasher.final();

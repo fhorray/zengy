@@ -578,6 +578,19 @@ pub const CommandRecorder = struct {
         self.arena.deinit();
     }
 
+    /// Number of commands recorded so far; pass it to `rollbackTo` to undo a partially recorded step.
+    pub fn mark(self: *const CommandRecorder) usize {
+        return self.commands.items.len;
+    }
+
+    /// Discards every command recorded after `marked` (a value from `mark` taken outside any pass), including a
+    /// pass that failed halfway. This lets a renderer drop an optional step without failing the whole frame.
+    pub fn rollbackTo(self: *CommandRecorder, marked: usize) void {
+        self.commands.shrinkRetainingCapacity(@min(marked, self.commands.items.len));
+        self.open_render_pass = false;
+        self.open_compute_pass = false;
+    }
+
     /// Drops recorded commands but keeps allocated capacity for the next frame.
     pub fn reset(self: *CommandRecorder) void {
         self.commands.clearRetainingCapacity();

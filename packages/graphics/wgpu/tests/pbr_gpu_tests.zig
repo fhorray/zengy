@@ -408,3 +408,104 @@ test "shadow draw reservation follows the passes that really run" {
     }
     std.testing.allocator.free(try f.renderFrame(64, 64, .rgba8_unorm)); // would fail with ShadowDrawBudgetExceeded
 }
+
+test "volumetric history ignores distant casters and resets for casters that shadow the fog" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    var cube = try render_3d.gltf.createCubeMesh(std.testing.allocator, 1.0);
+    defer cube.deinit();
+    const mesh = try f.r3d.createMesh(f.g, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    const backend = f.renderer.vtable();
+
+    var data = sceneFrame(.{ 0, 2, 8.0 }, 1.0);
+    data.directional_lights = &.{.{ .direction = .{ -0.3, -1.0, -0.2 }, .color = .{ 1, 1, 1 }, .illuminance_lux = 10_000, .shadows_enabled = true, .shadow_depth_bias = 0.005, .shadow_normal_bias = 0.05, .cascade_count = 4 }};
+    data.post_process.bloom.enabled = false;
+    data.fog.enabled = true;
+    data.fog.density = 0.05;
+    data.fog.volumetric.enabled = true;
+    data.fog.volumetric.temporal = true;
+    data.fog.volumetric.max_distance = 50;
+
+    const Frame = struct {
+        fn run(fx: *Fixture, d: *const pbr.ExtractedPbrFrame, m: gpu_3d.MeshHandle, near_x: f32, far_x: f32) !u64 {
+            const be = fx.renderer.vtable();
+            try be.beginPbrFrame(be.ctx, d);
+            for ([_]f32{ near_x, far_x }, 0..) |x, i| {
+                const model = math3d.Mat4.translation(x, 0, if (i == 0) 0 else -2000);
+                const mvp = math3d.Mat4.mul(math3d.Mat4{ .m = d.view_proj }, model);
+                try be.submitLitMesh(be.ctx, @bitCast(m), model.m, mvp.m, .{ .base_color = .{ 0.7, 0.7, 0.7, 1 } }, .{ 1, 1, 1, 1 });
+            }
+            std.testing.allocator.free(try fx.renderFrame(64, 64, .rgba8_unorm));
+            return fx.renderer.vol_light_key;
+        }
+    };
+    _ = backend;
+    const settled = try Frame.run(f, &data, mesh, 0, 5000);
+    try std.testing.expectEqual(settled, try Frame.run(f, &data, mesh, 0, 5000)); // static scene keeps its history
+    try std.testing.expectEqual(settled, try Frame.run(f, &data, mesh, 0, 7000)); // far caster moved: history survives
+    try std.testing.expect(settled != try Frame.run(f, &data, mesh, 2, 7000)); // near caster moved: history resets
+}
+
+test "a failing gpu gi dispatch drops the step and falls back without failing the frame" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const backend = f.renderer.vtable();
+
+    // One triangle BVH is enough to drive the compute pass.
+    const nodes = [_]pbr.GpuGiNode{.{ .aabb_min = .{ -1, 0, -1 }, .left_or_first = 0, .aabb_max = .{ 1, 0.1, 1 }, .prim_count = 1 }};
+    const tris = [_]pbr.GpuGiTriangle{.{ .v0 = .{ -1, 0, -1 }, .material = 0, .v1 = .{ 1, 0, -1 }, .mask = 0xffff_ffff, .v2 = .{ 0, 0, 1 } }};
+    const mats = [_]pbr.GpuGiMaterial{.{ .albedo_metal = .{ 0.8, 0.2, 0.2, 0 }, .emissive_rough = .{ 0, 0, 0, 0.8 } }};
+    var data = sceneFrame(.{ 0, 2, 6.0 }, 1.0);
+    data.directional_lights = &sun;
+    data.post_process.bloom.enabled = false;
+    data.dynamic_gi.origin_enabled = .{ -4, 0, -4, 1 };
+    data.dynamic_gi.spacing = .{ 2, 2, 2, 0 };
+    data.gpu_gi = .{ .enabled = true, .geometry_revision = 1, .grid_epoch = 1, .nodes = &nodes, .triangles = &tris, .materials = &mats };
+
+    for (0..2) |_| {
+        try backend.beginPbrFrame(backend.ctx, &data);
+        std.testing.allocator.free(try f.renderFrame(64, 64, .rgba8_unorm));
+    }
+    try std.testing.expect(f.renderer.gi.valid);
+    try std.testing.expect(!f.renderer.gi.failed);
+
+    // Break the compute inputs: the bind group for the destroyed snapshot buffer can no longer be created.
+    f.renderer.groups.?.clear();
+    f.g.destroyBuffer(f.renderer.gi.snapshot.?);
+    try backend.beginPbrFrame(backend.ctx, &data);
+    const pixels = try f.renderFrame(64, 64, .rgba8_unorm); // must still render
+    defer std.testing.allocator.free(pixels);
+    try std.testing.expect(f.renderer.gi.failed);
+    try std.testing.expect(!f.renderer.gi.valid);
+    try std.testing.expect(luma(px(pixels, 64, 32, 8)) > 5);
+
+    // It stays on the fallback instead of retrying a broken pass every frame.
+    try backend.beginPbrFrame(backend.ctx, &data);
+    std.testing.allocator.free(try f.renderFrame(64, 64, .rgba8_unorm));
+    try std.testing.expect(f.renderer.gi.failed);
+}
+
+test "bind group cache reaches a steady state: no groups are created after the first frames" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    var cube = try render_3d.gltf.createCubeMesh(std.testing.allocator, 1.0);
+    defer cube.deinit();
+    const mesh = try f.r3d.createMesh(f.g, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    const backend = f.renderer.vtable();
+    var data = sceneFrame(.{ 0, 3.5, 5.0 }, 1.0);
+    data.directional_lights = &sun;
+    data.post_process.ssao.enabled = true;
+    data.post_process.bloom.enabled = true;
+    const model = math3d.Mat4.identity();
+    for (0..6) |_| {
+        try backend.beginPbrFrame(backend.ctx, &data);
+        try backend.submitLitMesh(backend.ctx, @bitCast(mesh), model.m, data.view_proj, .{ .base_color = .{ 0.8, 0.8, 0.8, 1 } }, .{ 1, 1, 1, 1 });
+        std.testing.allocator.free(try f.renderFrame(96, 96, .rgba8_unorm));
+    }
+    const s = f.renderer.bindGroupStats();
+    std.debug.print("\n[pbr] bind groups: entries={d} peak={d} hits/frame={d} created/frame={d} evicted={d}\n", .{ s.entries, s.peak_entries, s.hits_last_frame, s.created_last_frame, s.evicted_total });
+    try std.testing.expect(s.entries > 0 and s.entries < 64);
+    try std.testing.expectEqual(@as(u32, 0), s.created_last_frame); // steady state: only cache hits
+    try std.testing.expect(s.hits_last_frame > 0);
+    try std.testing.expectEqual(@as(u64, 0), s.over_budget_frames);
+}

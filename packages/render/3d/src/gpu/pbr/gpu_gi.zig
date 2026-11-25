@@ -162,11 +162,13 @@ pub const State = struct {
         params.dispatch_info = .{ self.cursor, std.math.clamp(input.rays_per_probe, 12, 64), self.frame, if (reset) 1 else 0 };
         const workgroups = std.math.clamp(input.probes_per_frame, 1, probe_slots);
 
+        // Everything that can fail for a reason other than recorder memory happens before the pass opens.
+        const params_offset = try ring.pushValue(params);
         try rec.beginComputePass(.{ .label = "helios gpu gi" });
         try rec.setComputePipeline(p.compute);
         try rec.setBindGroup(0, geo_group, &.{});
         try rec.setBindGroup(1, out_group, &.{});
-        try rec.setBindGroup(2, p.g_params, &.{try ring.pushValue(params)});
+        try rec.setBindGroup(2, p.g_params, &.{params_offset});
         try rec.dispatch(workgroups, 1, 1);
         try rec.endComputePass();
 

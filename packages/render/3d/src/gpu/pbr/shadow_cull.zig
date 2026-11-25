@@ -127,3 +127,27 @@ test "light frustum test culls spheres outside an identity clip volume and keeps
     // In front of the near plane is not culled.
     try std.testing.expect(!sphereOutsideLightFrustum(vp, .{ .center = .{ 0, 0, -3 }, .radius = 0.5 }));
 }
+
+/// A sphere inside which a light can put shadows on something visible (a point/spot light's range, or the fog
+/// volume around the camera for the sun), restricted to the layers the light affects.
+pub const Reach = struct {
+    center: [3]f32,
+    radius: f32,
+    layers: u32,
+};
+
+/// True when `s` touches the reach sphere. Used to hash only the casters that can change a temporal result.
+pub fn sphereWithinReach(s: Sphere, reach: Reach) bool {
+    const dx = s.center[0] - reach.center[0];
+    const dy = s.center[1] - reach.center[1];
+    const dz = s.center[2] - reach.center[2];
+    const r = reach.radius + s.radius;
+    return dx * dx + dy * dy + dz * dz <= r * r;
+}
+
+test "reach spheres keep nearby casters and drop distant ones" {
+    const reach: Reach = .{ .center = .{ 0, 0, 0 }, .radius = 10, .layers = 1 };
+    try std.testing.expect(sphereWithinReach(.{ .center = .{ 5, 0, 0 }, .radius = 1 }, reach));
+    try std.testing.expect(sphereWithinReach(.{ .center = .{ 12, 0, 0 }, .radius = 2.5 }, reach)); // touches the edge
+    try std.testing.expect(!sphereWithinReach(.{ .center = .{ 40, 0, 0 }, .radius = 3 }, reach));
+}
