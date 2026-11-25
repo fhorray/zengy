@@ -1,6 +1,6 @@
 # `sdl3`
 
-Vendored SDL 3.4.20 headers and Windows x64 import library (`SDL3.lib`) used by [`window-sdl3`](../window/sdl3/README.md) and [`graphics-sdlgpu`](../graphics/sdlgpu/README.md).
+Vendored SDL 3.4.20 headers and Windows x64 import library (`SDL3.lib`) used by [`window-sdl3`](../../packages/window/sdl3/README.md) and [`graphics-sdlgpu`](../../packages/graphics/sdlgpu/README.md).
 
 ## Notes
 

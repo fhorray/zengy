@@ -35,7 +35,7 @@ Concrete changes:
 - An adapter error is returned to the caller; Remote never retries it as a direct write.
 
 ## Exceptions
-`packages/sdl3` is vendored SDK and provisioning infrastructure used by the build and CLI, not a feature package. It stays where it is.
+Vendored SDL3 SDK files and their provisioning manifest live in `third_party/sdl3` (moved from `packages/sdl3`), since they are infrastructure, not a feature package. The build, CLI installer and `.paths` use the new location.
 
 ## Out of scope
 Scene documents, editor selection, document history, panels and the editor executable belong to `apps/editor` when they are built. Nothing here creates them.

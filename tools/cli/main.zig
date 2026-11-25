@@ -8,7 +8,7 @@
 //! - `new <name>`: scaffolds a game.toml + starter Python script + IDE typings project.
 //! - `typings`: writes Python `.pyi` stubs (`typings/`) and `pyrightconfig.json` in CWD.
 //! - `add <pkg>`: downloads an official package from GitHub into `./packages/<pkg>/`
-//!   (and any required `third_party/` dependency such as `pocketpy` or `sdl3`).
+//!   (and any required `third_party/` dependency such as `sdl3`).
 //!
 //! Usage:
 //!   zig build run-cli

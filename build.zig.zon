@@ -36,6 +36,7 @@
         "include",
         "src",
         "packages",
+        "third_party",
         "apps",
         "LICENSE",
         "README.md",

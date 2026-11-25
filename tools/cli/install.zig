@@ -19,12 +19,15 @@ pub fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Off
     const dir = packageDir(pkg.name);
     // `mkdir -p` does not exist in cmd.exe (it creates a folder literally named "-p"), so the
     // directory creation is spelled per shell.
-    const mk = if (builtin.os.tag == .windows) "(if not exist packages mkdir packages)" else "mkdir -p packages";
+    const mk = if (builtin.os.tag == .windows)
+        "(if not exist packages mkdir packages) && (if not exist third_party mkdir third_party)"
+    else
+        "mkdir -p packages third_party";
     const shell_cmd = if (pkg.third_party) |tp|
         try std.fmt.allocPrint(
             allocator,
-            "{s} && curl -sL https://github.com/fhorray/zengy/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zengy-main/packages/{s} zengy-main/packages/{s}",
-            .{ mk, dir, packageDir(tp) },
+            "{s} && curl -sL https://github.com/fhorray/zengy/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 -C . zengy-main/packages/{s} zengy-main/third_party/{s}",
+            .{ mk, dir, tp },
         )
     else
         try std.fmt.allocPrint(
@@ -53,8 +56,8 @@ pub fn installOfficialPackage(allocator: std.mem.Allocator, io: std.Io, pkg: Off
 
     std.debug.print("Installed official package into ./packages/{s}/\n", .{dir});
     if (pkg.third_party) |tp| {
-        std.debug.print("Installed required dependency into ./packages/{s}/\n", .{packageDir(tp)});
-        const tp_dir = try std.fmt.allocPrint(allocator, "packages/{s}", .{packageDir(tp)});
+        std.debug.print("Installed required dependency into ./third_party/{s}/\n", .{tp});
+        const tp_dir = try std.fmt.allocPrint(allocator, "third_party/{s}", .{tp});
         defer allocator.free(tp_dir);
         try provisionPackageDir(allocator, io, tp_dir);
     }

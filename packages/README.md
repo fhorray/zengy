@@ -17,7 +17,7 @@ Related packages are grouped by category; the public package name used by `zengy
 | `scripting/` | `host`, `lua`, `python` |
 | `render/` | `2d`, `3d`, `text` |
 | `formats/`, `tooling/` | format adapters and file watcher |
-| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `testing`, `default-plugins`, `sdl3` (third-party SDK) |
+| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `testing`, `default-plugins` |
 
 ## Package Catalog
 
@@ -55,6 +55,5 @@ Related packages are grouped by category; the public package name used by `zengy
 
 ## Not packages
 
-- `sdl3/` is vendored SDK and provisioning infrastructure (headers, import library, `zengy.toml` runtime fetch), kept at this path for the build and CLI. It is not a feature package.
+- SDL3 SDK files (headers, import library, `zengy.toml` runtime fetch) live in [`third_party/sdl3/`](../third_party/sdl3/README.md), not here. `zengy add` of an SDL3 provider installs them into `./third_party/sdl3/`.
 - The editor shell moved to `apps/editor` (see [ADR-008](../docs/adr/ADR-008-application-package-boundaries.md)); it is no longer installable with `zengy add`.
-- `ui/plume` and `ui/widgets` are source packages that are not yet in the CLI catalog; install them by copying or vendoring the source.
