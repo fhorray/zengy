@@ -3,5 +3,6 @@ test {
     _ = @import("gpu_device_tests.zig");
     _ = @import("render_2d_gpu_tests.zig");
     _ = @import("render_3d_gpu_tests.zig");
+    _ = @import("pbr_gpu_tests.zig");
     _ = @import("windowed_gpu_tests.zig");
 }

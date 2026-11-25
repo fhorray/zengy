@@ -343,7 +343,10 @@ pub const DepthStencilState = struct {
 pub const RenderPipelineDesc = struct {
     label: ?[]const u8 = null,
     layout: PipelineLayoutHandle,
+    /// Module holding the vertex entry point (and the fragment one unless `fragment_shader` is set).
     shader: ShaderModuleHandle,
+    /// Separate module for the fragment stage, for shaders translated stage by stage. Null reuses `shader`.
+    fragment_shader: ?ShaderModuleHandle = null,
     vertex_entry: []const u8 = "vs_main",
     /// Null builds a depth-only pipeline (for example shadow maps).
     fragment_entry: ?[]const u8 = "fs_main",

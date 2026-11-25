@@ -849,6 +849,7 @@ fn createRenderPipeline(ctx: *anyopaque, desc: gpu.RenderPipelineDesc) anyerror!
     const self = dev(ctx);
     const layout = self.pipeline_layouts.get(desc.layout) orelse return error.InvalidHandle;
     const shader = self.shaders.get(desc.shader) orelse return error.InvalidHandle;
+    const fragment_module = if (desc.fragment_shader) |h| (self.shaders.get(h) orelse return error.InvalidHandle).raw else shader.raw;
     var arena = std.heap.ArenaAllocator.init(self.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -887,7 +888,7 @@ fn createRenderPipeline(ctx: *anyopaque, desc: gpu.RenderPipelineDesc) anyerror!
 
     var fragment = std.mem.zeroes(c.WGPUFragmentState);
     if (desc.fragment_entry) |entry| {
-        fragment.module = shader.raw;
+        fragment.module = fragment_module;
         fragment.entryPoint = .{ .data = entry.ptr, .length = entry.len };
         fragment.targetCount = targets.len;
         fragment.targets = targets.ptr;

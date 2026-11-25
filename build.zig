@@ -626,6 +626,7 @@ pub fn build(b: *std.Build) void {
     gpu_3d_mod.addImport("engine", engine_mod);
     gpu_3d_mod.addImport("graphics", graphics_mod);
     gpu_3d_mod.addImport("gizmos", gizmos_mod);
+    gpu_3d_mod.addImport("render_3d", render_3d_mod);
 
     const draw_2d_mod = b.addModule("draw_2d", .{
         .root_source_file = b.path("packages/render/2d/src/draw_2d.zig"),
@@ -1589,6 +1590,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "gizmos", .mod = gizmos_mod },
+        .{ .name = "render_3d", .mod = render_3d_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/render/2d/tests/render_2d_tests.zig", target, optimize, false, &.{

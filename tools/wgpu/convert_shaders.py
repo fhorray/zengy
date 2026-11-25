@@ -21,6 +21,30 @@ GROUP = re.compile(r"\bset\s*=\s*(\d+)")
 COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/", re.S)
 STAGES = {".vert", ".frag", ".comp"}
 
+# WGSL has no NaN/infinity predicates, so test the IEEE-754 bit pattern instead.
+NAN_INF = """
+bool zy_isnan(float v) { return (floatBitsToUint(v) & 0x7fffffffu) > 0x7f800000u; }
+bool zy_isinf(float v) { return (floatBitsToUint(v) & 0x7fffffffu) == 0x7f800000u; }
+bvec2 zy_isnan(vec2 v) { return bvec2(zy_isnan(v.x), zy_isnan(v.y)); }
+bvec2 zy_isinf(vec2 v) { return bvec2(zy_isinf(v.x), zy_isinf(v.y)); }
+bvec3 zy_isnan(vec3 v) { return bvec3(zy_isnan(v.x), zy_isnan(v.y), zy_isnan(v.z)); }
+bvec3 zy_isinf(vec3 v) { return bvec3(zy_isinf(v.x), zy_isinf(v.y), zy_isinf(v.z)); }
+bvec4 zy_isnan(vec4 v) { return bvec4(zy_isnan(v.x), zy_isnan(v.y), zy_isnan(v.z), zy_isnan(v.w)); }
+bvec4 zy_isinf(vec4 v) { return bvec4(zy_isinf(v.x), zy_isinf(v.y), zy_isinf(v.z), zy_isinf(v.w)); }
+"""
+ISNAN = re.compile(r"\bisnan\s*\(")
+ISINF = re.compile(r"\bisinf\s*\(")
+
+
+def replace_nan_checks(source: str) -> str:
+    if not (ISNAN.search(source) or ISINF.search(source)):
+        return source
+    source = ISINF.sub("zy_isinf(", ISNAN.sub("zy_isnan(", source))
+    # Insert after the #version line, before any code that uses the helpers.
+    head, sep, rest = source.partition("\n")
+    return head + sep + NAN_INF + rest
+
+
 def split_samplers(source: str):
     # Leave comments intact, but mask them while finding declarations.
     masked = COMMENTS.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), source)
@@ -48,8 +72,10 @@ def split_samplers(source: str):
             raise ValueError(f"Generated name collision: {name}")
         # GLSL separate shadow samplers still use the sampler type; the constructor
         # carries the comparison semantics. Naga decides the resulting WGSL type.
+        # Comparison lookups need the dedicated shadow sampler type in Naga's GLSL front end.
+        sampler_kind = "samplerShadow" if shadow else "sampler"
         replacement = (f"\nlayout(set={g}, binding={b}) uniform texture{shape} {image};\n"
-                       f"layout(set={g}, binding={sampler_b}) uniform sampler {sampler};\n"
+                       f"layout(set={g}, binding={sampler_b}) uniform {sampler_kind} {sampler};\n"
                        f"#define {name} {kind}({image}, {sampler})\n")
         edits.append((match.start(),match.end(),replacement))
         bindings.append(dict(name=name,group=g,texture_binding=b,sampler_binding=sampler_b,comparison=shadow))
@@ -68,13 +94,14 @@ def convert(repo: Path, output: Path, naga: str):
         entry={'source':src.relative_to(repo).as_posix(),'source_sha256':hashlib.sha256(src.read_bytes()).hexdigest()}
         dest=output/(src.name+'.wgsl')
         try:
-            text,bindings=split_samplers(src.read_text(encoding='utf-8'))
+            text,bindings=split_samplers(replace_nan_checks(src.read_text(encoding='utf-8')))
             entry['bindings']=bindings
             with tempfile.TemporaryDirectory() as tmp:
                 intermediate=Path(tmp)/src.name
                 intermediate.write_text(text,encoding='utf-8')
                 candidate=Path(tmp)/dest.name
-                for command in ([naga,str(intermediate),str(candidate)],[naga,str(candidate)]):
+                stage={'.vert':'vert','.frag':'frag','.comp':'comp'}[src.suffix]
+                for command in ([naga,'--input-kind','glsl','--shader-stage',stage,str(intermediate),str(candidate)],[naga,str(candidate)]):
                     result=subprocess.run(command,text=True,capture_output=True,timeout=120)
                     if result.returncode: raise RuntimeError((result.stdout+'\n'+result.stderr).strip())
                 shutil.copyfile(candidate,dest)
@@ -93,6 +120,6 @@ def main():
     parser.add_argument('--output',required=True,type=Path)
     parser.add_argument('--naga',default='naga')
     args=parser.parse_args()
-    if not shutil.which(args.naga): parser.error('Install naga-cli 27.0.3 or pass --naga')
+    if not shutil.which(args.naga): parser.error('Install naga-cli 27.0.0 (cargo install naga-cli --version 27.0.0 --locked) or pass --naga')
     return convert(args.repo.resolve(),args.output.resolve(),args.naga)
 if __name__=='__main__': raise SystemExit(main())

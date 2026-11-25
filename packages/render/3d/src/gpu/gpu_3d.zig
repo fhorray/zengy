@@ -8,8 +8,12 @@ const std = @import("std");
 const engine = @import("engine");
 const graphics = @import("graphics");
 const gizmos = @import("gizmos");
+const render_3d = @import("render_3d");
 
 pub const renderer = @import("renderer.zig");
+pub const pbr_gpu = @import("pbr/gpu.zig");
+pub const pbr_renderer = @import("pbr/renderer.zig");
+pub const PbrRenderer = pbr_renderer.PbrRenderer;
 pub const Renderer3D = renderer.Renderer3D;
 pub const MeshHandle = renderer.MeshHandle;
 
@@ -41,6 +45,11 @@ fn buildModule(raw_app: *anyopaque) !void {
     try service.registerRenderer(r3d.worldRenderer());
     errdefer _ = service.unregisterRenderer("official.render.3d.gpu.world");
     try service.registerRenderer(r3d.gizmoRenderer());
+
+    try app.resources.insert(PbrRenderer, try PbrRenderer.init(app.allocator, r3d));
+    errdefer _ = app.resources.remove(PbrRenderer);
+    const pbr = app.resources.get(PbrRenderer).?;
+    try service.registerRenderer(pbr.frameRenderer());
 }
 
 /// Hooks optional producers once every module is built.
@@ -50,15 +59,22 @@ fn startModule(raw_app: *anyopaque) !void {
     if (app.resources.get(gizmos.GizmoService)) |giz| {
         giz.setBackend(.{ .ctx = r3d, .submitGizmos = submitGizmos });
     }
+    // The frontend extracts lights, materials and cameras; this renderer is its PBR backend.
+    if (app.resources.get(render_3d.Render3DService)) |frontend| {
+        if (app.resources.get(PbrRenderer)) |pbr| frontend.setPbrBackend(pbr.vtable());
+    }
 }
 
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     if (app.resources.get(gizmos.GizmoService)) |giz| giz.setBackend(null);
+    if (app.resources.get(render_3d.Render3DService)) |frontend| frontend.setPbrBackend(null);
     if (graphicsService(app)) |service| {
+        _ = service.unregisterRenderer("official.render.3d.gpu.pbr");
         _ = service.unregisterRenderer("official.render.3d.gpu.world");
         _ = service.unregisterRenderer("official.render.3d.gpu.gizmos");
     } else |_| {}
+    _ = app.resources.remove(PbrRenderer);
     _ = app.resources.remove(Renderer3D);
 }
 
@@ -100,4 +116,16 @@ pub fn queueMeshDraw(app: *engine.App, mesh: MeshHandle, mvp: [16]f32, color: [4
 test "public API compiles" {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(renderer);
+    // Force analysis of the PBR GPU graph so type errors surface even before the renderer uses it.
+    std.testing.refAllDecls(pbr_gpu);
+    _ = &pbr_gpu.Gpu.init;
+    _ = &pbr_gpu.Gpu.deinit;
+    _ = &pbr_gpu.Gpu.postfxFor;
+    std.testing.refAllDecls(PbrRenderer);
+    _ = &PbrRenderer.render;
+    _ = &PbrRenderer.vtable;
+    _ = &PbrRenderer.init;
+    _ = &PbrRenderer.deinit;
+    std.testing.refAllDecls(@import("pbr/layout.zig"));
+    std.testing.refAllDecls(@import("pbr/util.zig"));
 }

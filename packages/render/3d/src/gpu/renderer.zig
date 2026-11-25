@@ -8,6 +8,7 @@ const std = @import("std");
 const graphics = @import("graphics");
 const gizmos = @import("gizmos");
 const gizmo_lines = @import("gizmo_lines.zig");
+const shadow_cull = @import("pbr/shadow_cull.zig");
 
 const gpu = graphics.gpu;
 const frame = graphics.frame;
@@ -20,10 +21,12 @@ pub const depth_format: gpu.TextureFormat = .depth32_float;
 /// Stable mesh id. Its bit pattern fits `Mesh3D.mesh_asset`-style u64 fields.
 pub const MeshHandle = packed struct(u64) { index: u32, generation: u32 };
 
-const Mesh = struct {
+pub const Mesh = struct {
     vertex_buffer: gpu.BufferHandle,
     index_buffer: gpu.BufferHandle,
     index_count: u32,
+    /// Bounding sphere in model space, used by shadow caster culling.
+    bounds: shadow_cull.Sphere,
 };
 
 pub const QueuedMesh = struct {
@@ -94,6 +97,8 @@ pub const Renderer3D = struct {
     depth: ?DepthTarget = null,
     /// The world pass drew this frame, so gizmo depth tests have a populated depth buffer to load.
     world_drawn: bool = false,
+    /// The PBR renderer already drew the frame; the unlit pass then only reports the shared depth buffer.
+    pbr_rendered: bool = false,
 
     gizmo_view_proj: [16]f32 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 },
     gizmo_line_width: f32 = 2.0,
@@ -162,7 +167,13 @@ pub const Renderer3D = struct {
         const ib = try device.createBuffer(.{ .label = "mesh indices", .size = indices.len * 4, .usage = .{ .index = true, .copy_dst = true } });
         errdefer device.destroyBuffer(ib);
         try device.writeBuffer(ib, 0, std.mem.sliceAsBytes(indices));
-        return self.meshes.acquire(self.allocator, .{ .vertex_buffer = vb, .index_buffer = ib, .index_count = @intCast(indices.len) });
+        return self.meshes.acquire(self.allocator, .{
+            .vertex_buffer = vb,
+            .index_buffer = ib,
+            .index_count = @intCast(indices.len),
+            // 3D vertices are 32 bytes: position, normal, uv.
+            .bounds = shadow_cull.sphereFromVertices(vertex_bytes, 32),
+        });
     }
 
     pub fn destroyMesh(self: *Renderer3D, device: gpu.GpuDevice, handle: MeshHandle) void {
@@ -250,7 +261,7 @@ pub const Renderer3D = struct {
     }
 
     /// Depth buffer shared by the world and gizmo passes; recreated when the target size changes.
-    fn ensureDepth(self: *Renderer3D, device: gpu.GpuDevice, width: u32, height: u32) !gpu.TextureViewHandle {
+    pub fn ensureDepth(self: *Renderer3D, device: gpu.GpuDevice, width: u32, height: u32) !gpu.TextureViewHandle {
         if (self.depth) |d| {
             if (d.width == width and d.height == height) return d.view;
             device.destroyTextureView(d.view);
@@ -340,6 +351,12 @@ pub const Renderer3D = struct {
     fn renderWorld(self: *Renderer3D, input: *frame.FrameInput) !void {
         defer self.queued.clearRetainingCapacity();
         self.world_drawn = false;
+        if (self.pbr_rendered) {
+            // A PBR frame replaces the unlit pass (as before); gizmos still depth-test against its depth buffer.
+            self.pbr_rendered = false;
+            self.world_drawn = true;
+            return;
+        }
         if (self.queued.items.len == 0) return;
 
         const gs = try self.ensureGpu(input.device);
