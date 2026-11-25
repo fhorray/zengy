@@ -641,6 +641,39 @@ pub fn build(b: *std.Build) void {
 
     // Optional migration provider. The existing default build is unchanged.
     if (b.option([]const u8, "wgpu-root", "Absolute path to the wgpu-native v27.0.4.1 SDK")) |wgpu_root| {
+        const wgpu_include: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "include" }) };
+        const wgpu_lib: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib" }) };
+
+        // Typed access to the pinned webgpu.h/wgpu.h for the Zig resource layer.
+        const translate_wgpu = b.addTranslateC(.{
+            .root_source_file = b.path("packages/graphics/wgpu/src/wgpu_c.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        translate_wgpu.addIncludePath(wgpu_include);
+        const wgpu_c_mod = translate_wgpu.createModule();
+
+        // Native device layer: the C bridge (surface/swapchain) plus the Zig implementation of
+        // `graphics.gpu.GpuDevice`. Owns every wgpu-native call so renderers never see WGPU* types.
+        const wgpu_gpu_mod = b.addModule("wgpu_gpu", .{
+            .root_source_file = b.path("packages/graphics/wgpu/src/gpu_device.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        wgpu_gpu_mod.addImport("graphics", graphics_mod);
+        wgpu_gpu_mod.addImport("wgpu_c", wgpu_c_mod);
+        wgpu_gpu_mod.addIncludePath(b.path("packages/sdl3/include"));
+        wgpu_gpu_mod.addLibraryPath(b.path("packages/sdl3/lib/x64"));
+        wgpu_gpu_mod.linkSystemLibrary("SDL3", .{});
+        wgpu_gpu_mod.addIncludePath(wgpu_include);
+        wgpu_gpu_mod.addLibraryPath(wgpu_lib);
+        wgpu_gpu_mod.addCSourceFiles(.{
+            .files = &.{ "packages/graphics/wgpu/src/bridge.c", "packages/graphics/wgpu/src/geometry.c" },
+            .flags = &.{"-std=c11"},
+        });
+        wgpu_gpu_mod.linkSystemLibrary("wgpu_native", .{ .preferred_link_mode = .dynamic });
+
         const graphics_wgpu_mod = b.addModule("graphics_wgpu", .{
             .root_source_file = b.path("packages/graphics/wgpu/src/graphics_wgpu.zig"),
             .target = target,
@@ -650,16 +683,37 @@ pub fn build(b: *std.Build) void {
         graphics_wgpu_mod.addImport("engine", engine_mod);
         graphics_wgpu_mod.addImport("graphics", graphics_mod);
         graphics_wgpu_mod.addImport("window_sdl3", window_sdl3_mod);
-        graphics_wgpu_mod.addIncludePath(b.path("packages/sdl3/include"));
-        graphics_wgpu_mod.addLibraryPath(b.path("packages/sdl3/lib/x64"));
-        graphics_wgpu_mod.linkSystemLibrary("SDL3", .{});
-        graphics_wgpu_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "include" }) });
-        graphics_wgpu_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib" }) });
-        graphics_wgpu_mod.addCSourceFiles(.{
-            .files = &.{ "packages/graphics/wgpu/src/bridge.c", "packages/graphics/wgpu/src/geometry.c" },
-            .flags = &.{"-std=c11"},
+        graphics_wgpu_mod.addImport("wgpu_gpu", wgpu_gpu_mod);
+
+        // Real-GPU conformance tests. Kept out of the default `test` step, which must run without a GPU.
+        const gpu_test_mod = b.createModule(.{
+            .root_source_file = b.path("packages/graphics/wgpu/tests/gpu_device_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
         });
-        graphics_wgpu_mod.linkSystemLibrary("wgpu_native", .{ .preferred_link_mode = .dynamic });
+        gpu_test_mod.addImport("graphics", graphics_mod);
+        gpu_test_mod.addImport("wgpu_gpu", wgpu_gpu_mod);
+        const gpu_tests = b.addTest(.{ .root_module = gpu_test_mod });
+        const gpu_test_step = b.step("test-wgpu-gpu", "Run wgpu GpuDevice conformance tests on a real adapter");
+        // On Windows the loader needs SDL3.dll and wgpu_native.dll beside the executable, so run an
+        // installed copy (the cache copy fails with 0xC0000135 / exit 53), like `run-visual-hello`.
+        const wgpu_dll = b.addInstallBinFile(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib", "wgpu_native.dll" }) }, "wgpu_native.dll");
+        if (target.result.os.tag == .windows) {
+            const install_gpu_tests = b.addInstallArtifact(gpu_tests, .{ .dest_sub_path = "wgpu-gpu-tests.exe" });
+            const run_gpu_tests = b.addSystemCommand(&.{"zig-out/bin/wgpu-gpu-tests.exe"});
+            run_gpu_tests.setCwd(b.path("."));
+            run_gpu_tests.step.dependOn(&install_gpu_tests.step);
+            run_gpu_tests.step.dependOn(&wgpu_dll.step);
+            if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
+                const install_sdl = b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll");
+                run_gpu_tests.step.dependOn(&install_sdl.step);
+            }
+            gpu_test_step.dependOn(&run_gpu_tests.step);
+        } else {
+            gpu_test_step.dependOn(&b.addRunArtifact(gpu_tests).step);
+        }
+
         const visual_wgpu_mod = b.createModule(.{
             .root_source_file = b.path("examples/visual-wgpu/main.zig"),
             .target = target,
@@ -674,9 +728,21 @@ pub fn build(b: *std.Build) void {
         const install_wgpu = b.addInstallArtifact(visual_wgpu_exe, .{});
         const build_wgpu_step = b.step("build-visual-wgpu", "Build the native wgpu migration demo");
         build_wgpu_step.dependOn(&install_wgpu.step);
-        const run_wgpu = b.addRunArtifact(visual_wgpu_exe);
         const run_wgpu_step = b.step("run-visual-wgpu", "Run the native wgpu migration demo");
-        run_wgpu_step.dependOn(&run_wgpu.step);
+        if (target.result.os.tag == .windows) {
+            // Same loader constraint as the GPU tests: run the installed copy with its DLLs beside it.
+            const run_wgpu = b.addSystemCommand(&.{"zig-out/bin/visual-wgpu.exe"});
+            run_wgpu.setCwd(b.path("."));
+            run_wgpu.step.dependOn(&install_wgpu.step);
+            run_wgpu.step.dependOn(&wgpu_dll.step);
+            if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
+                const install_sdl = b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll");
+                run_wgpu.step.dependOn(&install_sdl.step);
+            }
+            run_wgpu_step.dependOn(&run_wgpu.step);
+        } else {
+            run_wgpu_step.dependOn(&b.addRunArtifact(visual_wgpu_exe).step);
+        }
     }
 
     // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
@@ -1251,6 +1317,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },
     }, null);
+
+    // Backend-neutral GPU contract: handle pools, command recorder and format helpers.
+    addModuleTest(b, test_step, "packages/graphics/core/src/gpu.zig", target, optimize, false, &.{}, null);
 
     addModuleTest(b, test_step, "packages/graphics/core/tests/graphics_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },

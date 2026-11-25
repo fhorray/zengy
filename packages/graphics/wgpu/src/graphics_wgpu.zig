@@ -4,6 +4,7 @@ const std = @import("std");
 const engine = @import("engine");
 const graphics = @import("graphics");
 const window_sdl3 = @import("window_sdl3");
+const wgpu_gpu = @import("wgpu_gpu");
 
 pub const PROVIDER_ID = "official.graphics.wgpu";
 pub const MODULE_OWNER_ID: u64 = 2099;
@@ -19,6 +20,8 @@ extern fn zwgpu_rect(out: *[6]Vertex2D, rect: *const [4]f32, clip: *const [4]f32
 const State = struct {
     allocator: std.mem.Allocator,
     gpu: *Native,
+    /// Resource/command layer over the same native device (see `graphics.gpu`).
+    device: *wgpu_gpu.Device,
     service: graphics.GraphicsDeviceService,
     surface: ?graphics.RenderTargetHandle = null,
     triangles: std.ArrayList(Vertex2D) = .empty,
@@ -100,9 +103,21 @@ fn buildModule(raw: *anyopaque) !void {
     const wgsl: []const u8 = @embedFile("shaders/color.wgsl");
     const gpu = zwgpu_create(window,wgsl.ptr,wgsl.len) orelse return nativeError();
     errdefer zwgpu_destroy(gpu);
+    const device = try wgpu_gpu.Device.initFromBridge(app.allocator, gpu, false);
+    errdefer device.deinit();
+    const detected = device.caps;
+    // Capabilities come from the real adapter report, not from constants.
+    const caps: graphics.DeviceCapabilities = .{
+        .compute = detected.supportsCompute(),
+        .depth_texture_sampling = true,
+        .storage_buffers = detected.limits.max_storage_buffers_per_shader_stage > 0,
+        .timestamp_queries = detected.features.timestamp_query,
+        .detected = detected,
+    };
     const state = try app.allocator.create(State);
     errdefer app.allocator.destroy(state);
-    state.* = .{ .allocator = app.allocator, .gpu = gpu, .service = graphics.GraphicsDeviceService.initWithBackend(app.allocator,&backend,state,.{ .compute = false, .depth_texture_sampling = false, .storage_buffers = false, .timestamp_queries = false }) };
+    state.* = .{ .allocator = app.allocator, .gpu = gpu, .device = device, .service = graphics.GraphicsDeviceService.initWithBackend(app.allocator,&backend,state,caps) };
+    state.service.gpu_device = device.gpuDevice();
     errdefer state.service.deinit();
     try app.resources.insert(StateRef,.{ .state = state });
     errdefer _ = app.resources.remove(StateRef);
@@ -117,7 +132,7 @@ fn stopModule(raw: *anyopaque) void {
     _ = app.services.unregisterByOwner(MODULE_OWNER_ID);
     _ = app.resources.remove(StateRef);
     state.triangles.deinit(state.allocator); state.vertices.deinit(state.allocator); state.clips.deinit(state.allocator);
-    state.service.deinit(); zwgpu_destroy(state.gpu); app.allocator.destroy(state);
+    state.service.deinit(); state.device.deinit(); zwgpu_destroy(state.gpu); app.allocator.destroy(state);
 }
 pub fn module() engine.Module {
     return .{ .descriptor = .{ .id = PROVIDER_ID, .version = "0.1.0", .provides_capabilities = &.{"engine.graphics.device/1"}, .required_capabilities = &.{"engine.window/1"} }, .build = buildModule, .stop = stopModule };

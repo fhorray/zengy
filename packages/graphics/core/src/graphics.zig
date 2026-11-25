@@ -12,6 +12,9 @@
 const std = @import("std");
 const engine = @import("engine");
 
+/// Backend-neutral GPU resource, pipeline and command contract implemented by providers.
+pub const gpu = @import("gpu.zig");
+
 pub const MODULE_OWNER_ID: u64 = 2002;
 
 pub const RenderTargetHandle = packed struct(u64) {
@@ -24,6 +27,8 @@ pub const DeviceCapabilities = struct {
     depth_texture_sampling: bool = true,
     storage_buffers: bool = false,
     timestamp_queries: bool = false,
+    /// Full adapter report (features, limits, identification) when the provider exposes a `GpuDevice`.
+    detected: ?gpu.Capabilities = null,
 };
 
 /// RGBA color in linear or sRGB [0..1] component space.
@@ -199,6 +204,8 @@ pub const GraphicsDeviceService = struct {
     caps: DeviceCapabilities,
     backend: ?*const BackendVTable = null,
     backend_ctx: ?*anyopaque = null,
+    /// Resource and command interface of the active provider; null for the headless software service.
+    gpu_device: ?gpu.GpuDevice = null,
 
     pub fn init(allocator: std.mem.Allocator) GraphicsDeviceService {
         return .{
@@ -234,6 +241,11 @@ pub const GraphicsDeviceService = struct {
 
     pub fn capabilities(self: *const GraphicsDeviceService) DeviceCapabilities {
         return self.caps;
+    }
+
+    /// Returns the provider's GPU resource interface, or `error.GpuUnavailable` for the software service.
+    pub fn gpuDevice(self: *const GraphicsDeviceService) !gpu.GpuDevice {
+        return self.gpu_device orelse error.GpuUnavailable;
     }
 
     pub fn setDeviceAvailable(self: *GraphicsDeviceService, available: bool) void {
