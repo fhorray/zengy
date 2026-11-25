@@ -7,6 +7,16 @@ on:
     branches: [ main, staging ]
 
 jobs:
+  architecture:
+    name: Architecture Boundaries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard self-test
+        run: python3 tools/ci/check_architecture.py --self-test
+      - name: Check dependency boundaries
+        run: python3 tools/ci/check_architecture.py
+
   test:
     name: Build & Test (${{ matrix.optimize }})
     runs-on: ubuntu-24.04
