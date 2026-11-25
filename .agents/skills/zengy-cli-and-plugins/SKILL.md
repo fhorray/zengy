@@ -2,8 +2,8 @@
 name: zengy-cli-and-plugins
 description: >-
   Guides development and testing of the zengy CLI (tools/cli), zengy-runtime
-  (tools/runtime), game.toml projects, zengy.toml manifests, and sandbox project
-  tests. Use when modifying tools/cli/, tools/runtime/, or plugin installation.
+  (apps/runtime), game.toml projects, zengy.toml manifests, and sandbox project
+  tests. Use when modifying tools/cli/, apps/runtime/, or plugin installation.
 ---
 
 # `zengy` CLI, Runtime & Plugin Workflows
@@ -21,7 +21,7 @@ description: >-
 
 ## 2. Native Zig Projects (`build.zig` + `build.zig.zon`)
 
-- Users add the engine via `zig fetch --save git+https://github.com/fhorray/zigeng#<tag>`.
+- Users add the engine via `zig fetch --save git+https://github.com/fhorray/zengy#<tag>`.
 - When running `zengy add <pkg>` in a directory with `build.zig.zon`, `tools/cli/main.zig` runs `provisionPackageDir()`:
   - Reads `<pkg>/zengy.toml` via `tools/cli/pkg_manifest.zig`.
   - Runs `zig fetch --save=<name> <url>` for matching `host_platform` (`<os>-<arch>`).

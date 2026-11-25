@@ -15,6 +15,18 @@ description: >-
 3. **Agnostic & community-extensible by design**: `zengy` is backend- and workflow-agnostic. Every new feature must be architected so the community can extend, swap, or build on top of it—following the same pattern as `scripting-host` (plug in any language VM), `physics` (swap solvers), or `ui-core`/`ui-widgets` (author any UI frontend or editor kit). Expose clean capability contracts, registries, events, or C ABI extension points rather than hardcoding a single vendor, language, or workflow.
 4. **Headless-first**: Any game or test must run deterministically without a window or GPU when visual modules are omitted.
 
+## Layer Decision Procedure
+
+1. Foundation required by the minimal headless engine → `src/core/`.
+2. Reusable capability or provider with application-independent semantics → `packages/`.
+3. Owns one application's UI, document state, workflow, selection or composition → that application under `apps/` (`apps/runtime`, `apps/editor`). An app directory is not a CLI-installable package.
+4. Automation for development, testing, installation or release → `tools/`.
+5. Only demonstrates an API → `examples/`; integration sandbox → `projects/`.
+
+Packages must never import `apps/`, `tools/`, `examples/` or tests. See `docs/adr/ADR-008-application-package-boundaries.md`; `tools/ci/check_architecture.py` enforces it.
+
+Every public `b.addModule` module must have a class row (`sdk`, `installable`, `source`, `internal`) in the "Module classification" table of `packages/README.md`; `installable` rows must match an entry in `tools/cli/catalog.zig`. Adding a package means updating the build, that table, and (if installable) the catalog; the guard enforces it.
+
 ## Package Directory Layout vs Public Names
 
 Related packages are grouped under category subdirectories in `packages/`, while public CLI names remain flat and hyphenated:
@@ -26,7 +38,7 @@ Related packages are grouped under category subdirectories in `packages/`, while
 - `ui`: `ui-core` (`packages/ui/core`), `ui-markup` (`packages/ui/markup`)
 - `scripting`: `scripting-host` (`packages/scripting/host`), `scripting-lua` (`packages/scripting/lua`), `scripting-python` (`packages/scripting/python`)
 - `formats` / `tooling`: `formats/toml`, `formats/json`, `tooling/file-watcher`
-- Flat: `assets`, `scene`, `editor-shell`, `testing`, `default-plugins`, `sdl3`
+- Flat: `assets`, `scene`, `testing`, `default-plugins`, `sdl3`
 
 ## Checklist When Adding a New Official Package
 

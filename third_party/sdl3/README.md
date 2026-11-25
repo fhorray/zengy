@@ -1,6 +1,6 @@
 # `sdl3`
 
-Vendored SDL 3.4.20 headers and Windows x64 import library (`SDL3.lib`) used by [`window-sdl3`](../window/sdl3/README.md) and [`graphics-wgpu`](../graphics/wgpu/README.md) (surface creation only).
+Vendored SDL 3.4.20 headers and Windows x64 import library (`SDL3.lib`) used by [`window-sdl3`](../../packages/window/sdl3/README.md) and [`graphics-wgpu`](../../packages/graphics/wgpu/README.md) (surface creation only).
 
 ## Notes
 

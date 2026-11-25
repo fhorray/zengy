@@ -112,7 +112,7 @@ Plugins that use engine modules (`physics/jolt`, `physics/rapier`) depend on `ze
 
 ```zig
 .zengy = .{
-    .url = "git+https://github.com/fhorray/zigeng#<commit>",
+    .url = "git+https://github.com/fhorray/zengy#<commit>",
     .hash = "zengy-<version>-...",   // `zig fetch <url>` prints it
 },
 ```

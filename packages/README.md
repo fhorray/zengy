@@ -11,13 +11,15 @@ Related packages are grouped by category; the public package name used by `zengy
 | Category | Directories |
 |---|---|
 | `physics/` | `core` (contract), `jolt`, `rapier` |
-| `ui/` | `core`, `markup` |
+| `ui/` | `core`, `markup`, `widgets`, `plume` |
 | `window/` | `core`, `sdl3` |
 | `graphics/` | `core`, `wgpu` |
 | `scripting/` | `host`, `lua`, `python` |
 | `render/` | `2d`, `3d`, `text` |
+| `audio/` | `core`, `sdl3`, `zaudio` |
+| `input/` | `core`, `haptics`, `sdl3` |
 | `formats/`, `tooling/` | format adapters and file watcher |
-| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `editor-shell`, `testing`, `default-plugins`, `sdl3` (third-party SDK) |
+| `flat` | `assets`, `scene`, `prefab`, `gizmos`, `shapes`, `dev-tools`, `picking`, `remote`, `log`, `state`, `camera`, `testing`, `default-plugins` |
 
 ## Package Catalog
 
@@ -41,7 +43,6 @@ Related packages are grouped by category; the public package name used by `zengy
 | [`assets/`](assets/src/assets.zig) | `official.assets` | `engine.assets/1` | URI-cached asset registry, priority-ordered importers, and owner-scoped unload. |
 | [`scene/`](scene/src/scene.zig) | `official.scene` | `engine.scene.2d/1` | 2D transform hierarchy (`Transform2D`, `Parent`), O(N) `.post_update` propagation, scene graph v1 (`scene.graph`: child lists, `reparent`, despawn policies), and `SceneSnapshot`. |
 | [`prefab/`](prefab/src/prefab.zig) | `official.prefab` | `engine.prefab/1` | Portable `Prefab` entity trees (stable type ids, versioned encoded components), field overrides, atomic batch `instantiate`, and a `PrefabLibrary` resource. |
-| [`editor-shell/`](editor-shell/src/editor_shell.zig) | `official.tools.editor_shell` | `engine.tools.editor_shell/1` | Optional dockable panel registry, schema-driven inspector, and transactional undo/redo. |
 | [`render/3d/`](render/3d/src/render_3d.zig) | `official.render.3d` | `engine.render.3d/1` | 3D transform/mesh components (`Transform3D`, `MeshRef`) and `.render_extract` draw extraction (powered by `official.camera`). |
 | [`render/prism/`](render/prism/src/prism.zig) | `official.render.prism` | `engine.render.prism/1` | Prism modular rendering orchestration: `ViewRegistry`, `PassGraph`, `PipelineCacheKey`, `RetirementQueue`, and headless `RecordingBackend`. |
 | [`render/helios/`](render/helios/src/helios.zig) | `official.render.helios` | `engine.render.helios/1` | Helios optional hybrid indirect illumination: SSGI Hi-Z traversal, `WorldRadianceCache`, and energy-conserving probe/sky fallback. |
@@ -55,3 +56,65 @@ Related packages are grouped by category; the public package name used by `zengy
 | [`formats/json/`](formats/json/src/json_format.zig) | `official.format.json` | `engine.format.json/1` | Dual JSON adapter (`std.json` for small configs, `yyjson` C11 for high-volume payloads). |
 | [`tooling/file-watcher/`](tooling/file-watcher/src/file_watcher.zig) | `official.tooling.file_watcher` | `engine.tooling.file_watcher/1` | Filesystem watching adapter over `lookout` for hot reload. |
 | [`testing/`](testing/src/testing_sdk.zig) | `official.testing` | `engine.testing.driver/1`, `engine.testing.capture/1` | Deterministic `TestDriver`, strict TOML `Scenario` runner, and offscreen RGBA8 `CaptureService`. |
+
+## Not packages
+
+- SDL3 SDK files (headers, import library, `zengy.toml` runtime fetch) live in [`third_party/sdl3/`](../third_party/sdl3/README.md), not here. `zengy add` of an SDL3 provider installs them into `./third_party/sdl3/`.
+- The editor shell moved to `apps/editor` (see [ADR-008](../docs/adr/ADR-008-application-package-boundaries.md)); it is no longer installable with `zengy add`.
+
+## Module classification
+
+Every Zig module declared with `b.addModule(...)` in `build/` has exactly one class. `tools/ci/check_architecture.py` fails when a module is missing here or an `installable` module has no matching CLI catalog entry.
+
+- `sdk`: the engine core module.
+- `installable`: a package users add with `zengy add <catalog name>`.
+- `source`: a public Zig module that needs a third-party Zig/C dependency declared in `build.zig.zon`, so it is used from the repository (or the Zig package) and is not offered by `zengy add`.
+- `internal`: an implementation detail of another package; not a supported import.
+
+Application-local modules (`editor_shell`, the editor `remote_adapter`, the runtime) are not SDK modules and are not listed. Third-party dependencies (`z_toml`, `lookout`, `yyjson`, `lua_c`, `zaudio`, `sdl3_win64`, PocketPy, SDL3 headers) are declared in `build.zig.zon` or under `third_party/`.
+
+| Module | Class | Catalog name |
+|---|---|---|
+| `engine` | sdk | |
+| `window` | installable | `window` |
+| `window_sdl3` | installable | `window-sdl3` |
+| `graphics` | installable | `graphics` |
+| `graphics_wgpu` | installable | `graphics-wgpu` |
+| `wgpu_gpu` | internal | |
+| `draw_2d` | internal | |
+| `gpu_3d` | internal | |
+| `ui_core` | installable | `ui-core` |
+| `ui_markup` | installable | `ui-markup` |
+| `ui_widgets` | installable | `ui-widgets` |
+| `ui_plume` | installable | `ui-plume` |
+| `scripting_host` | installable | `scripting-host` |
+| `scripting_lua` | installable | `scripting-lua` |
+| `scripting_python` | installable | `scripting-python` |
+| `assets` | installable | `assets` |
+| `scene` | installable | `scene` |
+| `prefab` | installable | `prefab` |
+| `physics` | installable | `physics` |
+| `toml_format` | source | |
+| `json_format` | source | |
+| `file_watcher` | source | |
+| `testing_sdk` | installable | `testing` |
+| `default_plugins` | installable | `default-plugins` |
+| `input` | installable | `input` |
+| `input_haptics` | installable | `input-haptics` |
+| `input_sdl3` | installable | `input-sdl3` |
+| `camera` | installable | `camera` |
+| `state` | installable | `state` |
+| `audio` | installable | `audio` |
+| `audio_sdl3` | installable | `audio-sdl3` |
+| `audio_zaudio` | source | |
+| `render_2d` | installable | `render-2d` |
+| `render_3d` | installable | `render-3d` |
+| `prism` | installable | `render-prism` |
+| `helios` | installable | `render-helios` |
+| `text` | installable | `text` |
+| `gizmos` | installable | `gizmos` |
+| `shapes` | installable | `shapes` |
+| `dev_tools` | installable | `dev-tools` |
+| `picking` | installable | `picking` |
+| `remote` | installable | `remote` |
+| `log` | installable | `log` |

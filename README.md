@@ -29,7 +29,7 @@ Check the **Releases** page on GitHub for prebuilt `Windows x64` and `Linux x64`
 Requires **Zig `0.17.1`**:
 
 ```bash
-git clone https://github.com/fhorray/zigeng.git
+git clone https://github.com/fhorray/zengy.git
 cd zengy
 
 # Verify everything works

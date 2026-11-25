@@ -2,7 +2,7 @@
 //!
 //! Provides a backend-agnostic `FrameProfilerService` (`engine.dev_tools.profiler/1`)
 //! that tracks per-pass GPU/CPU timings (`Shadow`, `SSAO`, `Volumetric`, `Forward+`,
-//! `Bloom`, `PostFX`, `Gizmos`, `UI`) and rolling frame history for `editor-shell`
+//! `Bloom`, `PostFX`, `Gizmos`, `UI`) and rolling frame history for editor tooling
 //! and `remote` inspection.
 
 const std = @import("std");

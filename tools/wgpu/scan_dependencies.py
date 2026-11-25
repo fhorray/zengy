@@ -8,7 +8,7 @@ def main():
     paths=subprocess.check_output(['git','ls-files','-z'],cwd=repo).decode().split('\0'); results=[]
     for relative in paths:
         file=repo/relative
-        if file.suffix not in {'.zig','.zon','.c','.h','.md','.yml','.yaml','.py','.json','.toml','.vert','.frag','.comp'} or relative.startswith('packages/sdl3/') or relative.startswith('packages/graphics/wgpu/') or not file.is_file():continue
+        if file.suffix not in {'.zig','.zon','.c','.h','.md','.yml','.yaml','.py','.json','.toml','.vert','.frag','.comp'} or relative.startswith(('packages/sdl3/','third_party/sdl3/')) or relative.startswith('packages/graphics/wgpu/') or not file.is_file():continue
         if file.stat().st_size>4*1024*1024:continue
         text=file.read_text(encoding='utf-8',errors='replace');match={}
         for key,pat in PATTERNS.items():

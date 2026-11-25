@@ -1,21 +1,69 @@
 //! Remote JSON-RPC Inspector Protocol (`official.remote`).
 //!
 //! Exposes live ECS inspection, component editing, profiler pass timings,
-//! editor-shell panels, and pointer focus over JSON-RPC 2.0 (`engine.remote/1`).
+//! panel listing, and pointer focus over JSON-RPC 2.0 (`engine.remote/1`).
+//! Applications can attach an optional `RemoteIntegration` to route edits
+//! through their own history and to publish panel descriptions.
 
 const std = @import("std");
 const engine = @import("engine");
 const dev_tools = @import("dev_tools");
-const editor_shell = @import("editor_shell");
 const picking = @import("picking");
 const log_pkg = @import("log");
 
 /// Owner ID used when registering `official.remote` services.
 pub const MODULE_OWNER_ID: u64 = 2044;
 
+/// An already validated reflected field edit handed to an attached integration.
+pub const FieldEditRequest = struct {
+    entity: engine.EntityHandle,
+    schema_id: engine.reflection.SchemaId,
+    /// Borrowed; valid only for the duration of the callback.
+    field_name: []const u8,
+    value: engine.reflection.FieldValue,
+};
+
+/// A panel description handed to a `PanelVisitor`. Strings are borrowed for the visit only.
+pub const PanelView = struct {
+    id: []const u8,
+    title: []const u8,
+    open: bool,
+};
+
+/// Synchronous callback receiving one `PanelView` per panel.
+pub const PanelVisitor = struct {
+    context: *anyopaque,
+    visit: *const fn (context: *anyopaque, panel: PanelView) anyerror!void,
+};
+
+/// Optional application hooks for `RemoteInspectorService`.
+///
+/// Callbacks run synchronously on the thread that calls `handleRequest`, and only for
+/// explicit RPC requests. Implementations must resolve any application state through
+/// `app` at call time rather than caching pointers to removable resources.
+pub const RemoteIntegration = struct {
+    context: *anyopaque,
+    /// Applies a validated edit. When set it is called exactly once per edit; an error is
+    /// propagated and the edit is never retried as a direct write.
+    edit_field: ?*const fn (context: *anyopaque, app: *engine.App, request: FieldEditRequest) anyerror!void = null,
+    /// Enumerates panels for `zengy/list_panels`.
+    visit_panels: ?*const fn (context: *anyopaque, app: *engine.App, visitor: PanelVisitor) anyerror!void = null,
+};
+
 /// Remote inspector service handling JSON-RPC 2.0 inspection & mutation requests.
 pub const RemoteInspectorService = struct {
     requests_handled: u64 = 0,
+    integration: ?RemoteIntegration = null,
+
+    /// Attaches (or replaces) the optional application integration.
+    pub fn setIntegration(self: *RemoteInspectorService, integration: RemoteIntegration) void {
+        self.integration = integration;
+    }
+
+    /// Detaches the integration; later requests follow the no-integration behavior.
+    pub fn clearIntegration(self: *RemoteInspectorService) void {
+        self.integration = null;
+    }
 
     /// Processes a JSON-RPC 2.0 request against `app` and returns an owned JSON response.
     pub fn handleRequest(
@@ -51,11 +99,11 @@ pub const RemoteInspectorService = struct {
         } else if (std.mem.eql(u8, method, "zengy/get_entity")) {
             return handleGetEntity(app, allocator, id_val, params);
         } else if (std.mem.eql(u8, method, "zengy/set_component_field")) {
-            return handleSetField(app, allocator, id_val, params);
+            return handleSetField(self.integration, app, allocator, id_val, params);
         } else if (std.mem.eql(u8, method, "zengy/get_profiler")) {
             return handleGetProfiler(app, allocator, id_val);
         } else if (std.mem.eql(u8, method, "zengy/list_panels")) {
-            return handleListPanels(app, allocator, id_val);
+            return handleListPanels(self.integration, app, allocator, id_val);
         } else if (std.mem.eql(u8, method, "zengy/get_focus")) {
             return handleGetFocus(app, allocator, id_val);
         } else if (std.mem.eql(u8, method, "zengy/get_logs")) {
@@ -191,7 +239,7 @@ fn jsonToF32(v: std.json.Value) ?f32 {
     };
 }
 
-fn handleSetField(app: *engine.App, allocator: std.mem.Allocator, id_val: std.json.Value, params: ?std.json.Value) ![]u8 {
+fn handleSetField(integration: ?RemoteIntegration, app: *engine.App, allocator: std.mem.Allocator, id_val: std.json.Value, params: ?std.json.Value) ![]u8 {
     const handle = parseEntityFromParams(params) orelse return writeError(allocator, id_val, -32602, "Invalid entity params");
     if (!app.world.isAlive(handle)) return writeError(allocator, id_val, -32001, "Entity not alive");
 
@@ -229,8 +277,18 @@ fn handleSetField(app: *engine.App, allocator: std.mem.Allocator, id_val: std.js
         else => return writeError(allocator, id_val, -32602, "Unsupported field type"),
     };
 
-    if (app.resources.get(editor_shell.EditorShellService)) |shell| {
-        try shell.setInspectedField(&app.world, &app.types, handle, schema.schema_id, fd.name, typed_val);
+    const edit_hook: ?struct { context: *anyopaque, edit: *const fn (*anyopaque, *engine.App, FieldEditRequest) anyerror!void } = blk: {
+        const hooks = integration orelse break :blk null;
+        const edit = hooks.edit_field orelse break :blk null;
+        break :blk .{ .context = hooks.context, .edit = edit };
+    };
+    if (edit_hook) |h| {
+        try h.edit(h.context, app, .{
+            .entity = handle,
+            .schema_id = schema.schema_id,
+            .field_name = fd.name,
+            .value = typed_val,
+        });
     } else {
         const bytes = app.world.getRaw(handle, schema.component_type_id) orelse return writeError(allocator, id_val, -32004, "Component not present");
         try engine.TypeRegistry.setField(schema, bytes, fd.name, typed_val);
@@ -271,19 +329,31 @@ fn handleGetProfiler(app: *engine.App, allocator: std.mem.Allocator, id_val: std
     return buf.toOwnedSlice(allocator);
 }
 
-fn handleListPanels(app: *engine.App, allocator: std.mem.Allocator, id_val: std.json.Value) ![]u8 {
+/// Appends each visited panel to the response; JSON encoding stays in Remote.
+const PanelJsonContext = struct {
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    count: usize = 0,
+
+    fn visit(raw: *anyopaque, panel: PanelView) anyerror!void {
+        const self: *PanelJsonContext = @ptrCast(@alignCast(raw));
+        if (self.count > 0) try self.buf.append(self.allocator, ',');
+        self.count += 1;
+        try self.buf.print(self.allocator, "{{\"id\":\"{s}\",\"title\":\"{s}\",\"open\":{}}}", .{ panel.id, panel.title, panel.open });
+    }
+};
+
+fn handleListPanels(integration: ?RemoteIntegration, app: *engine.App, allocator: std.mem.Allocator, id_val: std.json.Value) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
     try appendIdJson(&buf, allocator, id_val);
     try buf.appendSlice(allocator, ",\"result\":{\"panels\":[");
 
-    if (app.resources.get(editor_shell.EditorShellService)) |shell| {
-        for (shell.panels.items, 0..) |p, i| {
-            if (i > 0) try buf.append(allocator, ',');
-            try buf.print(allocator, "{{\"id\":\"{s}\",\"title\":\"{s}\",\"open\":{}}}", .{ p.id, p.title, p.open });
-        }
-    }
+    if (integration) |hooks| if (hooks.visit_panels) |visit_panels| {
+        var ctx = PanelJsonContext{ .buf = &buf, .allocator = allocator };
+        try visit_panels(hooks.context, app, .{ .context = &ctx, .visit = PanelJsonContext.visit });
+    };
     try buf.appendSlice(allocator, "]}}");
     return buf.toOwnedSlice(allocator);
 }

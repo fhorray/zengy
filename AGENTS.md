@@ -10,6 +10,12 @@
 - **Reference ecosystem (`zig-gamedev`)**: When implementing specific Zig gamedev systems, math, audio, physics, or native bindings, consult [`zig-gamedev`](https://github.com/zig-gamedev) packages as a reference before reinventing low-level bindings, while wrapping any chosen dependency behind `zengy`'s agnostic capability contracts.
 - **Headless-first**: All core simulation and tests must run deterministically without a window or GPU.
 
+## Repository Layers
+
+- `src/core/` core SDK; `packages/` reusable optional capabilities and providers; `apps/` complete applications (`apps/runtime`, `apps/editor`); `tools/` developer automation (`cli`, `ci`); `examples/`, `projects/`, `benchmarks/`, `tests/` demos, integration sandboxes, perf and fixtures. See `docs/adr/ADR-008-application-package-boundaries.md`.
+- **Forbidden reverse dependencies**: core never imports packages; packages never import `apps/`, `tools/`, `examples/` or tests; apps and tools never import each other's sources (launching an executable is fine). Application-specific UI, documents, selection and workflow stay in the application until a concrete reuse need exists; do not create a package just to split a file.
+- Run `python3 tools/ci/check_architecture.py` after moving files or changing module wiring in `build.zig`.
+
 ## Code & Documentation Style
 
 - **English only**: Keep all repository code, comments, docstrings, documentation, skills, and commit messages in English.
@@ -36,7 +42,7 @@
 - **No binaries in git**: Never commit `.dll`, `.dylib`, `.so`, or `.exe` binaries into the repository.
 - **wgpu-native provisioning**: `graphics-wgpu` links the pinned wgpu-native `v27.0.4.1`, installed with `python tools/wgpu/install_wgpu.py --output .deps/wgpu-native` (SHA-256 verified, never committed). It is the only graphics foundation: no SDL_GPU, SPIR-V or custom Vulkan/DX12/Metal backends, and the Vulkan SDK is not required. Shaders are WGSL checked into the repo. A plain `zig build` must keep working without the SDK (visual targets are skipped).
 - **SDL3 provisioning**:
-  - Windows x64 fetches `SDL3-3.4.20-win32-x64.zip` via `build.zig.zon` (`sdl3_win64`) and `packages/sdl3/zengy.toml` (`zengy add`).
+  - Windows x64 fetches `SDL3-3.4.20-win32-x64.zip` via `build.zig.zon` (`sdl3_win64`) and `third_party/sdl3/zengy.toml` (`zengy add`).
   - macOS release archives (`.github/workflows/release.yml`) bundle `libSDL3.0.dylib` beside `zengy-runtime`, rewrite its dependency to `@executable_path/libSDL3.0.dylib` via `install_name_tool`, and re-sign both binaries with `codesign --force --sign -`. Native `zig build` of visual targets on macOS/Linux links the system SDL3 (`brew install sdl3` on macOS) because upstream SDL3 distributes macOS binaries as a `.dmg` that `zig fetch` cannot unpack.
 - **GitHub Actions runners**: `macos-14` was retired by GitHub on November 2, 2026. Always use `macos-15` (or newer) for macOS workflows.
 - **Cross-platform CLI (`tools/cli/`)**: Prefer `std.process.run` with explicit `argv`; when shell commands are unavoidable, handle `cmd.exe` vs `sh -c` explicitly (e.g., never pass `mkdir -p` to `cmd.exe`).
@@ -52,7 +58,7 @@
 
 Load the relevant skill before making changes in these areas:
 
-- `.agents/skills/sdl3-cross-platform/SKILL.md` — SDL3 linking, `packages/sdl3/zengy.toml`, and macOS/Windows/Linux release bundling.
+- `.agents/skills/sdl3-cross-platform/SKILL.md` — SDL3 linking, `third_party/sdl3/zengy.toml`, and macOS/Windows/Linux release bundling.
 - `.agents/skills/zengy-architecture-and-packages/SKILL.md` — Module boundaries, `packages/` layout, and adding new official packages.
 - `.agents/skills/zengy-cli-and-plugins/SKILL.md` — `zengy` CLI (`game.toml` and `build.zig.zon` hooks), `--fork`, and sandbox tests.
 - `.agents/skills/zengy-c-abi-and-ffi/SKILL.md` — `include/engine_extension.h` contract and `c_plugin` verification.

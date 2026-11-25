@@ -1,7 +1,7 @@
-//! Visual Shapes, Picking, Profiler & Remote Inspector Showcase (`examples/visual-inspector/main.zig`).
+//! Visual Shapes, Picking, Profiler & Remote Inspector Showcase (`apps/editor/examples/visual-inspector/main.zig`).
 //!
 //! Combines `official.shapes`, `official.picking`, `official.gizmos`,
-//! `official.dev_tools`, `official.tools.editor_shell`, and `official.remote`:
+//! `official.dev_tools`, `app.editor.shell`, and `official.remote`:
 //! - Procedural PBR shapes (`Plane`, `Cuboid`, `Sphere`, `Capsule`, `Cylinder`, `Torus`, `Cone`)
 //! - 3D raycast picking + `InputFocus` selection + `GizmoService` highlight
 //! - Live per-pass profiler HUD (`Shadow`, `SSAO`, `Forward+`, `Volumetric`, `Bloom`, `PostFX`)
@@ -34,6 +34,7 @@ const dev_tools = @import("dev_tools");
 const editor_shell = @import("editor_shell");
 const picking = @import("picking");
 const remote = @import("remote");
+const remote_adapter = @import("remote_adapter");
 
 const InspectorState = struct {
     app: *engine.App,
@@ -235,6 +236,8 @@ pub fn main(init: std.process.Init) !void {
     try app.addSystem(.{ .name = "inspector.overlay", .stage = .render_extract, .run = renderOverlay });
 
     try app.initialize();
+    // Route remote edits through the editor shell history and expose its panels.
+    try remote_adapter.attach(&app);
     if (app.resources.get(gizmos.GizmoService)) |giz| {
         giz.config.line.width = 2.0;
         giz.config.xray_alpha = 0.95;

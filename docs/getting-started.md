@@ -5,7 +5,7 @@ This guide walks you through setting up `zengy`, running the built-in examples, 
 ## 1. Prerequisites
 
 - **Zig `0.17.1`** (pinned in [`build.zig.zon`](../build.zig.zon)).
-- **Visual demos on Windows x64**: SDL 3.4.20 headers and `SDL3.lib` are vendored in `packages/sdl3/`. Place `SDL3.dll` in `packages/sdl3/bin/x64/SDL3.dll` (or next to the `.exe` in `zig-out/bin/`). Install the pinned wgpu-native SDK once with `python tools/wgpu/install_wgpu.py --output .deps/wgpu-native`; any Vulkan, DX12 or Metal driver works and the Vulkan SDK is not required.
+- **Visual demos on Windows x64**: SDL 3.4.20 headers and `SDL3.lib` are vendored in `third_party/sdl3/`. Place `SDL3.dll` in `third_party/sdl3/bin/x64/SDL3.dll` (or next to the `.exe` in `zig-out/bin/`). Install the pinned wgpu-native SDK once with `python tools/wgpu/install_wgpu.py --output .deps/wgpu-native`; any Vulkan, DX12 or Metal driver works and the Vulkan SDK is not required.
 - **Linux / macOS**: Headless builds and `zig build test` work out of the box. Native visual builds on Linux/macOS require installing SDL3 system libraries.
 
 ## 2. Verify Your Environment
