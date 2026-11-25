@@ -196,7 +196,7 @@ All previous high-severity rendering issues are fixed or explicitly deferred wit
 
 ### 5.1 Architectural decisions
 
-- [x] Write ADRs for package boundaries, graphics provider contract, render world, frame ownership, pass scheduling and compatibility. Use existing module descriptors and scopes; review service exclusivity and ABI implications. (`docs/adr/ADR-008-prism-helios-rendering.md`)
+- [x] Write ADRs for package boundaries, graphics provider contract, render world, frame ownership, pass scheduling and compatibility. Use existing module descriptors and scopes; review service exclusivity and ABI implications. (`docs/adr/ADR-009-prism-helios-rendering.md`)
 - [ ] Inventory all SDL-specific types and calls in `pbr_backend.zig` and public graphics helpers. Classify resource creation, recording, presentation, feature policy and scene data.
 - [ ] Initially split code inside existing packages if that avoids build churn. Move pure policy first, then shader-independent passes; migrate one pass end-to-end at a time. Avoid a permanent second implementation.
 - [x] Define a narrow GPU interface driven by existing passes: buffer/texture/sampler/shader/pipeline handles, upload, render/compute/copy recording, submission/completion, format/capability queries. Explicit ownership, errors, usage flags and thread affinity. Avoid abstracting native features not yet needed. (`PrismBackendVTable` + `RecordingBackend` in `packages/render/prism`)

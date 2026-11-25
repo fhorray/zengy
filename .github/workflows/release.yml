@@ -44,6 +44,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
+      - name: Install pinned wgpu-native (Windows x64 gnu)
+        # Runtime links wgpu-native; release must provision the same pinned SDK as CI/local builds.
+        run: python3 tools/wgpu/install_wgpu.py --target windows-x86_64-gnu --output .deps/wgpu-native
       - name: Build Windows x64 (ReleaseSafe)
         run: zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
       - name: Stage Windows release archive
@@ -54,6 +57,9 @@ jobs:
           cp zig-out/bin/zengy.exe zig-out/bin/zengy-runtime.exe "$STAGE/"
           curl -sL "https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20-win32-x64.zip" -o /tmp/sdl3.zip
           unzip -j -o /tmp/sdl3.zip "SDL3.dll" -d "$STAGE/"
+          cp .deps/wgpu-native/lib/wgpu_native.dll "$STAGE/"
+          if [ -f .deps/wgpu-native/LICENSE ]; then cp .deps/wgpu-native/LICENSE "$STAGE/LICENSE-wgpu-native"; fi
+          if [ -f .deps/wgpu-native/zengy-wgpu-version.txt ]; then cp .deps/wgpu-native/zengy-wgpu-version.txt "$STAGE/"; fi
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
           (cd dist && zip -r "zengy-${TAG}-x86_64-windows.zip" "zengy-${TAG}-x86_64-windows")
@@ -102,6 +108,8 @@ jobs:
           version: 0.17.1
       - name: Install SDL3 via Homebrew
         run: brew install sdl3
+      - name: Install pinned wgpu-native (macOS arm64)
+        run: python3 tools/wgpu/install_wgpu.py --target macos-aarch64 --output .deps/wgpu-native
       - name: Build macOS arm64 CLI & runtime (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
       - name: Stage macOS release archive
@@ -118,9 +126,26 @@ jobs:
           if [ -n "$SDL3_DEP" ]; then
             install_name_tool -change "$SDL3_DEP" "@executable_path/libSDL3.0.dylib" "$STAGE/zengy-runtime"
           fi
+          # Bundle wgpu-native next to the runtime (name varies by SDK layout).
+          WGPU_LIB="$(find .deps/wgpu-native/lib -maxdepth 1 \( -name 'libwgpu_native*.dylib' -o -name 'wgpu_native*.dylib' \) | head -n 1)"
+          if [ -z "$WGPU_LIB" ]; then
+            echo "wgpu-native dylib missing under .deps/wgpu-native/lib" >&2
+            ls -la .deps/wgpu-native/lib >&2 || true
+            exit 1
+          fi
+          cp -L "$WGPU_LIB" "$STAGE/libwgpu_native.dylib"
+          chmod 755 "$STAGE/libwgpu_native.dylib"
+          install_name_tool -id "@executable_path/libwgpu_native.dylib" "$STAGE/libwgpu_native.dylib"
+          WGPU_DEP="$(otool -L "$STAGE/zengy-runtime" | awk '/wgpu/{print $1; exit}')"
+          if [ -n "$WGPU_DEP" ]; then
+            install_name_tool -change "$WGPU_DEP" "@executable_path/libwgpu_native.dylib" "$STAGE/zengy-runtime"
+          fi
           codesign --force --sign - "$STAGE/libSDL3.0.dylib"
+          codesign --force --sign - "$STAGE/libwgpu_native.dylib"
           codesign --force --sign - "$STAGE/zengy-runtime"
           otool -L "$STAGE/zengy-runtime"
+          if [ -f .deps/wgpu-native/LICENSE ]; then cp .deps/wgpu-native/LICENSE "$STAGE/LICENSE-wgpu-native"; fi
+          if [ -f .deps/wgpu-native/zengy-wgpu-version.txt ]; then cp .deps/wgpu-native/zengy-wgpu-version.txt "$STAGE/"; fi
           cp include/engine_extension.h "$STAGE/include/"
           cp README.md LICENSE "$STAGE/"
           tar -czf "dist/zengy-${TAG}-arm64-macos.tar.gz" -C dist "zengy-${TAG}-arm64-macos"

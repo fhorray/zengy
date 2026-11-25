@@ -27,6 +27,7 @@ Welcome to the `zengy` documentation. This engine is built around a **minimal he
   - [ADR-006: Scheduler, Commands, Borrows, and Thread Affinity](adr/ADR-006-scheduler-commands.md)
   - [ADR-007: ECS Backend Facade](adr/ADR-007-ecs-facade.md)
   - [ADR-008: Application and Package Boundaries](adr/ADR-008-application-package-boundaries.md)
+  - [ADR-009: Prism & Helios Rendering Architecture](adr/ADR-009-prism-helios-rendering.md)
 
 ## Quickstart Commands
 

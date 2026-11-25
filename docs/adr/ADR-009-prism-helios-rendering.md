@@ -1,8 +1,9 @@
-# ADR-008: Prism & Helios Rendering Architecture
+# ADR-009: Prism & Helios Rendering Architecture
 
 - **Status:** Accepted (Stage 01 Foundation)
 - **Date:** 2026-11-24
-- **Related:** ADR-001, ADR-002, ADR-003, ADR-005, ADR-006, ADR-007
+- **Related:** ADR-001, ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008
+- **Note:** Renumbered from a duplicate ADR-008 collision with application/package boundaries.
 
 ## Context
 

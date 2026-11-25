@@ -89,7 +89,9 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     });
     if (wgpu_missing) |fail| editor_exe.step.dependOn(&fail.step) else b.installArtifact(editor_exe);
 
-    const run_editor = b.addSystemCommand(&.{"zig-out/bin/zengy-editor.exe"});
+    // Run the installed binary so SDL3/wgpu DLLs beside zig-out/bin are found (cache copy fails on Windows).
+    const editor_bin = if (target.result.os.tag == .windows) "zig-out/bin/zengy-editor.exe" else "zig-out/bin/zengy-editor";
+    const run_editor = b.addSystemCommand(&.{editor_bin});
     run_editor.setCwd(b.path("."));
     run_editor.step.dependOn(b.getInstallStep());
     if (wgpu_missing) |fail| run_editor.step.dependOn(&fail.step);
