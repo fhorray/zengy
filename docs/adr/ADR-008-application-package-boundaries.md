@@ -29,9 +29,9 @@ Concrete changes:
 - Move reusable tooling (remote, gizmos, testing, file watching) into apps: these are application-independent capabilities and stay packages.
 - Regroup `packages/` into new categories: churn that breaks public names and paths for no boundary benefit.
 
-## Tradeoffs and compatibility
-- Removing `editor-shell` from the CLI catalog is a deliberate breaking change for anyone running `zengy add editor-shell` or importing the old module path. Migration: copy `apps/editor/src/shell.zig` into the consuming application and attach `remote_adapter` explicitly if remote edits should join its history.
-- Remote edits no longer enter undo history implicitly; the application must attach the adapter. Without an adapter `set_component_field` writes directly and `list_panels` returns `{"panels":[]}`.
+## Consequences
+- `editor-shell` is not a public module or CLI package. No compatibility layer, deprecation period or migration path is provided.
+- Remote edits enter undo history only when the application attaches the adapter. Without one, `set_component_field` writes directly and `list_panels` returns `{"panels":[]}`.
 - An adapter error is returned to the caller; Remote never retries it as a direct write.
 
 ## Exceptions
