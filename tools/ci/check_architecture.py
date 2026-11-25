@@ -103,7 +103,7 @@ def check_sources(root, errors):
 
 
 def check_catalog(root, errors):
-    p = os.path.join(root, "tools/cli/main.zig")
+    p = os.path.join(root, "tools/cli/catalog.zig")
     if not os.path.isfile(p):
         return
     text = open(p, encoding="utf-8").read()
@@ -111,7 +111,7 @@ def check_catalog(root, errors):
     for name, entry in re.findall(r'\.name = "([\w-]+)", \.entry = "([^"]+)"', text):
         f = f"packages/{dirs.get(name, name)}/{entry}"
         if not os.path.isfile(os.path.join(root, f)):
-            errors.append(f"tools/cli/main.zig: official package '{name}' maps to missing file {f}")
+            errors.append(f"tools/cli/catalog.zig: official package '{name}' maps to missing file {f}")
 
 
 def check(root):
