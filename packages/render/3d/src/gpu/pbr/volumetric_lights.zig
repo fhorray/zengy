@@ -1,4 +1,4 @@
-//! Deterministic point-light ranking for the volumetric fog pass (`graphics-sdlgpu`).
+//! Deterministic point-light ranking for the volumetric fog pass (`render-3d` GPU renderer).
 //!
 //! Pure Zig with no GPU or SDL dependency, so the selection is unit-tested headlessly.
 

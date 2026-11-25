@@ -1,6 +1,6 @@
 # Running the visual demos without a display or GPU
 
-Useful in containers and CI to smoke-test `graphics-sdlgpu`, `window-sdl3`, and the visual examples.
+Useful in containers and CI to smoke-test `graphics-wgpu`, `window-sdl3`, and the visual examples.
 
 1. Install SDL3 3.4.x (Ubuntu 24.04 has no `libsdl3-dev`): build `libsdl-org/SDL` at tag `release-3.4.20`
    with CMake and install it to `/usr/local` (needs the X11/Wayland/ALSA/Vulkan `-dev` packages).

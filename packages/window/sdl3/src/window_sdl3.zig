@@ -226,7 +226,7 @@ fn refreshPixelSize(state: *SdlState) void {
 }
 
 /// Returns an opaque pointer to the underlying `SDL_Window` for sibling native backends
-/// (such as `official.graphics.sdlgpu`) without leaking SDL types into public engine contracts.
+/// (such as `official.graphics.wgpu`) without leaking SDL types into public engine contracts.
 pub fn sdlWindowOpaque(app: *engine.App) ?*anyopaque {
     const state = app.resources.get(SdlState) orelse return null;
     return @ptrCast(state.sdl_window);

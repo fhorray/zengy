@@ -3,7 +3,7 @@
 //! Spawns ECS entities with `Transform2D`, `Sprite`, `Visibility`, and `Camera2D`,
 //! uploads a procedural RGBA8 checkerboard texture, animates movement and rotation
 //! in `.update`, extracts visible sprites in `.render_extract`, and submits batched
-//! textured quads to `official.graphics.sdlgpu`.
+//! textured quads to `official.graphics.wgpu`.
 //!
 //! Run with: `zig build run-visual-2d`
 

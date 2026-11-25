@@ -16,7 +16,7 @@ Each primitive `.mesh(allocator)` returns a `ShapeMesh` containing:
 - `vertices: []render_3d.gltf.Vertex3D` (positions, normals, `[0..1]` UVs)
 - `tangents: [][4]f32` (orthogonalized `(tx, ty, tz, handedness)` computed via `computeTangents`)
 - `indices: []u32`, `bounds_center`, `bounds_radius`
-- `toMeshData(allocator)` for direct use with `render_3d` / `graphics_sdlgpu.createMesh3D`.
+- `toMeshData(allocator)` for direct use with `render_3d` / `gpu_3d.createMesh3D`.
 
 ## Example
 
@@ -24,5 +24,5 @@ Each primitive `.mesh(allocator)` returns a `ShapeMesh` containing:
 var torus = try (shapes.Torus{ .major_radius = 0.6, .minor_radius = 0.2 }).mesh(allocator);
 defer torus.deinit();
 
-const gpu_mesh = try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(torus.vertices), torus.indices);
+const gpu_mesh = try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(torus.vertices), torus.indices);
 ```

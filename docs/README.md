@@ -9,7 +9,7 @@ Welcome to the `zengy` documentation. This engine is built around a **minimal he
   - [Headless GPU Testing](headless-gpu-testing.md) — offscreen/lavapipe verification and GPU smoke checks
   - [Benchmarks Baseline](benchmarks-baseline.md) — ECS, Scene Graph, and parallel scheduler baselines
   - [Releasing, CI/CD & Distribution](releasing.md) — merging to `main`, tagging releases, and `engine-cli` scope
-  - [Package Catalog](../packages/README.md) — all optional packages, including [PocketPy Python](../packages/scripting/python/README.md), [SDL_GPU](../packages/graphics/sdlgpu/README.md), [2D](../packages/render/2d/README.md), and [3D](../packages/render/3d/README.md)
+  - [Package Catalog](../packages/README.md) — all optional packages, including [PocketPy Python](../packages/scripting/python/README.md), [wgpu](../packages/graphics/wgpu/README.md), [2D](../packages/render/2d/README.md), and [3D](../packages/render/3d/README.md)
 - **API Reference**
   - [Core App, ECS, Scheduler, Commands, Events & Diagnostics](api/core-app-and-ecs.md)
   - [Modules, Services & Runtime Reflection](api/modules-services-and-reflection.md)

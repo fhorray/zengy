@@ -25,7 +25,7 @@ test "LogService filters by subsystem, invokes custom sinks, and mirrors Diagnos
 
     try app.resources.insert(log.LogConfig, .{
         .level = .info,
-        .filter = "sdlgpu=warn,picking=debug,info",
+        .filter = "wgpu=warn,picking=debug,info",
         .enable_console_sink = false,
     });
     try app.registerModule(log.module());
@@ -35,12 +35,12 @@ test "LogService filters by subsystem, invokes custom sinks, and mirrors Diagnos
     var cap = SinkCapture{};
     try svc.registerSink(.{ .id = "test.capture", .ctx = &cap, .write = testSinkWrite });
 
-    // Filtered out: sdlgpu=warn drops info
-    svc.emit(.info, "sdlgpu.pbr", "dropped info");
+    // Filtered out: wgpu=warn drops info
+    svc.emit(.info, "wgpu.pbr", "dropped info");
     try testing.expectEqual(@as(usize, 0), cap.count);
 
-    // Passes: sdlgpu=warn allows warn
-    svc.emit(.warn, "sdlgpu.pbr", "kept warn");
+    // Passes: wgpu=warn allows warn
+    svc.emit(.warn, "wgpu.pbr", "kept warn");
     try testing.expectEqual(@as(usize, 1), cap.count);
 
     // Passes: picking=debug allows debug

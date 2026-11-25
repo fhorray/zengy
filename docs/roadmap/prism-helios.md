@@ -7,6 +7,8 @@
 **Primary backend:** SDL3 GPU  
 **Naming:** Prism = rendering framework; Helios = optional advanced lighting subsystem; Plume = existing editor/tooling UI kit.
 
+> **Update:** the graphics provider referenced below (SDL GPU, `packages/graphics/sdlgpu`) has been replaced by wgpu-native; see [docs/migration/wgpu.md](../migration/wgpu.md). Paths and shader notes in this roadmap describe the plan as written against the old baseline.
+
 > This is an engineering proposal, not a description of features already shipped. Preserve Zengy's existing module, service, ECS, ownership and headless contracts. Every new capability must earn its complexity through measurable results.
 
 ## Contents

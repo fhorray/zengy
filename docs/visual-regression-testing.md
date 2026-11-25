@@ -67,14 +67,14 @@ Open `<scenario>.diff.png` next to `<scenario>.png`, then the matching `.hdr.png
 - The capture size is the window pixel size (1280x720 by default); a different DPI scale fails the size check
   instead of being silently rescaled.
 - Auto exposure leaves a delta of about 1/255 between identical runs, hence the per-pixel threshold.
-- Frame and pass times are not gated: frame pacing caps the frame time and GPU pass timing needs timestamp queries.
+- Frame times are not gated (frame pacing caps them). GPU pass times come from timestamp queries when the adapter supports them and are reported through `dev_tools.FrameProfilerService`.
 
 ## Code map
 
 - `packages/testing/src/render_regression.zig` (`testing_sdk.render_regression`): PNG codec (8-bit RGB, zlib), HDR
   statistics, speckle, contrast and high-frequency metrics, image comparison. Pure Zig and provider-agnostic; it works on
   `graphics.CaptureImage`, the capture contract type in `graphics`, so any graphics provider can feed it.
-- `graphics_sdlgpu.requestCapture` / `takeCapture`: read back `final`, `hdr`, or `ssao`.
-  `final` renders the post-process pass a second time into an offscreen texture, so the capture never contains
-  the HUD and never reads the swapchain.
+- `graphics_wgpu.requestCapture` / `takeCapture`: read back `final`, `hdr`, or `ssao`.
+  `final` is copied from the swapchain after the world renderers and before the 2D overlays, so the capture never
+  contains the HUD; `hdr` and `ssao` are offered by the PBR renderer through `FrameInput.offerCapture`.
 - `examples/visual-pbr/main.zig`: the scenario runner (`CaptureRunner`).

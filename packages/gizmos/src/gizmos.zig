@@ -85,7 +85,7 @@ pub const GizmoSubmitParams = struct {
     depth_bias: f32 = 0.0,
 };
 
-/// Backend vtable implemented by concrete renderers (e.g. `official.graphics.sdlgpu`).
+/// Backend vtable implemented by concrete renderers (e.g. `official.render.3d.gpu`).
 pub const GizmoBackendVTable = struct {
     ctx: *anyopaque,
     submitGizmos: *const fn (

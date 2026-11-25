@@ -57,7 +57,7 @@ const RenderTargetSlot = struct {
     presented_frames: u64,
 };
 
-/// Optional backend hooks for native GPU providers (e.g., `official.graphics.sdlgpu`).
+/// Optional backend hooks for native GPU providers (e.g., `official.graphics.wgpu`).
 /// When `backend` is null, `GraphicsDeviceService` operates in headless software mode.
 pub const BackendVTable = struct {
     on_create_surface: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, window_handle: u64, width: u32, height: u32) anyerror!void = null,

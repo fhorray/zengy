@@ -16,7 +16,7 @@ Most game engines force every project to carry a window manager, GPU driver, UI 
 2. **Everything Else is Optional & Replaceable**  
    Want to open a window and draw 2D sprites or 3D meshes? Register the visual modules. Want to run the exact same game logic on a Linux server or in CI? Leave the visual modules out.
 3. **No Lock-In**  
-   Official packages (SDL3 windowing, SDL_GPU rendering, 2D/3D renderers, UI, Lua, PocketPy/Python) are just regular plugins. You can omit them, mix and match them, or write your own in Zig or via the C ABI (`include/engine_extension.h`).
+   Official packages (SDL3 windowing, wgpu-native rendering, 2D/3D renderers, UI, Lua, PocketPy/Python) are just regular plugins. You can omit them, mix and match them, or write your own in Zig or via the C ABI (`include/engine_extension.h`).
 
 ---
 
@@ -87,7 +87,7 @@ pub fn main() !void {
 }
 ```
 
-When you are ready to add graphics, simply register the optional modules you want (for example `window_sdl3`, `graphics_sdlgpu`, `render_2d`, `render_3d`, or `ui_core`)—your `moveSystem` and components stay unchanged.
+When you are ready to add graphics, simply register the optional modules you want (for example `window_sdl3`, `graphics_wgpu`, `render_2d`, `render_3d`, or `ui_core`)—your `moveSystem` and components stay unchanged.
 
 ---
 
@@ -96,7 +96,7 @@ When you are ready to add graphics, simply register the optional modules you wan
 | What you want to add | Official Package(s) | Notes |
 |---|---|---|
 | **Native Window & Input** | `window-sdl3` (or `window` for headless) | Resizable window, DPI scaling, keyboard, mouse, text input |
-| **GPU Rendering** | `graphics-sdlgpu` (or `graphics` for headless) | SDL_GPU (Vulkan/SPIR-V) with 2D batching, scissor clipping & 3D depth |
+| **GPU Rendering** | `graphics-wgpu` (or `graphics` for headless) | wgpu-native (Vulkan/DX12/Metal through one WebGPU API) with WGSL shaders, 2D batching, clipping, PBR Forward+ and Helios GI |
 | **2D Scenes & Sprites** | `scene` + `render-2d` | `Transform2D`, `Camera2D`, `Sprite`, `Visibility`, layer sorting |
 | **3D Scenes & glTF** | `render-3d` | `Transform3D`, `Camera3D`, `MeshRef`, glTF 2.0 loader, frustum culling |
 | **UI & Text** | `ui-core`, `ui-markup`, `text` | Shared retained UI IR (`ui-core`) for any frontend, HTML-like in-game markup (`ui-markup`), TTF text & icons ([ADR-0001](docs/adr/0001-layered-ui-architecture.md)) |

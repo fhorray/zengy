@@ -3,7 +3,7 @@
 //! Builds on `engine.diagnostics` (`LogLevel`, `Diagnostics`) to provide
 //! `LogService` (`engine.log/1`) with:
 //! - Global minimum level (`LogConfig.level`) and per-subsystem filter strings
-//!   (e.g. `"sdlgpu=warn,picking=debug,info"`).
+//!   (e.g. `"wgpu=warn,picking=debug,info"`).
 //! - Pluggable `LogSinkVTable` outputs (built-in ANSI console sink, custom UI/file
 //!   sinks, and an in-memory ring buffer for `editor-shell` and `remote`).
 //! - Automatic mirroring of `app.diagnostics` records during `.post_update` and an
@@ -149,7 +149,7 @@ pub const LogService = struct {
         self.recent.deinit(self.allocator);
     }
 
-    /// Parses a comma-separated filter string such as `"sdlgpu=warn,picking=debug,info"`.
+    /// Parses a comma-separated filter string such as `"wgpu=warn,picking=debug,info"`.
     pub fn parseFilter(self: *LogService, filter_str: []const u8) !void {
         for (self.rules.items) |r| self.allocator.free(r.prefix);
         self.rules.clearRetainingCapacity();

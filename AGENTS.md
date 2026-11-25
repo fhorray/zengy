@@ -5,7 +5,7 @@
 ## Core Architecture Rules
 
 - **Strict unidirectional dependency**: `src/core/` (`@import("engine")`) **never** imports anything from `packages/`, SDL, GPU drivers, UI, or scripting VMs.
-- **Capabilities before implementations**: Core defines `App`, `World`, `Scheduler`, `EventBus`, `ResourceRegistry`, `ServiceRegistry`, and `ModuleGraph`. Contracts (`window`, `graphics`, `physics`, `scripting-host`, `ui-core`) define interfaces/vtables; providers (`window-sdl3`, `graphics-sdlgpu`, `physics-jolt`, `physics-rapier`, `scripting-lua`, `scripting-python`) implement them without leaking backend internals.
+- **Capabilities before implementations**: Core defines `App`, `World`, `Scheduler`, `EventBus`, `ResourceRegistry`, `ServiceRegistry`, and `ModuleGraph`. Contracts (`window`, `graphics`, `physics`, `scripting-host`, `ui-core`) define interfaces/vtables; providers (`window-sdl3`, `graphics-wgpu`, `physics-jolt`, `physics-rapier`, `scripting-lua`, `scripting-python`) implement them without leaking backend internals.
 - **Agnostic & community-extensible by design**: Every new feature must be designed as an open, extensible contract (capability/vtable, service/resource registry, or C ABI hook) rather than a closed monolith—just like `scripting-host` lets the community plug in any scripting language or `ui-core`/`ui-widgets` lets them build custom UI frontends—so third-party packages can extend, replace, and compose features without modifying core or official providers.
 - **Reference ecosystem (`zig-gamedev`)**: When implementing specific Zig gamedev systems, math, audio, physics, or native bindings, consult [`zig-gamedev`](https://github.com/zig-gamedev) packages as a reference before reinventing low-level bindings, while wrapping any chosen dependency behind `zengy`'s agnostic capability contracts.
 - **Headless-first**: All core simulation and tests must run deterministically without a window or GPU.
@@ -25,6 +25,7 @@
 - Use **Zig `0.17.1`** for all builds and tests.
 - Primary verification commands:
   - `zig build test --summary all` (and `-Doptimize=ReleaseSafe`)
+  - `zig build test-wgpu-gpu` (real adapter; skips without one) and `zig build build-wgpu-examples`
   - `zig build run-headless`
   - `zig build run-cli`, `zig build run-cli -Dcli-cmd=packages`, `zig build run-cli -Dcli-cmd=test-scenario`
   - `zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all`
@@ -33,6 +34,7 @@
 ## Cross-Platform & Packaging Rules
 
 - **No binaries in git**: Never commit `.dll`, `.dylib`, `.so`, or `.exe` binaries into the repository.
+- **wgpu-native provisioning**: `graphics-wgpu` links the pinned wgpu-native `v27.0.4.1`, installed with `python tools/wgpu/install_wgpu.py --output .deps/wgpu-native` (SHA-256 verified, never committed). It is the only graphics foundation: no SDL_GPU, SPIR-V or custom Vulkan/DX12/Metal backends, and the Vulkan SDK is not required. Shaders are WGSL checked into the repo. A plain `zig build` must keep working without the SDK (visual targets are skipped).
 - **SDL3 provisioning**:
   - Windows x64 fetches `SDL3-3.4.20-win32-x64.zip` via `build.zig.zon` (`sdl3_win64`) and `packages/sdl3/zengy.toml` (`zengy add`).
   - macOS release archives (`.github/workflows/release.yml`) bundle `libSDL3.0.dylib` beside `zengy-runtime`, rewrite its dependency to `@executable_path/libSDL3.0.dylib` via `install_name_tool`, and re-sign both binaries with `codesign --force --sign -`. Native `zig build` of visual targets on macOS/Linux links the system SDL3 (`brew install sdl3` on macOS) because upstream SDL3 distributes macOS binaries as a `.dmg` that `zig fetch` cannot unpack.

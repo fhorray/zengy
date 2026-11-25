@@ -3,7 +3,7 @@
 //! Generates ready-to-render 3D meshes (`Plane`, `Cuboid`, `Sphere`, `Capsule`,
 //! `Cylinder`, `Torus`, `Cone`) with positions, normals, UVs, and 4-component
 //! MikkTSpace-style tangents `(tx, ty, tz, handedness)` compatible with
-//! `render_3d.gltf.Vertex3D` and `graphics_sdlgpu.createMesh3D`.
+//! `render_3d.gltf.Vertex3D` and `gpu_3d.createMesh3D`.
 
 const std = @import("std");
 const engine = @import("engine");

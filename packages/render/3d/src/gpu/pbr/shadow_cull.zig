@@ -1,4 +1,4 @@
-//! Shadow-caster culling helpers (`graphics-sdlgpu`). Pure Zig, so they are unit-tested headlessly.
+//! Shadow-caster culling helpers (`render-3d` GPU renderer). Pure Zig, so they are unit-tested headlessly.
 
 const std = @import("std");
 

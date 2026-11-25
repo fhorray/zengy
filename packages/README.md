@@ -13,7 +13,7 @@ Related packages are grouped by category; the public package name used by `zengy
 | `physics/` | `core` (contract), `jolt`, `rapier` |
 | `ui/` | `core`, `markup` |
 | `window/` | `core`, `sdl3` |
-| `graphics/` | `core`, `sdlgpu` |
+| `graphics/` | `core`, `wgpu` |
 | `scripting/` | `host`, `lua`, `python` |
 | `render/` | `2d`, `3d`, `text` |
 | `formats/`, `tooling/` | format adapters and file watcher |
@@ -26,7 +26,7 @@ Related packages are grouped by category; the public package name used by `zengy
 | [`window/core/`](window/core/src/window.zig) | `official.window` | `engine.window/1`, `engine.input/1` | Window lifecycle, DPI/resize events, and keyboard/mouse input state. |
 | [`window/sdl3/`](window/sdl3/src/window_sdl3.zig) | `official.window.sdl3` | `engine.window/1`, `engine.input/1` | Native SDL3 window, OS event loop, DPI scaling, and keyboard/mouse input. |
 | [`graphics/core/`](graphics/core/src/graphics.zig) | `official.graphics` | `engine.graphics.device/1` | Render targets, draw command lists (`clear`, `rect`, `text`), and `present()`. |
-| [`graphics/sdlgpu/`](graphics/sdlgpu/src/graphics_sdlgpu.zig) | `official.graphics.sdlgpu` | `engine.graphics.device/1` | Native SDL_GPU backend (Vulkan/SPIR-V), swapchain, pipelines, and Diagnostics logging. |
+| [`graphics/wgpu/`](graphics/wgpu/src/graphics_wgpu.zig) | `official.graphics.wgpu` | `engine.graphics.device/1` | wgpu-native provider: surface/swapchain, the neutral `GpuDevice`, capture and capability detection. |
 | [`render/text/`](render/text/src/text.zig) | `official.text` | — | Embedded 8x8 ASCII bitmap font atlas, glyph UVs, text measurement, and quad emission. |
 | [`render/2d/`](render/2d/src/render_2d.zig) | `official.render.2d` | `engine.render.2d/1` | `Sprite`, `Visibility`, and `.render_extract` 2D batch extraction (powered by `official.camera`). |
 | [`camera/`](camera/src/camera.zig) | `official.camera` | `engine.camera/1` | Unified 2D/3D `Camera`, `Projection`, `Viewport`, `RenderTarget`, `RenderLayers`, `Frustum`, `FreeCamera`, and `viewportToWorld` ray picking. |

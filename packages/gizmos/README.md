@@ -12,7 +12,7 @@ Immediate-mode 3D debug and editor gizmos for `zengy` (`engine.gizmos/1`).
 - **Depth-tested & X-ray layers:**
   - Depth-tested: `line`, `ray`, `arrow`, `cuboid`, `roundedCuboid`, `axes`, `circle`, `sphere`, `rect`, `cross`, `grid`, `gridOriented`.
   - X-ray (always on top, modulated by `config.xray_alpha`): `lineXray`, `arrowXray`, `cuboidXray`, `circleXray`, `coneSolidXray`, `cuboidSolidXray`, `transformGizmo`.
-- **Automatic `.render_extract` submission:** Reads the primary `camera.CameraService` `clip_from_world` matrix and dispatches queued vertices to the registered `GizmoBackendVTable` (implemented by `official.graphics.sdlgpu`).
+- **Automatic `.render_extract` submission:** Reads the primary `camera.CameraService` `clip_from_world` matrix and dispatches queued vertices to the registered `GizmoBackendVTable` (implemented by `official.render.3d.gpu`).
 
 ---
 
@@ -20,7 +20,7 @@ Immediate-mode 3D debug and editor gizmos for `zengy` (`engine.gizmos/1`).
 
 ### 1. Register the module
 
-Register `gizmos.module()` alongside `camera.module()` (and `graphics_sdlgpu.module()` for visual rendering):
+Register `gizmos.module()` alongside `camera.module()` (and `graphics_wgpu.module()` and `gpu_3d.module()` for visual rendering):
 
 ```zig
 const engine = @import("engine");

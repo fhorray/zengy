@@ -2,7 +2,7 @@
 //!
 //! Builds a UI tree using `ui_markup` (proving markup parity), handles real mouse clicks,
 //! keyboard/text input for a textbox, scroll/clipping for a list, and renders with high-DPI
-//! scaling through `official.graphics.sdlgpu`.
+//! scaling through `official.graphics.wgpu`.
 //!
 //! Run with: `zig build run-visual-ui`
 

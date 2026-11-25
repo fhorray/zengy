@@ -5,7 +5,7 @@ Per-pass frame profiler and developer telemetry for `zengy` (`engine.dev_tools.p
 ## Features
 
 - `FrameProfilerService`: Records per-pass timings (`Shadow`, `SSAO`, `Volumetric`, `Forward+`, `Bloom`, `PostFX`, `Gizmos`, `UI`) with smoothed EMA durations, 120-frame rolling history, and FPS estimation.
-- Backend-agnostic: Works headlessly in tests and integrates automatically with `official.graphics.sdlgpu` PBR passes.
+- Backend-agnostic: Works headlessly in tests and integrates automatically with `official.render.3d.gpu` PBR passes (GPU timestamp queries).
 
 ## Usage
 

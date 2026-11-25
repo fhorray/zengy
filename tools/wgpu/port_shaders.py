@@ -9,6 +9,8 @@ onto the engine's WebGPU layout:
 * pbr.frag: group 0 = material textures, group 1 = vertex uniforms, group 2 = frame resources, group 3 = fragment uniforms
 
 The generated WGSL is checked in and becomes the source of truth; this script documents and reproduces the port.
+The GLSL sources were deleted together with `packages/graphics/sdlgpu`; check them out from the commit before that
+removal (`git log --diff-filter=D -- packages/graphics/sdlgpu/src/shaders`) into `SRC` to run the script again.
 Requires naga-cli 27.0.0 on PATH.
 """
 from __future__ import annotations

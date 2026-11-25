@@ -169,7 +169,7 @@ fn sphereScreenBounds(
 
     // Reject lights whose footprint lies entirely outside the screen BEFORE clamping. Clamping first
     // turns every off-screen light into an edge-cluster light, which is the wasted work this avoids.
-    // SDL_GPU screen UV: y=0 at top (+1 NDC), y=1 at bottom (-1 NDC).
+    // Screen UV: y=0 at top (+1 NDC), y=1 at bottom (-1 NDC).
     const raw_min_u = (ndc_cx - ndc_rx) * 0.5 + 0.5;
     const raw_max_u = (ndc_cx + ndc_rx) * 0.5 + 0.5;
     const raw_min_v = 0.5 - (ndc_cy + ndc_ry) * 0.5;

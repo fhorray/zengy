@@ -117,6 +117,9 @@ const Scenario = struct {
     /// Largest per-channel difference tolerated against the golden, on top of the pixel-fraction limit. Catches
     /// small but strong artefacts such as ghosts that touch few pixels.
     max_delta: u8 = 255,
+    /// Share of pixels allowed to differ from the golden. Near-black scenes whose reference is a different scenario
+    /// (`golden_of`) differ faintly almost everywhere, so they use a wider share together with a `max_delta` gate.
+    max_fraction: f64 = MAX_DIFF_FRACTION,
     /// Half-resolution volumetric march.
     vol_half: bool = false,
     /// Alternate between two distant poses every frame, so the capture frame is a camera cut for the temporal fog.
@@ -220,7 +223,7 @@ const SCENARIOS = [_]Scenario{
     // Local-light PCSS in the dark room with large light sources: the penumbra comes from each light's radius.
     // Layer masks: lights restricted to a layer no mesh uses must look like lights that are switched off.
     .{ .name = "vol_room_lights_zero", .pose = .vol_room, .fog = false, .lights_off = true },
-    .{ .name = "vol_room_lights_masked", .pose = .vol_room, .fog = false, .light_layers = 0x2, .golden_of = "vol_room_lights_zero" },
+    .{ .name = "vol_room_lights_masked", .pose = .vol_room, .fog = false, .light_layers = 0x2, .max_delta = 16, .max_fraction = 0.25, .golden_of = "vol_room_lights_zero" },
     .{ .name = "local_soft_off", .light_radius = 0.6, .sun_lux = 600, .fog = false },
     .{ .name = "local_pcss", .light_radius = 0.6, .sun_lux = 600, .fog = false, .shadow_pcss = true },
 };
@@ -330,8 +333,8 @@ const CaptureRunner = struct {
             self.fail(sc.name, "max channel delta {d} exceeds {d} (localised artefact such as a ghost)", .{ diff.max_delta, sc.max_delta });
         }
         const sweep = sc.bias_gate or std.mem.startsWith(u8, sc.name, "bias_sweep") or std.mem.startsWith(u8, sc.name, "acne_n_") or sc.acne_check != .none;
-        if (frac > MAX_DIFF_FRACTION and !sweep) {
-            self.fail(sc.name, "{d:.3}% of pixels differ from the golden (limit {d:.3}%)", .{ frac * 100.0, MAX_DIFF_FRACTION * 100.0 });
+        if (frac > sc.max_fraction and !sweep) {
+            self.fail(sc.name, "{d:.3}% of pixels differ from the golden (limit {d:.3}%)", .{ frac * 100.0, sc.max_fraction * 100.0 });
             const diff_img = try capture.diffImageRgb8(self.allocator, rgb, golden.rgb, PIXEL_THRESHOLD);
             defer self.allocator.free(diff_img);
             try self.writePng(self.out_dir, sc.name, ".diff.png", img.width, img.height, diff_img);

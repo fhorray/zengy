@@ -7,7 +7,7 @@ on:
       - 'tools/wgpu/**'
       - 'examples/visual-wgpu/**'
       - 'packages/window/sdl3/**'
-      - 'packages/render/2d/**'
+      - 'packages/render/**'
       - 'packages/graphics/core/**'
       - 'build.zig'
       - '.github/workflows/wgpu-foundation.yml'
@@ -17,7 +17,7 @@ on:
       - 'tools/wgpu/**'
       - 'examples/visual-wgpu/**'
       - 'packages/window/sdl3/**'
-      - 'packages/render/2d/**'
+      - 'packages/render/**'
       - 'packages/graphics/core/**'
       - 'build.zig'
       - '.github/workflows/wgpu-foundation.yml'
@@ -45,11 +45,11 @@ jobs:
           version: 0.17.1
       - name: Install pinned native SDK
         run: python tools/wgpu/install_wgpu.py --output .deps/wgpu-native
-      - name: Compile and link migration demo
+      - name: Compile and link every example on the wgpu stack
         shell: pwsh
         run: |
           $root = (Resolve-Path .deps/wgpu-native).Path
-          zig build build-visual-wgpu "-Dwgpu-root=$root" -Doptimize=ReleaseSafe
+          zig build build-wgpu-examples "-Dwgpu-root=$root" -Doptimize=ReleaseSafe
       - name: GPU conformance tests (skipped when the runner has no adapter)
         shell: pwsh
         run: |

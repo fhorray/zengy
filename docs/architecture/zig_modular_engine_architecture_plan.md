@@ -579,7 +579,7 @@ Python publishes `game.damage`; Lua receives it and applies a change via `Comman
 - **Phases 0–2:** Core contracts, ADRs, headless `App`/`World`/`Scheduler`/`Events`/`Commands`, `ModuleRegistry`, `ServiceRegistry`.
 - **Phase 3:** Extension SDK & C ABI (`include/engine_extension.h`, `PluginHost`).
 - **Phase 4:** Reflection & dynamic schemas.
-- **Phases 5–6:** `window`, `graphics`, `ui-core`, `window-sdl3`, `graphics-sdlgpu`.
+- **Phases 5–6:** `window`, `graphics`, `ui-core`, `window-sdl3`, `graphics-wgpu` (originally SDL_GPU; replaced during the wgpu migration).
 - **Phases 7–9:** `scripting-host`, `scripting-lua`, `scripting-python`, `ui-markup`, `ui-novaui`.
 - **Phases 10–13:** `scene`, `assets`, `render-2d`, `render-3d`, `physics` + external pluggable backends (`physics-jolt`, `physics-rapier`), `zengy` CLI, and `zengy-runtime`.
 

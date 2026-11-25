@@ -6,7 +6,7 @@
 
 ## Context
 
-`zengy` has a working Forward+ PBR renderer in `packages/graphics/sdlgpu/src/pbr_backend.zig` paired with scene extraction in `packages/render/3d/src/render_3d.zig`. As rendering features expand (multi-view rendering, temporal histories, advanced shadows, reflections, atmosphere, and optional hybrid/ray-traced lighting), monolithic backend policy in `pbr_backend.zig` becomes harder to validate headlessly, reuse across views, or extend from third-party packages.
+`zengy` has a working Forward+ PBR renderer in the former `packages/graphics/sdlgpu/src/pbr_backend.zig` (now `packages/render/3d/src/gpu/pbr/`) paired with scene extraction in `packages/render/3d/src/render_3d.zig`. As rendering features expand (multi-view rendering, temporal histories, advanced shadows, reflections, atmosphere, and optional hybrid/ray-traced lighting), monolithic backend policy in `pbr_backend.zig` becomes harder to validate headlessly, reuse across views, or extend from third-party packages.
 
 ## Decision
 
@@ -25,4 +25,4 @@
 
 - `src/core/` remains 100% GPU-free and headless-first.
 - Pass ordering, read-before-write errors, cyclic dependencies, and view history invalidation can be verified deterministically in headless unit tests via `RecordingBackend`.
-- Third-party packages can inspect or extend render passes through versioned capabilities without patching core or SDL_GPU internals.
+- Third-party packages can inspect or extend render passes through versioned capabilities without patching core or graphics provider internals.

@@ -1,4 +1,4 @@
-//! Local shadow atlas planning and shadow-cache keys for `graphics-sdlgpu`.
+//! Local shadow atlas planning and shadow-cache keys for the `render-3d` GPU renderer.
 //!
 //! Pure Zig with no GPU or SDL dependency, so ranking, packing and cache invalidation are unit-tested headlessly.
 //!

@@ -1,7 +1,7 @@
 //! Agnostic PBR Materials, Lights, Sky/Atmosphere, & Post-Processing Contracts (`packages/render/3d/src/pbr.zig`).
 //!
 //! Defines backend-neutral ECS components, resources, and `PbrBackendVTable`
-//! so any GPU backend (e.g. `official.graphics.sdlgpu`) or headless mock can
+//! so any GPU backend (e.g. `official.render.3d.gpu`) or headless mock can
 //! implement PBR lighting, shadows, auto exposure, bloom, and tonemapping.
 
 const std = @import("std");
@@ -648,7 +648,7 @@ pub const ExtractedPbrFrame = struct {
     dt: f32 = 0.0,
 };
 
-/// Backend-neutral PBR rendering vtable implemented by `official.graphics.sdlgpu` or mocks.
+/// Backend-neutral PBR rendering vtable implemented by `official.render.3d.gpu` or mocks.
 pub const PbrBackendVTable = struct {
     ctx: *anyopaque,
     beginPbrFrame: *const fn (ctx: *anyopaque, frame: *const ExtractedPbrFrame) anyerror!void,
