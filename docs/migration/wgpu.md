@@ -59,7 +59,7 @@ splitter + bind-group remap) and then **validated by creating the pipelines on a
 problems Naga's CLI does not (for example `subgroupBarrier` needing an optional feature, empty bind-group layouts
 that still need an empty group). The auto-exposure histogram was ported by hand. The GLSL sources were deleted with
 `packages/graphics/sdlgpu`; the port script documents the process and reads them from the commit before the removal
-(`git show <that commit>:packages/graphics/sdlgpu/src/shaders`).
+(`git show eeaf386:packages/graphics/sdlgpu/src/shaders`).
 
 Layout checks: every uniform block has a `comptime` size assertion against its extern struct; bindings are listed in
 `shaders/bindings.json`.
