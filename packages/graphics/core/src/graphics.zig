@@ -348,6 +348,13 @@ fn serviceOf(app: *engine.App) !*GraphicsDeviceService {
     return @ptrCast(@alignCast(@constCast(entry.api_ptr)));
 }
 
+/// Creates a sampleable offscreen color target (`render_attachment` + `texture_binding` + `copy_src`).
+/// Use the returned `TextureId` with `DrawCommand.image` after rendering into the texture view.
+pub fn createRenderTarget(app: *engine.App, width: u32, height: u32, format: gpu.TextureFormat) !TextureId {
+    const service = try serviceOf(app);
+    return service.textures.createRenderTarget(try service.gpuDevice(), width, height, format);
+}
+
 /// Uploads tightly packed linear RGBA8 pixels (normals, roughness, UI) with a full mip chain.
 /// The returned id is valid for every renderer; 0 is reserved for the built-in white texture.
 pub fn createTextureRgba8(app: *engine.App, width: u32, height: u32, pixels: []const u8) !TextureId {

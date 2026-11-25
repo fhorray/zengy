@@ -202,6 +202,23 @@ pub const Batcher = struct {
                     try self.flush(.white, active, first, self.added(first));
                 }
             },
+            .image => |img| {
+                if (img.texture_id == 0 or img.width <= 0 or img.height <= 0) continue;
+                const first = self.mark();
+                try tess.appendTexturedQuadVertices(&self.vertices, self.allocator, .{
+                    .x = img.x * dpi,
+                    .y = img.y * dpi,
+                    .width = img.width * dpi,
+                    .height = img.height * dpi,
+                    .u0 = img.u0,
+                    .v0 = img.v0,
+                    .u1 = img.u1,
+                    .v1 = img.v1,
+                    .color = img.tint,
+                    .scissor = active,
+                });
+                try self.flush(.{ .user = img.texture_id }, active, first, 6);
+            },
             .text => |tx| {
                 self.text_scratch.clearRetainingCapacity();
                 const target_px = (if (tx.scale > 0.0) tx.scale else 2.0) * 8.0 * dpi;
@@ -329,6 +346,23 @@ test "nested clips intersect and dpi scales coordinates" {
     try testing.expectEqual(@as(u32, 50), sc.w); // (0..100) ∩ (50..150) at 2x
     try testing.expectEqual(@as(f32, 2.0), b.vertices.items[0].x);
     try testing.expectEqual(@as(f32, 4.0), b.vertices.items[0].y);
+}
+
+test "DrawCommand.image samples a user texture slot" {
+    var font: text.TtfAtlas = undefined;
+    var icons: text.IconAtlas = undefined;
+    const atlases = try testAtlases(&font, &icons);
+    defer font.deinit();
+    defer icons.deinit();
+    var b = Batcher.init(testing.allocator);
+    defer b.deinit();
+
+    try b.build(&.{
+        .{ .image = .{ .x = 0, .y = 0, .width = 8, .height = 8, .texture_id = 99 } },
+    }, &.{}, &.{}, 1.0, atlases);
+    try testing.expectEqual(@as(usize, 1), b.batches.items.len);
+    try testing.expectEqual(TextureSlot{ .user = 99 }, b.batches.items[0].texture);
+    try testing.expectEqual(@as(u32, 6), b.batches.items[0].vertex_count);
 }
 
 test "text and icons go to their atlas slots, queued quads use user textures" {

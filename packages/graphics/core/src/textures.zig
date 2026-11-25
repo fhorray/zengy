@@ -103,6 +103,26 @@ pub const TextureStore = struct {
         device.destroyTexture(removed.value.texture);
     }
 
+    /// Creates a sampleable render-attachment texture (no initial upload). Suitable as an offscreen
+    /// color target that UI can later sample via `DrawCommand.image`. Zero dimensions are rejected.
+    pub fn createRenderTarget(self: *TextureStore, device: gpu.GpuDevice, width: u32, height: u32, format: gpu.TextureFormat) !TextureId {
+        if (width == 0 or height == 0) return error.InvalidTextureSize;
+        const texture = try device.createTexture(.{
+            .label = "render-target",
+            .width = width,
+            .height = height,
+            .mip_levels = 1,
+            .format = format,
+            .usage = .{ .texture_binding = true, .render_attachment = true, .copy_src = true },
+        });
+        errdefer device.destroyTexture(texture);
+        const view = try device.createTextureView(.{ .texture = texture });
+        errdefer device.destroyTextureView(view);
+        const id: TextureId = @bitCast(texture);
+        try self.entries.put(self.allocator, id, .{ .texture = texture, .view = view, .width = width, .height = height, .format = format, .mip_levels = 1 });
+        return id;
+    }
+
     /// Uploads tightly packed RGBA8 pixels and builds a full mip chain. `srgb` selects the sRGB format
     /// (albedo, emissive); linear data (normals, roughness, UI) uses `rgba8_unorm`.
     pub fn createRgba8(self: *TextureStore, device: gpu.GpuDevice, width: u32, height: u32, pixels: []const u8, srgb: bool) !TextureId {

@@ -142,6 +142,20 @@ pub const DrawCommand = union(enum) {
         align_mode: enum { left, center, right } = .left,
         box_width: f32 = 0.0,
     },
+    /// Sampleable texture quad in logical coordinates. `texture_id` is a `TextureStore` id
+    /// (never serialized GPU handles). UVs default to the full texture; tint multiplies sample color.
+    image: struct {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        texture_id: u64,
+        u0: f32 = 0,
+        v0: f32 = 0,
+        u1: f32 = 1,
+        v1: f32 = 1,
+        tint: Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    },
     clip_rect: ?ClipRect,
     clip_push: ClipRect,
     clip_pop: void,

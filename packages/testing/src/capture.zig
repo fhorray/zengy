@@ -332,6 +332,26 @@ pub const CaptureService = struct {
                         cursor_x += 4.0;
                     }
                 },
+                // Headless capture has no GPU sampler: fill a solid tinted rect so layout tests still see coverage.
+                .image => |img| {
+                    if (!std.math.isFinite(img.x) or !std.math.isFinite(img.y) or !std.math.isFinite(img.width) or !std.math.isFinite(img.height)) continue;
+                    if (img.width <= 0 or img.height <= 0) continue;
+                    const x0: i32 = @intFromFloat(@floor(img.x));
+                    const y0: i32 = @intFromFloat(@floor(img.y));
+                    const x1: i32 = @intFromFloat(@ceil(img.x + img.width));
+                    const y1: i32 = @intFromFloat(@ceil(img.y + img.height));
+                    const r = floatToU8(img.tint.r);
+                    const g = floatToU8(img.tint.g);
+                    const b = floatToU8(img.tint.b);
+                    const a = floatToU8(img.tint.a);
+                    var py = y0;
+                    while (py < y1) : (py += 1) {
+                        var px = x0;
+                        while (px < x1) : (px += 1) {
+                            self.blendPixelClipped(px, py, active_clip, r, g, b, a);
+                        }
+                    }
+                },
                 .clip_rect => |cr| {
                     clip_depth = 0;
                     if (cr) |r| {
