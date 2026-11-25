@@ -196,6 +196,18 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .{ .name = "render_3d", .mod = render_3d_mod },
     }, null);
 
+    addModuleTest(b, test_step, "apps/editor/tests/panels_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "window", .mod = window_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "ui_core", .mod = ui_core_mod },
+        .{ .name = "ui_widgets", .mod = ui_widgets_mod },
+        .{ .name = "ui_plume", .mod = ui_plume_mod },
+        .{ .name = "document", .mod = mods.editor_document_mod },
+        .{ .name = "panels", .mod = mods.editor_panels_mod },
+        .{ .name = "render_3d", .mod = render_3d_mod },
+    }, null);
+
     addModuleTest(b, test_step, "packages/render/3d/tests/render_3d_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },

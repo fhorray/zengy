@@ -39,6 +39,7 @@ pub const Modules = struct {
     log_mod: *std.Build.Module,
     editor_remote_adapter_mod: *std.Build.Module,
     editor_document_mod: *std.Build.Module,
+    editor_panels_mod: *std.Build.Module,
     window_sdl3_mod: *std.Build.Module,
     input_sdl3_mod: *std.Build.Module,
     zaudio_pkg_mod: *std.Build.Module,
@@ -446,6 +447,18 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // Shell routes authoring history through the document module.
     editor_shell_mod.addImport("document", editor_document_mod);
 
+    // Editor Plume Hierarchy / Inspector harness (`apps/editor`): rebuilds docks from the document.
+    const editor_panels_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/src/panels.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    editor_panels_mod.addImport("graphics", graphics_mod);
+    editor_panels_mod.addImport("ui_core", ui_core_mod);
+    editor_panels_mod.addImport("ui_widgets", ui_widgets_mod);
+    editor_panels_mod.addImport("ui_plume", ui_plume_mod);
+    editor_panels_mod.addImport("document", editor_document_mod);
+
     // SDL 3.4.20 (zlib) vendored in third_party/sdl3 (Windows x64 binaries).
     const sdl3_c_mod = blk: {
         const translate_sdl3 = b.addTranslateC(.{
@@ -642,6 +655,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .log_mod = log_mod,
         .editor_remote_adapter_mod = editor_remote_adapter_mod,
         .editor_document_mod = editor_document_mod,
+        .editor_panels_mod = editor_panels_mod,
         .window_sdl3_mod = window_sdl3_mod,
         .input_sdl3_mod = input_sdl3_mod,
         .zaudio_pkg_mod = zaudio_pkg_mod,
