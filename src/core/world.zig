@@ -619,6 +619,17 @@ pub const World = struct {
         return self.guids.items[entity.index];
     }
 
+    /// Looks up a live entity by persistent `EntityGuid`. Linear scan; prefer handle-based
+    /// access on hot paths. Returns null when the GUID is unused or the slot is dead.
+    pub fn findByGuid(self: *const World, guid: EntityGuid) ?EntityHandle {
+        for (self.guids.items, 0..) |g, idx| {
+            if (g != guid) continue;
+            if (idx >= self.alive_flags.items.len or !self.alive_flags.items[idx]) continue;
+            return .{ .index = @intCast(idx), .generation = self.generations.items[idx] };
+        }
+        return null;
+    }
+
     pub fn set(self: *World, entity: EntityHandle, comptime T: type, value: T) !void {
         try self.checkMutable();
         if (!self.isAlive(entity)) return error.InvalidEntity;
@@ -656,6 +667,13 @@ pub const World = struct {
         const pool = self.pools.get(tid) orelse return null;
         self.touch(pool, entity);
         return pool.getBytes(entity);
+    }
+
+    /// Read-only raw component bytes. Does not touch change ticks; use for inspection/serialization.
+    pub fn getRawConst(self: *const World, entity: EntityHandle, tid: ComponentTypeId) ?[]const u8 {
+        if (!self.isAlive(entity)) return null;
+        const pool = self.pools.get(tid) orelse return null;
+        return pool.getBytesConst(entity);
     }
 
     pub fn has(self: *const World, entity: EntityHandle, comptime T: type) bool {

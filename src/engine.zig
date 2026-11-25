@@ -60,5 +60,6 @@ pub const Module = module_registry.Module;
 pub const TypeRegistry = reflection.TypeRegistry;
 pub const ComponentSchema = reflection.ComponentSchema;
 pub const FieldDescriptor = reflection.FieldDescriptor;
+pub const NativeFieldSpec = reflection.NativeFieldSpec;
 pub const Diagnostics = diagnostics.Diagnostics;
 pub const LogLevel = diagnostics.LogLevel;

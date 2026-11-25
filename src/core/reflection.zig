@@ -77,6 +77,13 @@ pub const FieldDescriptor = struct {
     offset: usize = 0,
 };
 
+/// Field layout for a native Zig component. Offsets must match `@offsetOf(T, field)`.
+pub const NativeFieldSpec = struct {
+    name: []const u8,
+    field_type: FieldType,
+    offset: usize,
+};
+
 pub const SchemaId = u64;
 
 /// Version-independent 128-bit identity of a component type (`namespace.name`). Persisted data
@@ -258,6 +265,107 @@ pub const TypeRegistry = struct {
             self.name_to_schema.putAssumeCapacity(full_name, schema_id);
         }
         return schema;
+    }
+
+    /// Registers a reflection schema bound to an existing native Zig component type.
+    /// Uses `World.comptimeTypeId(T)` so inspection/serialization share the native pool
+    /// (no duplicate dynamic component type). Field offsets must match the native layout.
+    pub fn registerNativeSchema(
+        self: *TypeRegistry,
+        comptime T: type,
+        namespace: []const u8,
+        name: []const u8,
+        version: u32,
+        input_fields: []const NativeFieldSpec,
+    ) !ComponentSchema {
+        const schema_id = computeSchemaId(namespace, name, version);
+        if (self.schemas.get(schema_id)) |existing| {
+            if (existing.component_type_id != world_mod.World.comptimeTypeId(T)) return error.SchemaTypeMismatch;
+            if (existing.byte_size != @sizeOf(T)) return error.SchemaSizeMismatch;
+            return existing;
+        }
+
+        const native_size = @sizeOf(T);
+        const native_align = @alignOf(T);
+        for (input_fields) |f| {
+            if (f.offset >= native_size) return error.FieldOffsetOutOfRange;
+            if (f.offset % f.field_type.alignment() != 0) return error.FieldAlignmentMismatch;
+            const end = std.math.add(usize, f.offset, f.field_type.byteSize()) catch return error.FieldOffsetOutOfRange;
+            if (end > native_size) return error.FieldOffsetOutOfRange;
+        }
+
+        const ns_copy = try self.allocator.dupe(u8, namespace);
+        errdefer self.allocator.free(ns_copy);
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+
+        const fields = try self.allocator.alloc(FieldDescriptor, input_fields.len);
+        errdefer self.allocator.free(fields);
+        var initialized_fields: usize = 0;
+        errdefer {
+            for (fields[0..initialized_fields]) |f| self.allocator.free(f.name);
+        }
+        for (input_fields, 0..) |f, i| {
+            fields[i] = .{
+                .name = try self.allocator.dupe(u8, f.name),
+                .field_type = f.field_type,
+                .offset = f.offset,
+            };
+            initialized_fields += 1;
+        }
+
+        const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ namespace, name });
+        errdefer self.allocator.free(full_name);
+
+        _ = native_align;
+        const schema = ComponentSchema{
+            .schema_id = schema_id,
+            .stable_id = computeStableId(namespace, name),
+            .component_type_id = world_mod.World.comptimeTypeId(T),
+            .owner_id = 0,
+            .namespace = ns_copy,
+            .name = name_copy,
+            .version = version,
+            .storage = .blittable,
+            .byte_size = native_size,
+            .fields = fields,
+        };
+
+        try self.schemas.ensureUnusedCapacity(self.allocator, 1);
+        try self.name_to_schema.ensureUnusedCapacity(self.allocator, 1);
+        try self.latest_version.ensureUnusedCapacity(self.allocator, 1);
+        try self.stable_names.ensureUnusedCapacity(self.allocator, 1);
+
+        const lv = self.latest_version.getOrPutAssumeCapacity(schema.stable_id);
+        if (!lv.found_existing or lv.value_ptr.* < version) lv.value_ptr.* = version;
+        self.stable_names.putAssumeCapacity(schema.stable_id, schema_id);
+        self.schemas.putAssumeCapacity(schema_id, schema);
+        if (self.name_to_schema.getPtr(full_name)) |existing_sid| {
+            existing_sid.* = schema_id;
+            self.allocator.free(full_name);
+        } else {
+            self.name_to_schema.putAssumeCapacity(full_name, schema_id);
+        }
+        return schema;
+    }
+
+    /// Writes a reflected field through ECS mutation rules. Validates the value type against the
+    /// schema, then commits via `World.setRaw` so change ticks and mutability checks apply once.
+    pub fn setReflectedField(
+        self: *const TypeRegistry,
+        world: *world_mod.World,
+        entity: world_mod.EntityHandle,
+        schema_id: SchemaId,
+        field_name: []const u8,
+        value: FieldValue,
+    ) !void {
+        const schema = self.getById(schema_id) orelse return error.SchemaNotFound;
+        const bytes = world.getRawConst(entity, schema.component_type_id) orelse return error.ComponentNotPresent;
+        const owned = try world.allocator.alloc(u8, bytes.len);
+        defer world.allocator.free(owned);
+        @memcpy(owned, bytes);
+        try setField(schema, owned, field_name, value);
+        try world.setRaw(entity, schema.component_type_id, owned);
     }
 
     /// Unregisters all schemas registered under `owner_id` and frees their metadata.

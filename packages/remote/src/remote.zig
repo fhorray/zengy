@@ -153,7 +153,7 @@ fn handleListEntities(app: *engine.App, allocator: std.mem.Allocator, id_val: st
         var first_comp = true;
         var it = app.types.schemas.valueIterator();
         while (it.next()) |schema| {
-            if (app.world.getRaw(handle, schema.component_type_id) != null) {
+            if (app.world.getRawConst(handle, schema.component_type_id) != null) {
                 if (!first_comp) try buf.append(allocator, ',');
                 first_comp = false;
                 try buf.print(allocator, "\"{s}.{s}\"", .{ schema.namespace, schema.name });
@@ -166,17 +166,28 @@ fn handleListEntities(app: *engine.App, allocator: std.mem.Allocator, id_val: st
     return buf.toOwnedSlice(allocator);
 }
 
+fn parseBoundedU32(v: std.json.Value) ?u32 {
+    if (v != .integer) return null;
+    const i = v.integer;
+    if (i < 0 or i > std.math.maxInt(u32)) return null;
+    return @intCast(i);
+}
+
+fn parseBoundedI32(v: std.json.Value) ?i32 {
+    if (v != .integer) return null;
+    const i = v.integer;
+    if (i < std.math.minInt(i32) or i > std.math.maxInt(i32)) return null;
+    return @intCast(i);
+}
+
 fn parseEntityFromParams(params: ?std.json.Value) ?engine.EntityHandle {
     const p = params orelse return null;
     if (p != .object) return null;
     const idx_val = p.object.get("index") orelse p.object.get("id") orelse return null;
-    if (idx_val != .integer or idx_val.integer < 0) return null;
+    const idx = parseBoundedU32(idx_val) orelse return null;
     const gen_val = p.object.get("generation");
-    const gen: u32 = if (gen_val != null and gen_val.? == .integer and gen_val.?.integer >= 0)
-        @intCast(gen_val.?.integer)
-    else
-        1;
-    return .{ .index = @intCast(idx_val.integer), .generation = gen };
+    const gen: u32 = if (gen_val) |gv| (parseBoundedU32(gv) orelse return null) else 1;
+    return .{ .index = idx, .generation = gen };
 }
 
 fn appendFieldValueJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, val: engine.reflection.FieldValue) !void {
@@ -214,7 +225,7 @@ fn handleGetEntity(app: *engine.App, allocator: std.mem.Allocator, id_val: std.j
     var first_comp = true;
     var it = app.types.schemas.valueIterator();
     while (it.next()) |schema| {
-        const bytes = app.world.getRaw(handle, schema.component_type_id) orelse continue;
+        const bytes = app.world.getRawConst(handle, schema.component_type_id) orelse continue;
         if (!first_comp) try buf.append(allocator, ',');
         first_comp = false;
         try buf.print(allocator, "\"{s}.{s}\":{{", .{ schema.namespace, schema.name });
@@ -263,16 +274,22 @@ fn handleSetField(integration: ?RemoteIntegration, app: *engine.App, allocator: 
 
     const typed_val: engine.reflection.FieldValue = switch (fd.field_type) {
         .bool_t => if (val_json == .bool) .{ .bool_t = val_json.bool } else return writeError(allocator, id_val, -32602, "Expected bool"),
-        .i32_t => if (val_json == .integer) .{ .i32_t = @intCast(val_json.integer) } else return writeError(allocator, id_val, -32602, "Expected i32"),
-        .u32_t => if (val_json == .integer and val_json.integer >= 0) .{ .u32_t = @intCast(val_json.integer) } else return writeError(allocator, id_val, -32602, "Expected u32"),
-        .f32_t => .{ .f32_t = jsonToF32(val_json) orelse return writeError(allocator, id_val, -32602, "Expected f32") },
+        .i32_t => .{ .i32_t = parseBoundedI32(val_json) orelse return writeError(allocator, id_val, -32602, "Expected i32") },
+        .u32_t => .{ .u32_t = parseBoundedU32(val_json) orelse return writeError(allocator, id_val, -32602, "Expected u32") },
+        .f32_t => blk: {
+            const f = jsonToF32(val_json) orelse return writeError(allocator, id_val, -32602, "Expected f32");
+            if (!std.math.isFinite(f)) return writeError(allocator, id_val, -32602, "Expected finite f32");
+            break :blk .{ .f32_t = f };
+        },
         .vec3_t => blk: {
             if (val_json != .array or val_json.array.items.len != 3) return writeError(allocator, id_val, -32602, "Expected [3]f32");
-            break :blk .{ .vec3_t = .{
-                jsonToF32(val_json.array.items[0]) orelse return writeError(allocator, id_val, -32602, "Expected f32"),
-                jsonToF32(val_json.array.items[1]) orelse return writeError(allocator, id_val, -32602, "Expected f32"),
-                jsonToF32(val_json.array.items[2]) orelse return writeError(allocator, id_val, -32602, "Expected f32"),
-            } };
+            const x = jsonToF32(val_json.array.items[0]) orelse return writeError(allocator, id_val, -32602, "Expected f32");
+            const y = jsonToF32(val_json.array.items[1]) orelse return writeError(allocator, id_val, -32602, "Expected f32");
+            const z = jsonToF32(val_json.array.items[2]) orelse return writeError(allocator, id_val, -32602, "Expected f32");
+            if (!std.math.isFinite(x) or !std.math.isFinite(y) or !std.math.isFinite(z)) {
+                return writeError(allocator, id_val, -32602, "Expected finite f32");
+            }
+            break :blk .{ .vec3_t = .{ x, y, z } };
         },
         else => return writeError(allocator, id_val, -32602, "Unsupported field type"),
     };
@@ -290,8 +307,7 @@ fn handleSetField(integration: ?RemoteIntegration, app: *engine.App, allocator: 
             .value = typed_val,
         });
     } else {
-        const bytes = app.world.getRaw(handle, schema.component_type_id) orelse return writeError(allocator, id_val, -32004, "Component not present");
-        try engine.TypeRegistry.setField(schema, bytes, fd.name, typed_val);
+        try app.types.setReflectedField(&app.world, handle, schema.schema_id, fd.name, typed_val);
     }
 
     var buf = std.ArrayList(u8).empty;

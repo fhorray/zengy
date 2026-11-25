@@ -1155,6 +1155,64 @@ test "Scheduler.parallelBatches groups only conflict-free, unordered systems" {
     try testing.expectEqual(@as(usize, 6), flat);
 }
 
+test "getRawConst and getConst do not touch change ticks; getRaw does" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    try world.enableChangeTracking(Health);
+    const e = try world.spawn();
+    try world.set(e, Health, .{ .hp = 7 });
+    const tid = engine.World.comptimeTypeId(Health);
+    const pool = world.pools.get(tid).?;
+    const dense = pool.sparse.items[e.index];
+    const before = pool.changed_ticks.items[dense];
+
+    _ = world.getRawConst(e, tid);
+    _ = world.getConst(e, Health);
+    try testing.expectEqual(before, pool.changed_ticks.items[dense]);
+
+    world.advanceTick();
+    _ = world.getRaw(e, tid);
+    try testing.expect(pool.changed_ticks.items[dense] != before);
+    try testing.expectEqual(world.tick, pool.changed_ticks.items[dense]);
+}
+
+test "registerNativeSchema shares the native component pool" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    var reg = engine.TypeRegistry.init(testing.allocator);
+    defer reg.deinit();
+
+    const tid = try world.registerComponent(Health);
+    const schema = try reg.registerNativeSchema(Health, "game", "Health", 1, &.{
+        .{ .name = "hp", .field_type = .i32_t, .offset = @offsetOf(Health, "hp") },
+    });
+    try testing.expectEqual(tid, schema.component_type_id);
+    try testing.expectEqual(@sizeOf(Health), schema.byte_size);
+
+    const e = try world.spawn();
+    try world.set(e, Health, .{ .hp = 42 });
+    const bytes = world.getRawConst(e, schema.component_type_id).?;
+    const fv = try engine.TypeRegistry.getField(schema, bytes, "hp");
+    try testing.expectEqual(@as(i32, 42), fv.i32_t);
+
+    try reg.setReflectedField(&world, e, schema.schema_id, "hp", .{ .i32_t = 9 });
+    try testing.expectEqual(@as(i32, 9), world.getConst(e, Health).?.hp);
+
+    // A dynamic schema for the same logical name must not be required; native binding wins.
+    try testing.expectEqual(@as(usize, 1), world.pools.count());
+}
+
+test "findByGuid resolves live entities and rejects dead slots" {
+    var world = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
+    defer world.deinit();
+    try world.setGuidNamespace(0x11);
+    const e = try world.spawn();
+    const guid = world.getGuid(e).?;
+    try testing.expectEqual(e.index, world.findByGuid(guid).?.index);
+    _ = try world.despawn(e);
+    try testing.expect(world.findByGuid(guid) == null);
+}
+
 test "World.setGuidNamespace partitions GUIDs and is rejected once entities exist" {
     var a = engine.World.init(testing.allocator, .{ .index = 0, .generation = 1 });
     defer a.deinit();
