@@ -149,7 +149,7 @@ fn sampleVolShadow(wp: vec3<f32>, view_depth: f32) -> f32 {
                     let _e187 = suv;
                     let _e188 = proj;
                     let _e194 = vec3<f32>(_e187.x, _e187.y, (_e188.z - 0.0006f));
-                    let _e197 = textureSampleCompare(zengy_u_shadow_tex_image, zengy_u_shadow_tex_sampler, _e194.xy, _e194.z);
+                    let _e197 = textureSampleCompareLevel(zengy_u_shadow_tex_image, zengy_u_shadow_tex_sampler, _e194.xy, _e194.z);
                     return _e197;
                 }
             }
@@ -209,7 +209,7 @@ fn sampleLocalTile(tile: i32, wp_2: vec3<f32>) -> f32 {
     let _e138 = suv_1;
     let _e139 = proj_1;
     let _e145 = vec3<f32>(_e138.x, _e138.y, (_e139.z - 0.001f));
-    let _e148 = textureSampleCompare(zengy_u_local_shadow_tex_image, zengy_u_local_shadow_tex_sampler, _e145.xy, _e145.z);
+    let _e148 = textureSampleCompareLevel(zengy_u_local_shadow_tex_image, zengy_u_local_shadow_tex_sampler, _e145.xy, _e145.z);
     return _e148;
 }
 

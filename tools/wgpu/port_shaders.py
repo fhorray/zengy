@@ -104,6 +104,9 @@ def port_one(repo: Path, src: Path, naga: str, defines: list[str] | None = None,
     # Naga maps GLSL barrier() to subgroupBarrier(), which needs the optional Subgroups feature. GLSL's barrier()
     # is a workgroup barrier, so emit the portable WGSL equivalent.
     out = out.replace('subgroupBarrier();', 'workgroupBarrier();')
+    # Shadow lookups run inside loops with a varying trip count. Implicit-derivative sampling there is rejected by
+    # FXC (Direct3D 12). The shadow atlases have a single mip, so the explicit level-0 variant is equivalent.
+    out = out.replace('textureSampleCompare(', 'textureSampleCompareLevel(')
     # Fail loudly if the remap produced two variables with the same slot.
     slots = [(g, b) for _, _, g, b in used]
     if len(slots) != len(set(slots)):

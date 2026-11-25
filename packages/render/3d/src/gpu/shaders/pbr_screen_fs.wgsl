@@ -781,7 +781,7 @@ fn sampleCascadePCF(c_idx: i32, N_6: vec3<f32>, L_2: vec3<f32>, rot: f32, view_d
             let _e404 = proj;
             let _e406 = bias;
             let _e410 = vec3<f32>(_e403.x, _e403.y, (_e404.z - _e406));
-            let _e413 = textureSampleCompare(zengy_u_shadow_tex_image, zengy_u_shadow_tex_sampler, _e410.xy, _e410.z);
+            let _e413 = textureSampleCompareLevel(zengy_u_shadow_tex_image, zengy_u_shadow_tex_sampler, _e410.xy, _e410.z);
             shadow = (_e402 + _e413);
         }
         continuing {
@@ -1160,7 +1160,7 @@ fn sampleLocalTile(tile_idx: i32, world_pos: vec3<f32>, bias_1: f32, rot_3: f32,
             let _e401 = proj_1;
             let _e403 = bias_2;
             let _e407 = vec3<f32>(_e400.x, _e400.y, (_e401.z - _e403));
-            let _e410 = textureSampleCompare(zengy_u_local_shadow_tex_image, zengy_u_local_shadow_tex_sampler, _e407.xy, _e407.z);
+            let _e410 = textureSampleCompareLevel(zengy_u_local_shadow_tex_image, zengy_u_local_shadow_tex_sampler, _e407.xy, _e407.z);
             s = (_e399 + _e410);
         }
         continuing {
