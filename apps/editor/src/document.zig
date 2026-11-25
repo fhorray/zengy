@@ -113,34 +113,49 @@ pub const EditorDocument = struct {
 
     /// Sets the entity's transform and records an undo step. Clears the redo history.
     /// Reserves history capacity before mutating so a failed allocation leaves the world untouched.
+    /// Rejects entities that are not listed in this document.
     pub fn setTransform(self: *EditorDocument, world: *engine.World, entity: engine.EntityHandle, after: render_3d.Transform3D) !void {
-        const tf = world.get(entity, render_3d.Transform3D) orelse return error.MissingTransform;
+        if (self.indexOf(entity) == null) return error.EntityNotInDocument;
+        if (!finiteTransform(after)) return error.InvalidTransform;
+        const before = (world.getConst(entity, render_3d.Transform3D) orelse return error.MissingTransform).*;
+        if (std.meta.eql(before, after)) return;
         try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
         if (self.undo_stack.items.len >= MAX_HISTORY) _ = self.undo_stack.orderedRemove(0);
-        const before = tf.*;
-        tf.* = after;
+        try world.set(entity, render_3d.Transform3D, after);
         self.undo_stack.appendAssumeCapacity(.{ .entity = entity, .before = before, .after = after });
         self.redo_stack.clearRetainingCapacity();
     }
 
-    /// Reverts the latest transform edit. Returns false when there is nothing to undo.
+    /// Reverts the latest transform edit. Returns false when there is nothing to undo or the
+    /// target is no longer a listed, live transform entity (stale entries are dropped).
     pub fn undo(self: *EditorDocument, world: *engine.World) !bool {
-        if (self.undo_stack.items.len == 0) return false;
-        try self.redo_stack.ensureUnusedCapacity(self.allocator, 1);
-        const edit = self.undo_stack.pop().?;
-        self.redo_stack.appendAssumeCapacity(edit);
-        if (world.get(edit.entity, render_3d.Transform3D)) |tf| tf.* = edit.before;
-        return true;
+        while (self.undo_stack.items.len > 0) {
+            try self.redo_stack.ensureUnusedCapacity(self.allocator, 1);
+            const edit = self.undo_stack.pop().?;
+            if (self.indexOf(edit.entity) == null or world.getConst(edit.entity, render_3d.Transform3D) == null) {
+                continue; // drop stale history; do not report success
+            }
+            try world.set(edit.entity, render_3d.Transform3D, edit.before);
+            self.redo_stack.appendAssumeCapacity(edit);
+            return true;
+        }
+        return false;
     }
 
-    /// Re-applies the latest undone transform edit. Returns false when there is nothing to redo.
+    /// Re-applies the latest undone transform edit. Returns false when there is nothing to redo
+    /// or the target is no longer applicable.
     pub fn redo(self: *EditorDocument, world: *engine.World) !bool {
-        if (self.redo_stack.items.len == 0) return false;
-        try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
-        const edit = self.redo_stack.pop().?;
-        self.undo_stack.appendAssumeCapacity(edit);
-        if (world.get(edit.entity, render_3d.Transform3D)) |tf| tf.* = edit.after;
-        return true;
+        while (self.redo_stack.items.len > 0) {
+            try self.undo_stack.ensureUnusedCapacity(self.allocator, 1);
+            const edit = self.redo_stack.pop().?;
+            if (self.indexOf(edit.entity) == null or world.getConst(edit.entity, render_3d.Transform3D) == null) {
+                continue;
+            }
+            try world.set(edit.entity, render_3d.Transform3D, edit.after);
+            self.undo_stack.appendAssumeCapacity(edit);
+            return true;
+        }
+        return false;
     }
 
     fn purge(stack: *std.ArrayList(TransformEdit), entity: engine.EntityHandle) void {
@@ -152,3 +167,12 @@ pub const EditorDocument = struct {
         }
     }
 };
+
+fn finiteTransform(t: render_3d.Transform3D) bool {
+    inline for (.{ t.position, t.rotation_euler, t.scale }) |vec| {
+        inline for (vec) |v| {
+            if (!std.math.isFinite(v)) return false;
+        }
+    }
+    return true;
+}

@@ -109,12 +109,15 @@ fn updateEditor(ctx: *engine.SystemContext) !void {
     const doc = st.doc;
     const win = windowSize(st.app);
 
-    // Hierarchy row click.
+    // Hierarchy row click (only rows that are actually painted).
     const pos = motion.position;
     const click = mouse.justPressed(.left);
-    if (click and pos[0] < LEFT_W and pos[1] >= LIST_TOP) {
+    if (click and pos[0] >= 0 and pos[0] < LEFT_W and pos[1] >= LIST_TOP and pos[1] < win.h - FOOTER_H) {
         const row: usize = @intFromFloat((pos[1] - LIST_TOP) / ROW_H);
-        if (row < doc.entries.items.len) doc.select(doc.entries.items[row].entity);
+        const row_y = LIST_TOP + ROW_H * @as(f32, @floatFromInt(row));
+        if (row < doc.entries.items.len and row_y + ROW_H <= win.h - FOOTER_H) {
+            doc.select(doc.entries.items[row].entity);
+        }
     }
 
     // Viewport picking. Clicks on panels must not pick through them.
@@ -174,19 +177,22 @@ fn updateEditor(ctx: *engine.SystemContext) !void {
         st.setStatus("Added {s}", .{name});
     }
 
-    // Delete the selection. Not undoable in the MVP.
+    // Delete the selection. Not undoable in the MVP; despawn first so a failed despawn keeps the document entry.
     if (keys.justPressed(.delete)) {
         if (doc.selected) |sel| {
-            _ = doc.unregister(sel);
-            _ = try ctx.world.despawn(sel);
-            focus.setFocus(null);
-            st.setStatus("Deleted (cannot be undone)", .{});
+            if (try ctx.world.despawn(sel)) {
+                _ = doc.unregister(sel);
+                focus.setFocus(null);
+                st.setStatus("Deleted (cannot be undone)", .{});
+            } else {
+                st.setStatus("Delete failed: entity not alive", .{});
+            }
         }
     }
 
     // Move / scale the selection.
     if (doc.selected) |sel| {
-        if (ctx.world.get(sel, render_3d.Transform3D)) |tf| {
+        if (ctx.world.getConst(sel, render_3d.Transform3D)) |tf| {
             const step: f32 = if (shift) COARSE_STEP else FINE_STEP;
             var next = tf.*;
             var changed = false;
@@ -229,12 +235,12 @@ fn updateEditor(ctx: *engine.SystemContext) !void {
     // Studio grid, hover highlight and the selection gizmo.
     giz.grid(.{ 0, 0.005, 0 }, .{ 24, 24 }, .{ 1.5, 1.5 }, .{ 0.45, 0.48, 0.55, 0.35 });
     if (focus.hovered_entity) |hov| {
-        if (ctx.world.get(hov, render_3d.Transform3D)) |tf| {
+        if (ctx.world.getConst(hov, render_3d.Transform3D)) |tf| {
             giz.cuboid(tf.position, .{ tf.scale[0] + 0.12, tf.scale[1] + 0.12, tf.scale[2] + 0.12 }, .{ 1.0, 0.9, 0.25, 0.9 });
         }
     }
     if (doc.selected) |sel| {
-        if (ctx.world.get(sel, render_3d.Transform3D)) |tf| {
+        if (ctx.world.getConst(sel, render_3d.Transform3D)) |tf| {
             giz.transformGizmo(tf.position, st.gizmo_mode, 1.35, 0);
         }
     }
@@ -280,7 +286,7 @@ fn renderOverlay(ctx: *engine.SystemContext) !void {
     try text(st, rx + 12, HEADER_H + 8, "Inspector", accent);
     if (doc.selectedEntry()) |entry| {
         try text(st, rx + 12, LIST_TOP, entry.name(), white);
-        if (ctx.world.get(entry.entity, render_3d.Transform3D)) |tf| {
+        if (ctx.world.getConst(entry.entity, render_3d.Transform3D)) |tf| {
             try text(st, rx + 12, LIST_TOP + 30, "Position", dim);
             try text(st, rx + 12, LIST_TOP + 50, st.fmt("x {d:.2}   y {d:.2}   z {d:.2}", .{ tf.position[0], tf.position[1], tf.position[2] }), white);
             try text(st, rx + 12, LIST_TOP + 80, "Scale", dim);
@@ -335,6 +341,8 @@ pub fn main(init: std.process.Init) !void {
     try app.addSystem(.{ .name = "editor.overlay", .stage = .render_extract, .run = renderOverlay });
 
     try app.initialize();
+    // Editor owns pointer routing (DPI + viewport gating); disable the automatic picking system.
+    if (app.resources.get(picking.PickingService)) |pick| pick.auto_update = false;
     if (app.resources.get(gizmos.GizmoService)) |giz| {
         giz.config.line.width = 2.0;
         giz.config.xray_alpha = 0.95;
@@ -400,7 +408,11 @@ pub fn main(init: std.process.Init) !void {
     try app.world.set(cam_e, camera.Camera, .{ .order = 0 });
     try app.world.set(cam_e, camera.Projection, .{ .perspective = .{ .fov_rad = std.math.pi / 3.0, .near = 0.2, .far = 150.0 } });
     try app.world.set(cam_e, camera.CameraPose, camera.CameraPose.lookAt(.{ 0, 3.8, 9.5 }, .{ 0, 0.7, 0 }, .{ 0, 1, 0 }));
-    try app.world.set(cam_e, camera.FreeCamera, .{ .walk_speed = 7.0, .run_speed = 14.0 });
+    try app.world.set(cam_e, camera.FreeCamera, .{
+        .walk_speed = 7.0,
+        .run_speed = 14.0,
+        .require_look_for_move = true,
+    });
     try app.world.set(cam_e, camera.FreeCameraState, .{});
     try app.world.set(cam_e, render_3d.pbr.PostProcessSettings, .{ .ssao = .{ .enabled = true }, .bloom = .{ .enabled = true } });
 

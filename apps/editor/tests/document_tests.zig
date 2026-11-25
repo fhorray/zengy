@@ -88,7 +88,23 @@ test "setTransform on an entity without a Transform3D fails without recording" {
     defer doc.deinit();
 
     const bare = try app.world.spawn();
+    try testing.expectError(error.EntityNotInDocument, doc.setTransform(&app.world, bare, .{}));
+    try doc.register(bare, "Bare");
     try testing.expectError(error.MissingTransform, doc.setTransform(&app.world, bare, .{}));
+    try testing.expect(!(try doc.undo(&app.world)));
+}
+
+test "undo skips stale targets and does not report false success" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    var doc = document.EditorDocument.init(testing.allocator);
+    defer doc.deinit();
+
+    const e = try spawnAt(&app, 1);
+    try doc.register(e, "E");
+    try doc.setTransform(&app.world, e, .{ .position = .{ 2, 0, 0 } });
+    _ = try app.world.despawn(e);
+    _ = doc.unregister(e);
     try testing.expect(!(try doc.undo(&app.world)));
 }
 
