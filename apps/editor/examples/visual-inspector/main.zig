@@ -1,4 +1,4 @@
-//! Visual Shapes, Picking, Profiler & Remote Inspector Showcase (`examples/visual-inspector/main.zig`).
+//! Visual Shapes, Picking, Profiler & Remote Inspector Showcase (`apps/editor/examples/visual-inspector/main.zig`).
 //!
 //! Combines `official.shapes`, `official.picking`, `official.gizmos`,
 //! `official.dev_tools`, `app.editor.shell`, and `official.remote`:

@@ -993,7 +993,7 @@ pub fn build(b: *std.Build) void {
 
     // Visual Shapes + Picking + Profiler + Remote Inspector Showcase. Run with `zig build run-visual-inspector`.
     const visual_inspector_mod = b.createModule(.{
-        .root_source_file = b.path("examples/visual-inspector/main.zig"),
+        .root_source_file = b.path("apps/editor/examples/visual-inspector/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
