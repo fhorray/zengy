@@ -11,7 +11,8 @@ const engine = @import("engine");
 const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
 const ui_core = @import("ui_core");
 const ui_markup = @import("ui_markup");
 
@@ -92,7 +93,8 @@ pub fn main() !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
     try app.registerModule(ui_core.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{

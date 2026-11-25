@@ -79,12 +79,14 @@ pub const Batcher = struct {
         return @intCast(self.vertices.items.len - first);
     }
 
-    /// Rebuilds vertices and batches for one frame. `queued` quads (sprites) are already in physical pixels
-    /// and draw first, under the command list. The `.clear` command is the provider's business, not ours.
+    /// Rebuilds vertices and batches for one frame. `triangles` (three vertices each) and `queued` quads
+    /// (sprites) are already in physical pixels and draw first, under the command list. The `.clear` command
+    /// is the provider's business, not ours.
     pub fn build(
         self: *Batcher,
         commands: []const graphics.DrawCommand,
         queued: []const Quad,
+        triangles: []const Vertex,
         dpi_scale: f32,
         atlases: Atlases,
     ) !void {
@@ -93,6 +95,12 @@ pub const Batcher = struct {
         var clip_stack: [max_clip_depth]ScissorRect = undefined;
         var clip_depth: usize = 0;
         var active: ?ScissorRect = null;
+
+        if (triangles.len >= 3) {
+            const first = self.mark();
+            try self.vertices.appendSlice(self.allocator, triangles[0 .. triangles.len / 3 * 3]);
+            try self.flush(.white, null, first, self.added(first));
+        }
 
         for (queued) |q| {
             const first = self.mark();
@@ -290,7 +298,7 @@ test "adjacent rects share one batch and clip changes split it" {
         .{ .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10, .color = red } },
         .clip_pop,
         .{ .rect = .{ .x = 0, .y = 0, .width = 10, .height = 10, .color = red } },
-    }, &.{}, 1.0, atlases);
+    }, &.{}, &.{}, 1.0, atlases);
 
     try testing.expectEqual(@as(usize, 24), b.vertices.items.len);
     try testing.expectEqual(@as(usize, 3), b.batches.items.len);
@@ -314,7 +322,7 @@ test "nested clips intersect and dpi scales coordinates" {
         .{ .clip_push = .{ .x = 0, .y = 0, .width = 50, .height = 50 } },
         .{ .clip_push = .{ .x = 25, .y = 25, .width = 50, .height = 50 } },
         .{ .rect = .{ .x = 1, .y = 2, .width = 3, .height = 4, .color = c } },
-    }, &.{}, 2.0, atlases);
+    }, &.{}, &.{}, 2.0, atlases);
 
     const sc = b.batches.items[0].scissor.?;
     try testing.expectEqual(@as(i32, 50), sc.x);
@@ -336,7 +344,7 @@ test "text and icons go to their atlas slots, queued quads use user textures" {
     try b.build(&.{
         .{ .text = .{ .x = 0, .y = 0, .content = "Hi", .color = white } },
         .{ .icon = .{ .x = 0, .y = 0, .size = 16, .kind = .check, .color = white } },
-    }, &.{.{ .x = 0, .y = 0, .width = 4, .height = 4, .texture = 42 }}, 1.0, atlases);
+    }, &.{.{ .x = 0, .y = 0, .width = 4, .height = 4, .texture = 42 }}, &.{}, 1.0, atlases);
 
     try testing.expect(b.batches.items.len >= 3);
     try testing.expectEqual(TextureSlot{ .user = 42 }, b.batches.items[0].texture);
@@ -349,4 +357,20 @@ test "scissor clamping rejects empty and out-of-bounds regions" {
     const r = clampScissor(.{ .x = -5, .y = -5, .w = 20, .h = 20 }, 100, 100).?;
     try testing.expectEqual(@as(i32, 0), r.x);
     try testing.expectEqual(@as(u32, 15), r.w);
+}
+
+test "queued triangles draw first as a white batch" {
+    var font: text.TtfAtlas = undefined;
+    var icons: text.IconAtlas = undefined;
+    const atlases = try testAtlases(&font, &icons);
+    defer font.deinit();
+    defer icons.deinit();
+    var b = Batcher.init(testing.allocator);
+    defer b.deinit();
+
+    const v = Vertex{ .x = 0, .y = 0, .u = 0, .v = 0, .r = 1, .g = 0, .b = 0, .a = 1 };
+    try b.build(&.{.{ .rect = .{ .x = 0, .y = 0, .width = 4, .height = 4, .color = .{ .r = 1, .g = 1, .b = 1 } } }}, &.{}, &.{ v, v, v, v }, 1.0, atlases);
+    // The stray 4th vertex is dropped: only whole triangles are accepted.
+    try testing.expectEqual(@as(usize, 9), b.vertices.items.len);
+    try testing.expectEqual(@as(u32, 9), b.batches.items[0].vertex_count); // white triangle + white rect merge
 }

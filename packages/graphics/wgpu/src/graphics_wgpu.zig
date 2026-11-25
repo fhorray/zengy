@@ -10,6 +10,7 @@ const window_sdl3 = @import("window_sdl3");
 const wgpu_gpu = @import("wgpu_gpu");
 
 const gpu = graphics.gpu;
+const frame = graphics.frame;
 
 pub const PROVIDER_ID = "official.graphics.wgpu";
 pub const MODULE_OWNER_ID: u64 = 2099;
@@ -19,6 +20,29 @@ extern fn zwgpu_create(window: *anyopaque) ?*anyopaque;
 extern fn zwgpu_destroy(bridge: *anyopaque) void;
 extern fn zwgpu_drawable_size(bridge: *anyopaque, width: *u32, height: *u32) c_int;
 extern fn zwgpu_error() [*:0]const u8;
+// libc is linked already; used only by the debug frame dump below.
+extern fn SDL_GetTicksNS() u64;
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern fn fwrite(ptr: *const anyopaque, size: usize, count: usize, file: *anyopaque) usize;
+extern fn fclose(file: *anyopaque) c_int;
+
+/// Frame number (1-based) dumped when `ZENGY_WGPU_CAPTURE_PPM` is set.
+const debug_capture_frame: u64 = 20;
+
+/// Read-back of the frame being captured; the buffer is reused across captures.
+const Capture = struct {
+    request: ?graphics.CaptureTarget = null,
+    /// A copy was recorded for the frame currently being presented.
+    scheduled: bool = false,
+    buffer: ?gpu.BufferHandle = null,
+    capacity: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    pitch: u32 = 0,
+    format: gpu.TextureFormat = .bgra8_unorm,
+    ready: ?graphics.CaptureImage = null,
+};
 
 const State = struct {
     app: *engine.App,
@@ -30,6 +54,10 @@ const State = struct {
     /// Reused every frame so presenting does not allocate in steady state.
     recorder: gpu.CommandRecorder,
     default_clear: gpu.ClearColor = .{ .r = 0.07, .g = 0.09, .b = 0.13, .a = 1.0 },
+    capture: Capture = .{},
+    frames_presented: u64 = 0,
+    /// Debug: path from `ZENGY_WGPU_CAPTURE_PPM`; the provider dumps one presented frame there.
+    debug_capture_path: ?[*:0]const u8 = null,
 };
 
 /// Registry handle: State stays on the heap so `service` and `backend` pointers remain stable.
@@ -66,6 +94,81 @@ fn isFatal(err: anyerror) bool {
     return err == error.GpuFailure or err == error.SurfaceFailure;
 }
 
+/// `.final` capture point: after the world renderers, before 2D overlays. Skipped if nothing drew yet, in
+/// which case the capture happens at the end of the frame (no world means final == presented).
+fn captureFinalRender(ctx: *anyopaque, input: *frame.FrameInput) anyerror!void {
+    const state: *State = @ptrCast(@alignCast(ctx));
+    if (state.capture.request != .final or !input.color_target_used) return;
+    try scheduleCapture(state, input);
+}
+
+fn scheduleCapture(state: *State, input: *frame.FrameInput) !void {
+    const cap = &state.capture;
+    if (cap.scheduled) return;
+    const pitch = gpu.alignedBytesPerRow(input.target.width * 4);
+    const bytes = @as(u64, pitch) * input.target.height;
+    if (cap.buffer == null or cap.capacity < bytes) {
+        if (cap.buffer) |old| input.device.destroyBuffer(old);
+        cap.buffer = null;
+        cap.buffer = try input.device.createBuffer(.{ .label = "capture", .size = bytes, .usage = .{ .map_read = true, .copy_dst = true } });
+        cap.capacity = bytes;
+    }
+    try input.recorder.copySwapchainToBuffer(cap.buffer.?, .{ .bytes_per_row = pitch, .rows_per_image = input.target.height });
+    cap.scheduled = true;
+    cap.width = input.target.width;
+    cap.height = input.target.height;
+    cap.pitch = pitch;
+    cap.format = input.target.color_format;
+}
+
+/// Reads the copied frame back and converts it to float RGBA. Capture is a tool path, so this blocks.
+fn finishCapture(state: *State) !void {
+    const cap = &state.capture;
+    if (!cap.scheduled) return;
+    cap.scheduled = false;
+    cap.request = null;
+    const device = state.device.gpuDevice();
+    const raw = try state.allocator.alloc(u8, @as(usize, cap.pitch) * cap.height);
+    defer state.allocator.free(raw);
+    try device.readBufferBlocking(cap.buffer.?, 0, raw);
+
+    const rgba = try state.allocator.alloc(f32, @as(usize, cap.width) * cap.height * 4);
+    errdefer state.allocator.free(rgba);
+    const bgra = cap.format == .bgra8_unorm or cap.format == .bgra8_unorm_srgb;
+    for (0..cap.height) |y| {
+        for (0..cap.width) |x| {
+            const src = y * cap.pitch + x * 4;
+            const dst = (y * cap.width + x) * 4;
+            const r_index: usize = if (bgra) 2 else 0;
+            const b_index: usize = if (bgra) 0 else 2;
+            rgba[dst + 0] = @as(f32, @floatFromInt(raw[src + r_index])) / 255.0;
+            rgba[dst + 1] = @as(f32, @floatFromInt(raw[src + 1])) / 255.0;
+            rgba[dst + 2] = @as(f32, @floatFromInt(raw[src + b_index])) / 255.0;
+            rgba[dst + 3] = @as(f32, @floatFromInt(raw[src + 3])) / 255.0;
+        }
+    }
+    if (cap.ready) |*old| old.deinit(state.allocator);
+    cap.ready = .{ .width = cap.width, .height = cap.height, .rgba = rgba };
+}
+
+/// Writes a binary PPM (P6). Debug tooling only: lets CI and developers inspect a presented frame.
+fn writePpm(allocator: std.mem.Allocator, path: [*:0]const u8, image: graphics.CaptureImage) !void {
+    const header = try std.fmt.allocPrint(allocator, "P6\n{d} {d}\n255\n", .{ image.width, image.height });
+    defer allocator.free(header);
+    const pixels = try allocator.alloc(u8, @as(usize, image.width) * image.height * 3);
+    defer allocator.free(pixels);
+    for (0..@as(usize, image.width) * image.height) |i| {
+        for (0..3) |channel| {
+            const value = std.math.clamp(image.rgba[i * 4 + channel], 0.0, 1.0);
+            pixels[i * 3 + channel] = @intFromFloat(value * 255.0 + 0.5);
+        }
+    }
+    const file = fopen(path, "wb") orelse return error.CaptureWriteFailed;
+    defer _ = fclose(file);
+    if (fwrite(header.ptr, 1, header.len, file) != header.len) return error.CaptureWriteFailed;
+    if (fwrite(pixels.ptr, 1, pixels.len, file) != pixels.len) return error.CaptureWriteFailed;
+}
+
 fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []const graphics.DrawCommand) !void {
     const state = stateOf(raw);
     if (state.surface == null or !same(handle, state.surface.?)) return error.InvalidSurfaceHandle;
@@ -83,6 +186,12 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
         else => {},
     };
 
+    state.frames_presented += 1;
+    const t0 = SDL_GetTicksNS();
+    if (state.debug_capture_path != null and state.frames_presented == debug_capture_frame and state.capture.request == null) {
+        state.capture.request = .presented;
+    }
+
     const device = state.device.gpuDevice();
     const recorder = &state.recorder;
     recorder.reset();
@@ -96,13 +205,17 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
         .draw_commands = commands,
     };
     try state.service.renderers.run(&input);
+    const t1 = SDL_GetTicksNS();
     if (!input.color_target_used) {
         // Nothing drew: still clear the swapchain so the window shows the background instead of stale pixels.
         const attachments = [_]gpu.ColorAttachment{input.colorAttachment()};
         try recorder.beginRenderPass(.{ .label = "clear", .color_attachments = &attachments });
         try recorder.endRenderPass();
     }
+    // A capture still pending here means nothing needed the pre-overlay point: take the whole frame.
+    if (state.capture.request != null) try scheduleCapture(state, &input);
     try recorder.finish();
+    const t2 = SDL_GetTicksNS();
     device.submit(recorder.slice()) catch |err| {
         if (isFatal(err)) state.service.setDeviceAvailable(false);
         return err;
@@ -111,6 +224,19 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
         if (isFatal(err)) state.service.setDeviceAvailable(false);
         return err;
     };
+    if (getenv("ZENGY_WGPU_TIMING") != null) {
+        const t3 = SDL_GetTicksNS();
+        std.debug.print("[wgpu] frame {d}: renderers={d}us submit+present={d}us commands={d}\n", .{ state.frames_presented, (t1 - t0) / 1000, (t3 - t2) / 1000, recorder.slice().len });
+    }
+    try finishCapture(state);
+    if (state.debug_capture_path) |path| {
+        if (state.frames_presented == debug_capture_frame) {
+            if (state.capture.ready) |image| {
+                try writePpm(state.allocator, path, image);
+                std.debug.print("[wgpu] wrote frame {d} ({d}x{d}) to {s}\n", .{ state.frames_presented, image.width, image.height, path });
+            }
+        }
+    }
 }
 
 const backend: graphics.BackendVTable = .{
@@ -147,12 +273,19 @@ fn buildModule(raw: *anyopaque) !void {
         .device = device,
         .service = graphics.GraphicsDeviceService.initWithBackend(app.allocator, &backend, state, caps),
         .recorder = gpu.CommandRecorder.init(app.allocator),
+        .debug_capture_path = getenv("ZENGY_WGPU_CAPTURE_PPM"),
     };
     state.service.gpu_device = device.gpuDevice();
     errdefer {
         state.recorder.deinit();
         state.service.deinit();
     }
+    try state.service.registerRenderer(.{
+        .name = "official.graphics.wgpu.capture",
+        .ctx = state,
+        .order = frame.Order.overlay_2d - 1,
+        .render = captureFinalRender,
+    });
     try app.resources.insert(StateRef, .{ .state = state });
     errdefer _ = app.resources.remove(StateRef);
     try app.services.register(.{
@@ -176,6 +309,8 @@ fn stopModule(raw: *anyopaque) void {
     _ = app.resources.remove(StateRef);
     // Renderers drop their GPU resources while the device is still alive.
     state.service.deinit();
+    if (state.capture.buffer) |buffer| state.device.gpuDevice().destroyBuffer(buffer);
+    if (state.capture.ready) |*image| image.deinit(state.allocator);
     state.recorder.deinit();
     state.device.deinit();
     zwgpu_destroy(state.bridge);
@@ -199,4 +334,21 @@ pub fn module() engine.Module {
 pub fn driverName(app: *engine.App) ?[]const u8 {
     const ref = app.resources.get(StateRef) orelse return null;
     return @tagName(ref.state.device.caps.info.backend);
+}
+
+/// Asks the next presented frame to be read back. `final` excludes 2D overlays; `presented` includes them.
+/// Returns false for targets this provider cannot produce yet (`hdr`, `ssao` need the 3D renderer).
+pub fn requestCapture(app: *engine.App, target: graphics.CaptureTarget) bool {
+    const ref = app.resources.get(StateRef) orelse return false;
+    if (target == .hdr or target == .ssao) return false;
+    ref.state.capture.request = target;
+    return true;
+}
+
+/// Takes the capture produced by `requestCapture` once its frame was presented. The caller owns the image.
+pub fn takeCapture(app: *engine.App) ?graphics.CaptureImage {
+    const ref = app.resources.get(StateRef) orelse return null;
+    const image = ref.state.capture.ready;
+    ref.state.capture.ready = null;
+    return image;
 }

@@ -650,115 +650,119 @@ pub fn build(b: *std.Build) void {
     graphics_sdlgpu_mod.addImport("prism", prism_mod);
     graphics_sdlgpu_mod.addImport("sdl3_c", sdl3_c_mod);
 
-    // Optional migration provider. The existing default build is unchanged.
-    if (b.option([]const u8, "wgpu-root", "Absolute path to the wgpu-native v27.0.4.1 SDK")) |wgpu_root| {
-        const wgpu_include: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "include" }) };
-        const wgpu_lib: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib" }) };
+    // wgpu-native is the engine's graphics foundation. `tools/wgpu/install_wgpu.py` installs the pinned SDK into
+    // `.deps/wgpu-native`; `-Dwgpu-root` points at another copy. Headless tests never need it.
+    const wgpu_root: []const u8 = b.option([]const u8, "wgpu-root", "Absolute path to the wgpu-native v27.0.4.1 SDK (default: .deps/wgpu-native)") orelse ".deps/wgpu-native";
+    const wgpu_present = if (std.Io.Dir.cwd().access(b.graph.io, b.pathJoin(&.{ wgpu_root, "include", "webgpu", "webgpu.h" }), .{})) |_| true else |_| false;
+    // Steps that need the SDK depend on this so a missing SDK produces one clear message instead of a header error.
+    const wgpu_missing: ?*std.Build.Step.Fail = if (wgpu_present) null else b.addFail("wgpu-native SDK not found. Run `python tools/wgpu/install_wgpu.py --output .deps/wgpu-native` (or pass -Dwgpu-root=<path>).");
+    const wgpu_include: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "include" }) };
+    const wgpu_lib: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib" }) };
 
-        // Typed access to the pinned webgpu.h/wgpu.h for the Zig resource layer.
-        const translate_wgpu = b.addTranslateC(.{
-            .root_source_file = b.path("packages/graphics/wgpu/src/wgpu_c.h"),
-            .target = target,
-            .optimize = optimize,
-        });
-        translate_wgpu.addIncludePath(wgpu_include);
-        const wgpu_c_mod = translate_wgpu.createModule();
+    // Typed access to the pinned webgpu.h/wgpu.h for the Zig resource layer.
+    const translate_wgpu = b.addTranslateC(.{
+        .root_source_file = b.path("packages/graphics/wgpu/src/wgpu_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_wgpu.addIncludePath(wgpu_include);
+    const wgpu_c_mod = translate_wgpu.createModule();
 
-        // Native device layer: the C bridge (surface/swapchain) plus the Zig implementation of
-        // `graphics.gpu.GpuDevice`. Owns every wgpu-native call so renderers never see WGPU* types.
-        const wgpu_gpu_mod = b.addModule("wgpu_gpu", .{
-            .root_source_file = b.path("packages/graphics/wgpu/src/gpu_device.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        wgpu_gpu_mod.addImport("graphics", graphics_mod);
-        wgpu_gpu_mod.addImport("wgpu_c", wgpu_c_mod);
-        wgpu_gpu_mod.addIncludePath(b.path("packages/sdl3/include"));
-        wgpu_gpu_mod.addLibraryPath(b.path("packages/sdl3/lib/x64"));
-        wgpu_gpu_mod.linkSystemLibrary("SDL3", .{});
-        wgpu_gpu_mod.addIncludePath(wgpu_include);
-        wgpu_gpu_mod.addLibraryPath(wgpu_lib);
-        wgpu_gpu_mod.addCSourceFiles(.{
-            .files = &.{"packages/graphics/wgpu/src/bridge.c"},
-            .flags = &.{"-std=c11"},
-        });
-        wgpu_gpu_mod.linkSystemLibrary("wgpu_native", .{ .preferred_link_mode = .dynamic });
+    // Native device layer: the C bridge (surface/swapchain) plus the Zig implementation of
+    // `graphics.gpu.GpuDevice`. Owns every wgpu-native call so renderers never see WGPU* types.
+    const wgpu_gpu_mod = b.addModule("wgpu_gpu", .{
+        .root_source_file = b.path("packages/graphics/wgpu/src/gpu_device.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wgpu_gpu_mod.addImport("graphics", graphics_mod);
+    wgpu_gpu_mod.addImport("wgpu_c", wgpu_c_mod);
+    wgpu_gpu_mod.addIncludePath(b.path("packages/sdl3/include"));
+    wgpu_gpu_mod.addLibraryPath(b.path("packages/sdl3/lib/x64"));
+    wgpu_gpu_mod.linkSystemLibrary("SDL3", .{});
+    wgpu_gpu_mod.addIncludePath(wgpu_include);
+    wgpu_gpu_mod.addLibraryPath(wgpu_lib);
+    wgpu_gpu_mod.addCSourceFiles(.{
+        .files = &.{"packages/graphics/wgpu/src/bridge.c"},
+        .flags = &.{"-std=c11"},
+    });
+    wgpu_gpu_mod.linkSystemLibrary("wgpu_native", .{ .preferred_link_mode = .dynamic });
 
-        const graphics_wgpu_mod = b.addModule("graphics_wgpu", .{
-            .root_source_file = b.path("packages/graphics/wgpu/src/graphics_wgpu.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        graphics_wgpu_mod.addImport("engine", engine_mod);
-        graphics_wgpu_mod.addImport("graphics", graphics_mod);
-        graphics_wgpu_mod.addImport("window_sdl3", window_sdl3_mod);
-        graphics_wgpu_mod.addImport("wgpu_gpu", wgpu_gpu_mod);
+    const graphics_wgpu_mod = b.addModule("graphics_wgpu", .{
+        .root_source_file = b.path("packages/graphics/wgpu/src/graphics_wgpu.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    graphics_wgpu_mod.addImport("engine", engine_mod);
+    graphics_wgpu_mod.addImport("graphics", graphics_mod);
+    graphics_wgpu_mod.addImport("window_sdl3", window_sdl3_mod);
+    graphics_wgpu_mod.addImport("wgpu_gpu", wgpu_gpu_mod);
 
-        // Real-GPU conformance tests. Kept out of the default `test` step, which must run without a GPU.
-        const gpu_test_mod = b.createModule(.{
-            .root_source_file = b.path("packages/graphics/wgpu/tests/all_gpu_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        gpu_test_mod.addImport("graphics", graphics_mod);
-        gpu_test_mod.addImport("wgpu_gpu", wgpu_gpu_mod);
-        gpu_test_mod.addImport("draw_2d", draw_2d_mod);
-        gpu_test_mod.addImport("engine", engine_mod);
-        gpu_test_mod.addImport("window_sdl3", window_sdl3_mod);
-        gpu_test_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
-        const gpu_tests = b.addTest(.{ .root_module = gpu_test_mod });
-        const gpu_test_step = b.step("test-wgpu-gpu", "Run wgpu GpuDevice conformance tests on a real adapter");
-        // On Windows the loader needs SDL3.dll and wgpu_native.dll beside the executable, so run an
-        // installed copy (the cache copy fails with 0xC0000135 / exit 53), like `run-visual-hello`.
-        const wgpu_dll = b.addInstallBinFile(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib", "wgpu_native.dll" }) }, "wgpu_native.dll");
-        if (target.result.os.tag == .windows) {
-            const install_gpu_tests = b.addInstallArtifact(gpu_tests, .{ .dest_sub_path = "wgpu-gpu-tests.exe" });
-            const run_gpu_tests = b.addSystemCommand(&.{"zig-out/bin/wgpu-gpu-tests.exe"});
-            run_gpu_tests.setCwd(b.path("."));
-            run_gpu_tests.step.dependOn(&install_gpu_tests.step);
-            run_gpu_tests.step.dependOn(&wgpu_dll.step);
-            if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
-                const install_sdl = b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll");
-                run_gpu_tests.step.dependOn(&install_sdl.step);
-            }
-            gpu_test_step.dependOn(&run_gpu_tests.step);
-        } else {
-            gpu_test_step.dependOn(&b.addRunArtifact(gpu_tests).step);
+    // Real-GPU conformance tests. Kept out of the default `test` step, which must run without a GPU.
+    const gpu_test_mod = b.createModule(.{
+        .root_source_file = b.path("packages/graphics/wgpu/tests/all_gpu_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    gpu_test_mod.addImport("graphics", graphics_mod);
+    gpu_test_mod.addImport("wgpu_gpu", wgpu_gpu_mod);
+    gpu_test_mod.addImport("draw_2d", draw_2d_mod);
+    gpu_test_mod.addImport("engine", engine_mod);
+    gpu_test_mod.addImport("window_sdl3", window_sdl3_mod);
+    gpu_test_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    const gpu_tests = b.addTest(.{ .root_module = gpu_test_mod });
+    const gpu_test_step = b.step("test-wgpu-gpu", "Run wgpu GpuDevice conformance tests on a real adapter");
+    // On Windows the loader needs SDL3.dll and wgpu_native.dll beside the executable, so run an
+    // installed copy (the cache copy fails with 0xC0000135 / exit 53), like `run-visual-hello`.
+    const wgpu_dll = b.addInstallBinFile(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib", "wgpu_native.dll" }) }, "wgpu_native.dll");
+    if (wgpu_present and target.result.os.tag == .windows) b.getInstallStep().dependOn(&wgpu_dll.step);
+    if (target.result.os.tag == .windows) {
+        const install_gpu_tests = b.addInstallArtifact(gpu_tests, .{ .dest_sub_path = "wgpu-gpu-tests.exe" });
+        const run_gpu_tests = b.addSystemCommand(&.{"zig-out/bin/wgpu-gpu-tests.exe"});
+        run_gpu_tests.setCwd(b.path("."));
+        run_gpu_tests.step.dependOn(&install_gpu_tests.step);
+        run_gpu_tests.step.dependOn(&wgpu_dll.step);
+        if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
+            const install_sdl = b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll");
+            run_gpu_tests.step.dependOn(&install_sdl.step);
         }
+        gpu_test_step.dependOn(&run_gpu_tests.step);
+    } else {
+        gpu_test_step.dependOn(&b.addRunArtifact(gpu_tests).step);
+    }
 
-        const visual_wgpu_mod = b.createModule(.{
-            .root_source_file = b.path("examples/visual-wgpu/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        visual_wgpu_mod.addImport("engine", engine_mod);
-        visual_wgpu_mod.addImport("window_sdl3", window_sdl3_mod);
-        visual_wgpu_mod.addImport("graphics", graphics_mod);
-        visual_wgpu_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
-        visual_wgpu_mod.addImport("draw_2d", draw_2d_mod);
-        const visual_wgpu_exe = b.addExecutable(.{ .name = "visual-wgpu", .root_module = visual_wgpu_mod });
-        const install_wgpu = b.addInstallArtifact(visual_wgpu_exe, .{});
-        const build_wgpu_step = b.step("build-visual-wgpu", "Build the native wgpu migration demo");
-        build_wgpu_step.dependOn(&install_wgpu.step);
-        const run_wgpu_step = b.step("run-visual-wgpu", "Run the native wgpu migration demo");
-        if (target.result.os.tag == .windows) {
-            // Same loader constraint as the GPU tests: run the installed copy with its DLLs beside it.
-            const run_wgpu = b.addSystemCommand(&.{"zig-out/bin/visual-wgpu.exe"});
-            run_wgpu.setCwd(b.path("."));
-            run_wgpu.step.dependOn(&install_wgpu.step);
-            run_wgpu.step.dependOn(&wgpu_dll.step);
-            if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
-                const install_sdl = b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll");
-                run_wgpu.step.dependOn(&install_sdl.step);
-            }
-            run_wgpu_step.dependOn(&run_wgpu.step);
-        } else {
-            run_wgpu_step.dependOn(&b.addRunArtifact(visual_wgpu_exe).step);
+    const visual_wgpu_mod = b.createModule(.{
+        .root_source_file = b.path("examples/visual-wgpu/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    visual_wgpu_mod.addImport("engine", engine_mod);
+    visual_wgpu_mod.addImport("window_sdl3", window_sdl3_mod);
+    visual_wgpu_mod.addImport("graphics", graphics_mod);
+    visual_wgpu_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_wgpu_mod.addImport("draw_2d", draw_2d_mod);
+    const visual_wgpu_exe = b.addExecutable(.{ .name = "visual-wgpu", .root_module = visual_wgpu_mod });
+    const install_wgpu = b.addInstallArtifact(visual_wgpu_exe, .{});
+    const build_wgpu_step = b.step("build-visual-wgpu", "Build the native wgpu migration demo");
+    build_wgpu_step.dependOn(&install_wgpu.step);
+    const run_wgpu_step = b.step("run-visual-wgpu", "Run the native wgpu migration demo");
+    if (target.result.os.tag == .windows) {
+        // Same loader constraint as the GPU tests: run the installed copy with its DLLs beside it.
+        const run_wgpu = b.addSystemCommand(&.{"zig-out/bin/visual-wgpu.exe"});
+        run_wgpu.setCwd(b.path("."));
+        run_wgpu.step.dependOn(&install_wgpu.step);
+        run_wgpu.step.dependOn(&wgpu_dll.step);
+        if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
+            const install_sdl = b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll");
+            run_wgpu.step.dependOn(&install_sdl.step);
         }
+        run_wgpu_step.dependOn(&run_wgpu.step);
+    } else {
+        run_wgpu_step.dependOn(&b.addRunArtifact(visual_wgpu_exe).step);
     }
 
     // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
@@ -772,13 +776,15 @@ pub fn build(b: *std.Build) void {
     visual_gpu_mod.addImport("window", window_mod);
     visual_gpu_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_gpu_mod.addImport("graphics", graphics_mod);
-    visual_gpu_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_gpu_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_gpu_mod.addImport("draw_2d", draw_2d_mod);
 
     const visual_gpu_exe = b.addExecutable(.{
         .name = "visual-gpu",
         .root_module = visual_gpu_mod,
     });
     b.installArtifact(visual_gpu_exe);
+    if (wgpu_missing) |fail| visual_gpu_exe.step.dependOn(&fail.step);
 
     const run_visual_gpu = b.addSystemCommand(&.{"zig-out/bin/visual-gpu.exe"});
     run_visual_gpu.setCwd(b.path("."));
@@ -797,7 +803,8 @@ pub fn build(b: *std.Build) void {
     visual_2d_mod.addImport("window", window_mod);
     visual_2d_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_2d_mod.addImport("graphics", graphics_mod);
-    visual_2d_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_2d_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_2d_mod.addImport("draw_2d", draw_2d_mod);
     visual_2d_mod.addImport("scene", scene_mod);
     visual_2d_mod.addImport("camera", camera_mod);
     visual_2d_mod.addImport("render_2d", render_2d_mod);
@@ -807,6 +814,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_2d_mod,
     });
     b.installArtifact(visual_2d_exe);
+    if (wgpu_missing) |fail| visual_2d_exe.step.dependOn(&fail.step);
 
     const run_visual_2d = b.addSystemCommand(&.{"zig-out/bin/visual-2d.exe"});
     run_visual_2d.setCwd(b.path("."));
@@ -825,7 +833,8 @@ pub fn build(b: *std.Build) void {
     visual_plume_mod.addImport("window", window_mod);
     visual_plume_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_plume_mod.addImport("graphics", graphics_mod);
-    visual_plume_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_plume_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_plume_mod.addImport("draw_2d", draw_2d_mod);
     visual_plume_mod.addImport("ui_core", ui_core_mod);
     visual_plume_mod.addImport("ui_widgets", ui_widgets_mod);
     visual_plume_mod.addImport("ui_plume", ui_plume_mod);
@@ -835,6 +844,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_plume_mod,
     });
     b.installArtifact(visual_plume_exe);
+    if (wgpu_missing) |fail| visual_plume_exe.step.dependOn(&fail.step);
 
     const run_visual_plume = b.addSystemCommand(&.{"zig-out/bin/visual-plume.exe"});
     run_visual_plume.setCwd(b.path("."));
@@ -853,7 +863,8 @@ pub fn build(b: *std.Build) void {
     visual_ui_mod.addImport("window", window_mod);
     visual_ui_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_ui_mod.addImport("graphics", graphics_mod);
-    visual_ui_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_ui_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_ui_mod.addImport("draw_2d", draw_2d_mod);
     visual_ui_mod.addImport("ui_core", ui_core_mod);
     visual_ui_mod.addImport("ui_markup", ui_markup_mod);
 
@@ -862,6 +873,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_ui_mod,
     });
     b.installArtifact(visual_ui_exe);
+    if (wgpu_missing) |fail| visual_ui_exe.step.dependOn(&fail.step);
 
     const run_visual_ui = b.addSystemCommand(&.{"zig-out/bin/visual-ui.exe"});
     run_visual_ui.setCwd(b.path("."));
@@ -880,7 +892,8 @@ pub fn build(b: *std.Build) void {
     visual_pg_mod.addImport("window", window_mod);
     visual_pg_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_pg_mod.addImport("graphics", graphics_mod);
-    visual_pg_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_pg_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_pg_mod.addImport("draw_2d", draw_2d_mod);
     visual_pg_mod.addImport("scene", scene_mod);
     visual_pg_mod.addImport("camera", camera_mod);
     visual_pg_mod.addImport("render_2d", render_2d_mod);
@@ -892,12 +905,25 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_pg_mod,
     });
     b.installArtifact(visual_pg_exe);
+    if (wgpu_missing) |fail| visual_pg_exe.step.dependOn(&fail.step);
 
     const run_visual_pg = b.addSystemCommand(&.{"zig-out/bin/visual-playground.exe"});
     run_visual_pg.setCwd(b.path("."));
     run_visual_pg.step.dependOn(b.getInstallStep());
     const run_visual_pg_step = b.step("run-visual-playground", "Open the integrated 2D + UI Visual Playground (D5)");
     run_visual_pg_step.dependOn(&run_visual_pg.step);
+
+    // Builds and installs only the examples already running on wgpu (plus runtime DLLs), without the SDL GPU ones.
+    const wgpu_examples_step = b.step("build-wgpu-examples", "Install the examples that run on the wgpu stack");
+    for ([_]*std.Build.Step.Compile{ visual_gpu_exe, visual_2d_exe, visual_plume_exe, visual_ui_exe, visual_pg_exe }) |exe| {
+        wgpu_examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+    if (wgpu_present and target.result.os.tag == .windows) {
+        wgpu_examples_step.dependOn(&b.addInstallBinFile(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib", "wgpu_native.dll" }) }, "wgpu_native.dll").step);
+        if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
+            wgpu_examples_step.dependOn(&b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll").step);
+        }
+    }
 
     // Visual Python (PocketPy + SDL_GPU): Python script driving `engine.draw_rect`. Run with `zig build run-visual-python`.
     const visual_py_mod = b.createModule(.{

@@ -14,6 +14,7 @@ pub const tessellate = @import("tessellate.zig");
 
 pub const Renderer2D = renderer.Renderer2D;
 pub const TextureId = renderer.TextureId;
+pub const NdcVertex = renderer.NdcVertex;
 pub const TexturedQuad = tessellate.TexturedQuad;
 pub const ScissorRect = tessellate.ScissorRect;
 
@@ -63,6 +64,12 @@ pub fn rendererOf(app: *engine.App) ?*Renderer2D {
 pub fn queueTexturedQuad(app: *engine.App, quad: TexturedQuad) !void {
     const r2d = rendererOf(app) orelse return error.Render2DNotRegistered;
     try r2d.queueTexturedQuad(quad);
+}
+
+/// Queues a colored triangle in normalized device coordinates (y up); it draws under the next command list.
+pub fn queueTriangleNdc(app: *engine.App, a: NdcVertex, b: NdcVertex, c: NdcVertex) !void {
+    const r2d = rendererOf(app) orelse return error.Render2DNotRegistered;
+    try r2d.queueTriangleNdc(a, b, c);
 }
 
 fn createTexture(app: *engine.App, width: u32, height: u32, pixels: []const u8, srgb: bool) !TextureId {

@@ -43,7 +43,7 @@ fn render(ctx: *engine.SystemContext) !void {
         .{ .icon = .{ .x = 124, .y = 128, .size = 28, .kind = .search, .color = white } },
         .{ .icon = .{ .x = 164, .y = 128, .size = 28, .kind = .alert_triangle, .color = color(1, 0.8, 0.2, 1) } },
 
-        .{ .gradient_rect = .{ .x = 24, .y = 248, .width = 400, .height = 28, .kind = .hue_horizontal, .corner_radii = .{ 6, 6, 6, 6 } } },
+        .{ .gradient_rect = .{ .x = 24, .y = 248, .width = 400, .height = 28, .kind = .hue_horizontal } },
         .{ .gradient_rect = .{ .x = 24, .y = 288, .width = 400, .height = 28, .kind = .linear_horizontal, .stops = .{ color(1, 0.2, 0.3, 1), color(0.2, 0.4, 1, 1), white, white }, .corner_radii = .{ 6, 6, 6, 6 } } },
         .{ .color_wheel = .{ .x = 450, .y = 24, .size = 200, .hue_deg = hue } },
 

@@ -288,8 +288,10 @@ pub fn module() engine.Module {
     };
 }
 
-/// Which render target a capture request reads back (`final` is the post-processed frame without 2D overlays).
-pub const CaptureTarget = enum { final, hdr, ssao };
+/// Which render target a capture request reads back. `final` is the post-processed scene frame without 2D
+/// overlays; `presented` is the frame exactly as shown, overlays included. `hdr` and `ssao` need the 3D
+/// renderer and are rejected by providers that cannot produce them.
+pub const CaptureTarget = enum { final, hdr, ssao, presented };
 
 /// A captured render target as float RGBA. `final` captures hold display values in `[0, 1]`; `hdr` captures
 /// hold scene-linear radiance. Providers fill it; `official.testing` turns it into PNGs, statistics and diffs.

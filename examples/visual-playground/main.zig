@@ -1,6 +1,6 @@
 //! Visual Playground (D5) — Integrated 2D Scene + UI Panel (`examples/visual-playground/main.zig`).
 //!
-//! Combines `window_sdl3`, `graphics_sdlgpu`, `scene`, `render_2d`, and `ui_core`/`ui_markup`:
+//! Combines `window_sdl3`, `graphics_wgpu`, `draw_2d`, `scene`, `render_2d`, and `ui_core`/`ui_markup`:
 //! - Interactive 2D scene with `Camera2D` (WASD/Arrows to pan) and rotating/orbiting sprites.
 //! - Translucent UI overlay panel with live FPS & sprite counter, "Spawn Sprite" button,
 //!   and a clipped scrollable event log.
@@ -13,7 +13,8 @@ const engine = @import("engine");
 const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
 const scene = @import("scene");
 const camera = @import("camera");
 const render_2d = @import("render_2d");
@@ -36,7 +37,7 @@ const PlaygroundState = struct {
     input: *window.InputService,
     tree: *ui_core.UiTree,
     rt: graphics.RenderTargetHandle,
-    sprite_tex: graphics_sdlgpu.GpuTextureHandle,
+    sprite_tex: draw_2d.TextureId,
     camera_entity: engine.EntityHandle,
     fps_idx: ?usize = null,
     log_list_idx: ?usize = null,
@@ -66,7 +67,7 @@ fn spawnPlaygroundSprite(st: *PlaygroundState, wx: f32, wy: f32) !void {
         .width = 56.0,
         .height = 56.0,
         .color = col,
-        .texture_id = @bitCast(st.sprite_tex),
+        .texture_id = st.sprite_tex,
         .layer = @intCast(n),
     });
     try st.app.world.set(e, SpawnedSprite, .{
@@ -188,12 +189,7 @@ fn renderPlaygroundSystem(ctx: *engine.SystemContext) !void {
 
     // Queue 2D sprites (scaled from logical to physical pixels).
     for (frame.items.items) |item| {
-        const tex: graphics_sdlgpu.GpuTextureHandle = if (item.texture_id != 0)
-            @bitCast(item.texture_id)
-        else
-            graphics_sdlgpu.whiteTextureHandle(st.app).?;
-
-        try graphics_sdlgpu.queueTexturedQuad(st.app, .{
+        try draw_2d.queueTexturedQuad(st.app, .{
             .x = item.screen_x * dpi,
             .y = item.screen_y * dpi,
             .width = item.screen_w * dpi,
@@ -204,7 +200,7 @@ fn renderPlaygroundSystem(ctx: *engine.SystemContext) !void {
             .u1 = item.uv_max[0],
             .v1 = item.uv_max[1],
             .color = item.color,
-            .texture = tex,
+            .texture = item.texture_id,
         });
     }
 
@@ -225,7 +221,8 @@ pub fn main() !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
     try app.registerModule(scene.module());
     try app.registerModule(camera.module());
     try app.registerModule(render_2d.module());
@@ -296,7 +293,7 @@ pub fn main() !void {
             tex_pixels[idx + 3] = 255;
         }
     }
-    const sprite_tex = try graphics_sdlgpu.createTextureRgba8(&app, 32, 32, &tex_pixels);
+    const sprite_tex = try draw_2d.createTextureRgba8(&app, 32, 32, &tex_pixels);
 
     const cam_e = try app.world.spawn();
     try app.world.set(cam_e, camera.Camera, .{});

@@ -1,7 +1,7 @@
-//! Visual GPU Hello (D2) — SDL3 Window + SDL_GPU Rendering (`examples/visual-gpu/main.zig`).
+//! Visual GPU Hello (D2) — SDL3 Window + wgpu Rendering (`examples/visual-gpu/main.zig`).
 //!
 //! Opens a resizable 1280x720 window through `official.window.sdl3`, initializes
-//! `official.graphics.sdlgpu`, renders a shader-driven RGB triangle (NDC) and an
+//! `official.graphics.wgpu` + `official.render.2d.draw`, renders a shader-driven RGB triangle (NDC) and an
 //! animated pixel-space rectangle via `GraphicsDeviceService`, and logs backend
 //! initialization to `Diagnostics`.
 //!
@@ -12,7 +12,8 @@ const engine = @import("engine");
 const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
 
 const RenderState = struct {
     app: *engine.App,
@@ -29,12 +30,11 @@ fn renderFrameSystem(ctx: *engine.SystemContext) !void {
     try rs.gfx.beginFrame(rs.rt);
 
     // 1. Shader-rendered RGB triangle in NDC space.
-    try graphics_sdlgpu.queueTriangle(
+    try draw_2d.queueTriangleNdc(
         rs.app,
         .{ .x = 0.0, .y = 0.55, .r = 0.95, .g = 0.25, .b = 0.30, .a = 1.0 },
         .{ .x = -0.50, .y = -0.45, .r = 0.20, .g = 0.85, .b = 0.45, .a = 1.0 },
         .{ .x = 0.50, .y = -0.45, .r = 0.25, .g = 0.45, .b = 0.95, .a = 1.0 },
-        false,
     );
 
     // 2. Shader-rendered rectangle in pixel space via GraphicsDeviceService DrawCommand.
@@ -67,7 +67,8 @@ pub fn main() !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
         .title = "Zengy — Visual GPU Hello (D2)",
@@ -75,10 +76,6 @@ pub fn main() !void {
         .height = 720,
         .resizable = true,
     });
-    try app.resources.insert(graphics_sdlgpu.GpuConfig, .{
-        .debug_mode = true,
-    });
-
     try app.scheduler.addSystem(.{
         .name = "visual_gpu.render_frame",
         .stage = .render_extract,
@@ -105,7 +102,7 @@ pub fn main() !void {
         .rt = rt,
     });
 
-    const driver = graphics_sdlgpu.driverName(&app) orelse "unknown";
+    const driver = wgpu.driverName(&app) orelse "unknown";
     std.debug.print("[visual-gpu] driver={s}, pixels={d}x{d}, dpi={d:.2}\n", .{
         driver,
         px_w,
@@ -113,7 +110,7 @@ pub fn main() !void {
         dpi_scale,
     });
 
-    // Print startup Diagnostics recorded by graphics.sdlgpu.
+    // Print startup Diagnostics recorded during initialization.
     for (0..app.diagnostics.count()) |i| {
         if (app.diagnostics.get(i)) |rec| {
             std.debug.print("[diag:{s}] {s}\n", .{ rec.subsystem, rec.message });

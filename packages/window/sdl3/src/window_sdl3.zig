@@ -245,6 +245,22 @@ pub fn pixelSize(app: *engine.App) ?struct { width: u32, height: u32, dpi_scale:
     return .{ .width = state.pixel_w, .height = state.pixel_h, .dpi_scale = state.dpi_scale };
 }
 
+/// Converts SDL window coordinates to the logical UI space used by layout and renderers.
+///
+/// Renderers draw logical units multiplied by `dpi_scale` (SDL display scale) and UI layout uses
+/// `pixels / dpi_scale`, so the pointer must live in that same space. SDL reports window coordinates:
+/// pixels = coords * pixel_density, and display_scale = pixel_density * content_scale, hence
+/// logical = coords * pixel_density / display_scale. Where density is 1.0 and the display scale is 1.5
+/// (Windows at 150%), the raw coordinates would be 1.5x too large and hover/click would land on the
+/// wrong widget.
+fn mouseToLogical(state: *const SdlState, x: f32, y: f32) [2]f32 {
+    const density = c.SDL_GetWindowPixelDensity(state.sdl_window);
+    const scale = state.dpi_scale;
+    if (density <= 0.0 or scale <= 0.0) return .{ x, y };
+    const factor = density / scale;
+    return .{ x * factor, y * factor };
+}
+
 /// Drains the SDL event queue for this frame and updates Input and Window services.
 pub fn pollEvents(app: *engine.App) void {
     const state = app.resources.get(SdlState) orelse return;
@@ -278,13 +294,15 @@ pub fn pollEvents(app: *engine.App) void {
                 }
             },
             c.SDL_EVENT_MOUSE_MOTION => {
-                state.input_svc.injectMouseMove(ev.motion.x, ev.motion.y);
+                const m = mouseToLogical(state, ev.motion.x, ev.motion.y);
+                state.input_svc.injectMouseMove(m[0], m[1]);
             },
             c.SDL_EVENT_MOUSE_WHEEL => {
                 state.input_svc.injectMouseWheel(ev.wheel.x, ev.wheel.y);
             },
             c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP => {
-                state.input_svc.injectMouseMove(ev.button.x, ev.button.y);
+                const m = mouseToLogical(state, ev.button.x, ev.button.y);
+                state.input_svc.injectMouseMove(m[0], m[1]);
                 const button = mapMouseButton(ev.button.button) orelse continue;
                 state.input_svc.injectMouseButton(button, ev.button.down);
             },

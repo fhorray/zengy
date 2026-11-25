@@ -18,6 +18,9 @@ const min_vertex_buffer_bytes: u64 = 64 * 1024;
 
 pub const TextureId = u64;
 
+/// Triangle vertex in normalized device coordinates (x/y in -1..1, y up) with a per-vertex color.
+pub const NdcVertex = struct { x: f32, y: f32, r: f32, g: f32, b: f32, a: f32 };
+
 const TextureEntry = struct {
     texture: gpu.TextureHandle,
     view: gpu.TextureViewHandle,
@@ -51,6 +54,8 @@ pub const Renderer2D = struct {
     icons: text.IconAtlas,
     batcher: batcher_mod.Batcher,
     queued: std.ArrayList(tess.TexturedQuad) = .empty,
+    ndc_triangles: std.ArrayList(NdcVertex) = .empty,
+    triangle_scratch: std.ArrayList(batcher_mod.Vertex) = .empty,
     gpu_state: ?GpuState = null,
     user_textures: std.AutoHashMapUnmanaged(TextureId, TextureEntry) = .empty,
 
@@ -67,6 +72,8 @@ pub const Renderer2D = struct {
         if (self.gpu_state) |gs| self.destroyGpu(gs.device);
         self.user_textures.deinit(self.allocator);
         self.queued.deinit(self.allocator);
+        self.ndc_triangles.deinit(self.allocator);
+        self.triangle_scratch.deinit(self.allocator);
         self.batcher.deinit();
         self.icons.deinit();
         self.font.deinit();
@@ -81,6 +88,14 @@ pub const Renderer2D = struct {
     /// Queues a sprite quad (physical pixels) drawn under the next frame's command list.
     pub fn queueTexturedQuad(self: *Renderer2D, quad: tess.TexturedQuad) !void {
         try self.queued.append(self.allocator, quad);
+    }
+
+    /// Queues one colored triangle in normalized device coordinates; it draws under the next command list.
+    pub fn queueTriangleNdc(self: *Renderer2D, a: NdcVertex, b: NdcVertex, c: NdcVertex) !void {
+        for ([_]NdcVertex{ a, b, c }) |v| {
+            inline for (.{ v.x, v.y, v.r, v.g, v.b, v.a }) |f| if (!std.math.isFinite(f)) return error.InvalidVertex;
+        }
+        try self.ndc_triangles.appendSlice(self.allocator, &.{ a, b, c });
     }
 
     /// Uploads an RGBA8 image and returns an id usable as `TexturedQuad.texture`. Id 0 is reserved for white.
@@ -181,8 +196,25 @@ pub const Renderer2D = struct {
 
     pub fn render(self: *Renderer2D, input: *frame.FrameInput) !void {
         const gs = try self.ensureGpu(input.device);
-        try self.batcher.build(input.draw_commands, self.queued.items, input.target.dpi_scale, .{ .font = &self.font, .icons = &self.icons });
+        // NDC triangles become pixel-space vertices once the target size is known; UV (0,0) samples white.
+        self.triangle_scratch.clearRetainingCapacity();
+        const half_w: f32 = @as(f32, @floatFromInt(input.target.width)) * 0.5;
+        const half_h: f32 = @as(f32, @floatFromInt(input.target.height)) * 0.5;
+        for (self.ndc_triangles.items) |v| {
+            try self.triangle_scratch.append(self.allocator, .{
+                .x = (v.x + 1.0) * half_w,
+                .y = (1.0 - v.y) * half_h,
+                .u = 0,
+                .v = 0,
+                .r = v.r,
+                .g = v.g,
+                .b = v.b,
+                .a = v.a,
+            });
+        }
+        try self.batcher.build(input.draw_commands, self.queued.items, self.triangle_scratch.items, input.target.dpi_scale, .{ .font = &self.font, .icons = &self.icons });
         self.queued.clearRetainingCapacity();
+        self.ndc_triangles.clearRetainingCapacity();
         if (self.batcher.vertices.items.len == 0) return;
 
         const pipeline = try ensurePipeline(gs, input.target.color_format);
