@@ -24,6 +24,25 @@ pub const AlphaMode = enum {
 };
 
 /// Physically-based metallic-roughness material (glTF 2.0 compatible).
+/// Number of usable render layers. Masks are 24-bit so the GPU can carry them exactly in a float.
+pub const LAYER_COUNT: u5 = 24;
+/// Mask with every layer set; the default for lights, so existing scenes light everything as before.
+pub const ALL_LAYERS: u32 = 0x00FF_FFFF;
+/// Layer of a mesh without a `RenderLayers` component (bit 0).
+pub const DEFAULT_LAYER: u32 = 1;
+
+/// Layer membership of a mesh. A light affects a mesh only when their masks share a bit, and a mesh only casts
+/// into a light's shadow maps under the same rule. Lights default to `ALL_LAYERS`, meshes to `DEFAULT_LAYER`.
+/// Layers do not affect volumetric fog scattering, reflection probes or the sky.
+pub const RenderLayers = struct {
+    mask: u32 = DEFAULT_LAYER,
+};
+
+/// True when a light with layer mask `light` affects (and is shadowed by) a mesh with layer mask `mesh`.
+pub fn layersOverlap(light: u32, mesh: u32) bool {
+    return (light & mesh & ALL_LAYERS) != 0;
+}
+
 pub const StandardMaterial = struct {
     base_color: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 },
     emissive: [4]f32 = .{ 0.0, 0.0, 0.0, 1.0 },
@@ -152,6 +171,8 @@ pub const DirectionalLight = struct {
     /// Receiver normal offset strength: `shadow_normal_bias * 50` shadow texels at grazing angles (needs
     /// `ShadowQuality.normal_offset`). 0.05 removes acne at zero depth bias in the acne study scenarios.
     shadow_normal_bias: f32 = 0.05,
+    /// Layers this light affects (see `RenderLayers`).
+    layers: u32 = ALL_LAYERS,
     pcss_enabled: bool = false,
     /// Tangent of the light's apparent half-size for blocker-search PCSS (`ShadowQuality.pcss`); larger values give
     /// wider penumbrae. 0.03 is a soft, readable default; the real sun is about 0.005.
@@ -168,6 +189,10 @@ pub const PointLight = struct {
     radius: f32 = 0.05,
     shadows_enabled: bool = false,
     shadow_depth_bias: f32 = 0.02,
+    /// Layers this light affects (see `RenderLayers`).
+    layers: u32 = ALL_LAYERS,
+    /// Scale of the specular lobe: 1 is a normal light, 0 makes it diffuse-only (indirect bounce lights).
+    specular_scale: f32 = 1.0,
 };
 
 /// Cone spotlight component (intensity in lumens, angles in radians).
@@ -182,6 +207,8 @@ pub const SpotLight = struct {
     radius: f32 = 0.05,
     shadows_enabled: bool = false,
     shadow_depth_bias: f32 = 0.02,
+    /// Layers this light affects (see `RenderLayers`).
+    layers: u32 = ALL_LAYERS,
 };
 
 /// Rectangular area light component (intensity in lumens).
@@ -192,6 +219,8 @@ pub const RectLight = struct {
     height: f32 = 1.0,
     range: f32 = 20.0,
     two_sided: bool = false,
+    /// Layers this light affects (see `RenderLayers`).
+    layers: u32 = ALL_LAYERS,
 };
 
 /// Global ambient light resource (or hemisphere fallback when sky ambient is disabled).
@@ -268,8 +297,11 @@ pub const AutoExposureSettings = struct {
     max_ev100: f32 = 8.0,
     low_percent: f32 = 0.10,
     high_percent: f32 = 0.90,
-    speed_brighten: f32 = 3.0,
-    speed_darken: f32 = 1.0,
+    /// Adaptation rate (1/s) while the image is getting brighter, i.e. the exposure gain rises (moving into the
+    /// dark). Human eyes adapt to darkness slowly, so this is the smaller default.
+    speed_brighten: f32 = 1.0,
+    /// Adaptation rate (1/s) while the image is getting darker, i.e. the exposure gain falls (moving into light).
+    speed_darken: f32 = 3.0,
     compensation_ev: f32 = 0.0,
     metering_mask_tex: u64 = 0,
 };
@@ -340,6 +372,9 @@ pub const ReflectionProbe = struct {
     box_projection: bool = true,
     sky_tint: [3]f32 = .{ 0.25, 0.28, 0.34 },
     ground_tint: [3]f32 = .{ 0.12, 0.11, 0.10 },
+    /// Scale of the probe's diffuse irradiance (reflections are not scaled). A sealed room wants almost no diffuse
+    /// ambient, so the outside sky cannot light it, but still wants visible reflections of its dim interior.
+    diffuse_scale: f32 = 1.0,
 };
 
 /// Extracted reflection probe snapshot for backend submission.
@@ -351,6 +386,7 @@ pub const ExtractedReflectionProbe = struct {
     box_projection: bool,
     sky_tint: [3]f32,
     ground_tint: [3]f32,
+    diffuse_scale: f32 = 1.0,
 };
 
 /// Camera component configuring the HDR & post-processing stack.
@@ -397,6 +433,10 @@ pub const RenderQuality = struct {
     /// capture suite shows identical silhouettes on the target GPUs.
     reuse_depth_prepass: bool = false,
     ibl_rebuild_budget: IblRebuildBudget = .unlimited,
+    /// Keep the sun disc and halo out of the diffuse (SH9) irradiance of a procedural sky when a directional light
+    /// already lights the scene. The sun is then added once, by the shadowed analytic light, instead of twice (the
+    /// second time unshadowed). Reflections keep the disc. HDRI skies cannot be separated and are unaffected.
+    sun_in_ibl_diffuse: bool = false,
     shadows: ShadowQuality = .{},
 };
 
@@ -423,6 +463,7 @@ pub const ExtractedDirectionalLight = struct {
     shadow_normal_bias: f32,
     pcss_enabled: bool = false,
     pcss_light_size: f32 = 0.03,
+    layers: u32 = ALL_LAYERS,
     cascade_count: u8,
     cascade_bounds: [4]f32 = .{ 10.0, 23.0, 52.0, 120.0 },
     overlap_proportion: f32 = 0.18,
@@ -438,6 +479,8 @@ pub const ExtractedPointLight = struct {
     radius: f32,
     shadows_enabled: bool,
     shadow_depth_bias: f32 = 0.02,
+    layers: u32 = ALL_LAYERS,
+    specular_scale: f32 = 1.0,
 };
 
 /// Extracted spotlight snapshot for backend submission.
@@ -452,6 +495,7 @@ pub const ExtractedSpotLight = struct {
     radius: f32 = 0.05,
     shadows_enabled: bool,
     shadow_depth_bias: f32 = 0.02,
+    layers: u32 = ALL_LAYERS,
 };
 
 /// Extracted rectangular area light snapshot for backend submission.
@@ -465,6 +509,7 @@ pub const ExtractedRectLight = struct {
     half_extents: [2]f32,
     range: f32,
     two_sided: bool,
+    layers: u32 = ALL_LAYERS,
 };
 
 /// Per-frame extracted PBR lighting, environment, and post-processing view.
@@ -518,5 +563,8 @@ pub const PbrBackendVTable = struct {
         mesh_asset: u64,
         model_matrix: [16]f32,
     ) anyerror!void = null,
+    /// Optional: sets the layer mask of the next `submitLitMesh` / `submitShadowCaster` call; the backend resets it to
+    /// `DEFAULT_LAYER` afterwards. Backends without layer support leave it null and treat every mesh as layer 0.
+    setDrawLayers: ?*const fn (ctx: *anyopaque, layers: u32) void = null,
     endPbrFrame: *const fn (ctx: *anyopaque) anyerror!void,
 };

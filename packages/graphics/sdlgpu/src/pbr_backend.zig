@@ -61,6 +61,10 @@ const IblJob = struct {
     sun_dir: [3]f32,
     sun_col: [3]f32,
     sun_int: f32,
+    /// A directional light lights the scene analytically; its sun is left out of the diffuse SH when configured.
+    analytic_sun: bool = false,
+    /// Sky image without the sun, used for the diffuse SH when `analytic_sun` and the quality switch ask for it.
+    sky_no_sun: ?[][4]f32 = null,
     /// Content key of the HDRI this job converts (valid while a new texture is pending).
     hdri_ptr: usize,
     hdri_hash: u64,
@@ -117,6 +121,8 @@ const PbrFragUniforms = extern struct {
     cascade_depth_ranges: [4]f32,
     cluster_factors: [4]f32,
     probe_volumetric: [4]f32,
+    /// x = receiver layer mask, y = sun layer mask.
+    layer_info: [4]f32,
     cascade_info: [4]f32,
 };
 
@@ -167,15 +173,16 @@ const VolCompositeParams = extern struct {
 const GpuPointLight = extern struct {
     pos_range: [4]f32 = .{ 0, 0, 0, 1 },
     col_radius: [4]f32 = .{ 0, 0, 0, -1 },
-    /// x = light source radius in metres.
-    shadow_params: [4]f32 = .{ 0, 0, 0, 0 },
+    /// x = light source radius in metres, y = layer mask, z = specular scale.
+    shadow_params: [4]f32 = .{ 0, @floatFromInt(pbr.ALL_LAYERS), 1, 0 },
 };
 
 const GpuSpotLight = extern struct {
     pos_range: [4]f32 = .{ 0, 0, 0, 1 },
     dir_cos_inner: [4]f32 = .{ 0, -1, 0, 0.9 },
     col_cos_outer: [4]f32 = .{ 0, 0, 0, 0.8 },
-    shadow_params: [4]f32 = .{ -1, 0.02, 0, 0 },
+    /// x = shadow tile, y = depth bias, z = light source radius, w = layer mask.
+    shadow_params: [4]f32 = .{ -1, 0.02, 0, @floatFromInt(pbr.ALL_LAYERS) },
 };
 
 const GpuRectLight = extern struct {
@@ -290,11 +297,13 @@ pub const QueuedPbrDraw = struct {
     mvp_matrix: [16]f32,
     material: pbr.StandardMaterial,
     tint: [4]f32,
+    layers: u32 = pbr.DEFAULT_LAYER,
 };
 
 pub const QueuedShadowCaster = struct {
     mesh_asset: u64,
     model_matrix: [16]f32,
+    layers: u32 = pbr.DEFAULT_LAYER,
 };
 
 /// Fragment uniforms for `shadow_mask.frag`; layout must match its std140 block.
@@ -403,6 +412,8 @@ pub const PbrGpuState = struct {
     vol_history_valid: bool = false,
     vol_prev_view_proj: [16]f32 = @splat(0),
     vol_prev_cam: [3]f32 = .{ 0, 0, 0 },
+    /// Hash of the fog parameters and light slots the temporal history was built with.
+    vol_light_key: u64 = 0,
     vol_prev_fwd: [3]f32 = .{ 0, 0, -1 },
     vol_frame: u32 = 0,
     vol_sp_fader: volumetric_lights.SlotFader = .{},
@@ -438,6 +449,8 @@ pub const PbrGpuState = struct {
     /// Last reported dropped-reference count, to log budget overflow on change only.
     last_cluster_drops: u32 = 0,
     shadow_casters: std.ArrayList(QueuedShadowCaster) = .empty,
+    /// Layer mask applied to the next submitted mesh or caster (set through `setDrawLayers`).
+    pending_layers: u32 = pbr.DEFAULT_LAYER,
     frame_active: bool = false,
     frame_data: pbr.ExtractedPbrFrame = .{},
     dir_lights_copy: std.ArrayList(pbr.ExtractedDirectionalLight) = .empty,
@@ -786,6 +799,7 @@ pub const PbrGpuState = struct {
             .beginPbrFrame = beginPbrFrame,
             .submitLitMesh = submitLitMesh,
             .submitShadowCaster = submitShadowCaster,
+            .setDrawLayers = setDrawLayers,
             .endPbrFrame = endPbrFrame,
         };
     }
@@ -828,7 +842,14 @@ pub const PbrGpuState = struct {
             .mvp_matrix = mvp_matrix,
             .material = material,
             .tint = tint,
+            .layers = self.pending_layers,
         });
+        self.pending_layers = pbr.DEFAULT_LAYER;
+    }
+
+    fn setDrawLayers(raw: *anyopaque, layers: u32) void {
+        const self: *PbrGpuState = @ptrCast(@alignCast(raw));
+        self.pending_layers = layers;
     }
 
     fn submitShadowCaster(raw: *anyopaque, mesh_asset: u64, model_matrix: [16]f32) anyerror!void {
@@ -836,7 +857,9 @@ pub const PbrGpuState = struct {
         try self.shadow_casters.append(self.allocator, .{
             .mesh_asset = mesh_asset,
             .model_matrix = model_matrix,
+            .layers = self.pending_layers,
         });
+        self.pending_layers = pbr.DEFAULT_LAYER;
     }
 
     /// Picks the shadow-family pipeline for a queued material: alpha masks sample the base color, double-sided disables culling.
@@ -851,18 +874,21 @@ pub const PbrGpuState = struct {
     /// Pipelines and alpha-mask parameters are bound per draw; callers only set viewport and scissor.
     /// Cache key of one shadow map: the casters that `drawShadowQueue` would draw for `light_vp` (the others cannot
     /// change the map), the light matrix and `extra` (atlas rect, cascade index and the like).
-    fn shadowMapKey(self: *PbrGpuState, meshes: anytype, light_vp: math3d.Mat4, extra: []const f32) u64 {
+    fn shadowMapKey(self: *PbrGpuState, meshes: anytype, light_vp: math3d.Mat4, light_layers: u32, extra: []const f32) u64 {
         var hs = shadow_plan.CasterHasher.init(0x5ad0_77a1);
         for (self.queued_draws.items) |qm| {
+            if (!pbr.layersOverlap(light_layers, qm.layers)) continue;
             const gm = meshes.get(@bitCast(qm.mesh_asset)) orelse continue;
             if (shadow_cull.sphereOutsideLightFrustum(light_vp.m, shadow_cull.transformSphere(qm.model_matrix, gm.bounds))) continue;
             hs.addDraw(qm);
         }
         for (self.shadow_casters.items) |sc| {
+            if (!pbr.layersOverlap(light_layers, sc.layers)) continue;
             const gm = meshes.get(@bitCast(sc.mesh_asset)) orelse continue;
             if (shadow_cull.sphereOutsideLightFrustum(light_vp.m, shadow_cull.transformSphere(sc.model_matrix, gm.bounds))) continue;
             hs.addCaster(sc);
         }
+        hs.addFloats(&.{@as(f32, @floatFromInt(light_layers & pbr.ALL_LAYERS))});
         hs.addFloats(&light_vp.m);
         hs.addFloats(extra);
         return hs.final();
@@ -874,6 +900,7 @@ pub const PbrGpuState = struct {
         pass: *c.SDL_GPURenderPass,
         kind: ShadowDrawKind,
         light_vp: math3d.Mat4,
+        light_layers: u32,
         meshes: anytype,
         textures: anytype,
         white_tex: *c.SDL_GPUTexture,
@@ -883,6 +910,8 @@ pub const PbrGpuState = struct {
         for (self.queued_draws.items) |qm| {
             // Transparent surfaces must not write depth in the prepass, or SSAO and contact shadows treat them as solid.
             if (kind == .depth_prepass and qm.material.alpha_mode == .blend) continue;
+            // Only meshes that share a layer with the light cast into its map (the prepass draws everything).
+            if (kind == .light and !pbr.layersOverlap(light_layers, qm.layers)) continue;
             const gm = meshes.get(@bitCast(qm.mesh_asset)) orelse continue;
             // Casters fully outside this light's frustum cannot put a shadow inside it.
             if (kind == .light and shadow_cull.sphereOutsideLightFrustum(light_vp.m, shadow_cull.transformSphere(qm.model_matrix, gm.bounds))) continue;
@@ -919,6 +948,7 @@ pub const PbrGpuState = struct {
         if (kind != .light) return;
 
         for (self.shadow_casters.items) |sc| {
+            if (!pbr.layersOverlap(light_layers, sc.layers)) continue;
             const gm = meshes.get(@bitCast(sc.mesh_asset)) orelse continue;
             if (shadow_cull.sphereOutsideLightFrustum(light_vp.m, shadow_cull.transformSphere(sc.model_matrix, gm.bounds))) continue;
             // Casters carry no material, so they always use the opaque, back-face-culled pipeline.
@@ -1142,6 +1172,8 @@ pub const PbrGpuState = struct {
         var cascade_count: f32 = 0.0;
         var shadow_bias: f32 = 0.005;
         var normal_offset_texels: f32 = 0.0;
+        // Layers of the sun (the first directional light); every layer when there is none.
+        const sun_layers: u32 = if (self.frame_data.directional_lights.len > 0) self.frame_data.directional_lights[0].layers else pbr.ALL_LAYERS;
         const shadow_q = pp.quality.shadows;
         if (self.frame_data.directional_lights.len > 0 and self.frame_data.directional_lights[0].shadows_enabled) {
             const dl = self.frame_data.directional_lights[0];
@@ -1180,7 +1212,7 @@ pub const PbrGpuState = struct {
             var cascade_miss: [4]bool = @splat(true);
             var any_miss = false;
             for (0..active_cascades) |ci| {
-                const key = self.shadowMapKey(meshes, light_vps[ci], &.{ @floatFromInt(ci), cascade_count });
+                const key = self.shadowMapKey(meshes, light_vps[ci], sun_layers, &.{ @floatFromInt(ci), cascade_count });
                 cascade_miss[ci] = !self.dir_cascade_cache[ci].hit(key, cache_on);
                 any_miss = any_miss or cascade_miss[ci];
             }
@@ -1208,7 +1240,7 @@ pub const PbrGpuState = struct {
                         c.SDL_BindGPUGraphicsPipeline(sh_pass, self.depth_clear_pipeline);
                         c.SDL_DrawGPUPrimitives(sh_pass, 3, 1, 0, 0);
                     }
-                    self.drawShadowQueue(cmd_buf, sh_pass, .light, light_vps[ci], meshes, textures, white_tex, linear_sampler);
+                    self.drawShadowQueue(cmd_buf, sh_pass, .light, light_vps[ci], sun_layers, meshes, textures, white_tex, linear_sampler);
                 }
                 c.SDL_EndGPURenderPass(sh_pass);
             }
@@ -1233,6 +1265,8 @@ pub const PbrGpuState = struct {
             .{ .prioritize = shadow_q.prioritize_local_lights, .adaptive = shadow_q.adaptive_atlas },
         );
         const next_tile: u32 = splan.tile_count;
+        // Layer mask of the light that owns each atlas tile, for caster filtering and cache keys.
+        var tile_layers: [shadow_plan.MAX_TILES]u32 = @splat(pbr.ALL_LAYERS);
         const atlas_f: f32 = @floatFromInt(shadow_plan.ATLAS);
         for (0..next_tile) |t| {
             const r = splan.tiles[t];
@@ -1268,13 +1302,14 @@ pub const PbrGpuState = struct {
                 for (0..6) |f| {
                     const tgt = math3d.Vec3{ .x = eye.x + dirs[f].x, .y = eye.y + dirs[f].y, .z = eye.z + dirs[f].z };
                     local_sh_data.shadow_vp[first + f] = math3d.Mat4.mul(p_proj, math3d.Mat4.lookAt(eye, tgt, ups[f])).m;
+                    tile_layers[first + f] = pl.layers;
                     local_sh_data.info[first + f] = .{ @tan(std.math.pi * 0.256), 0.1, @max(pl.range, 1.0), 0 };
                 }
             }
             cl_lights.points[i] = .{
                 .pos_range = .{ pl.position[0], pl.position[1], pl.position[2], pl.range },
                 .col_radius = .{ pl.color[0] * sc, pl.color[1] * sc, pl.color[2] * sc, tile_id },
-                .shadow_params = .{ pl.radius, 0, 0, 0 },
+                .shadow_params = .{ pl.radius, @floatFromInt(pl.layers & pbr.ALL_LAYERS), pl.specular_scale, 0 },
             };
         }
 
@@ -1292,6 +1327,7 @@ pub const PbrGpuState = struct {
                 const tgt = math3d.Vec3{ .x = eye.x + dir.x, .y = eye.y + dir.y, .z = eye.z + dir.z };
                 const s_proj = perspectiveMat(std.math.clamp(sl.outer_angle_rad * 2.0, 0.2, std.math.pi * 0.9), 1.0, 0.1, @max(sl.range, 1.0));
                 local_sh_data.shadow_vp[tile] = math3d.Mat4.mul(s_proj, math3d.Mat4.lookAt(eye, tgt, up)).m;
+                tile_layers[tile] = sl.layers;
                 const spot_fov = std.math.clamp(sl.outer_angle_rad * 2.0, 0.2, std.math.pi * 0.9);
                 local_sh_data.info[tile] = .{ @tan(spot_fov * 0.5), 0.1, @max(sl.range, 1.0), 0 };
             }
@@ -1299,7 +1335,7 @@ pub const PbrGpuState = struct {
                 .pos_range = .{ sl.position[0], sl.position[1], sl.position[2], sl.range },
                 .dir_cos_inner = .{ sl.direction[0], sl.direction[1], sl.direction[2], @cos(sl.inner_angle_rad) },
                 .col_cos_outer = .{ sl.color[0] * sc, sl.color[1] * sc, sl.color[2] * sc, @cos(sl.outer_angle_rad) },
-                .shadow_params = .{ tile_id, sl.shadow_depth_bias, sl.radius, 0 },
+                .shadow_params = .{ tile_id, sl.shadow_depth_bias, sl.radius, @floatFromInt(sl.layers & pbr.ALL_LAYERS) },
             };
         }
 
@@ -1312,7 +1348,7 @@ pub const PbrGpuState = struct {
                 .dir_two = .{ rl.direction[0], rl.direction[1], rl.direction[2], if (rl.two_sided) 1.0 else 0.0 },
                 .right_hx = .{ rl.right[0], rl.right[1], rl.right[2], rl.half_extents[0] },
                 .up_hy = .{ rl.up[0], rl.up[1], rl.up[2], rl.half_extents[1] },
-                .col_pad = .{ rl.color[0] * sc, rl.color[1] * sc, rl.color[2] * sc, 0 },
+                .col_pad = .{ rl.color[0] * sc, rl.color[1] * sc, rl.color[2] * sc, @floatFromInt(rl.layers & pbr.ALL_LAYERS) },
             };
         }
 
@@ -1323,7 +1359,7 @@ pub const PbrGpuState = struct {
                 .pos_int = .{ pr.position[0], pr.position[1], pr.position[2], pr.intensity },
                 .half_blend = .{ pr.half_extents[0], pr.half_extents[1], pr.half_extents[2], pr.blend_distance },
                 .sky_box = .{ pr.sky_tint[0], pr.sky_tint[1], pr.sky_tint[2], if (pr.box_projection) 1.0 else 0.0 },
-                .ground_pad = .{ pr.ground_tint[0], pr.ground_tint[1], pr.ground_tint[2], 0 },
+                .ground_pad = .{ pr.ground_tint[0], pr.ground_tint[1], pr.ground_tint[2], pr.diffuse_scale },
             };
         }
 
@@ -1331,7 +1367,7 @@ pub const PbrGpuState = struct {
         var tile_miss: [shadow_plan.MAX_TILES]bool = @splat(true);
         var any_tile_miss = false;
         for (0..next_tile) |tidx| {
-            const key = self.shadowMapKey(meshes, .{ .m = local_sh_data.shadow_vp[tidx] }, &local_sh_data.atlas_rect[tidx]);
+            const key = self.shadowMapKey(meshes, .{ .m = local_sh_data.shadow_vp[tidx] }, tile_layers[tidx], &local_sh_data.atlas_rect[tidx]);
             tile_miss[tidx] = !self.local_tile_cache[tidx].hit(key, shadow_q.static_cache);
             any_tile_miss = any_tile_miss or tile_miss[tidx];
         }
@@ -1360,7 +1396,7 @@ pub const PbrGpuState = struct {
                     c.SDL_DrawGPUPrimitives(lsh_pass, 3, 1, 0, 0);
                 }
                 const lvp = math3d.Mat4{ .m = local_sh_data.shadow_vp[tidx] };
-                self.drawShadowQueue(cmd_buf, lsh_pass, .light, lvp, meshes, textures, white_tex, linear_sampler);
+                self.drawShadowQueue(cmd_buf, lsh_pass, .light, lvp, tile_layers[tidx], meshes, textures, white_tex, linear_sampler);
             }
             c.SDL_EndGPURenderPass(lsh_pass);
         }
@@ -1437,7 +1473,7 @@ pub const PbrGpuState = struct {
             });
             const dp_pass = c.SDL_BeginGPURenderPass(cmd_buf, null, 0, &pre_depth) orelse return error.SdlGpuFailure;
             c.SDL_SetGPUViewport(dp_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(tex_w), .h = @floatFromInt(tex_h), .min_depth = 0, .max_depth = 1 });
-            self.drawShadowQueue(cmd_buf, dp_pass, .depth_prepass, math3d.Mat4.identity(), meshes, textures, white_tex, linear_sampler);
+            self.drawShadowQueue(cmd_buf, dp_pass, .depth_prepass, math3d.Mat4.identity(), pbr.ALL_LAYERS, meshes, textures, white_tex, linear_sampler);
             c.SDL_EndGPURenderPass(dp_pass);
 
             const ao_w = @max(tex_w / 2, 1);
@@ -1683,6 +1719,7 @@ pub const PbrGpuState = struct {
                     .cascade_depth_ranges = cascade_depth_ranges,
                     .cluster_factors = .{ built_clusters.factors.z_scale, built_clusters.factors.z_bias, 1.0, if (mat.alpha_mode == .mask) mat.alpha_cutoff else -1.0 },
                     .probe_volumetric = .{ @floatFromInt(pr_count), pcss_on, vol_on, self.frame_data.fog.volumetric.scattering },
+                    .layer_info = .{ @floatFromInt(qm.layers & pbr.ALL_LAYERS), @floatFromInt(sun_layers & pbr.ALL_LAYERS), 0, 0 },
                     .cascade_info = .{ cascade_count, if (has_dir) self.frame_data.directional_lights[0].pcss_light_size else 0.03, shadow_q.depth_bias_floor_m, if (shadow_q.pcss) 1.0 else 0.0 },
                 };
                 c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &fu, @sizeOf(PbrFragUniforms));
@@ -1814,7 +1851,22 @@ pub const PbrGpuState = struct {
             if (temporal) {
                 const cam_now = self.frame_data.camera_position;
                 const fwd_now = self.frame_data.camera_forward;
-                const usable = self.vol_history_valid and volumetric_lights.historyUsable(self.vol_prev_cam, self.vol_prev_fwd, cam_now, fwd_now);
+                // History also dies when the fog itself changed: density, scattering, the sun, or any light that the
+                // volume uses moved, recoloured or switched slot. Reprojecting old scatter would trail behind the change.
+                var key_hasher = std.hash.Wyhash.init(0x76f6);
+                key_hasher.update(std.mem.asBytes(&vfp.sun_dir_int));
+                key_hasher.update(std.mem.asBytes(&vfp.sun_col_aniso));
+                key_hasher.update(std.mem.asBytes(&vfp.fog_col_scat));
+                key_hasher.update(std.mem.asBytes(&vfp.cam_pos_density[3]));
+                key_hasher.update(std.mem.asBytes(&vfp.spot_pos_range));
+                key_hasher.update(std.mem.asBytes(&vfp.spot_dir_cos));
+                key_hasher.update(std.mem.asBytes(&vfp.spot_col_on));
+                key_hasher.update(std.mem.asBytes(&vfp.point_pos));
+                key_hasher.update(std.mem.asBytes(&vfp.point_col));
+                const light_key = key_hasher.final();
+                const fog_unchanged = light_key == self.vol_light_key;
+                self.vol_light_key = light_key;
+                const usable = self.vol_history_valid and fog_unchanged and volumetric_lights.historyUsable(self.vol_prev_cam, self.vol_prev_fwd, cam_now, fwd_now);
                 const read_idx: usize = self.vol_history_read;
                 const write_idx: usize = 1 - read_idx;
                 const res_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
@@ -1921,7 +1973,7 @@ pub const PbrGpuState = struct {
             c.SDL_BindGPUComputePipeline(a_pass, self.adapt_pipeline);
             const ap = AdaptParams{
                 .ev_bounds = .{ pp.auto_exposure.min_ev100, pp.auto_exposure.max_ev100, pp.auto_exposure.low_percent, pp.auto_exposure.high_percent },
-                .speed_dt = .{ pp.auto_exposure.speed_brighten, pp.auto_exposure.speed_darken, @max(self.frame_data.dt, 1.0 / 120.0), pp.auto_exposure.compensation_ev },
+                .speed_dt = .{ pp.auto_exposure.speed_brighten, pp.auto_exposure.speed_darken, std.math.clamp(self.frame_data.dt, 1.0 / 10000.0, 0.1), pp.auto_exposure.compensation_ev },
                 .hist_range = .{ min_log2, log2_range, 1.0, 0.0 },
             };
             c.SDL_PushGPUComputeUniformData(cmd_buf, 0, &ap, @sizeOf(AdaptParams));
@@ -2127,6 +2179,7 @@ pub const PbrGpuState = struct {
         if (job.new_tex) |t| c.SDL_ReleaseGPUTexture(self.device, t);
         if (job.staging) |t| c.SDL_ReleaseGPUTransferBuffer(self.device, t);
         if (job.sky) |sky| self.allocator.free(sky);
+        if (job.sky_no_sun) |sky| self.allocator.free(sky);
         for (job.mips) |m| if (m) |mm| self.allocator.free(mm);
         self.ibl_job = null;
     }
@@ -2141,6 +2194,7 @@ pub const PbrGpuState = struct {
             .sun_dir = sun_dir,
             .sun_col = sun_col,
             .sun_int = sun_int,
+            .analytic_sun = self.frame_data.directional_lights.len > 0 and !self.frame_data.post_process.quality.sun_in_ibl_diffuse,
             .hdri_ptr = hdri_ptr,
             .hdri_hash = hdri_hash,
         };
@@ -2235,6 +2289,9 @@ pub const PbrGpuState = struct {
                     break :blk ds;
                 } else try ibl.generateProceduralEquirectSky(self.allocator, sky_cfg, job.sun_dir, job.sun_col, job.sun_int, ENV_W, ENV_H);
                 job.sky = sky_f32;
+                if (job.analytic_sun and !has_hdri and sky_cfg.sun_disk != .none) {
+                    job.sky_no_sun = try ibl.generateProceduralEquirectSky(self.allocator, sky_cfg, job.sun_dir, job.sun_col, 0.0, ENV_W, ENV_H);
+                }
                 job.mips[0] = try self.allocator.dupe([4]f32, sky_f32);
                 job.next_level = 1;
                 job.stage = .mips;
@@ -2285,7 +2342,7 @@ pub const PbrGpuState = struct {
                 _ = c.SDL_SubmitGPUCommandBuffer(cmd);
 
                 // Swap: diffuse SH, prefiltered mips and (if converted) the sky texture change in the same frame.
-                self.sky_sh = ibl.projectSkyDiffuse(job.sky.?, ENV_W, ENV_H);
+                self.sky_sh = ibl.projectSkyDiffuse(job.sky_no_sun orelse job.sky.?, ENV_W, ENV_H);
                 if (job.new_tex) |t| {
                     if (self.hdri_sky_texture) |old| c.SDL_ReleaseGPUTexture(self.device, old);
                     self.hdri_sky_texture = t;

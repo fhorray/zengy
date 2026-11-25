@@ -21,14 +21,14 @@ layout(set = 2, binding = 11) uniform sampler2D u_local_shadow_raw; // same for 
 struct GpuPointLight {
     vec4 pos_range;  // xyz=pos, w=range
     vec4 col_radius; // rgb=color*scale, w=shadow_tile (-1 = none)
-    vec4 shadow_params; // x=light source radius in metres (PCSS)
+    vec4 shadow_params; // x=light source radius in metres (PCSS, near-field softening), y=layer mask, z=specular scale
 };
 
 struct GpuSpotLight {
     vec4 pos_range;     // xyz=pos, w=range
     vec4 dir_cos_inner; // xyz=dir, w=cos_inner
     vec4 col_cos_outer; // rgb=color*scale, w=cos_outer
-    vec4 shadow_params; // x=shadow_tile (-1=none), y=bias, z=light source radius in metres (PCSS), w=0
+    vec4 shadow_params; // x=shadow_tile (-1=none), y=bias, z=light source radius in metres (PCSS), w=layer mask
 };
 
 struct GpuRectLight {
@@ -36,14 +36,14 @@ struct GpuRectLight {
     vec4 dir_two;   // xyz=dir, w=two_sided
     vec4 right_hx;  // xyz=right, w=half_width
     vec4 up_hy;     // xyz=up, w=half_height
-    vec4 col_pad;   // rgb=color*scale
+    vec4 col_pad;   // rgb=color*scale, w=layer mask
 };
 
 struct GpuReflectionProbe {
     vec4 pos_int;    // xyz=pos, w=intensity
     vec4 half_blend; // xyz=half_extents, w=blend_distance
     vec4 sky_box;    // rgb=sky_tint, w=box_projection
-    vec4 ground_pad; // rgb=ground_tint
+    vec4 ground_pad; // rgb=ground_tint, w=diffuse scale
 };
 
 layout(std430, set = 2, binding = 12) readonly buffer ClusterLightsBuffer {
@@ -90,6 +90,7 @@ layout(std140, set = 3, binding = 0) uniform PbrFragUniforms {
     vec4 cascade_depth_ranges; // 4 cascade depth ranges in metres
     vec4 cluster_factors;    // x=z_scale, y=z_bias, z=clustered_on, w=0
     vec4 probe_volumetric;   // x=probe_count, y=pcss_on, z=vol_fog_on, w=vol_scattering
+    vec4 layer_info;         // x=receiver layer mask, y=sun layer mask (24-bit masks carried as floats)
     vec4 cascade_info;       // x=number of cascades rendered this frame (0..4), y=PCSS light size (tangent of half-angle), z=minimum depth bias in metres, w=1 for blocker-search PCSS on local lights
 };
 
@@ -163,6 +164,11 @@ vec3 perturbNormal(vec3 N, vec3 V, vec2 uv) {
     float invmax = inversesqrt(max(dot(T, T), dot(B, B)) + 1e-8);
     mat3 TBN = mat3(T * invmax, B * invmax, N);
     return normalize(TBN * map_n);
+}
+
+bool layersOverlap(float light_mask, float mesh_mask) {
+    // Masks are exact integers below 2^24, so the float converts exactly; adding 0.5 would round 2^24 - 1 up.
+    return (uint(light_mask) & uint(mesh_mask)) != 0u;
 }
 
 float ign(vec2 p) {
@@ -327,7 +333,8 @@ float samplePointShadow(int base_tile, vec3 light_pos, vec3 N, vec3 L, float rot
     return sampleLocalTile(base_tile + face, v_world_pos, bias, rot, light_size);
 }
 
-vec3 evalLight(vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness, vec3 L, vec3 radiance) {
+// `spec_scale` 0 makes a light diffuse-only (bounce lights must not leave sharp specular glints on glossy floors).
+vec3 evalLight(vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness, vec3 L, vec3 radiance, float spec_scale) {
     float NdotL = max(dot(N, L), 0.0);
     if (NdotL <= 0.0) return vec3(0.0);
     vec3 H = normalize(V + L);
@@ -336,7 +343,7 @@ vec3 evalLight(vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float rough
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
     vec3 spec = (NDF * G * F) / max(4.0 * max(dot(N, V), 0.0) * NdotL, 0.0001);
     vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
-    return (kD * albedo / PI + spec) * radiance * NdotL;
+    return (kD * albedo / PI + spec * spec_scale) * radiance * NdotL;
 }
 
 vec3 evalRectLight(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness) {
@@ -357,7 +364,7 @@ vec3 evalRectLight(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float 
     float att = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
     att = (att * att) / (dist * dist + 1.0);
     float facing = (rl.dir_two.w > 0.5) ? abs(dot(-L, rl.dir_two.xyz)) : max(dot(-L, rl.dir_two.xyz), 0.0);
-    return evalLight(N, V, F0, albedo, metallic, roughness, L, rl.col_pad.rgb * att * facing);
+    return evalLight(N, V, F0, albedo, metallic, roughness, L, rl.col_pad.rgb * att * facing, 1.0);
 }
 
 void main() {
@@ -394,10 +401,10 @@ void main() {
     float rot = ign(gl_FragCoord.xy) * 6.2831853;
 
     vec3 Lo = vec3(0.0);
-    if (dir_light_dir.w > 0.0) {
+    if (dir_light_dir.w > 0.0 && layersOverlap(layer_info.y, layer_info.x)) {
         vec3 L = normalize(dir_light_dir.xyz);
         float vis = sampleShadowCSM(N, L, view_depth) * contact_shadow;
-        Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, dir_light_col.rgb * dir_light_dir.w) * vis;
+        Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, dir_light_col.rgb * dir_light_dir.w, 1.0) * vis;
     }
 
     if (cluster_factors.z > 0.5) {
@@ -410,15 +417,18 @@ void main() {
         uint p_cnt = cl.x & 0xFFu;
         for (uint i = 0u; i < p_cnt; ++i) {
             GpuPointLight pl = c_points[cluster_indices[p_off + i]];
+            if (!layersOverlap(pl.shadow_params.y, layer_info.x)) continue;
             vec3 to_l = pl.pos_range.xyz - v_world_pos;
             float dist = length(to_l);
             float range = max(pl.pos_range.w, 0.001);
             if (dist < range) {
                 float att = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
-                att = (att * att) / (dist * dist + 1.0);
+                // A light with a physical radius never gets brighter than a sphere of that radius allows: this removes the hotspot
+                // a point light paints on a wall it sits close to.
+                att = (att * att) / (dist * dist + 1.0 + pl.shadow_params.x * pl.shadow_params.x);
                 vec3 L = to_l / max(dist, 0.0001);
                 float vis = (pl.col_radius.w >= 0.0) ? samplePointShadow(int(pl.col_radius.w + 0.5), pl.pos_range.xyz, N, L, rot, pl.shadow_params.x) : 1.0;
-                Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, pl.col_radius.rgb * att) * vis;
+                Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, pl.col_radius.rgb * att, pl.shadow_params.z) * vis;
             }
         }
 
@@ -426,6 +436,7 @@ void main() {
         uint s_cnt = cl.y & 0xFFu;
         for (uint i = 0u; i < s_cnt; ++i) {
             GpuSpotLight sl = c_spots[cluster_indices[s_off + i]];
+            if (!layersOverlap(sl.shadow_params.w, layer_info.x)) continue;
             vec3 to_l = sl.pos_range.xyz - v_world_pos;
             float dist = length(to_l);
             float range = max(sl.pos_range.w, 0.001);
@@ -438,7 +449,7 @@ void main() {
                 att = (att * att) / (dist * dist + 1.0);
                 float spot_bias = 0.0012 + (1.0 - max(dot(N, L), 0.0)) * 0.004;
                 float vis = (sl.shadow_params.x >= 0.0) ? sampleLocalTile(int(sl.shadow_params.x + 0.5), v_world_pos, spot_bias, rot, sl.shadow_params.z) : 1.0;
-                Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, sl.col_cos_outer.rgb * att * cone) * vis;
+                Lo += evalLight(N, V, F0, albedo_a.rgb, metallic, roughness, L, sl.col_cos_outer.rgb * att * cone, 1.0) * vis;
             }
         }
 
@@ -446,6 +457,7 @@ void main() {
         uint r_cnt = cl.z & 0xFFu;
         for (uint i = 0u; i < r_cnt; ++i) {
             GpuRectLight rl = c_rects[cluster_indices[r_off + i]];
+            if (!layersOverlap(rl.col_pad.w, layer_info.x)) continue;
             Lo += evalRectLight(rl, N, V, F0, albedo_a.rgb, metallic, roughness);
         }
     }
@@ -474,7 +486,7 @@ void main() {
                 vec3 f3 = smoothstep(vec3(0.0), vec3(max(pr.half_blend.w, 0.05)), edge_d);
                 float w = f3.x * f3.y * f3.z * pr.pos_int.w;
                 float hemi = N.y * 0.5 + 0.5;
-                probe_irr += mix(pr.ground_pad.rgb, pr.sky_box.rgb, hemi) * w;
+                probe_irr += mix(pr.ground_pad.rgb, pr.sky_box.rgb, hemi) * (w * pr.ground_pad.w);
                 float r_hemi = R.y * 0.5 + 0.5;
                 probe_spec += mix(pr.ground_pad.rgb, pr.sky_box.rgb, r_hemi) * w;
                 probe_w += w;

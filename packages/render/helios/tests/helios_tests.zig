@@ -277,3 +277,57 @@ test "Helios Instant-Radiosity BVH GI solver produces colored bounce VPLs in a C
     try testing.expect(found_red);
     try testing.expect(found_green);
 }
+
+test "GI solver: adaptive sun sampling finds a thin gap that the uniform grid misses" {
+    // A sealed room (floor, ceiling, back wall) whose front wall is split by a 4 cm vertical gap. The sun comes
+    // through the gap and lands on the floor inside; only the refined sampling can see that.
+    var tris = std.ArrayList(helios.ray_query.BvhTriangle).empty;
+    defer tris.deinit(testing.allocator);
+    const A = testing.allocator;
+    try helios.gi_solver.appendBoxTriangles(A, &tris, .{ 0, -0.1, 0 }, .{ 6, 0.1, 6 }, 0); // floor
+    try helios.gi_solver.appendBoxTriangles(A, &tris, .{ 0, 4.1, 0 }, .{ 6, 0.1, 6 }, 1); // ceiling
+    try helios.gi_solver.appendBoxTriangles(A, &tris, .{ 0, 2, -6 }, .{ 6, 2, 0.1 }, 2); // back wall
+    try helios.gi_solver.appendBoxTriangles(A, &tris, .{ -2.88, 2, 6 }, .{ 3.17, 2, 0.1 }, 3); // front wall, left
+    try helios.gi_solver.appendBoxTriangles(A, &tris, .{ 3.19, 2, 6 }, .{ 2.86, 2, 0.1 }, 4); // front wall, right (gap 0.04 at x = 0.31, off the sample lattice)
+    try helios.gi_solver.appendBoxTriangles(A, &tris, .{ -6.05, 2, 0 }, .{ 0.1, 2, 6 }, 5);
+    try helios.gi_solver.appendBoxTriangles(A, &tris, .{ 6.05, 2, 0 }, .{ 0.1, 2, 6 }, 6);
+
+    var bvh = helios.ray_query.Bvh.init(A);
+    defer bvh.deinit();
+    try bvh.build(tris.items);
+
+    var mats: [7]helios.indirect_rt.SurfaceMaterial = undefined;
+    for (&mats) |*m| m.* = .{ .albedo = .{ 0.8, 0.8, 0.8 } };
+    mats[0] = .{ .albedo = .{ 0.9, 0.1, 0.1 } }; // red floor
+
+    const sun = helios.gi_solver.DirectSunEmitter{
+        .direction = .{ 0.0, -0.45, -1.0 },
+        .illuminance_lux = 48000.0,
+        .scene_center = .{ 0, 1.5, 0 },
+        .scene_radius = 8.0,
+    };
+    var cfg = helios.gi_solver.configForTier(.high);
+    cfg.max_vpls = 64; // keep every cluster so the ranking cannot hide the one behind the gap
+
+    // Count candidates that landed on the interior floor (z < 5.5): they exist only if a ray went through the gap.
+    var vpls = std.ArrayList(helios.gi_solver.VirtualPointLight).empty;
+    defer vpls.deinit(A);
+
+    cfg.sun_refine_max_depth = 0;
+    _ = try helios.gi_solver.solveInstantRadiosity(A, &bvh, &mats, &.{}, sun, cfg, &vpls);
+    var inside_uniform: usize = 0;
+    for (vpls.items) |v| {
+        if (v.position[2] < 5.5 and v.position[1] < 2.0 and v.color[0] > 0.7 and v.color[1] < 0.35) inside_uniform += 1;
+    }
+
+    cfg.sun_refine_max_depth = 5;
+    const stats = try helios.gi_solver.solveInstantRadiosity(A, &bvh, &mats, &.{}, sun, cfg, &vpls);
+    var inside_refined: usize = 0;
+    for (vpls.items) |v| {
+        if (v.position[2] < 5.5 and v.position[1] < 2.0 and v.color[0] > 0.7 and v.color[1] < 0.35) inside_refined += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), inside_uniform);
+    try testing.expect(inside_refined >= 1);
+    // The refinement budget bounds the extra work.
+    try testing.expect(stats.rays_cast <= 18 * 18 + cfg.sun_refine_ray_budget + 64);
+}

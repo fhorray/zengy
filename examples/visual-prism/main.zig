@@ -110,6 +110,77 @@ const ShapeAssets = struct {
     }
 };
 
+const GizmoMode = enum { move, scale };
+const GizmoAxis = enum(u8) { none, x, y, z, uniform };
+
+fn dot3(a: [3]f32, b: [3]f32) f32 {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+fn cross3(a: [3]f32, b: [3]f32) [3]f32 {
+    return .{
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    };
+}
+
+fn normalize3(v: [3]f32) [3]f32 {
+    const l = @sqrt(dot3(v, v));
+    if (l < 1e-6) return .{ 0, 1, 0 };
+    return .{ v[0] / l, v[1] / l, v[2] / l };
+}
+
+fn projectToScreen(m: [16]f32, p: [3]f32, vw: f32, vh: f32) ?[2]f32 {
+    const cx = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12];
+    const cy = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13];
+    const cw = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15];
+    if (cw <= 0.01) return null;
+    const ndc_x = cx / cw;
+    const ndc_y = cy / cw;
+    return .{ (ndc_x * 0.5 + 0.5) * vw, (0.5 - ndc_y * 0.5) * vh };
+}
+
+fn distPointToSegment2D(p: [2]f32, a: [2]f32, b: [2]f32) f32 {
+    const abx = b[0] - a[0];
+    const aby = b[1] - a[1];
+    const len2 = abx * abx + aby * aby;
+    if (len2 < 1e-4) return @sqrt((p[0] - a[0]) * (p[0] - a[0]) + (p[1] - a[1]) * (p[1] - a[1]));
+    const t = std.math.clamp(((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / len2, 0.0, 1.0);
+    const qx = a[0] + abx * t;
+    const qy = a[1] + aby * t;
+    return @sqrt((p[0] - qx) * (p[0] - qx) + (p[1] - qy) * (p[1] - qy));
+}
+
+/// One Helios bounce light that fades toward its latest solved target instead of popping in or out.
+const VplSlot = struct {
+    entity: engine.EntityHandle,
+    pos: [3]f32,
+    color: [3]f32,
+    lumens: f32,
+    range: f32,
+    target_pos: [3]f32,
+    target_color: [3]f32,
+    target_lumens: f32,
+    target_range: f32,
+    /// False once the solver no longer produces this light; the slot fades out and is despawned.
+    wanted: bool,
+};
+
+/// Physical radius (metres) given to bounce lights; it softens their near-field falloff.
+const VPL_RADIUS: f32 = 1.8;
+
+/// Render layer of the dark-room interior (scene 06). Bounce lights carry only this layer there.
+const ROOM_LAYER: u32 = 2;
+
+/// Minimum time between GI re-solves while an object is being dragged.
+const GI_DRAG_INTERVAL: f32 = 0.2;
+/// Time without movement after which the full-quality GI solve runs.
+const GI_SETTLE_SECONDS: f32 = 0.35;
+
+/// Exponential rate (1/s) at which bounce lights follow their targets: about 0.35 s to settle.
+const VPL_FADE_RATE: f32 = 6.0;
+
 const PrismShowcaseState = struct {
     app: *engine.App,
     gfx: *graphics.GraphicsDeviceService,
@@ -122,6 +193,12 @@ const PrismShowcaseState = struct {
     scene_name: [64]u8 = @splat(0),
     scene_name_len: usize = 0,
     spawned: std.ArrayList(engine.EntityHandle) = .empty,
+    spawned_obj_count: usize = 0,
+    selected_obj: usize = 0,
+    obj_edit_highlight: f32 = 0.0,
+    gizmo_mode: GizmoMode = .move,
+    gizmo_drag_axis: GizmoAxis = .none,
+    gizmo_hover_axis: GizmoAxis = .none,
     graph_opts: prism.ForwardPlusGraphOptions = .{
         .enable_shadows = true,
         .enable_ssao = true,
@@ -164,10 +241,15 @@ const PrismShowcaseState = struct {
     gi_materials: std.ArrayList(helios.indirect_rt.SurfaceMaterial) = .empty,
     gi_emitters: std.ArrayList(helios.gi_solver.DirectPointEmitter) = .empty,
     gi_vpls: std.ArrayList(helios.gi_solver.VirtualPointLight) = .empty,
-    gi_vpl_entities: std.ArrayList(engine.EntityHandle) = .empty,
+    gi_vpl_slots: std.ArrayList(VplSlot) = .empty,
     gi_stats: helios.gi_solver.GiSolveStats = .{},
     gi_dirty: bool = true,
-    gi_frame_counter: u32 = 0,
+    /// A GI re-solve is waiting (an object is being dragged). While the drag lasts the solve runs at most every
+    /// `GI_DRAG_INTERVAL` seconds and at reduced quality; once the object has been still for `GI_SETTLE_SECONDS`
+    /// one full-quality solve runs.
+    gi_pending: bool = false,
+    gi_cooldown: f32 = 0.0,
+    gi_move_age: f32 = 1.0e9,
     indoor_blend: f32 = 0.0,
     capture_dir: ?[]const u8 = null,
     capture_io: std.Io = undefined,
@@ -195,26 +277,128 @@ const PrismShowcaseState = struct {
         self.gi_materials.deinit(self.app.allocator);
         self.gi_emitters.deinit(self.app.allocator);
         self.gi_vpls.deinit(self.app.allocator);
-        self.gi_vpl_entities.deinit(self.app.allocator);
+        self.gi_vpl_slots.deinit(self.app.allocator);
         self.opaque_q.deinit(self.app.allocator);
         self.transparent_q.deinit(self.app.allocator);
         self.batches.deinit(self.app.allocator);
     }
 };
 
+fn rebuildGiBvhFromEntities(st: *PrismShowcaseState) !void {
+    const allocator = st.app.allocator;
+    var gi_tris = std.ArrayList(helios.ray_query.BvhTriangle).empty;
+    defer gi_tris.deinit(allocator);
+    const n = @min(st.spawned_obj_count, st.spawned.items.len);
+    for (0..n) |oi| {
+        const tf = st.app.world.get(st.spawned.items[oi], render_3d.Transform3D) orelse continue;
+        const half_ext = if (oi == 0)
+            [3]f32{ tf.scale[0] * 0.5, 0.05, tf.scale[2] * 0.5 }
+        else
+            [3]f32{ tf.scale[0] * 0.5, tf.scale[1] * 0.5, tf.scale[2] * 0.5 };
+        try helios.gi_solver.appendBoxTriangles(allocator, &gi_tris, tf.position, half_ext, @intCast(oi));
+    }
+    try st.gi_bvh.build(gi_tris.items);
+}
+
+/// Points the bounce-light slots at the freshly solved `st.gi_vpls`: existing slots are reused in order, extra lights
+/// spawn dark and fade in, and slots without a light fade out.
+fn retargetVplSlots(st: *PrismShowcaseState) !void {
+    const allocator = st.app.allocator;
+    for (st.gi_vpls.items, 0..) |vpl, i| {
+        if (i < st.gi_vpl_slots.items.len) {
+            const slot = &st.gi_vpl_slots.items[i];
+            slot.target_pos = vpl.position;
+            slot.target_color = vpl.color;
+            slot.target_lumens = vpl.lumens;
+            slot.target_range = vpl.range;
+            slot.wanted = true;
+        } else {
+            const ve = try st.app.world.spawn();
+            try st.app.world.set(ve, render_3d.Transform3D, .{ .position = vpl.position });
+            try st.app.world.set(ve, render_3d.pbr.PointLight, .{
+                .color = vpl.color,
+                .intensity_lumens = 0.0,
+                .range = vpl.range,
+                // Bounce light is diffuse: a large radius softens the near-field hotspot on nearby walls and no
+                // specular lobe means no moving glints on glossy floors.
+                .radius = VPL_RADIUS,
+                .specular_scale = 0.0,
+                .shadows_enabled = false,
+                // Unshadowed, so keep them from lighting meshes on the other side of a wall.
+                .layers = if (st.scene_index == 5) ROOM_LAYER else render_3d.pbr.ALL_LAYERS,
+            });
+            try st.gi_vpl_slots.append(allocator, .{
+                .entity = ve,
+                .pos = vpl.position,
+                .color = vpl.color,
+                .lumens = 0.0,
+                .range = vpl.range,
+                .target_pos = vpl.position,
+                .target_color = vpl.color,
+                .target_lumens = vpl.lumens,
+                .target_range = vpl.range,
+                .wanted = true,
+            });
+        }
+    }
+    for (st.gi_vpl_slots.items, 0..) |*slot, i| {
+        if (i >= st.gi_vpls.items.len) {
+            slot.wanted = false;
+            slot.target_lumens = 0.0;
+        }
+    }
+}
+
+/// Moves every bounce light toward its target and despawns the ones that faded out completely.
+fn updateVplFade(st: *PrismShowcaseState, dt: f32) void {
+    const alpha = 1.0 - @exp(-std.math.clamp(dt, 0.0, 0.1) * VPL_FADE_RATE);
+    var i: usize = 0;
+    while (i < st.gi_vpl_slots.items.len) {
+        const slot = &st.gi_vpl_slots.items[i];
+        for (0..3) |k| {
+            slot.pos[k] += (slot.target_pos[k] - slot.pos[k]) * alpha;
+            slot.color[k] += (slot.target_color[k] - slot.color[k]) * alpha;
+        }
+        slot.lumens += (slot.target_lumens - slot.lumens) * alpha;
+        slot.range += (slot.target_range - slot.range) * alpha;
+        if (!slot.wanted and slot.lumens < 1.0) {
+            _ = st.app.world.despawn(slot.entity) catch false;
+            _ = st.gi_vpl_slots.swapRemove(i);
+            continue;
+        }
+        if (st.app.world.get(slot.entity, render_3d.Transform3D)) |tf| tf.position = slot.pos;
+        if (st.app.world.get(slot.entity, render_3d.pbr.PointLight)) |pl| {
+            pl.color = slot.color;
+            pl.intensity_lumens = slot.lumens;
+            pl.range = slot.range;
+            pl.layers = if (st.scene_index == 5) ROOM_LAYER else render_3d.pbr.ALL_LAYERS;
+        }
+        i += 1;
+    }
+}
+
 fn rebuildHeliosGi(st: *PrismShowcaseState) !void {
     const allocator = st.app.allocator;
-    // Despawn previous GI bounce VPL entities.
-    for (st.gi_vpl_entities.items) |e| _ = st.app.world.despawn(e) catch false;
-    st.gi_vpl_entities.clearRetainingCapacity();
+    // Bounce lights are not despawned here: they are retargeted below and fade (see `updateVplFade`), so a change in
+    // visibility (a closing door, a moved cube) never turns the room's light off or on in a single frame.
     st.gi_vpls.clearRetainingCapacity();
 
     const hsvc = st.app.resources.get(helios.HeliosService) orelse return;
-    const cfg = helios.gi_solver.configForTier(hsvc.settings.tier);
+    var cfg = helios.gi_solver.configForTier(hsvc.settings.tier);
     if (cfg.max_vpls == 0) {
         st.gi_stats = .{};
+        try retargetVplSlots(st);
         st.gi_dirty = false;
         return;
+    }
+    // While an object is being dragged the solve runs often, so it uses a coarser sun refinement; the full-quality solve
+    // follows once the object is still.
+    if (st.gi_move_age < GI_SETTLE_SECONDS) {
+        cfg.sun_refine_max_depth = @min(cfg.sun_refine_max_depth, 3);
+        cfg.sun_refine_ray_budget = @min(cfg.sun_refine_ray_budget, 1536);
+    }
+    if (st.app.world.get(st.cam_entity, camera.CameraPose)) |cp| {
+        cfg.viewer_pos = cp.position;
     }
 
     var sun_opt: ?helios.gi_solver.DirectSunEmitter = null;
@@ -225,8 +409,8 @@ fn rebuildHeliosGi(st: *PrismShowcaseState) !void {
                 .direction = sun.direction,
                 .color = sun.color,
                 .illuminance_lux = sun.illuminance_lux,
-                .scene_center = if (st.scene_index == 5) .{ 0.0, 1.5, -2.0 } else focus,
-                .scene_radius = if (st.scene_index == 5) 7.5 else 10.0,
+                .scene_center = if (st.scene_index == 5) .{ 0.0, 1.2, -2.0 } else focus,
+                .scene_radius = if (st.scene_index == 5) 4.5 else 10.0,
             };
         }
     }
@@ -241,19 +425,7 @@ fn rebuildHeliosGi(st: *PrismShowcaseState) !void {
         &st.gi_vpls,
     );
 
-    // Spawn smooth unshadowed bounce VPLs into the ECS world for real-time Forward+ clustered GI.
-    for (st.gi_vpls.items) |vpl| {
-        const ve = try st.app.world.spawn();
-        try st.app.world.set(ve, render_3d.Transform3D, .{ .position = vpl.position });
-        try st.app.world.set(ve, render_3d.pbr.PointLight, .{
-            .color = vpl.color,
-            .intensity_lumens = vpl.lumens,
-            .range = vpl.range,
-            .radius = 0.65,
-            .shadows_enabled = false,
-        });
-        try st.gi_vpl_entities.append(allocator, ve);
-    }
+    try retargetVplSlots(st);
     st.gi_dirty = false;
 }
 
@@ -397,6 +569,11 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         const e = try st.app.world.spawn();
         try st.app.world.set(e, render_3d.Transform3D, .{ .position = obj.pos, .scale = obj.scale });
         try st.app.world.set(e, render_3d.MeshRef, .{ .mesh_asset = st.assets.meshForName(obj.shape), .material_handle = mat });
+        // Scene 06: everything except the ground plane belongs to the room layer, so the unshadowed bounce lights
+        // (which live on that layer only) never light the ground outside the walls.
+        if (idx == 5 and oi >= 1) {
+            try st.app.world.set(e, render_3d.pbr.RenderLayers, .{ .mask = render_3d.pbr.DEFAULT_LAYER | ROOM_LAYER });
+        }
         try st.spawned.append(allocator, e);
 
         try st.gi_materials.append(allocator, .{
@@ -412,6 +589,10 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         try helios.gi_solver.appendBoxTriangles(allocator, &gi_tris, obj.pos, half_ext, @intCast(oi));
     }
     try st.gi_bvh.build(gi_tris.items);
+    st.spawned_obj_count = sc.objects.len;
+    // Default selection to the interactive pedestal cube in Scene 06 (index 9) or the last prop object.
+    st.selected_obj = if (idx == 5 and sc.objects.len > 9) 9 else if (sc.objects.len > 1) sc.objects.len - 1 else 0;
+    st.obj_edit_highlight = 0.0;
 
     // Spawn JSON point lights & record direct emitters for Helios GI.
     for (sc.point_lights) |pl| {
@@ -430,6 +611,29 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
             .lumens = pl.lumens,
             .range = pl.range,
         });
+    }
+
+    // Scene 06: the sky IBL (SH9 + prefiltered environment) has no visibility term, so it would light the closed room
+    // from outside. A reflection probe over the interior replaces it with a near-black environment; its blend distance
+    // fades it in and out at the walls, so crossing the doorway is smooth and the global environment never rebuilds.
+    if (idx == 5) {
+        const pe = try st.app.world.spawn();
+        try st.app.world.set(pe, render_3d.Transform3D, .{ .position = .{ 0.0, 1.94, -2.0 } });
+        try st.app.world.set(pe, render_3d.pbr.ReflectionProbe, .{
+            // The interior is x +-2.9, y 0.08..3.8, z -4.9..0.9. The box is larger by the blend distance on every side, so
+            // the wall, floor and ceiling surfaces themselves sit fully inside the probe (weight 1). A box that ends at the
+            // surfaces gives them almost no weight and leaves the sky IBL lighting exactly the walls it should not.
+            .half_extents = .{ 3.5, 2.46, 3.5 },
+            .blend_distance = 0.6,
+            .intensity = 1.0,
+            .box_projection = true,
+            .sky_tint = .{ 0.05, 0.046, 0.046 },
+            .ground_tint = .{ 0.03, 0.028, 0.028 },
+            // Diffuse stays near zero (about 0.0007 linear), so the closed room is dark; the reflections keep a dim
+            // interior colour instead of black, which is what metallic and glossy props show.
+            .diffuse_scale = 0.015,
+        });
+        try st.spawned.append(allocator, pe);
     }
 
     st.gi_dirty = true;
@@ -525,8 +729,9 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
         if (ctx.world.get(st.sun_entity, render_3d.pbr.DirectionalLight)) |sun| {
             sun.direction = .{ -@cos(st.sun_angle) * 0.6, -@max(@sin(st.sun_angle), 0.05), -0.45 };
         }
-        st.gi_frame_counter += 1;
-        if (st.gi_frame_counter % 6 == 0) st.gi_dirty = true;
+        // The GI solve is throttled and runs at reduced quality while the sun moves (see `gi_pending`).
+        st.gi_pending = true;
+        st.gi_move_age = 0.0;
     }
     if (keys.justPressed(.key_g)) st.show_bounds = !st.show_bounds;
     if (keys.justPressed(.key_p)) st.show_volumes = !st.show_volumes;
@@ -541,9 +746,240 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
             st.gi_dirty = true;
         }
     }
+
+    // Interactive 3D Transform Gizmo (Left-Click drag X/Y/Z handles, Left-Click object to select,
+    // [Z] toggle Move/Scale, plus keyboard [Arrows/U/O] move, [J/L] scale, [M] cycle) with live GI BVH update.
+    if (keys.justPressed(.key_z)) {
+        st.gizmo_mode = if (st.gizmo_mode == .move) .scale else .move;
+    }
+    if (st.spawned_obj_count > 1) {
+        if (keys.justPressed(.key_m)) {
+            st.selected_obj = 1 + (st.selected_obj % (st.spawned_obj_count - 1));
+            st.obj_edit_highlight = 1.5;
+        }
+        const mouse_opt = ctx.resources.get(input.MouseInput);
+        const motion_opt = ctx.resources.get(input.AccumulatedMouseMotion);
+        const px_g = window_sdl3.pixelSize(st.app);
+        const gvw: f32 = @floatFromInt(if (px_g) |p| p.width else 1280);
+        const gvh: f32 = @floatFromInt(if (px_g) |p| p.height else 720);
+
+        if (st.selected_obj < st.spawned_obj_count and st.selected_obj < st.spawned.items.len) {
+            if (ctx.world.get(st.spawned.items[st.selected_obj], render_3d.Transform3D)) |tf| {
+                const cam_dx = tf.position[0] - cam_pose.position[0];
+                const cam_dy = tf.position[1] - cam_pose.position[1];
+                const cam_dz = tf.position[2] - cam_pose.position[2];
+                const cam_dist = @max(@sqrt(cam_dx * cam_dx + cam_dy * cam_dy + cam_dz * cam_dz), 1.5);
+                const g_len: f32 = std.math.clamp(cam_dist * 0.16, 0.75, 2.6);
+
+                const p0 = tf.position;
+                const px_tip = [3]f32{ p0[0] + g_len, p0[1], p0[2] };
+                const py_tip = [3]f32{ p0[0], p0[1] + g_len, p0[2] };
+                const pz_tip = [3]f32{ p0[0], p0[1], p0[2] + g_len };
+
+                const s0 = projectToScreen(cam.computed.clip_from_world, p0, gvw, gvh);
+                const sx = projectToScreen(cam.computed.clip_from_world, px_tip, gvw, gvh);
+                const sy = projectToScreen(cam.computed.clip_from_world, py_tip, gvw, gvh);
+                const sz = projectToScreen(cam.computed.clip_from_world, pz_tip, gvw, gvh);
+
+                var moved = false;
+
+                if (mouse_opt != null and motion_opt != null) {
+                    const mouse = mouse_opt.?;
+                    const motion = motion_opt.?;
+                    const mpos = motion.position;
+
+                    if (st.gizmo_drag_axis == .none) {
+                        var best_axis: GizmoAxis = .none;
+                        var best_d: f32 = 16.0;
+                        if (s0) |o2| {
+                            if (st.gizmo_mode == .scale) {
+                                const dc = @sqrt((mpos[0] - o2[0]) * (mpos[0] - o2[0]) + (mpos[1] - o2[1]) * (mpos[1] - o2[1]));
+                                if (dc < 18.0) {
+                                    best_axis = .uniform;
+                                    best_d = dc;
+                                }
+                            }
+                            if (sx) |t2| {
+                                const d = distPointToSegment2D(mpos, o2, t2);
+                                if (d < best_d) {
+                                    best_d = d;
+                                    best_axis = .x;
+                                }
+                            }
+                            if (sy) |t2| {
+                                const d = distPointToSegment2D(mpos, o2, t2);
+                                if (d < best_d) {
+                                    best_d = d;
+                                    best_axis = .y;
+                                }
+                            }
+                            if (sz) |t2| {
+                                const d = distPointToSegment2D(mpos, o2, t2);
+                                if (d < best_d) {
+                                    best_d = d;
+                                    best_axis = .z;
+                                }
+                            }
+                        }
+                        st.gizmo_hover_axis = best_axis;
+
+                        if (mouse.justPressed(.left) and !mouse.pressed(.right)) {
+                            if (best_axis != .none) {
+                                st.gizmo_drag_axis = best_axis;
+                            } else {
+                                const right_v = normalize3(cross3(cam_pose.forward, cam_pose.up));
+                                const up_v = normalize3(cross3(right_v, cam_pose.forward));
+                                const tan_half = @tan(std.math.pi / 6.0);
+                                const aspect = gvw / @max(gvh, 1.0);
+                                const ndc_x = (mpos[0] / @max(gvw, 1.0)) * 2.0 - 1.0;
+                                const ndc_y = 1.0 - (mpos[1] / @max(gvh, 1.0)) * 2.0;
+                                const rdir = normalize3(.{
+                                    cam_pose.forward[0] + right_v[0] * (ndc_x * aspect * tan_half) + up_v[0] * (ndc_y * tan_half),
+                                    cam_pose.forward[1] + right_v[1] * (ndc_x * aspect * tan_half) + up_v[1] * (ndc_y * tan_half),
+                                    cam_pose.forward[2] + right_v[2] * (ndc_x * aspect * tan_half) + up_v[2] * (ndc_y * tan_half),
+                                });
+                                var qst = helios.ray_query.QueryStats{};
+                                const hit = st.gi_bvh.traceClosest(.{ .origin = cam_pose.position, .direction = rdir, .t_min = 0.05, .t_max = 120.0 }, &qst);
+                                if (hit.hit and hit.instance_id > 0 and hit.instance_id < st.spawned_obj_count) {
+                                    st.selected_obj = hit.instance_id;
+                                    st.obj_edit_highlight = 1.0;
+                                }
+                            }
+                        }
+                    } else {
+                        if (!mouse.pressed(.left) or mouse.pressed(.right)) {
+                            st.gizmo_drag_axis = .none;
+                        } else if (motion.delta[0] != 0.0 or motion.delta[1] != 0.0) {
+                            if (st.gizmo_drag_axis == .uniform) {
+                                const delta_s = (motion.delta[0] - motion.delta[1]) * 0.008;
+                                const ns = std.math.clamp(tf.scale[0] + delta_s, 0.2, 8.0);
+                                const ratio = ns / @max(tf.scale[0], 0.05);
+                                tf.scale = .{ tf.scale[0] * ratio, tf.scale[1] * ratio, tf.scale[2] * ratio };
+                                moved = true;
+                            } else if (s0) |o2| {
+                                const tip2_opt: ?[2]f32 = switch (st.gizmo_drag_axis) {
+                                    .x => sx,
+                                    .y => sy,
+                                    .z => sz,
+                                    else => null,
+                                };
+                                if (tip2_opt) |t2| {
+                                    const ax = t2[0] - o2[0];
+                                    const ay = t2[1] - o2[1];
+                                    const alen = @max(@sqrt(ax * ax + ay * ay), 12.0);
+                                    const amount = ((motion.delta[0] * ax + motion.delta[1] * ay) / alen) * (g_len / alen);
+                                    const idx_ax: usize = switch (st.gizmo_drag_axis) {
+                                        .x => 0,
+                                        .y => 1,
+                                        .z => 2,
+                                        else => 0,
+                                    };
+                                    if (st.gizmo_mode == .move) {
+                                        tf.position[idx_ax] += amount;
+                                    } else {
+                                        tf.scale[idx_ax] = std.math.clamp(tf.scale[idx_ax] + amount, 0.2, 8.0);
+                                    }
+                                    moved = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                const move_sp: f32 = 2.6 * @as(f32, @floatCast(ctx.dt));
+                const scale_sp: f32 = 1.2 * @as(f32, @floatCast(ctx.dt));
+                if (keys.pressed(.arrow_left)) {
+                    tf.position[0] -= move_sp;
+                    moved = true;
+                }
+                if (keys.pressed(.arrow_right)) {
+                    tf.position[0] += move_sp;
+                    moved = true;
+                }
+                if (keys.pressed(.arrow_up)) {
+                    tf.position[2] -= move_sp;
+                    moved = true;
+                }
+                if (keys.pressed(.arrow_down)) {
+                    tf.position[2] += move_sp;
+                    moved = true;
+                }
+                if (keys.pressed(.key_o)) {
+                    tf.position[1] += move_sp;
+                    moved = true;
+                }
+                if (keys.pressed(.key_u)) {
+                    tf.position[1] = @max(tf.position[1] - move_sp, tf.scale[1] * 0.5);
+                    moved = true;
+                }
+                if (keys.pressed(.key_l)) {
+                    const ns = @min(tf.scale[0] + scale_sp, 6.0);
+                    const ratio = ns / @max(tf.scale[0], 0.05);
+                    tf.scale = .{ tf.scale[0] * ratio, tf.scale[1] * ratio, tf.scale[2] * ratio };
+                    moved = true;
+                }
+                if (keys.pressed(.key_j)) {
+                    const ns = @max(tf.scale[0] - scale_sp, 0.25);
+                    const ratio = ns / @max(tf.scale[0], 0.05);
+                    tf.scale = .{ tf.scale[0] * ratio, tf.scale[1] * ratio, tf.scale[2] * ratio };
+                    moved = true;
+                }
+                if (moved) {
+                    st.obj_edit_highlight = 0.6;
+                    try rebuildGiBvhFromEntities(st);
+                    // The solve itself is deferred and throttled (see `gi_pending`): running it on every frame of a
+                    // drag made moving objects stutter.
+                    st.gi_pending = true;
+                    st.gi_move_age = 0.0;
+                }
+
+                // Draw X-Ray 3D RGB Transform Gizmo.
+                const active_ax = if (st.gizmo_drag_axis != .none) st.gizmo_drag_axis else st.gizmo_hover_axis;
+                const col_x: [4]f32 = if (active_ax == .x) .{ 1.0, 0.95, 0.2, 1.0 } else .{ 1.0, 0.22, 0.22, 1.0 };
+                const col_y: [4]f32 = if (active_ax == .y) .{ 1.0, 0.95, 0.2, 1.0 } else .{ 0.22, 1.0, 0.30, 1.0 };
+                const col_z: [4]f32 = if (active_ax == .z) .{ 1.0, 0.95, 0.2, 1.0 } else .{ 0.25, 0.55, 1.0, 1.0 };
+                giz.lineXray(p0, px_tip, col_x);
+                giz.lineXray(p0, py_tip, col_y);
+                giz.lineXray(p0, pz_tip, col_z);
+
+                const h_sz = g_len * 0.14;
+                if (st.gizmo_mode == .move) {
+                    giz.sphere(px_tip, h_sz * 0.7, 8, col_x);
+                    giz.sphere(py_tip, h_sz * 0.7, 8, col_y);
+                    giz.sphere(pz_tip, h_sz * 0.7, 8, col_z);
+                } else {
+                    const col_c: [4]f32 = if (active_ax == .uniform) .{ 1.0, 0.95, 0.2, 1.0 } else .{ 0.95, 0.95, 0.98, 1.0 };
+                    giz.cuboid(p0, .{ h_sz * 1.4, h_sz * 1.4, h_sz * 1.4 }, col_c);
+                    giz.cuboid(px_tip, .{ h_sz, h_sz, h_sz }, col_x);
+                    giz.cuboid(py_tip, .{ h_sz, h_sz, h_sz }, col_y);
+                    giz.cuboid(pz_tip, .{ h_sz, h_sz, h_sz }, col_z);
+                }
+                if (st.obj_edit_highlight > 0.0) {
+                    st.obj_edit_highlight = @max(0.0, st.obj_edit_highlight - @as(f32, @floatCast(ctx.dt)));
+                    giz.cuboid(tf.position, .{ tf.scale[0] + 0.05, tf.scale[1] + 0.05, tf.scale[2] + 0.05 }, .{ 0.25, 0.95, 1.0, 0.85 });
+                }
+            }
+        }
+    }
+
+    {
+        const frame_dt: f32 = @floatCast(ctx.dt);
+        st.gi_move_age += frame_dt;
+        st.gi_cooldown -= frame_dt;
+        if (st.gi_pending) {
+            if (st.gi_move_age >= GI_SETTLE_SECONDS) {
+                st.gi_dirty = true;
+                st.gi_pending = false;
+            } else if (st.gi_cooldown <= 0.0) {
+                st.gi_dirty = true;
+                st.gi_cooldown = GI_DRAG_INTERVAL;
+            }
+        }
+    }
     if (st.gi_dirty) {
         try rebuildHeliosGi(st);
     }
+    updateVplFade(st, @floatCast(ctx.dt));
 
     // Optional automated screenshot capture (`ZENGY_PRISM_CAPTURE=<dir>`) to visually verify GI OFF vs HIGH.
     if (st.capture_dir) |cdir| {
@@ -678,56 +1114,24 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
         }
     }
 
-    // In Scene 06 (Dark Room Sunbeam), smoothly blend outdoor sky IBL occlusion across the doorway
-    // (spatial smoothstep + temporal lerp) so there is zero abrupt pop when walking in or out.
+    // In Scene 06 (Dark Room Sunbeam), keep SkyEnvironment static (zero per-frame IBL rebuilds / flicker)
+    // and only update AmbientLight + trigger Helios GI visibility re-solve when crossing the doorway.
     if (st.scene_index == 5 and st.sky_preset == 0) {
         const p = cam_pose.position;
-        // Signed distance inside the room box [-5.1..5.1, -0.2..6.1, -7.1..3.3] with a 3.0m soft doorway ramp.
-        const dx = @max(@abs(p[0]) - 5.1, 0.0);
-        const dy = @max(@max(-0.2 - p[1], p[1] - 6.1), 0.0);
-        const dz = @max(@max(-7.1 - p[2], p[2] - 3.3), 0.0);
+        const dx = @max(@abs(p[0]) - 3.1, 0.0);
+        const dy = @max(@max(-0.2 - p[1], p[1] - 3.9), 0.0);
+        const dz = @max(@max(-5.1 - p[2], p[2] - 1.1), 0.0);
         const outside_dist = @sqrt(dx * dx + dy * dy + dz * dz);
-        const t = 1.0 - std.math.clamp(outside_dist / 3.0, 0.0, 1.0);
+        const t = 1.0 - std.math.clamp(outside_dist / 2.5, 0.0, 1.0);
         const spatial_inside = t * t * (3.0 - 2.0 * t);
         const alpha = 1.0 - @exp(-@as(f32, @floatCast(ctx.dt)) * 4.5);
+        const prev_blend = st.indoor_blend;
         st.indoor_blend += (spatial_inside - st.indoor_blend) * alpha;
-
-        const scale: f32 = 1.0 - st.indoor_blend * 0.985;
-        if (ctx.resources.get(render_3d.pbr.SkyEnvironment)) |sky| {
-            sky.sky_tint = .{ st.scene_sky_tint[0] * scale, st.scene_sky_tint[1] * scale, st.scene_sky_tint[2] * scale };
-            sky.horizon_tint = .{ st.scene_horizon_tint[0] * scale, st.scene_horizon_tint[1] * scale, st.scene_horizon_tint[2] * scale };
-            sky.ground_albedo = .{ st.scene_ground_albedo[0] * scale, st.scene_ground_albedo[1] * scale, st.scene_ground_albedo[2] * scale };
+        if ((prev_blend < 0.5 and st.indoor_blend >= 0.5) or (prev_blend >= 0.5 and st.indoor_blend < 0.5)) {
+            st.gi_dirty = true;
         }
         if (ctx.resources.get(render_3d.pbr.AmbientLight)) |amb| {
-            amb.brightness = 0.05 * (1.0 - st.indoor_blend) + 0.004 * st.indoor_blend;
-        }
-    } else {
-        st.indoor_blend = 0.0;
-        if (ctx.resources.get(render_3d.pbr.AmbientLight)) |amb| amb.brightness = 0.05;
-    }
-
-    // In Scene 06 (Dark Room Sunbeam), smoothly blend outdoor sky IBL occlusion across the doorway
-    // (spatial smoothstep + temporal lerp) so there is zero abrupt pop when walking in or out.
-    if (st.scene_index == 5 and st.sky_preset == 0) {
-        const p = cam_pose.position;
-        // Signed distance inside the room box [-5.1..5.1, -0.2..6.1, -7.1..3.3] with a 3.0m soft doorway ramp.
-        const dx = @max(@abs(p[0]) - 5.1, 0.0);
-        const dy = @max(@max(-0.2 - p[1], p[1] - 6.1), 0.0);
-        const dz = @max(@max(-7.1 - p[2], p[2] - 3.3), 0.0);
-        const outside_dist = @sqrt(dx * dx + dy * dy + dz * dz);
-        const t = 1.0 - std.math.clamp(outside_dist / 3.0, 0.0, 1.0);
-        const spatial_inside = t * t * (3.0 - 2.0 * t);
-        const alpha = 1.0 - @exp(-@as(f32, @floatCast(ctx.dt)) * 4.5);
-        st.indoor_blend += (spatial_inside - st.indoor_blend) * alpha;
-
-        const scale: f32 = 1.0 - st.indoor_blend * 0.985;
-        if (ctx.resources.get(render_3d.pbr.SkyEnvironment)) |sky| {
-            sky.sky_tint = .{ st.scene_sky_tint[0] * scale, st.scene_sky_tint[1] * scale, st.scene_sky_tint[2] * scale };
-            sky.horizon_tint = .{ st.scene_horizon_tint[0] * scale, st.scene_horizon_tint[1] * scale, st.scene_horizon_tint[2] * scale };
-            sky.ground_albedo = .{ st.scene_ground_albedo[0] * scale, st.scene_ground_albedo[1] * scale, st.scene_ground_albedo[2] * scale };
-        }
-        if (ctx.resources.get(render_3d.pbr.AmbientLight)) |amb| {
-            amb.brightness = 0.05 * (1.0 - st.indoor_blend) + 0.004 * st.indoor_blend;
+            amb.brightness = 0.02 * (1.0 - st.indoor_blend);
         }
     } else {
         st.indoor_blend = 0.0;
@@ -848,11 +1252,10 @@ fn updatePrismShowcase(ctx: *engine.SystemContext) !void {
     const tm_name: []const u8 = if (pp_opt) |pp| @tagName(pp.tonemap_mode) else "agx";
     const tm_look: []const u8 = if (pp_opt) |pp| (if (pp.tonemap_mode == .agx and pp.tonemap_look == .punchy) "(Punchy)" else "") else "";
     const ae_on: bool = if (pp_opt) |pp| pp.auto_exposure.enabled else true;
-    const vig_on: bool = if (pp_opt) |pp| pp.vignette.enabled else false;
     const h5 = std.fmt.bufPrint(
         &st.hud5,
-        "[N]Sky:{s} | [R]SunRot:{any} | [T]Tonemap:{s}{s} | [X]AutoExp:{any} | [V]Vig:{any} | [F]Fog:{any}",
-        .{ sky_label, st.rotate_sun, tm_name, tm_look, ae_on, vig_on, st.base_fog_enabled },
+        "[N]Sky:{s} [R]Sun:{any} [T]TM:{s}{s} [X]AE:{any} [F]Fog:{any} | [Z]Gizmo:{s} (LMB Drag/Pick) [M]Obj#{d}",
+        .{ sky_label, st.rotate_sun, tm_name, tm_look, ae_on, st.base_fog_enabled, @tagName(st.gizmo_mode), st.selected_obj },
     ) catch "PBR";
     st.hud5_len = h5.len;
 }
@@ -980,7 +1383,7 @@ pub fn main(init: std.process.Init) !void {
     try app.world.set(cam_e, camera.FreeCamera, .{ .walk_speed = 8.0, .run_speed = 18.0 });
     try app.world.set(cam_e, camera.FreeCameraState, .{});
     try app.world.set(cam_e, render_3d.pbr.PostProcessSettings, .{
-        .auto_exposure = .{ .enabled = true, .min_ev100 = -3.5, .max_ev100 = 4.5, .speed_brighten = 1.8, .speed_darken = 2.5 },
+        .auto_exposure = .{ .enabled = true, .min_ev100 = -3.0, .max_ev100 = 4.5, .speed_brighten = 1.2, .speed_darken = 2.0 },
         .bloom = .{ .enabled = true, .intensity = 0.30, .threshold = 1.1, .scatter = 0.72 },
         .ssao = .{ .enabled = true, .radius = 0.65, .intensity = 1.25, .bias = 0.03 },
         .contact_shadows = .{ .enabled = true, .length = 0.45, .thickness = 0.12, .opacity = 0.8 },
@@ -991,6 +1394,8 @@ pub fn main(init: std.process.Init) !void {
                 .static_cache = true,
                 .adaptive_atlas = true,
             },
+            // A moving sun rebuilds the environment often; spread each rebuild over several frames.
+            .ibl_rebuild_budget = .sliced,
         },
         .tonemap_mode = .agx,
         .tonemap_look = .base,

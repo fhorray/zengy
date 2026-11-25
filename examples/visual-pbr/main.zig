@@ -53,6 +53,8 @@ const PbrDemoState = struct {
     nudge_entity: engine.EntityHandle,
     /// The shadowed spot light and the two point lights; `light_radius` scenarios resize their sources.
     local_lights: [3]engine.EntityHandle,
+    /// Intensities the three local lights were spawned with, restored by every scenario.
+    local_light_lumens: [3]f32,
     /// The sky HDRI and an identical copy at another address; `hdri_swap` scenarios switch between them to force a
     /// re-upload without changing the picture.
     hdri_main: []const [4]f32,
@@ -135,6 +137,10 @@ const Scenario = struct {
     light_radius: f32 = 0,
     /// Sun illuminance override (lux); 0 keeps the sky preset's value. A dim sun lets local-light shadows show.
     sun_lux: f32 = 0,
+    /// Layer mask given to the spot and point lights (they affect only meshes sharing a layer; meshes use layer 0).
+    light_layers: u32 = render_3d.pbr.ALL_LAYERS,
+    /// Switch the three local lights off by intensity (the reference for a layer mask that excludes every mesh).
+    lights_off: bool = false,
 };
 
 /// Expectation on the floor's fine-grained contrast relative to the `acne_ref` golden.
@@ -210,6 +216,9 @@ const SCENARIOS = [_]Scenario{
     .{ .name = "bias_sweep_300", .shadow_normal_offset = true, .normal_bias = 0.3, .golden_of = "gallery_default" },
     .{ .name = "gallery_pcss", .shadow_pcss = true },
     // Local-light PCSS in the dark room with large light sources: the penumbra comes from each light's radius.
+    // Layer masks: lights restricted to a layer no mesh uses must look like lights that are switched off.
+    .{ .name = "vol_room_lights_zero", .pose = .vol_room, .fog = false, .lights_off = true },
+    .{ .name = "vol_room_lights_masked", .pose = .vol_room, .fog = false, .light_layers = 0x2, .golden_of = "vol_room_lights_zero" },
     .{ .name = "local_soft_off", .light_radius = 0.6, .sun_lux = 600, .fog = false },
     .{ .name = "local_pcss", .light_radius = 0.6, .sun_lux = 600, .fog = false, .shadow_pcss = true },
 };
@@ -458,13 +467,24 @@ fn resetFreeCamera(ctx: *engine.SystemContext, st: *PbrDemoState) void {
     if (ctx.world.get(st.cam_entity, camera.FreeCamera)) |fc| fc.state.initialized = false;
 }
 
-/// Gives the spot and point lights the source radius `radius` (0 restores their defaults).
-fn applyLightRadius(ctx: *engine.SystemContext, st: *PbrDemoState, radius: f32) void {
+/// Configures the spot and point lights for a scenario: source radius (0 restores the default), layer mask, and
+/// whether they are switched off.
+fn applyLocalLights(ctx: *engine.SystemContext, st: *PbrDemoState, sc: Scenario) void {
     const default_radius: f32 = 0.05;
-    const r = if (radius > 0) radius else default_radius;
-    if (ctx.world.get(st.local_lights[0], render_3d.pbr.SpotLight)) |sl| sl.radius = r;
-    if (ctx.world.get(st.local_lights[1], render_3d.pbr.PointLight)) |pl| pl.radius = r;
-    if (ctx.world.get(st.local_lights[2], render_3d.pbr.PointLight)) |pl| pl.radius = r;
+    const r = if (sc.light_radius > 0) sc.light_radius else default_radius;
+    const scale: f32 = if (sc.lights_off) 0.0 else 1.0;
+    if (ctx.world.get(st.local_lights[0], render_3d.pbr.SpotLight)) |sl| {
+        sl.radius = r;
+        sl.layers = sc.light_layers;
+        sl.intensity_lumens = st.local_light_lumens[0] * scale;
+    }
+    for (1..3) |i| {
+        if (ctx.world.get(st.local_lights[i], render_3d.pbr.PointLight)) |pl| {
+            pl.radius = r;
+            pl.layers = sc.light_layers;
+            pl.intensity_lumens = st.local_light_lumens[i] * scale;
+        }
+    }
 }
 
 /// Camera pose of a scenario; `dx`/`dz` shift the eye (and a third of it the target) for the shake scenarios.
@@ -547,7 +567,7 @@ fn stepCapture(
                     sky_env.hdri_pixels = if (sc.hdri_swap) st.hdri_alt else st.hdri_main;
                 }
                 if (ctx.world.get(st.nudge_entity, render_3d.Transform3D)) |tr| tr.position[0] = NUDGE_HOME_X;
-                applyLightRadius(ctx, st, sc.light_radius);
+                applyLocalLights(ctx, st, sc);
                 cr.dt_sum = 0;
                 cr.dt_max = 0;
                 cr.dt_frames = 0;
@@ -880,7 +900,7 @@ pub fn main(init: std.process.Init) !void {
     try app.world.set(cam_e, camera.FreeCamera, .{ .walk_speed = 7.0, .run_speed = 16.0 });
     try app.world.set(cam_e, camera.FreeCameraState, .{});
     try app.world.set(cam_e, render_3d.pbr.PostProcessSettings, .{
-        .auto_exposure = .{ .enabled = true, .min_ev100 = -2.0, .max_ev100 = 3.0, .speed_brighten = 3.0, .speed_darken = 1.5 },
+        .auto_exposure = .{ .enabled = true, .min_ev100 = -2.0, .max_ev100 = 3.0, .speed_brighten = 1.5, .speed_darken = 3.0 },
         .bloom = .{ .enabled = true, .intensity = 0.25, .threshold = 1.2, .scatter = 0.7 },
         .ssao = .{ .enabled = true, .radius = 0.65, .intensity = 1.2, .bias = 0.03 },
         .contact_shadows = .{ .enabled = true, .length = 0.45, .thickness = 0.12, .opacity = 0.8 },
@@ -1150,6 +1170,11 @@ pub fn main(init: std.process.Init) !void {
         .sun_entity = sun_e,
         .nudge_entity = leaf_e,
         .local_lights = .{ spot_e, pl1, pl2 },
+        .local_light_lumens = .{
+            (app.world.get(spot_e, render_3d.pbr.SpotLight) orelse unreachable).intensity_lumens,
+            (app.world.get(pl1, render_3d.pbr.PointLight) orelse unreachable).intensity_lumens,
+            (app.world.get(pl2, render_3d.pbr.PointLight) orelse unreachable).intensity_lumens,
+        },
         .hdri_main = hdri.pixels,
         .hdri_alt = hdri_alt,
         .capture = capture_runner,

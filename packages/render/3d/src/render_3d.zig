@@ -55,12 +55,14 @@ pub const ExtractedMeshDraw = struct {
     mesh_asset: u64,
     material_id: u32,
     material_handle: ?pbr.MaterialHandle,
+    layers: u32 = pbr.DEFAULT_LAYER,
 };
 
 /// Lightweight shadow-caster draw item for meshes outside the main camera frustum.
 pub const ShadowCasterDraw = struct {
     mesh_asset: u64,
     model_matrix: math3d.Mat4,
+    layers: u32 = pbr.DEFAULT_LAYER,
 };
 
 /// Extracts visible 3D meshes, lights, environment, and post-processing state for GPU submission.
@@ -161,11 +163,12 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
 
     var mesh_q = try ctx.query(.{
         .read = .{MeshRef},
-        .optional = .{ scene.incremental.GlobalTransform3D, Transform3D },
+        .optional = .{ scene.incremental.GlobalTransform3D, Transform3D, pbr.RenderLayers },
     });
     defer mesh_q.deinit();
     while (mesh_q.next()) |row| {
         const m = row.read(MeshRef);
+        const layers: u32 = if (row.optional(pbr.RenderLayers)) |rl| rl.mask else pbr.DEFAULT_LAYER;
         var model: math3d.Mat4 = undefined;
         var pos: [3]f32 = .{ 0, 0, 0 };
         var max_scale: f32 = 1.0;
@@ -198,6 +201,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 try svc.shadow_casters.append(svc.allocator, .{
                     .mesh_asset = m.mesh_asset,
                     .model_matrix = model,
+                    .layers = layers,
                 });
                 continue;
             }
@@ -212,6 +216,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
             .mesh_asset = m.mesh_asset,
             .material_id = m.material_id,
             .material_handle = m.material_handle,
+            .layers = layers,
         });
     }
 
@@ -240,6 +245,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 .shadow_normal_bias = dl.shadow_normal_bias,
                 .pcss_enabled = dl.pcss_enabled,
                 .pcss_light_size = dl.pcss_light_size,
+                .layers = dl.layers,
                 .cascade_count = cfg.cascade_count,
                 .cascade_bounds = pbr.calculateCascadeBounds(cfg),
                 .overlap_proportion = cfg.overlap_proportion,
@@ -267,6 +273,8 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 .intensity_lumens = pl.intensity_lumens,
                 .range = pl.range,
                 .radius = pl.radius,
+                .layers = pl.layers,
+                .specular_scale = pl.specular_scale,
                 .shadows_enabled = pl.shadows_enabled,
                 .shadow_depth_bias = pl.shadow_depth_bias,
             });
@@ -300,6 +308,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 .inner_angle_rad = sl.inner_angle_rad,
                 .outer_angle_rad = sl.outer_angle_rad,
                 .radius = sl.radius,
+                .layers = sl.layers,
                 .shadows_enabled = sl.shadows_enabled,
                 .shadow_depth_bias = sl.shadow_depth_bias,
             });
@@ -332,6 +341,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 .half_extents = .{ rl.width * 0.5, rl.height * 0.5 },
                 .range = rl.range,
                 .two_sided = rl.two_sided,
+                .layers = rl.layers,
             });
         }
     }
@@ -357,6 +367,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 .box_projection = rp.box_projection,
                 .sky_tint = rp.sky_tint,
                 .ground_tint = rp.ground_tint,
+                .diffuse_scale = rp.diffuse_scale,
             });
         }
     }
@@ -391,10 +402,12 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 if (mat_reg) |reg| (reg.getConst(mh) orelse &pbr.StandardMaterial{}).* else .{}
             else
                 .{};
+            if (be.setDrawLayers) |set_layers| set_layers(be.ctx, draw.layers);
             try be.submitLitMesh(be.ctx, draw.mesh_asset, draw.model_matrix.m, draw.mvp_matrix.m, mat, draw.color);
         }
         if (be.submitShadowCaster) |submit_sc| {
             for (svc.shadow_casters.items) |sc| {
+                if (be.setDrawLayers) |set_layers| set_layers(be.ctx, sc.layers);
                 try submit_sc(be.ctx, sc.mesh_asset, sc.model_matrix.m);
             }
         }

@@ -101,6 +101,12 @@ void main() {
     vec4 wp4 = inv_view_proj * far_ndc;
     vec3 wp = wp4.xyz / max(wp4.w, 1e-5);
 
+    // Nothing to scatter or extinguish: skip the 64-step march entirely.
+    if (cam_pos_density.w <= 0.0 && fog_col_scat.w <= 0.0) {
+        frag_color = vec4(0.0);
+        return;
+    }
+
     vec3 ray = wp - cam_pos_density.xyz;
     float dist = length(ray);
     vec3 ray_dir = ray / max(dist, 1e-4);

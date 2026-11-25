@@ -39,6 +39,9 @@ void main() {
         imageStore(u_exposure_out, ivec2(0, 0), vec4(adapted_ev100, 0.0, 0.0, 1.0));
         return;
     }
+    // Bin 0 holds black pixels (luminance below the histogram floor). They are the darkest part of the
+    // distribution, so they enter the percentile window at the floor luminance (hist_range.x) instead of being
+    // skipped; skipping them made a nearly black frame fall back to EV 0 and jump instead of settling at the floor.
 
     float low_count = float(total) * ev_bounds.z;
     float high_count = float(total) * ev_bounds.w;
@@ -46,14 +49,14 @@ void main() {
     float weighted_sum = 0.0;
     float weight_total = 0.0;
 
-    for (uint i = 1u; i < 64u; ++i) {
+    for (uint i = 0u; i < 64u; ++i) {
         float c = float(s_bins[i]);
         float next_acc = accum + c;
         float lo = max(accum, low_count);
         float hi = min(next_acc, high_count);
         if (hi > lo) {
             float w = hi - lo;
-            float log_lum = hist_range.x + ((float(i) - 0.5) / 62.0) * hist_range.y;
+            float log_lum = (i == 0u) ? hist_range.x : hist_range.x + ((float(i) - 0.5) / 62.0) * hist_range.y;
             weighted_sum += log_lum * w;
             weight_total += w;
         }
@@ -71,7 +74,9 @@ void main() {
     if (isnan(prev) || isinf(prev)) {
         prev = clamped_ev;
     }
-    float spd = (clamped_ev > prev) ? speed_dt.x : speed_dt.y;
+    // Exposure gain is exp2(-ev): a lower EV brightens the image. speed_brighten (x) applies while the image is
+    // getting brighter (EV falling, e.g. entering a dark room), speed_darken (y) while it gets darker (EV rising).
+    float spd = (clamped_ev < prev) ? speed_dt.x : speed_dt.y;
     float alpha = 1.0 - exp(-max(speed_dt.z, 0.0001) * max(spd, 0.01));
     float next_ev = mix(prev, clamped_ev, alpha);
     adapted_ev100 = next_ev;

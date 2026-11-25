@@ -502,3 +502,14 @@ test "RenderQuality defaults keep the established rendering path" {
     try testing.expect(!q.reuse_depth_prepass);
     try testing.expectEqual(render_3d.pbr.IblRebuildBudget.unlimited, q.ibl_rebuild_budget);
 }
+
+test "layer masks: lights default to every layer, meshes to layer 0, and overlap needs a shared bit" {
+    const pbr = render_3d.pbr;
+    const light = pbr.PointLight{};
+    try testing.expect(pbr.layersOverlap(light.layers, (pbr.RenderLayers{}).mask));
+    try testing.expect(!pbr.layersOverlap(0b10, 0b01));
+    try testing.expect(pbr.layersOverlap(0b11, 0b10));
+    // Bits above the 24 usable layers never match.
+    try testing.expect(!pbr.layersOverlap(0xFF00_0000, 0xFF00_0000));
+    try testing.expectEqual(@as(u32, 0x00FF_FFFF), pbr.ALL_LAYERS);
+}

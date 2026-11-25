@@ -49,6 +49,16 @@ pub const GiSolveConfig = struct {
     normal_offset: f32 = 0.42,
     bounce_energy_scale: f32 = 0.65,
     vpl_range: f32 = 11.0,
+    /// Deepest subdivision of a sun-grid cell next to a silhouette or seam (0 disables adaptive refinement). Each
+    /// level halves the cell, so a 0.5 m cell reaches about 1.6 cm at depth 5. A uniform grid never samples a
+    /// crack narrower than its pitch, which left sealed rooms with a thin sun beam and no bounce light.
+    sun_refine_max_depth: u8 = 5,
+    /// Upper bound on extra rays spent on refinement per solve, so a busy scene cannot stall a frame.
+    sun_refine_ray_budget: u32 = 12288,
+    /// Optional camera/viewer position. When set, candidate VPLs that are completely occluded
+    /// behind solid walls/ceilings from the viewer are rejected via `Bvh.traceAnyHit`, preventing
+    /// outdoor bounce light from leaking into sealed dark interiors.
+    viewer_pos: ?[3]f32 = null,
 };
 
 /// Diagnostic summary returned by `solveInstantRadiosity`.
@@ -151,7 +161,8 @@ fn addOrMergeVpl(
     cand: VirtualPointLight,
     merge_radius: f32,
 ) !void {
-    if (cand.lumens < 0.05) return;
+    // Refined sun cells carry a tiny share of the flux each; they add up when merged, so only reject the negligible.
+    if (cand.lumens < 0.001) return;
     const r2 = merge_radius * merge_radius;
     for (vpls.items) |*v| {
         const dx = v.position[0] - cand.position[0];
@@ -179,6 +190,94 @@ fn addOrMergeVpl(
     }
     try vpls.append(allocator, cand);
 }
+
+/// Quadtree cell of the sun-ray grid waiting to be examined: centre `u`/`v`, edge `size` (scene units), the centre
+/// ray and the four corner rays in the order [-u,-v], [+u,-v], [-u,+v], [+u,+v].
+const SunCell = struct {
+    u: f32,
+    v: f32,
+    size: f32,
+    depth: u8,
+    center: bvh_mod.RayHit,
+    corners: [4]bvh_mod.RayHit,
+};
+
+/// True when two sun rays hit different surfaces at a similar depth: the seam between touching meshes, where a
+/// crack can hide. Depth jumps (a silhouette against the far background, a ray that went through a gap) are not
+/// seams, so they do not trigger subdivision and the refinement budget goes where gaps can actually be.
+fn hitsDiffer(a: bvh_mod.RayHit, b: bvh_mod.RayHit) bool {
+    if (!a.hit or !b.hit) return false;
+    return a.instance_id != b.instance_id and @abs(a.t - b.t) < 1.0;
+}
+
+/// Casts directional sun rays over a plane perpendicular to the sun and turns hits into bounce candidates.
+const SunSampler = struct {
+    allocator: std.mem.Allocator,
+    bvh: *const bvh_mod.Bvh,
+    materials: []const indirect_rt.SurfaceMaterial,
+    config: GiSolveConfig,
+    sun: DirectSunEmitter,
+    s_dir: [3]f32,
+    right: [3]f32,
+    fwd: [3]f32,
+    /// Flux (lumens) carried by one coarse grid cell; sub-cells carry their area share of it.
+    flux_per_cell: f32,
+    qstats: *bvh_mod.QueryStats,
+    stats: *GiSolveStats,
+    raw_vpls: *std.ArrayList(VirtualPointLight),
+
+    fn cellCenter(self: *const SunSampler, ix: usize, iy: usize, side: u32) [2]f32 {
+        const sf = @as(f32, @floatFromInt(side));
+        return .{
+            ((@as(f32, @floatFromInt(ix)) + 0.5) / sf * 2.0 - 1.0) * self.sun.scene_radius,
+            ((@as(f32, @floatFromInt(iy)) + 0.5) / sf * 2.0 - 1.0) * self.sun.scene_radius,
+        };
+    }
+
+    fn origin(self: *const SunSampler, u: f32, v: f32) [3]f32 {
+        const s = self.sun;
+        return .{
+            s.scene_center[0] - self.s_dir[0] * (s.scene_radius * 2.0) + self.right[0] * u + self.fwd[0] * v,
+            s.scene_center[1] - self.s_dir[1] * (s.scene_radius * 2.0) + self.right[1] * u + self.fwd[1] * v,
+            s.scene_center[2] - self.s_dir[2] * (s.scene_radius * 2.0) + self.right[2] * u + self.fwd[2] * v,
+        };
+    }
+
+    fn trace(self: *const SunSampler, u: f32, v: f32) bvh_mod.RayHit {
+        const ray = bvh_mod.Ray{ .origin = self.origin(u, v), .direction = self.s_dir, .t_min = 0.1, .t_max = self.sun.scene_radius * 5.0 };
+        return self.bvh.traceClosest(ray, self.qstats);
+    }
+
+    /// Adds the bounce candidate for `hit` (found by the ray through `u`/`v`) with `weight` of a coarse cell's flux.
+    fn deposit(self: *SunSampler, hit: bvh_mod.RayHit, u: f32, v: f32, weight: f32) void {
+        if (!hit.hit) return;
+        self.stats.primary_hits += 1;
+        const s = self.sun;
+        const config = self.config;
+        const mat = if (hit.instance_id < self.materials.len) self.materials[hit.instance_id] else indirect_rt.SurfaceMaterial{};
+        var n = normalize3(hit.normal);
+        if (dot3(n, self.s_dir) > 0.0) n = .{ -n[0], -n[1], -n[2] };
+        const ndotl = @max(dot3(n, .{ -self.s_dir[0], -self.s_dir[1], -self.s_dir[2] }), 0.05);
+        const o = self.origin(u, v);
+        const hit_p = [3]f32{
+            o[0] + self.s_dir[0] * hit.t + n[0] * (config.normal_offset + 0.25),
+            o[1] + self.s_dir[1] * hit.t + n[1] * (config.normal_offset + 0.25),
+            o[2] + self.s_dir[2] * hit.t + n[2] * (config.normal_offset + 0.25),
+        };
+        const rgb = [3]f32{ s.color[0] * mat.albedo[0], s.color[1] * mat.albedo[1], s.color[2] * mat.albedo[2] };
+        const max_c = @max(rgb[0], @max(rgb[1], rgb[2]));
+        if (max_c < 0.03) return;
+        // A failed append only drops one candidate; the solver must not abort a frame over it.
+        addOrMergeVpl(self.allocator, self.raw_vpls, .{
+            .position = hit_p,
+            .normal = n,
+            .color = .{ rgb[0] / max_c, rgb[1] / max_c, rgb[2] / max_c },
+            .lumens = self.flux_per_cell * weight * max_c * ndotl * 4.5,
+            .range = config.vpl_range * 1.15,
+            .bounce_depth = 1,
+        }, config.merge_radius * 1.1) catch {};
+    }
+};
 
 /// Traces real multi-bounce indirect GI rays against `bvh` and outputs clustered `VirtualPointLight`s.
 pub fn solveInstantRadiosity(
@@ -283,7 +382,8 @@ pub fn solveInstantRadiosity(
         }
     }
 
-    // 2. Trace stratified directional sun rays onto the scene for outdoor bounce GI.
+    // 2. Trace stratified directional sun rays onto the scene for outdoor bounce GI. Cells whose neighbours hit a
+    //    different surface (or nothing) are subdivided, so thin gaps and silhouettes are still sampled.
     if (sun) |s| {
         if (s.illuminance_lux > 50.0 and config.sun_grid_side > 0) {
             const s_dir = normalize3(s.direction);
@@ -292,43 +392,127 @@ pub fn solveInstantRadiosity(
             const fwd = normalize3(cross3(s_dir, right));
             const side = config.sun_grid_side;
             const total_rays = side * side;
-            const sun_flux_per_ray = (s.illuminance_lux * 0.22 * config.bounce_energy_scale) / @as(f32, @floatFromInt(total_rays));
+            var sampler = SunSampler{
+                .allocator = allocator,
+                .bvh = bvh,
+                .materials = materials,
+                .config = config,
+                .sun = s,
+                .s_dir = s_dir,
+                .right = right,
+                .fwd = fwd,
+                .flux_per_cell = (s.illuminance_lux * 0.22 * config.bounce_energy_scale) / @as(f32, @floatFromInt(total_rays)),
+                .qstats = &qstats,
+                .stats = &stats,
+                .raw_vpls = &raw_vpls,
+            };
+            const cell = 2.0 * s.scene_radius / @as(f32, @floatFromInt(side));
+
+            // Coarse lattice: one centre ray per cell and one ray per cell corner (corners are shared by neighbours).
+            const centers = try allocator.alloc(bvh_mod.RayHit, @as(usize, side) * side);
+            defer allocator.free(centers);
+            const lattice = try allocator.alloc(bvh_mod.RayHit, (@as(usize, side) + 1) * (side + 1));
+            defer allocator.free(lattice);
+            for (0..side) |iy| {
+                for (0..side) |ix| {
+                    const uv = sampler.cellCenter(ix, iy, side);
+                    centers[iy * side + ix] = sampler.trace(uv[0], uv[1]);
+                }
+            }
+            for (0..side + 1) |iy| {
+                for (0..side + 1) |ix| {
+                    const cu = (@as(f32, @floatFromInt(ix)) / @as(f32, @floatFromInt(side)) * 2.0 - 1.0) * s.scene_radius;
+                    const cv = (@as(f32, @floatFromInt(iy)) / @as(f32, @floatFromInt(side)) * 2.0 - 1.0) * s.scene_radius;
+                    lattice[iy * (side + 1) + ix] = sampler.trace(cu, cv);
+                }
+            }
+
+            // Breadth first: every seam is refined to the same depth before any seam goes deeper, so a small budget
+            // cannot be spent entirely on the first seams in raster order.
+            var level = std.ArrayList(SunCell).empty;
+            defer level.deinit(allocator);
+            var next = std.ArrayList(SunCell).empty;
+            defer next.deinit(allocator);
+            var refine_budget: u32 = if (config.sun_refine_max_depth > 0) config.sun_refine_ray_budget else 0;
 
             for (0..side) |iy| {
                 for (0..side) |ix| {
-                    const u = ((@as(f32, @floatFromInt(ix)) + 0.5) / @as(f32, @floatFromInt(side)) * 2.0 - 1.0) * s.scene_radius;
-                    const v = ((@as(f32, @floatFromInt(iy)) + 0.5) / @as(f32, @floatFromInt(side)) * 2.0 - 1.0) * s.scene_radius;
-                    const origin = [3]f32{
-                        s.scene_center[0] - s_dir[0] * (s.scene_radius * 2.0) + right[0] * u + fwd[0] * v,
-                        s.scene_center[1] - s_dir[1] * (s.scene_radius * 2.0) + right[1] * u + fwd[1] * v,
-                        s.scene_center[2] - s_dir[2] * (s.scene_radius * 2.0) + right[2] * u + fwd[2] * v,
-                    };
-                    const ray = bvh_mod.Ray{ .origin = origin, .direction = s_dir, .t_min = 0.1, .t_max = s.scene_radius * 5.0 };
-                    const hit = bvh.traceClosest(ray, &qstats);
-                    if (!hit.hit) continue;
-                    stats.primary_hits += 1;
-
-                    const mat = if (hit.instance_id < materials.len) materials[hit.instance_id] else indirect_rt.SurfaceMaterial{};
-                    var n = normalize3(hit.normal);
-                    if (dot3(n, s_dir) > 0.0) n = .{ -n[0], -n[1], -n[2] };
-                    const ndotl = @max(dot3(n, .{ -s_dir[0], -s_dir[1], -s_dir[2] }), 0.05);
-                    const hit_p = [3]f32{
-                        origin[0] + s_dir[0] * hit.t + n[0] * (config.normal_offset + 0.25),
-                        origin[1] + s_dir[1] * hit.t + n[1] * (config.normal_offset + 0.25),
-                        origin[2] + s_dir[2] * hit.t + n[2] * (config.normal_offset + 0.25),
-                    };
-                    const rgb = [3]f32{ s.color[0] * mat.albedo[0], s.color[1] * mat.albedo[1], s.color[2] * mat.albedo[2] };
-                    const max_c = @max(rgb[0], @max(rgb[1], rgb[2]));
-                    if (max_c < 0.03) continue;
-                    try addOrMergeVpl(allocator, &raw_vpls, .{
-                        .position = hit_p,
-                        .normal = n,
-                        .color = .{ rgb[0] / max_c, rgb[1] / max_c, rgb[2] / max_c },
-                        .lumens = sun_flux_per_ray * max_c * ndotl * 4.5,
-                        .range = config.vpl_range * 1.15,
-                        .bounce_depth = 1,
-                    }, config.merge_radius * 1.1);
+                    const uv = sampler.cellCenter(ix, iy, side);
+                    try level.append(allocator, .{
+                        .u = uv[0],
+                        .v = uv[1],
+                        .size = cell,
+                        .depth = 0,
+                        .center = centers[iy * side + ix],
+                        .corners = .{
+                            lattice[iy * (side + 1) + ix],
+                            lattice[iy * (side + 1) + ix + 1],
+                            lattice[(iy + 1) * (side + 1) + ix],
+                            lattice[(iy + 1) * (side + 1) + ix + 1],
+                        },
+                    });
                 }
+            }
+            while (level.items.len > 0) {
+                next.clearRetainingCapacity();
+                for (level.items) |cur| {
+                    const weight = (cur.size / cell) * (cur.size / cell);
+                    // A cell is uniform when its centre and four corners show no seam between different surfaces.
+                    var uniform = true;
+                    for (cur.corners) |corner| {
+                        if (hitsDiffer(cur.center, corner)) uniform = false;
+                    }
+                    for (0..4) |k| {
+                        if (hitsDiffer(cur.corners[k], cur.corners[(k + 1) % 4])) uniform = false;
+                    }
+                    const can_split = !uniform and cur.depth < config.sun_refine_max_depth and refine_budget >= 8;
+                    if (!can_split) {
+                        if (uniform) {
+                            sampler.deposit(cur.center, cur.u, cur.v, weight);
+                        } else {
+                            // A seam cell that cannot be split further: each sample carries a fifth of it, so a ray
+                            // that slipped through a crack still contributes.
+                            const hs = cur.size * 0.5;
+                            const w5 = weight * 0.2;
+                            sampler.deposit(cur.center, cur.u, cur.v, w5);
+                            sampler.deposit(cur.corners[0], cur.u - hs, cur.v - hs, w5);
+                            sampler.deposit(cur.corners[1], cur.u + hs, cur.v - hs, w5);
+                            sampler.deposit(cur.corners[2], cur.u - hs, cur.v + hs, w5);
+                            sampler.deposit(cur.corners[3], cur.u + hs, cur.v + hs, w5);
+                        }
+                        continue;
+                    }
+                    // Split into four quadrants. The cell's corners and centre are reused; the four edge midpoints are
+                    // traced once and shared by the quadrants, plus one new centre ray per quadrant.
+                    const hs = cur.size * 0.5;
+                    const qs = cur.size * 0.25;
+                    const mid_l = sampler.trace(cur.u - hs, cur.v);
+                    const mid_r = sampler.trace(cur.u + hs, cur.v);
+                    const mid_b = sampler.trace(cur.u, cur.v - hs);
+                    const mid_t = sampler.trace(cur.u, cur.v + hs);
+                    refine_budget -= 4;
+                    // corners order: [-u,-v], [+u,-v], [-u,+v], [+u,+v]
+                    const q_corners = [4][4]bvh_mod.RayHit{
+                        .{ cur.corners[0], mid_b, mid_l, cur.center },
+                        .{ mid_b, cur.corners[1], cur.center, mid_r },
+                        .{ mid_l, cur.center, cur.corners[2], mid_t },
+                        .{ cur.center, mid_r, mid_t, cur.corners[3] },
+                    };
+                    for (0..4) |k| {
+                        const cu = cur.u + (if (k & 1 == 0) -qs else qs);
+                        const cv = cur.v + (if (k & 2 == 0) -qs else qs);
+                        refine_budget -|= 1;
+                        try next.append(allocator, .{
+                            .u = cu,
+                            .v = cv,
+                            .size = hs,
+                            .depth = cur.depth + 1,
+                            .center = sampler.trace(cu, cv),
+                            .corners = q_corners[k],
+                        });
+                    }
+                }
+                std.mem.swap(std.ArrayList(SunCell), &level, &next);
             }
         }
     }
@@ -355,11 +539,44 @@ pub fn solveInstantRadiosity(
     }.lessThan);
 
     const keep = @min(raw_vpls.items.len, config.max_vpls);
-    for (raw_vpls.items[0..keep]) |v| {
-        if (v.lumens < 4.0) continue;
+    var kept: usize = 0;
+    for (raw_vpls.items) |v| {
+        if (kept >= keep) break;
+        // A thin sun beam (a door ajar, a crack) carries little flux but is often the only light in a dark room, so
+        // the cut-off is low; the ranking above already sends weak clusters to the end of the list.
+        if (v.lumens < 0.75) continue;
+
+        // Prevent unshadowed VPL light-leaking through solid walls/ceilings when viewer_pos is given.
+        if (config.viewer_pos) |vp| {
+            const probes = [3][3]f32{
+                vp,
+                .{ vp[0], vp[1] + 0.85, vp[2] },
+                .{ vp[0], @max(vp[1] - 0.5, 0.3), vp[2] },
+            };
+            var visible = false;
+            for (probes) |orig| {
+                const dx = v.position[0] - orig[0];
+                const dy = v.position[1] - orig[1];
+                const dz = v.position[2] - orig[2];
+                const dist = @sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist < 0.15) {
+                    visible = true;
+                    break;
+                }
+                const dir = [3]f32{ dx / dist, dy / dist, dz / dist };
+                const vis_ray = bvh_mod.Ray{ .origin = orig, .direction = dir, .t_min = 0.05, .t_max = @max(dist - 0.12, 0.06) };
+                if (!bvh.traceAnyHit(vis_ray, &qstats)) {
+                    visible = true;
+                    break;
+                }
+            }
+            if (!visible) continue;
+        }
+
         var clamped = v;
         clamped.lumens = @min(clamped.lumens, 780.0);
         try out_vpls.append(allocator, clamped);
+        kept += 1;
     }
 
     stats.rays_cast = qstats.rays_cast;
