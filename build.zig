@@ -627,6 +627,8 @@ pub fn build(b: *std.Build) void {
     gpu_3d_mod.addImport("graphics", graphics_mod);
     gpu_3d_mod.addImport("gizmos", gizmos_mod);
     gpu_3d_mod.addImport("render_3d", render_3d_mod);
+    gpu_3d_mod.addImport("dev_tools", dev_tools_mod);
+    gpu_3d_mod.addImport("prism", prism_mod);
 
     const draw_2d_mod = b.addModule("draw_2d", .{
         .root_source_file = b.path("packages/render/2d/src/draw_2d.zig"),

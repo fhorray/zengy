@@ -304,3 +304,49 @@ test "screen transport traces the Hi-Z pyramid and changes indirect lighting" {
     try std.testing.expect(differing > 200);
     try std.testing.expect(luma(px(results[1], 96, 48, 48)) > 5);
 }
+
+const TimingCollector = struct {
+    frames: u32 = 0,
+    forward_ns: u64 = 0,
+    shadow_seen: bool = false,
+    last_frame_ns: u64 = 0,
+
+    fn begin(_: *anyopaque) void {}
+    fn record(ctx: *anyopaque, name: []const u8, _: gpu_3d.pbr_renderer.TimingCategory, ns: u64) void {
+        const self: *TimingCollector = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "Forward+")) self.forward_ns += ns;
+        if (std.mem.eql(u8, name, "Shadow")) self.shadow_seen = true;
+    }
+    fn end(ctx: *anyopaque, frame_ns: u64) void {
+        const self: *TimingCollector = @ptrCast(@alignCast(ctx));
+        self.frames += 1;
+        self.last_frame_ns = frame_ns;
+    }
+};
+
+test "gpu pass timings arrive asynchronously through the sink" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    if (!f.g.capabilities().features.timestamp_query) return error.SkipZigTest;
+    var collector: TimingCollector = .{};
+    f.renderer.setTimingSink(.{ .ctx = &collector, .begin_frame = TimingCollector.begin, .record = TimingCollector.record, .end_frame = TimingCollector.end });
+    var cube = try render_3d.gltf.createCubeMesh(std.testing.allocator, 1.0);
+    defer cube.deinit();
+    const mesh = try f.r3d.createMesh(f.g, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    var data = sceneFrame(.{ 0, 2.5, 5.0 }, 1.0);
+    data.directional_lights = &sun;
+    data.directional_lights = &.{.{ .direction = .{ -0.3, -1.0, -0.2 }, .color = .{ 1, 1, 1 }, .illuminance_lux = 10_000, .shadows_enabled = true, .shadow_depth_bias = 0.005, .shadow_normal_bias = 0.05, .cascade_count = 4 }};
+    data.dt = 1.0 / 60.0;
+    const backend = f.renderer.vtable();
+    const model = math3d.Mat4.identity();
+    for (0..8) |_| {
+        try backend.beginPbrFrame(backend.ctx, &data);
+        try backend.submitLitMesh(backend.ctx, @bitCast(mesh), model.m, data.view_proj, .{ .base_color = .{ 0.8, 0.8, 0.8, 1 } }, .{ 1, 1, 1, 1 });
+        std.testing.allocator.free(try f.renderFrame(64, 64, .rgba8_unorm));
+    }
+    std.debug.print("\n[pbr] gpu timing: frames={d} forward+={d}ns shadow={}\n", .{ collector.frames, collector.forward_ns, collector.shadow_seen });
+    try std.testing.expect(collector.frames >= 3);
+    try std.testing.expect(collector.forward_ns > 0);
+    try std.testing.expect(collector.shadow_seen);
+    try std.testing.expect(collector.last_frame_ns >= 16_666_666 and collector.last_frame_ns <= 16_666_667);
+}

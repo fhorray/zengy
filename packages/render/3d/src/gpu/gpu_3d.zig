@@ -9,6 +9,8 @@ const engine = @import("engine");
 const graphics = @import("graphics");
 const gizmos = @import("gizmos");
 const render_3d = @import("render_3d");
+const dev_tools = @import("dev_tools");
+const prism = @import("prism");
 
 pub const renderer = @import("renderer.zig");
 pub const pbr_gpu = @import("pbr/gpu.zig");
@@ -52,6 +54,27 @@ fn buildModule(raw_app: *anyopaque) !void {
     try service.registerRenderer(pbr.frameRenderer());
 }
 
+fn profilerBegin(ctx: *anyopaque) void {
+    const prof: *dev_tools.FrameProfilerService = @ptrCast(@alignCast(ctx));
+    prof.beginFrame(0);
+}
+
+fn profilerRecord(ctx: *anyopaque, name: []const u8, category: pbr_renderer.TimingCategory, duration_ns: u64) void {
+    const prof: *dev_tools.FrameProfilerService = @ptrCast(@alignCast(ctx));
+    // The categories share their names with the profiler's, so the mapping cannot drift silently.
+    const mapped = std.meta.stringToEnum(dev_tools.PassCategory, @tagName(category)) orelse .other;
+    prof.recordPass(name, mapped, duration_ns);
+}
+
+fn profilerEnd(ctx: *anyopaque, frame_ns: u64) void {
+    const prof: *dev_tools.FrameProfilerService = @ptrCast(@alignCast(ctx));
+    prof.endFrame(frame_ns);
+}
+
+fn prismBeginFrame(_: ?*anyopaque, _: u64) !void {}
+fn prismExecutePass(_: ?*anyopaque, _: prism.RenderViewId, _: prism.PassDesc) !void {}
+fn prismEndFrame(_: ?*anyopaque, _: u64) !void {}
+
 /// Hooks optional producers once every module is built.
 fn startModule(raw_app: *anyopaque) !void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
@@ -63,12 +86,38 @@ fn startModule(raw_app: *anyopaque) !void {
     if (app.resources.get(render_3d.Render3DService)) |frontend| {
         if (app.resources.get(PbrRenderer)) |pbr| frontend.setPbrBackend(pbr.vtable());
     }
+    if (app.resources.get(PbrRenderer)) |pbr| {
+        if (app.resources.get(dev_tools.FrameProfilerService)) |prof| {
+            pbr.setTimingSink(.{ .ctx = prof, .begin_frame = profilerBegin, .record = profilerRecord, .end_frame = profilerEnd });
+        }
+    }
+    // Prism orchestrates passes; this provider's PBR renderer executes them itself, so the pass hooks are no-ops.
+    // Capabilities describe what the renderer really does: hybrid lighting runs through GPU GI, compute is always
+    // available on wgpu, and no hardware ray tracing or TAA is exposed.
+    if (app.resources.get(prism.PrismService)) |psvc| {
+        psvc.setBackend(.{
+            .id = PROVIDER_ID,
+            .capabilities = .{
+                .supports_hybrid_lighting = true,
+                .supports_ray_tracing = false,
+                .supports_taa = false,
+                .supports_compute = true,
+                .max_resolution_scale = 2.0,
+            },
+            .ctx = null,
+            .begin_frame = prismBeginFrame,
+            .execute_pass = prismExecutePass,
+            .end_frame = prismEndFrame,
+        });
+    }
 }
 
 fn stopModule(raw_app: *anyopaque) void {
     const app: *engine.App = @ptrCast(@alignCast(raw_app));
     if (app.resources.get(gizmos.GizmoService)) |giz| giz.setBackend(null);
     if (app.resources.get(render_3d.Render3DService)) |frontend| frontend.setPbrBackend(null);
+    if (app.resources.get(PbrRenderer)) |pbr| pbr.setTimingSink(null);
+    if (app.resources.get(prism.PrismService)) |psvc| psvc.setBackend(null);
     if (graphicsService(app)) |service| {
         _ = service.unregisterRenderer("official.render.3d.gpu.pbr");
         _ = service.unregisterRenderer("official.render.3d.gpu.world");

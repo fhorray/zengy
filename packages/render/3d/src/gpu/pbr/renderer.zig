@@ -15,6 +15,12 @@ const shadow_plan = @import("shadow_plan.zig");
 const volumetric_lights = @import("volumetric_lights.zig");
 const gpu_gi = @import("gpu_gi.zig");
 const screen_transport = @import("screen_transport.zig");
+const gpu_timing = @import("gpu_timing.zig");
+
+/// Receiver of GPU pass timings (see `PbrRenderer.setTimingSink`).
+pub const TimingSink = gpu_timing.Sink;
+/// Pass groups reported through `TimingSink`.
+pub const TimingCategory = gpu_timing.Category;
 const gpu_objects = @import("gpu.zig");
 const frame_res = @import("frame_res.zig");
 const base = @import("../renderer.zig");
@@ -118,6 +124,11 @@ pub const PbrRenderer = struct {
     last_analytic_sun: bool = false,
     last_hdri_width: u32 = 0,
     last_hdri_height: u32 = 0,
+
+    // GPU pass timing (timestamp queries); absent when the adapter does not support them.
+    timing: ?gpu_timing.Timing = null,
+    timing_probed: bool = false,
+    timing_sink: ?gpu_timing.Sink = null,
 
     // Screen-space transport: metadata targets, Hi-Z pyramid and the resolved HDR image.
     screen: ?ScreenState = null,
@@ -336,6 +347,9 @@ pub const PbrRenderer = struct {
             if (db.buffer) |b| device.destroyBuffer(b);
             db.* = .{};
         }
+        if (self.timing) |*t| t.deinit();
+        self.timing = null;
+        self.timing_probed = false;
         self.destroyTargets(device);
         self.destroyScreen(device);
         self.gi.deinit(device);
@@ -666,6 +680,11 @@ pub const PbrRenderer = struct {
         return self.mask_params.group.?;
     }
 
+    /// Routes GPU pass timings (available two to three frames after recording) to `sink`; null disables reporting.
+    pub fn setTimingSink(self: *PbrRenderer, sink: ?gpu_timing.Sink) void {
+        self.timing_sink = sink;
+    }
+
     pub fn render(self: *PbrRenderer, input: *frame.FrameInput) !void {
         defer {
             self.queued_draws.clearRetainingCapacity();
@@ -677,6 +696,16 @@ pub const PbrRenderer = struct {
         const device = input.device;
         const g = try self.ensureGpu(device);
         const rec = input.recorder;
+
+        // Timestamp spans are injected into the passes recorded below, then resolved for async readback.
+        if (!self.timing_probed) {
+            self.timing_probed = true;
+            self.timing = gpu_timing.Timing.init(device);
+        }
+        const first_command = rec.commands.items.len;
+        const frame_ns: u64 = if (std.math.isFinite(self.frame_data.dt) and self.frame_data.dt > 0) @intFromFloat(@as(f64, self.frame_data.dt) * 1e9) else 0;
+        if (self.timing) |*t| t.beginFrame(self.timing_sink, frame_ns);
+        defer if (self.timing) |*t| t.endFrame(rec, first_command) catch {};
         const tex_w = input.target.width;
         const tex_h = input.target.height;
         try self.ensureTargets(device, tex_w, tex_h);
