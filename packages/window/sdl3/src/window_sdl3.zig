@@ -28,6 +28,7 @@ pub const WindowConfig = struct {
     width: u32 = 1280,
     height: u32 = 720,
     resizable: bool = true,
+    metal_view: bool = false,
 };
 
 /// Target frame time used by `runVisualLoop` (60 Hz) to avoid spinning a CPU core.
@@ -81,6 +82,7 @@ fn buildModule(raw_app: *anyopaque) !void {
 
     var flags: c.SDL_WindowFlags = c.SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (cfg.resizable) flags |= c.SDL_WINDOW_RESIZABLE;
+    if (cfg.metal_view and @import("builtin").os.tag == .macos) flags |= c.SDL_WINDOW_METAL;
 
     var title_buf: [256]u8 = undefined;
     const title_len = @min(cfg.title.len, title_buf.len - 1);

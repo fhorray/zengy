@@ -639,6 +639,46 @@ pub fn build(b: *std.Build) void {
     graphics_sdlgpu_mod.addImport("prism", prism_mod);
     graphics_sdlgpu_mod.addImport("sdl3_c", sdl3_c_mod);
 
+    // Optional migration provider. The existing default build is unchanged.
+    if (b.option([]const u8, "wgpu-root", "Absolute path to the wgpu-native v27.0.4.1 SDK")) |wgpu_root| {
+        const graphics_wgpu_mod = b.addModule("graphics_wgpu", .{
+            .root_source_file = b.path("packages/graphics/wgpu/src/graphics_wgpu.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        graphics_wgpu_mod.addImport("engine", engine_mod);
+        graphics_wgpu_mod.addImport("graphics", graphics_mod);
+        graphics_wgpu_mod.addImport("window_sdl3", window_sdl3_mod);
+        graphics_wgpu_mod.addIncludePath(b.path("packages/sdl3/include"));
+        graphics_wgpu_mod.addLibraryPath(b.path("packages/sdl3/lib/x64"));
+        graphics_wgpu_mod.linkSystemLibrary("SDL3", .{});
+        graphics_wgpu_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "include" }) });
+        graphics_wgpu_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib" }) });
+        graphics_wgpu_mod.addCSourceFiles(.{
+            .files = &.{ "packages/graphics/wgpu/src/bridge.c", "packages/graphics/wgpu/src/geometry.c" },
+            .flags = &.{"-std=c11"},
+        });
+        graphics_wgpu_mod.linkSystemLibrary("wgpu_native", .{ .preferred_link_mode = .dynamic });
+        const visual_wgpu_mod = b.createModule(.{
+            .root_source_file = b.path("examples/visual-wgpu/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        visual_wgpu_mod.addImport("engine", engine_mod);
+        visual_wgpu_mod.addImport("window_sdl3", window_sdl3_mod);
+        visual_wgpu_mod.addImport("graphics", graphics_mod);
+        visual_wgpu_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+        const visual_wgpu_exe = b.addExecutable(.{ .name = "visual-wgpu", .root_module = visual_wgpu_mod });
+        const install_wgpu = b.addInstallArtifact(visual_wgpu_exe, .{});
+        const build_wgpu_step = b.step("build-visual-wgpu", "Build the native wgpu migration demo");
+        build_wgpu_step.dependOn(&install_wgpu.step);
+        const run_wgpu = b.addRunArtifact(visual_wgpu_exe);
+        const run_wgpu_step = b.step("run-visual-wgpu", "Run the native wgpu migration demo");
+        run_wgpu_step.dependOn(&run_wgpu.step);
+    }
+
     // Visual GPU hello (D2): SDL3 window + SDL_GPU triangle & rect. Run with `zig build run-visual-gpu`.
     const visual_gpu_mod = b.createModule(.{
         .root_source_file = b.path("examples/visual-gpu/main.zig"),

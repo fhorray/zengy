@@ -18,3 +18,5 @@ target/
 # Plugins/caches installed by `zengy add` inside projects
 .zengy/
 .tmp
+# Downloaded native SDKs (wgpu-native, etc.)
+.deps/

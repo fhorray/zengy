@@ -339,7 +339,7 @@ test "lighting hardening: BVH parallel slab and coincident centroids" {
     const triangle = helios.ray_query.BvhTriangle{
         .v0 = .{ 0, 0, -2 }, .v1 = .{ 1, 0, -2 }, .v2 = .{ 0, 1, -2 },
     };
-    const triangles = [_]helios.ray_query.BvhTriangle{triangle} ** 32;
+    const triangles: [32]helios.ray_query.BvhTriangle = @splat(triangle);
     var bvh = helios.ray_query.Bvh.init(testing.allocator);
     defer bvh.deinit();
     try bvh.build(&triangles);

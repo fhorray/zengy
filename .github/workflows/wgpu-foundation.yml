@@ -1,0 +1,52 @@
+name: wgpu foundation
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'packages/graphics/wgpu/**'
+      - 'tools/wgpu/**'
+      - 'examples/visual-wgpu/**'
+      - 'packages/window/sdl3/**'
+      - 'build.zig'
+      - '.github/workflows/wgpu-foundation.yml'
+  pull_request:
+    paths:
+      - 'packages/graphics/wgpu/**'
+      - 'tools/wgpu/**'
+      - 'examples/visual-wgpu/**'
+      - 'packages/window/sdl3/**'
+      - 'build.zig'
+      - '.github/workflows/wgpu-foundation.yml'
+permissions:
+  contents: read
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test shader candidate transformations
+        run: python -m unittest discover -s tools/wgpu -p 'test_*.py' -v
+      - name: Test clipped geometry
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=undefined packages/graphics/wgpu/src/geometry.c packages/graphics/wgpu/tests/geometry_test.c -o /tmp/wgpu-geometry
+          /tmp/wgpu-geometry
+  native-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Install pinned native SDK
+        run: python tools/wgpu/install_wgpu.py --output .deps/wgpu-native
+      - name: Compile and link migration demo
+        shell: pwsh
+        run: |
+          $root = (Resolve-Path .deps/wgpu-native).Path
+          zig build build-visual-wgpu "-Dwgpu-root=$root" -Doptimize=ReleaseSafe
