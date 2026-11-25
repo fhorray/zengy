@@ -16,7 +16,9 @@ const std = @import("std");
 const engine = @import("engine");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
+const gpu_3d = @import("gpu_3d");
 const input = @import("input");
 const input_haptics = @import("input_haptics");
 const input_sdl3 = @import("input_sdl3");
@@ -35,7 +37,7 @@ const GamepadDemoState = struct {
     app: *engine.App,
     gfx: *graphics.GraphicsDeviceService,
     rt: graphics.RenderTargetHandle,
-    cube_mesh: graphics_sdlgpu.GpuMeshHandle,
+    cube_mesh: gpu_3d.MeshHandle,
     cam_entity: engine.EntityHandle,
     cube_entity: engine.EntityHandle,
     color_idx: usize = 0,
@@ -314,7 +316,7 @@ fn renderGamepadDemo(ctx: *engine.SystemContext) !void {
     if (ctx.world.get(st.cube_entity, render_3d.Transform3D)) |t| {
         if (ctx.world.get(st.cube_entity, render_3d.MeshRef)) |m| {
             const mvp = render_3d.math3d.Mat4.mul(vp, t.toModelMatrix());
-            try graphics_sdlgpu.queueMeshDraw(st.app, st.cube_mesh, mvp.m, m.color, null);
+            try gpu_3d.queueMeshDraw(st.app, st.cube_mesh, mvp.m, m.color, null);
         }
     }
 
@@ -330,7 +332,9 @@ pub fn main() !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
+    try app.registerModule(gpu_3d.module());
     try app.registerModule(input.module());
     try app.registerModule(input_haptics.module());
     try app.registerModule(input_sdl3.module());
@@ -353,7 +357,7 @@ pub fn main() !void {
 
     var cube = try render_3d.gltf.createCubeMesh(allocator, 0.9);
     defer cube.deinit();
-    const gpu_cube = try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    const gpu_cube = try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(cube.vertices), cube.indices);
 
     const cam_e = try app.world.spawn();
     try app.world.set(cam_e, camera.Camera, .{ .order = 0 });

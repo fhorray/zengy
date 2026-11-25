@@ -293,7 +293,7 @@ pub fn main() !void {
             tex_pixels[idx + 3] = 255;
         }
     }
-    const sprite_tex = try draw_2d.createTextureRgba8(&app, 32, 32, &tex_pixels);
+    const sprite_tex = try graphics.createTextureRgba8(&app, 32, 32, &tex_pixels);
 
     const cam_e = try app.world.spawn();
     try app.world.set(cam_e, camera.Camera, .{});

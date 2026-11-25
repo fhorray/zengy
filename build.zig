@@ -617,6 +617,16 @@ pub fn build(b: *std.Build) void {
     render_2d_mod.addImport("camera", camera_mod);
 
     // GPU executor for draw commands and sprite quads. Needs only the neutral graphics contract + text atlases.
+    // GPU renderer for unlit meshes and gizmos (neutral graphics contract only).
+    const gpu_3d_mod = b.addModule("gpu_3d", .{
+        .root_source_file = b.path("packages/render/3d/src/gpu/gpu_3d.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gpu_3d_mod.addImport("engine", engine_mod);
+    gpu_3d_mod.addImport("graphics", graphics_mod);
+    gpu_3d_mod.addImport("gizmos", gizmos_mod);
+
     const draw_2d_mod = b.addModule("draw_2d", .{
         .root_source_file = b.path("packages/render/2d/src/draw_2d.zig"),
         .target = target,
@@ -710,6 +720,9 @@ pub fn build(b: *std.Build) void {
     gpu_test_mod.addImport("graphics", graphics_mod);
     gpu_test_mod.addImport("wgpu_gpu", wgpu_gpu_mod);
     gpu_test_mod.addImport("draw_2d", draw_2d_mod);
+    gpu_test_mod.addImport("gpu_3d", gpu_3d_mod);
+    gpu_test_mod.addImport("gizmos", gizmos_mod);
+    gpu_test_mod.addImport("render_3d", render_3d_mod);
     gpu_test_mod.addImport("engine", engine_mod);
     gpu_test_mod.addImport("window_sdl3", window_sdl3_mod);
     gpu_test_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
@@ -913,18 +926,6 @@ pub fn build(b: *std.Build) void {
     const run_visual_pg_step = b.step("run-visual-playground", "Open the integrated 2D + UI Visual Playground (D5)");
     run_visual_pg_step.dependOn(&run_visual_pg.step);
 
-    // Builds and installs only the examples already running on wgpu (plus runtime DLLs), without the SDL GPU ones.
-    const wgpu_examples_step = b.step("build-wgpu-examples", "Install the examples that run on the wgpu stack");
-    for ([_]*std.Build.Step.Compile{ visual_gpu_exe, visual_2d_exe, visual_plume_exe, visual_ui_exe, visual_pg_exe }) |exe| {
-        wgpu_examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
-    }
-    if (wgpu_present and target.result.os.tag == .windows) {
-        wgpu_examples_step.dependOn(&b.addInstallBinFile(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib", "wgpu_native.dll" }) }, "wgpu_native.dll").step);
-        if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
-            wgpu_examples_step.dependOn(&b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll").step);
-        }
-    }
-
     // Visual Python (PocketPy + SDL_GPU): Python script driving `engine.draw_rect`. Run with `zig build run-visual-python`.
     const visual_py_mod = b.createModule(.{
         .root_source_file = b.path("examples/visual-python/main.zig"),
@@ -935,7 +936,8 @@ pub fn build(b: *std.Build) void {
     visual_py_mod.addImport("engine", engine_mod);
     visual_py_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_py_mod.addImport("graphics", graphics_mod);
-    visual_py_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_py_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_py_mod.addImport("draw_2d", draw_2d_mod);
     visual_py_mod.addImport("scripting_host", scripting_host_mod);
     visual_py_mod.addImport("scripting_python", scripting_python_mod);
 
@@ -944,6 +946,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_py_mod,
     });
     b.installArtifact(visual_py_exe);
+    if (wgpu_missing) |fail| visual_py_exe.step.dependOn(&fail.step);
 
     const run_visual_py = b.addSystemCommand(&.{"zig-out/bin/visual-python.exe"});
     run_visual_py.setCwd(b.path("."));
@@ -962,7 +965,9 @@ pub fn build(b: *std.Build) void {
     visual_3d_mod.addImport("window", window_mod);
     visual_3d_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_3d_mod.addImport("graphics", graphics_mod);
-    visual_3d_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_3d_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_3d_mod.addImport("draw_2d", draw_2d_mod);
+    visual_3d_mod.addImport("gpu_3d", gpu_3d_mod);
     visual_3d_mod.addImport("camera", camera_mod);
     visual_3d_mod.addImport("render_3d", render_3d_mod);
 
@@ -971,6 +976,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_3d_mod,
     });
     b.installArtifact(visual_3d_exe);
+    if (wgpu_missing) |fail| visual_3d_exe.step.dependOn(&fail.step);
 
     const run_visual_3d = b.addSystemCommand(&.{"zig-out/bin/visual-3d.exe"});
     run_visual_3d.setCwd(b.path("."));
@@ -1008,7 +1014,9 @@ pub fn build(b: *std.Build) void {
     visual_camera_mod.addImport("window", window_mod);
     visual_camera_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_camera_mod.addImport("graphics", graphics_mod);
-    visual_camera_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_camera_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_camera_mod.addImport("draw_2d", draw_2d_mod);
+    visual_camera_mod.addImport("gpu_3d", gpu_3d_mod);
     visual_camera_mod.addImport("input", input_mod);
     visual_camera_mod.addImport("camera", camera_mod);
     visual_camera_mod.addImport("render_3d", render_3d_mod);
@@ -1018,6 +1026,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_camera_mod,
     });
     b.installArtifact(visual_camera_exe);
+    if (wgpu_missing) |fail| visual_camera_exe.step.dependOn(&fail.step);
 
     const run_visual_camera = b.addSystemCommand(&.{"zig-out/bin/visual-camera.exe"});
     run_visual_camera.setCwd(b.path("."));
@@ -1035,7 +1044,9 @@ pub fn build(b: *std.Build) void {
     visual_gamepad_mod.addImport("engine", engine_mod);
     visual_gamepad_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_gamepad_mod.addImport("graphics", graphics_mod);
-    visual_gamepad_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_gamepad_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_gamepad_mod.addImport("draw_2d", draw_2d_mod);
+    visual_gamepad_mod.addImport("gpu_3d", gpu_3d_mod);
     visual_gamepad_mod.addImport("input", input_mod);
     visual_gamepad_mod.addImport("input_haptics", input_haptics_mod);
     visual_gamepad_mod.addImport("input_sdl3", input_sdl3_mod);
@@ -1047,6 +1058,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_gamepad_mod,
     });
     b.installArtifact(visual_gamepad_exe);
+    if (wgpu_missing) |fail| visual_gamepad_exe.step.dependOn(&fail.step);
 
     const run_visual_gamepad = b.addSystemCommand(&.{"zig-out/bin/visual-gamepad.exe"});
     run_visual_gamepad.setCwd(b.path("."));
@@ -1064,7 +1076,9 @@ pub fn build(b: *std.Build) void {
     visual_audio_mod.addImport("engine", engine_mod);
     visual_audio_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_audio_mod.addImport("graphics", graphics_mod);
-    visual_audio_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_audio_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_audio_mod.addImport("draw_2d", draw_2d_mod);
+    visual_audio_mod.addImport("gpu_3d", gpu_3d_mod);
     visual_audio_mod.addImport("input", input_mod);
     visual_audio_mod.addImport("input_sdl3", input_sdl3_mod);
     visual_audio_mod.addImport("camera", camera_mod);
@@ -1078,6 +1092,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_audio_mod,
     });
     b.installArtifact(visual_audio_exe);
+    if (wgpu_missing) |fail| visual_audio_exe.step.dependOn(&fail.step);
 
     const run_visual_audio = b.addSystemCommand(&.{"zig-out/bin/visual-audio.exe"});
     run_visual_audio.setCwd(b.path("."));
@@ -1125,7 +1140,9 @@ pub fn build(b: *std.Build) void {
     visual_gizmos_mod.addImport("engine", engine_mod);
     visual_gizmos_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_gizmos_mod.addImport("graphics", graphics_mod);
-    visual_gizmos_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_gizmos_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_gizmos_mod.addImport("draw_2d", draw_2d_mod);
+    visual_gizmos_mod.addImport("gpu_3d", gpu_3d_mod);
     visual_gizmos_mod.addImport("input", input_mod);
     visual_gizmos_mod.addImport("input_sdl3", input_sdl3_mod);
     visual_gizmos_mod.addImport("camera", camera_mod);
@@ -1137,6 +1154,7 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_gizmos_mod,
     });
     b.installArtifact(visual_gizmos_exe);
+    if (wgpu_missing) |fail| visual_gizmos_exe.step.dependOn(&fail.step);
 
     const run_visual_gizmos = b.addSystemCommand(&.{"zig-out/bin/visual-gizmos.exe"});
     run_visual_gizmos.setCwd(b.path("."));
@@ -1154,7 +1172,9 @@ pub fn build(b: *std.Build) void {
     visual_inspector_mod.addImport("engine", engine_mod);
     visual_inspector_mod.addImport("window_sdl3", window_sdl3_mod);
     visual_inspector_mod.addImport("graphics", graphics_mod);
-    visual_inspector_mod.addImport("graphics_sdlgpu", graphics_sdlgpu_mod);
+    visual_inspector_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    visual_inspector_mod.addImport("draw_2d", draw_2d_mod);
+    visual_inspector_mod.addImport("gpu_3d", gpu_3d_mod);
     visual_inspector_mod.addImport("input", input_mod);
     visual_inspector_mod.addImport("input_sdl3", input_sdl3_mod);
     visual_inspector_mod.addImport("ui_core", ui_core_mod);
@@ -1173,12 +1193,25 @@ pub fn build(b: *std.Build) void {
         .root_module = visual_inspector_mod,
     });
     b.installArtifact(visual_inspector_exe);
+    if (wgpu_missing) |fail| visual_inspector_exe.step.dependOn(&fail.step);
 
     const run_visual_inspector = b.addSystemCommand(&.{"zig-out/bin/visual-inspector.exe"});
     run_visual_inspector.setCwd(b.path("."));
     run_visual_inspector.step.dependOn(b.getInstallStep());
     const run_visual_inspector_step = b.step("run-visual-inspector", "Open the Visual Shapes, Picking & Profiler Showcase");
     run_visual_inspector_step.dependOn(&run_visual_inspector.step);
+
+    // Builds and installs only the examples already running on wgpu (plus runtime DLLs), without the SDL GPU ones.
+    const wgpu_examples_step = b.step("build-wgpu-examples", "Install the examples that run on the wgpu stack");
+    for ([_]*std.Build.Step.Compile{ visual_gpu_exe, visual_2d_exe, visual_plume_exe, visual_ui_exe, visual_pg_exe, visual_py_exe, visual_3d_exe, visual_camera_exe, visual_gamepad_exe, visual_audio_exe, visual_gizmos_exe, visual_inspector_exe }) |exe| {
+        wgpu_examples_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+    if (wgpu_present and target.result.os.tag == .windows) {
+        wgpu_examples_step.dependOn(&b.addInstallBinFile(.{ .cwd_relative = b.pathJoin(&.{ wgpu_root, "lib", "wgpu_native.dll" }) }, "wgpu_native.dll").step);
+        if (b.lazyDependency("sdl3_win64", .{})) |sdl3_win64| {
+            wgpu_examples_step.dependOn(&b.addInstallBinFile(sdl3_win64.path("SDL3.dll"), "SDL3.dll").step);
+        }
+    }
 
     // Visual Prism Stage 01+02 Showcase. Run with `zig build run-visual-prism`.
     const visual_prism_mod = b.createModule(.{
@@ -1550,6 +1583,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "text", .mod = text_mod },
+    }, null);
+
+    addModuleTest(b, test_step, "packages/render/3d/src/gpu/gpu_3d.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "graphics", .mod = graphics_mod },
+        .{ .name = "gizmos", .mod = gizmos_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/render/2d/tests/render_2d_tests.zig", target, optimize, false, &.{

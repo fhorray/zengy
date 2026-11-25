@@ -72,29 +72,6 @@ pub fn queueTriangleNdc(app: *engine.App, a: NdcVertex, b: NdcVertex, c: NdcVert
     try r2d.queueTriangleNdc(a, b, c);
 }
 
-fn createTexture(app: *engine.App, width: u32, height: u32, pixels: []const u8, srgb: bool) !TextureId {
-    const r2d = rendererOf(app) orelse return error.Render2DNotRegistered;
-    const device = try (try graphicsService(app)).gpuDevice();
-    return r2d.createTexture(device, width, height, pixels, srgb);
-}
-
-/// Uploads linear RGBA8 pixels; returns an id for `TexturedQuad.texture` (0 is the white texture).
-pub fn createTextureRgba8(app: *engine.App, width: u32, height: u32, pixels: []const u8) !TextureId {
-    return createTexture(app, width, height, pixels, false);
-}
-
-/// Uploads sRGB-encoded RGBA8 pixels; sampling converts to linear like the legacy backend.
-pub fn createTextureSrgbRgba8(app: *engine.App, width: u32, height: u32, pixels: []const u8) !TextureId {
-    return createTexture(app, width, height, pixels, true);
-}
-
-pub fn destroyTexture(app: *engine.App, id: TextureId) void {
-    const r2d = rendererOf(app) orelse return;
-    const service = graphicsService(app) catch return;
-    const device = service.gpuDevice() catch return;
-    r2d.destroyTexture(device, id);
-}
-
 /// `UiTree.measure_text_fn` implementation. Pass `rendererOf(app)` as the context pointer.
 pub fn measureTextWidth(raw_ctx: ?*anyopaque, content: []const u8, scale: f32) f32 {
     const ctx = raw_ctx orelse return @as(f32, @floatFromInt(content.len)) * 4.4 * (if (scale > 0.0) scale else 1.0);

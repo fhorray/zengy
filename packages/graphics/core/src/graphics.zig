@@ -42,6 +42,10 @@ pub const DrawCommand = draw.DrawCommand;
 /// Frame renderer extension point (defined in frame.zig).
 pub const frame = @import("frame.zig");
 
+/// Shared GPU texture store (defined in textures.zig).
+pub const textures = @import("textures.zig");
+pub const TextureId = textures.TextureId;
+
 const RenderTargetSlot = struct {
     window_handle: u64,
     width: u32,
@@ -74,6 +78,8 @@ pub const GraphicsDeviceService = struct {
     gpu_device: ?gpu.GpuDevice = null,
     /// Renderers (2D, 3D, gizmos, ...) that draw into every presented frame, sorted by `frame.Order`.
     renderers: frame.RendererList = .{},
+    /// Textures shared by every renderer (sprites, meshes, materials).
+    textures: textures.TextureStore,
 
     pub fn init(allocator: std.mem.Allocator) GraphicsDeviceService {
         return .{
@@ -82,6 +88,7 @@ pub const GraphicsDeviceService = struct {
             .last_frame_commands = .empty,
             .device_available = true,
             .caps = .{},
+            .textures = textures.TextureStore.init(allocator),
         };
     }
 
@@ -99,18 +106,28 @@ pub const GraphicsDeviceService = struct {
             .caps = caps,
             .backend = backend,
             .backend_ctx = backend_ctx,
+            .textures = textures.TextureStore.init(allocator),
         };
     }
 
     pub fn deinit(self: *GraphicsDeviceService) void {
+        // Renderers first: their bind groups reference texture views owned by the store.
         if (self.gpu_device) |device| self.renderers.releaseAll(device);
         self.renderers.deinit(self.allocator);
+        self.textures.deinit(self.gpu_device);
         self.targets.deinit(self.allocator);
         self.last_frame_commands.deinit(self.allocator);
     }
 
     pub fn capabilities(self: *const GraphicsDeviceService) DeviceCapabilities {
         return self.caps;
+    }
+
+    /// Destroys a shared texture after telling every renderer to drop bindings that reference it.
+    pub fn destroyTexture(self: *GraphicsDeviceService, id: TextureId) void {
+        const device = self.gpu_device orelse return;
+        self.renderers.forgetTexture(device, id);
+        self.textures.destroy(device, id);
     }
 
     /// Registers a renderer that records GPU work into every presented frame (see `frame.zig`).
@@ -306,3 +323,27 @@ pub const CaptureImage = struct {
         self.* = undefined;
     }
 };
+
+fn serviceOf(app: *engine.App) !*GraphicsDeviceService {
+    const entry = try app.services.getService("engine.graphics.device", 1);
+    return @ptrCast(@alignCast(@constCast(entry.api_ptr)));
+}
+
+/// Uploads tightly packed linear RGBA8 pixels (normals, roughness, UI) with a full mip chain.
+/// The returned id is valid for every renderer; 0 is reserved for the built-in white texture.
+pub fn createTextureRgba8(app: *engine.App, width: u32, height: u32, pixels: []const u8) !TextureId {
+    const service = try serviceOf(app);
+    return service.textures.createRgba8(try service.gpuDevice(), width, height, pixels, false);
+}
+
+/// Uploads sRGB-encoded RGBA8 pixels (albedo, emissive) with a full mip chain.
+pub fn createTextureSrgbRgba8(app: *engine.App, width: u32, height: u32, pixels: []const u8) !TextureId {
+    const service = try serviceOf(app);
+    return service.textures.createRgba8(try service.gpuDevice(), width, height, pixels, true);
+}
+
+/// Destroys a texture created with `createTextureRgba8`/`createTextureSrgbRgba8`.
+pub fn destroyTexture(app: *engine.App, id: TextureId) void {
+    const service = serviceOf(app) catch return;
+    service.destroyTexture(id);
+}

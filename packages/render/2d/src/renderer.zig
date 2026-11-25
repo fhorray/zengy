@@ -16,7 +16,7 @@ const shader_source = @embedFile("textured.wgsl");
 const vertex_stride: u64 = @sizeOf(tess.Vertex2DTextured);
 const min_vertex_buffer_bytes: u64 = 64 * 1024;
 
-pub const TextureId = u64;
+pub const TextureId = graphics.TextureId;
 
 /// Triangle vertex in normalized device coordinates (x/y in -1..1, y up) with a per-vertex color.
 pub const NdcVertex = struct { x: f32, y: f32, r: f32, g: f32, b: f32, a: f32 };
@@ -57,7 +57,8 @@ pub const Renderer2D = struct {
     ndc_triangles: std.ArrayList(NdcVertex) = .empty,
     triangle_scratch: std.ArrayList(batcher_mod.Vertex) = .empty,
     gpu_state: ?GpuState = null,
-    user_textures: std.AutoHashMapUnmanaged(TextureId, TextureEntry) = .empty,
+    /// Bind groups for textures owned by the shared `graphics.textures` store, created on first use.
+    user_groups: std.AutoHashMapUnmanaged(TextureId, gpu.BindGroupHandle) = .empty,
 
     /// Bakes the CPU atlases. GPU resources are created lazily on the first frame.
     pub fn init(allocator: std.mem.Allocator) !Renderer2D {
@@ -70,7 +71,7 @@ pub const Renderer2D = struct {
 
     pub fn deinit(self: *Renderer2D) void {
         if (self.gpu_state) |gs| self.destroyGpu(gs.device);
-        self.user_textures.deinit(self.allocator);
+        self.user_groups.deinit(self.allocator);
         self.queued.deinit(self.allocator);
         self.ndc_triangles.deinit(self.allocator);
         self.triangle_scratch.deinit(self.allocator);
@@ -98,20 +99,10 @@ pub const Renderer2D = struct {
         try self.ndc_triangles.appendSlice(self.allocator, &.{ a, b, c });
     }
 
-    /// Uploads an RGBA8 image and returns an id usable as `TexturedQuad.texture`. Id 0 is reserved for white.
-    pub fn createTexture(self: *Renderer2D, device: gpu.GpuDevice, width: u32, height: u32, pixels: []const u8, srgb: bool) !TextureId {
-        if (pixels.len != @as(usize, width) * height * 4) return error.InvalidTextureSize;
-        const gs = try self.ensureGpu(device);
-        const entry = try createTextureEntry(gs, width, height, pixels, if (srgb) .rgba8_unorm_srgb else .rgba8_unorm, gs.sampler_nearest);
-        errdefer destroyEntry(device, entry);
-        const id: TextureId = @bitCast(entry.texture);
-        try self.user_textures.put(self.allocator, id, entry);
-        return id;
-    }
-
-    pub fn destroyTexture(self: *Renderer2D, device: gpu.GpuDevice, id: TextureId) void {
-        const removed = self.user_textures.fetchRemove(id) orelse return;
-        destroyEntry(device, removed.value);
+    /// Drops the cached bind group of a texture that is about to be destroyed in the shared store.
+    pub fn forgetTexture(self: *Renderer2D, device: gpu.GpuDevice, id: TextureId) void {
+        const removed = self.user_groups.fetchRemove(id) orelse return;
+        device.destroyBindGroup(removed.value);
     }
 
     pub fn frameRenderer(self: *Renderer2D) frame.FrameRenderer {
@@ -121,12 +112,18 @@ pub const Renderer2D = struct {
             .order = frame.Order.overlay_2d,
             .render = renderThunk,
             .release = releaseThunk,
+            .forget_texture = forgetThunk,
         };
     }
 
     fn renderThunk(ctx: *anyopaque, input: *frame.FrameInput) anyerror!void {
         const self: *Renderer2D = @ptrCast(@alignCast(ctx));
         try self.render(input);
+    }
+
+    fn forgetThunk(ctx: *anyopaque, device: gpu.GpuDevice, id: TextureId) void {
+        const self: *Renderer2D = @ptrCast(@alignCast(ctx));
+        self.forgetTexture(device, id);
     }
 
     fn releaseThunk(ctx: *anyopaque, device: gpu.GpuDevice) void {
@@ -165,9 +162,9 @@ pub const Renderer2D = struct {
     }
 
     fn destroyGpu(self: *Renderer2D, device: gpu.GpuDevice) void {
-        var user = self.user_textures.valueIterator();
-        while (user.next()) |entry| destroyEntry(device, entry.*);
-        self.user_textures.clearRetainingCapacity();
+        var groups = self.user_groups.valueIterator();
+        while (groups.next()) |group| device.destroyBindGroup(group.*);
+        self.user_groups.clearRetainingCapacity();
         const gs = self.gpu_state orelse return;
         destroyEntry(device, gs.white);
         destroyEntry(device, gs.font);
@@ -185,13 +182,26 @@ pub const Renderer2D = struct {
         self.gpu_state = null;
     }
 
-    fn bindGroupFor(self: *const Renderer2D, gs: *const GpuState, slot: batcher_mod.TextureSlot) gpu.BindGroupHandle {
-        return switch (slot) {
-            .white => gs.white.bind_group,
-            .font => gs.font.bind_group,
-            .icons => gs.icons.bind_group,
-            .user => |id| if (self.user_textures.get(id)) |entry| entry.bind_group else gs.white.bind_group,
-        };
+    fn bindGroupFor(self: *Renderer2D, gs: *const GpuState, store: *const graphics.textures.TextureStore, slot: batcher_mod.TextureSlot) gpu.BindGroupHandle {
+        switch (slot) {
+            .white => return gs.white.bind_group,
+            .font => return gs.font.bind_group,
+            .icons => return gs.icons.bind_group,
+            .user => |id| {
+                if (self.user_groups.get(id)) |group| return group;
+                // Unknown or destroyed texture: fall back to white instead of failing the whole frame.
+                const entry = store.get(id) orelse return gs.white.bind_group;
+                const group = gs.device.createBindGroup(.{ .layout = gs.texture_layout, .entries = &.{
+                    .{ .binding = 0, .resource = .{ .texture_view = entry.view } },
+                    .{ .binding = 1, .resource = .{ .sampler = gs.sampler_nearest } },
+                } }) catch return gs.white.bind_group;
+                self.user_groups.put(self.allocator, id, group) catch {
+                    gs.device.destroyBindGroup(group);
+                    return gs.white.bind_group;
+                };
+                return group;
+            },
+        }
     }
 
     pub fn render(self: *Renderer2D, input: *frame.FrameInput) !void {
@@ -236,7 +246,7 @@ pub const Renderer2D = struct {
             else
                 batcher_mod.ScissorRect{ .x = 0, .y = 0, .w = input.target.width, .h = input.target.height };
             try rec.setScissor(@intCast(scissor.x), @intCast(scissor.y), scissor.w, scissor.h);
-            try rec.setBindGroup(1, self.bindGroupFor(gs, batch.texture), &.{});
+            try rec.setBindGroup(1, self.bindGroupFor(gs, input.textures, batch.texture), &.{});
             try rec.draw(batch.vertex_count, 1, batch.first_vertex, 0);
         }
         try rec.endRenderPass();

@@ -11,7 +11,9 @@ const engine = @import("engine");
 const window = @import("window");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
+const gpu_3d = @import("gpu_3d");
 const camera = @import("camera");
 const render_3d = @import("render_3d");
 
@@ -21,8 +23,8 @@ const Demo3DState = struct {
     gfx: *graphics.GraphicsDeviceService,
     input: *window.InputService,
     rt: graphics.RenderTargetHandle,
-    cube_mesh: graphics_sdlgpu.GpuMeshHandle,
-    checker_tex: graphics_sdlgpu.GpuTextureHandle,
+    cube_mesh: gpu_3d.MeshHandle,
+    checker_tex: graphics.TextureId,
     cam_entity: engine.EntityHandle,
     center_cube: engine.EntityHandle,
     orbit_cube: engine.EntityHandle,
@@ -76,9 +78,9 @@ fn render3DSystem(ctx: *engine.SystemContext) !void {
     });
 
     for (r3d.extracted_draws.items) |draw| {
-        const mesh_handle: graphics_sdlgpu.GpuMeshHandle = @bitCast(draw.mesh_asset);
-        const tex: ?graphics_sdlgpu.GpuTextureHandle = if (draw.material_id == 1) st.checker_tex else null;
-        try graphics_sdlgpu.queueMeshDraw(st.app, mesh_handle, draw.mvp_matrix.m, draw.color, tex);
+        const mesh_handle: gpu_3d.MeshHandle = @bitCast(draw.mesh_asset);
+        const tex: ?graphics.TextureId = if (draw.material_id == 1) st.checker_tex else null;
+        try gpu_3d.queueMeshDraw(st.app, mesh_handle, draw.mvp_matrix.m, draw.color, tex);
     }
 
     try st.gfx.present(st.rt);
@@ -95,7 +97,9 @@ pub fn main() !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
+    try app.registerModule(gpu_3d.module());
     try app.registerModule(camera.module());
     try app.registerModule(render_3d.module());
 
@@ -123,7 +127,7 @@ pub fn main() !void {
 
     var cube = try render_3d.gltf.createCubeMesh(allocator, 0.75);
     defer cube.deinit();
-    const gpu_cube = try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    const gpu_cube = try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(cube.vertices), cube.indices);
 
     var tex_pixels: [32 * 32 * 4]u8 = undefined;
     for (0..32) |y| {
@@ -136,7 +140,7 @@ pub fn main() !void {
             tex_pixels[idx + 3] = 255;
         }
     }
-    const checker_tex = try graphics_sdlgpu.createTextureRgba8(&app, 32, 32, &tex_pixels);
+    const checker_tex = try graphics.createTextureRgba8(&app, 32, 32, &tex_pixels);
 
     const cam_e = try app.world.spawn();
     try app.world.set(cam_e, camera.Camera, .{});

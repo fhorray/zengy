@@ -13,15 +13,17 @@ const Fixture = struct {
     device: *wgpu_gpu.Device,
     g: gpu.GpuDevice,
     r2d: draw_2d.Renderer2D,
+    textures: graphics.textures.TextureStore,
 
     fn init(allocator: std.mem.Allocator) !Fixture {
         const device = wgpu_gpu.Device.initHeadless(allocator) catch return error.SkipZigTest;
         errdefer device.deinit();
-        return .{ .allocator = allocator, .device = device, .g = device.gpuDevice(), .r2d = try draw_2d.Renderer2D.init(allocator) };
+        return .{ .allocator = allocator, .device = device, .g = device.gpuDevice(), .r2d = try draw_2d.Renderer2D.init(allocator), .textures = graphics.textures.TextureStore.init(allocator) };
     }
 
     fn deinit(self: *Fixture) void {
         self.r2d.deinit();
+        self.textures.deinit(self.g);
         self.device.deinit();
     }
 
@@ -37,6 +39,7 @@ const Fixture = struct {
         var input: frame.FrameInput = .{
             .device = self.g,
             .recorder = &rec,
+            .textures = &self.textures,
             .target = .{ .width = width, .height = height, .dpi_scale = dpi, .color_format = format },
             .clear = clear,
             .draw_commands = commands,
@@ -181,8 +184,7 @@ test "queued sprite quad samples a user texture with nearest filtering" {
     defer f.deinit();
     // 2x2 texture: red green / blue white.
     const texels = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 };
-    const id = try f.r2d.createTexture(f.g, 2, 2, &texels, false);
-    defer f.r2d.destroyTexture(f.g, id);
+    const id = try f.textures.createRgba8(f.g, 2, 2, &texels, false);
     try f.r2d.queueTexturedQuad(.{ .x = 0, .y = 0, .width = 32, .height = 32, .texture = id });
     const pixels = try f.renderFrame(&.{}, 32, 32, 1.0, .rgba8_unorm, .{ .r = 0, .g = 0, .b = 0, .a = 1 });
     defer std.testing.allocator.free(pixels);
@@ -212,8 +214,7 @@ test "pipeline follows a target format change without losing textures" {
     var f = try Fixture.init(std.testing.allocator);
     defer f.deinit();
     const texels = [_]u8{ 255, 0, 0, 255 };
-    const id = try f.r2d.createTexture(f.g, 1, 1, &texels, false);
-    defer f.r2d.destroyTexture(f.g, id);
+    const id = try f.textures.createRgba8(f.g, 1, 1, &texels, false);
 
     try f.r2d.queueTexturedQuad(.{ .x = 0, .y = 0, .width = 16, .height = 16, .texture = id });
     const rgba = try f.renderFrame(&.{}, 16, 16, 1.0, .rgba8_unorm, .{ .r = 0, .g = 0, .b = 0, .a = 1 });
@@ -233,4 +234,45 @@ test "frame with no commands still clears the target" {
     const pixels = try f.renderFrame(&.{}, 16, 16, 1.0, .rgba8_unorm, .{ .r = 1, .g = 0, .b = 0, .a = 1 });
     defer std.testing.allocator.free(pixels);
     try expectPixel(pixels, 16, 8, 8, .{ 255, 0, 0, 255 }, 0);
+}
+
+test "texture store builds a correct mip chain on the GPU" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    // 4x4: left half white, right half black.
+    var texels: [4 * 4 * 4]u8 = undefined;
+    for (0..4) |y| for (0..4) |x| {
+        const v: u8 = if (x < 2) 255 else 0;
+        texels[(y * 4 + x) * 4 ..][0..4].* = .{ v, v, v, 255 };
+    };
+    const id = try f.textures.createRgba8(f.g, 4, 4, &texels, false);
+    const entry = f.textures.get(id).?;
+    try std.testing.expectEqual(@as(u32, 3), entry.mip_levels);
+
+    const staging = try f.g.createBuffer(.{ .size = 512, .usage = .{ .map_read = true, .copy_dst = true } });
+    defer f.g.destroyBuffer(staging);
+    var rec = gpu.CommandRecorder.init(std.testing.allocator);
+    defer rec.deinit();
+    // Level 1 (2x2) lands in rows of 256 bytes; level 2 (1x1) goes to the second half of the buffer.
+    try rec.copyTextureToBuffer(.{ .texture = entry.texture, .mip_level = 1 }, staging, .{ .offset = 0, .bytes_per_row = 256, .rows_per_image = 2 }, .{ .width = 2, .height = 2 });
+    try rec.finish();
+    try f.g.submit(rec.slice());
+    var raw: [512]u8 = undefined;
+    try f.g.readBufferBlocking(staging, 0, &raw);
+    // Level 1: column 0 is white, column 1 is black (box filter of pure halves).
+    try std.testing.expectEqual(@as(u8, 255), raw[0]);
+    try std.testing.expectEqual(@as(u8, 0), raw[4]);
+    try std.testing.expectEqual(@as(u8, 255), raw[256]);
+    try std.testing.expectEqual(@as(u8, 0), raw[260]);
+
+    // Level 2 averages the two columns: mid gray.
+    const staging2 = try f.g.createBuffer(.{ .size = 256, .usage = .{ .map_read = true, .copy_dst = true } });
+    defer f.g.destroyBuffer(staging2);
+    var rec2 = gpu.CommandRecorder.init(std.testing.allocator);
+    defer rec2.deinit();
+    try rec2.copyTextureToBuffer(.{ .texture = entry.texture, .mip_level = 2 }, staging2, .{ .bytes_per_row = 256, .rows_per_image = 1 }, .{ .width = 1, .height = 1 });
+    try f.g.submit(rec2.slice());
+    var raw2: [256]u8 = undefined;
+    try f.g.readBufferBlocking(staging2, 0, &raw2);
+    try std.testing.expect(raw2[0] >= 126 and raw2[0] <= 129);
 }

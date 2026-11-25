@@ -2,7 +2,7 @@
 //!
 //! Loads a PocketPy script into `ScriptingHost` that defines `on_frame(arg)` and calls
 //! `engine.draw_rect(...)` each frame. The host translates `ScriptDrawQueue` rects into
-//! `graphics.DrawCommand.rect` and presents them via `official.graphics.sdlgpu`.
+//! `graphics.DrawCommand.rect` and presents them via `official.graphics.wgpu`.
 //!
 //! Run with: `zig build run-visual-python`
 
@@ -10,7 +10,8 @@ const std = @import("std");
 const engine = @import("engine");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
 const scripting_host = @import("scripting_host");
 const scripting_python = @import("scripting_python");
 
@@ -101,7 +102,8 @@ pub fn main() !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
     try app.registerModule(scripting_host.module());
     try app.registerModule(scripting_python.module());
 

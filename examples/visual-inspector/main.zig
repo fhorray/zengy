@@ -20,7 +20,9 @@ const std = @import("std");
 const engine = @import("engine");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
+const gpu_3d = @import("gpu_3d");
 const input = @import("input");
 const input_sdl3 = @import("input_sdl3");
 const ui_core = @import("ui_core");
@@ -183,7 +185,7 @@ fn spawnShape(
     schema: engine.reflection.ComponentSchema,
     kind_id: u32,
 ) !engine.EntityHandle {
-    const gpu_mesh = try graphics_sdlgpu.createMesh3D(app, std.mem.sliceAsBytes(shape_mesh.vertices), shape_mesh.indices);
+    const gpu_mesh = try gpu_3d.createMesh3D(app, std.mem.sliceAsBytes(shape_mesh.vertices), shape_mesh.indices);
     const e = try app.world.spawn();
     try app.world.set(e, render_3d.Transform3D, .{ .position = pos });
     try app.world.set(e, render_3d.MeshRef, .{ .mesh_asset = @bitCast(gpu_mesh), .material_handle = mat });
@@ -204,7 +206,9 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
+    try app.registerModule(gpu_3d.module());
     try app.registerModule(input.module());
     try app.registerModule(input_sdl3.module());
     try app.registerModule(ui_core.module());
@@ -223,7 +227,7 @@ pub fn main(init: std.process.Init) !void {
         .height = 720,
         .resizable = true,
     });
-    try app.resources.insert(graphics_sdlgpu.GpuConfig, .{
+    try app.resources.insert(wgpu.GpuConfig, .{
         .default_clear_color = .{ .r = 0.12, .g = 0.13, .b = 0.16, .a = 1.0 },
     });
 
@@ -250,7 +254,7 @@ pub fn main(init: std.process.Init) !void {
     // 1. Procedural Plane floor
     var plane_m = try (shapes.Plane{ .size = .{ 20.0, 14.0 }, .subdivisions = .{ 4, 4 } }).mesh(allocator);
     defer plane_m.deinit();
-    const floor_gpu = try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(plane_m.vertices), plane_m.indices);
+    const floor_gpu = try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(plane_m.vertices), plane_m.indices);
     const floor_mat = try mats.add(.{ .base_color = .{ 0.18, 0.20, 0.24, 1.0 }, .roughness = 0.85 });
     const floor_e = try app.world.spawn();
     try app.world.set(floor_e, render_3d.Transform3D, .{ .position = .{ 0, 0, 0 } });

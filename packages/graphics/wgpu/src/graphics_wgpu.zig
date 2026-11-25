@@ -16,6 +16,12 @@ pub const PROVIDER_ID = "official.graphics.wgpu";
 pub const MODULE_OWNER_ID: u64 = 2099;
 pub const Device = wgpu_gpu.Device;
 
+/// Optional resource read when the provider is built (insert before `app.initialize()`).
+pub const GpuConfig = struct {
+    /// Background used when a frame has no `.clear` draw command.
+    default_clear_color: graphics.Color = .{ .r = 0.07, .g = 0.09, .b = 0.13, .a = 1.0 },
+};
+
 extern fn zwgpu_create(window: *anyopaque) ?*anyopaque;
 extern fn zwgpu_destroy(bridge: *anyopaque) void;
 extern fn zwgpu_drawable_size(bridge: *anyopaque, width: *u32, height: *u32) c_int;
@@ -200,6 +206,7 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
     var input: graphics.frame.FrameInput = .{
         .device = device,
         .recorder = recorder,
+        .textures = &state.service.textures,
         .target = .{ .width = width, .height = height, .dpi_scale = dpi_scale, .color_format = format },
         .clear = clear,
         .draw_commands = commands,
@@ -275,6 +282,10 @@ fn buildModule(raw: *anyopaque) !void {
         .recorder = gpu.CommandRecorder.init(app.allocator),
         .debug_capture_path = getenv("ZENGY_WGPU_CAPTURE_PPM"),
     };
+    if (app.resources.get(GpuConfig)) |cfg| {
+        const c = cfg.default_clear_color;
+        state.default_clear = .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
+    }
     state.service.gpu_device = device.gpuDevice();
     errdefer {
         state.recorder.deinit();

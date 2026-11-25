@@ -13,6 +13,7 @@
 const std = @import("std");
 const gpu = @import("gpu.zig");
 const draw = @import("draw.zig");
+const textures = @import("textures.zig");
 
 /// Fixed render order bands. Lower runs first; use values in between to slot new renderers.
 pub const Order = struct {
@@ -36,6 +37,8 @@ pub const FrameTarget = struct {
 pub const FrameInput = struct {
     device: gpu.GpuDevice,
     recorder: *gpu.CommandRecorder,
+    /// Textures shared by all renderers; look ids up here and keep your own bind groups.
+    textures: *textures.TextureStore,
     target: FrameTarget,
     /// Background color requested by the application (`DrawCommand.clear`) or the provider default.
     clear: gpu.ClearColor,
@@ -63,6 +66,8 @@ pub const FrameRenderer = struct {
     render: *const fn (ctx: *anyopaque, input: *FrameInput) anyerror!void,
     /// Called when the device is replaced or the service is torn down, so the renderer can drop GPU resources.
     release: ?*const fn (ctx: *anyopaque, device: gpu.GpuDevice) void = null,
+    /// Called before a texture is destroyed so the renderer can drop bind groups that reference it.
+    forget_texture: ?*const fn (ctx: *anyopaque, device: gpu.GpuDevice, id: textures.TextureId) void = null,
 };
 
 /// Ordered list of renderers. Insertion keeps the list sorted so frame execution is a plain loop.
@@ -103,6 +108,13 @@ pub const RendererList = struct {
         for (self.items.items) |renderer| try renderer.render(renderer.ctx, input);
     }
 
+    /// Tells every renderer to drop cached bindings of `id`.
+    pub fn forgetTexture(self: *const RendererList, device: gpu.GpuDevice, id: textures.TextureId) void {
+        for (self.items.items) |renderer| {
+            if (renderer.forget_texture) |forget| forget(renderer.ctx, device, id);
+        }
+    }
+
     /// Lets every renderer drop device-owned resources (device loss or shutdown).
     pub fn releaseAll(self: *const RendererList, device: gpu.GpuDevice) void {
         for (self.items.items) |renderer| {
@@ -127,6 +139,7 @@ fn dummyInput(recorder: *gpu.CommandRecorder) FrameInput {
     return .{
         .device = undefined,
         .recorder = recorder,
+        .textures = undefined,
         .target = .{ .width = 1, .height = 1, .dpi_scale = 1, .color_format = .bgra8_unorm },
         .clear = .{},
         .draw_commands = &.{},

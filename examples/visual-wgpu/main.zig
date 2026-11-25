@@ -97,8 +97,8 @@ pub fn main() !void {
     defer _ = gfx.destroySurface(target);
 
     const pixels = checkerPixels();
-    const checker = try draw_2d.createTextureRgba8(&app, 4, 4, &pixels);
-    defer draw_2d.destroyTexture(&app, checker);
+    const checker = try graphics.createTextureRgba8(&app, 4, 4, &pixels);
+    defer graphics.destroyTexture(&app, checker);
 
     try app.resources.insert(State, .{ .app = &app, .gfx = gfx, .target = target, .checker = checker });
 

@@ -179,7 +179,7 @@ pub fn main() !void {
             tex_pixels[idx + 3] = 255;
         }
     }
-    const checker_tex = try draw_2d.createTextureRgba8(&app, 32, 32, &tex_pixels);
+    const checker_tex = try graphics.createTextureRgba8(&app, 32, 32, &tex_pixels);
 
     const cam = try app.world.spawn();
     try app.world.set(cam, camera.Camera, .{});

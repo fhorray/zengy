@@ -18,7 +18,9 @@ const std = @import("std");
 const engine = @import("engine");
 const window_sdl3 = @import("window_sdl3");
 const graphics = @import("graphics");
-const graphics_sdlgpu = @import("graphics_sdlgpu");
+const wgpu = @import("graphics_wgpu");
+const draw_2d = @import("draw_2d");
+const gpu_3d = @import("gpu_3d");
 const input = @import("input");
 const input_sdl3 = @import("input_sdl3");
 const camera = @import("camera");
@@ -418,7 +420,9 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit();
 
     try app.registerModule(window_sdl3.module());
-    try app.registerModule(graphics_sdlgpu.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
+    try app.registerModule(gpu_3d.module());
     try app.registerModule(input.module());
     try app.registerModule(input_sdl3.module());
     try app.registerModule(camera.module());
@@ -431,7 +435,7 @@ pub fn main(init: std.process.Init) !void {
         .height = 720,
         .resizable = true,
     });
-    try app.resources.insert(graphics_sdlgpu.GpuConfig, .{
+    try app.resources.insert(wgpu.GpuConfig, .{
         .default_clear_color = .{ .r = 0.14, .g = 0.15, .b = 0.18, .a = 1.0 },
     });
 
@@ -450,7 +454,7 @@ pub fn main(init: std.process.Init) !void {
 
     var cube = try render_3d.gltf.createCubeMesh(allocator, 1.0);
     defer cube.deinit();
-    const gpu_cube = try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(cube.vertices), cube.indices);
+    const gpu_cube = try gpu_3d.createMesh3D(&app, std.mem.sliceAsBytes(cube.vertices), cube.indices);
 
     // Dark matte slate floor pad under the interactive cube.
     const pad_mat = try mats.add(.{ .base_color = .{ 0.18, 0.21, 0.24, 1.0 }, .roughness = 0.88 });
