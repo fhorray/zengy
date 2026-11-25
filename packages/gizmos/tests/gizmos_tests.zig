@@ -3,6 +3,10 @@ const engine = @import("engine");
 const camera = @import("camera");
 const gizmos = @import("gizmos");
 
+test {
+    std.testing.refAllDecls(gizmos.manipulator);
+}
+
 const MockState = struct {
     submits: usize = 0,
     depth_count: usize = 0,

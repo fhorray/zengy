@@ -462,6 +462,10 @@ pub const FreeCamera = struct {
     key_down: input.KeyCode = .key_q,
     key_run: input.KeyCode = .shift_left,
     look_button: ?input.MouseButton = .right,
+    /// When true, movement keys only apply while `look_button` is held (or always when
+    /// `look_button` is null). Games keep the default false; editors should set true so typing
+    /// in panels cannot fly the camera.
+    require_look_for_move: bool = false,
     invert_x: bool = false,
     invert_y: bool = false,
     enabled: bool = true,
@@ -525,13 +529,16 @@ pub fn freeCameraSystem(ctx: *engine.SystemContext) !void {
         const fwd = vec3Normalize(.{ sy * cp, sp, -cy * cp });
         const right = vec3Normalize(vec3Cross(fwd, .{ 0, 1, 0 }));
 
+        const can_move = if (cfg.require_look_for_move) looking else true;
         var move = [3]f32{ 0, 0, 0 };
-        if (keys.pressed(cfg.key_forward)) move = .{ move[0] + fwd[0], move[1] + fwd[1], move[2] + fwd[2] };
-        if (keys.pressed(cfg.key_back)) move = .{ move[0] - fwd[0], move[1] - fwd[1], move[2] - fwd[2] };
-        if (keys.pressed(cfg.key_right)) move = .{ move[0] + right[0], move[1] + right[1], move[2] + right[2] };
-        if (keys.pressed(cfg.key_left)) move = .{ move[0] - right[0], move[1] - right[1], move[2] - right[2] };
-        if (keys.pressed(cfg.key_up)) move[1] += 1.0;
-        if (keys.pressed(cfg.key_down)) move[1] -= 1.0;
+        if (can_move) {
+            if (keys.pressed(cfg.key_forward)) move = .{ move[0] + fwd[0], move[1] + fwd[1], move[2] + fwd[2] };
+            if (keys.pressed(cfg.key_back)) move = .{ move[0] - fwd[0], move[1] - fwd[1], move[2] - fwd[2] };
+            if (keys.pressed(cfg.key_right)) move = .{ move[0] + right[0], move[1] + right[1], move[2] + right[2] };
+            if (keys.pressed(cfg.key_left)) move = .{ move[0] - right[0], move[1] - right[1], move[2] - right[2] };
+            if (keys.pressed(cfg.key_up)) move[1] += 1.0;
+            if (keys.pressed(cfg.key_down)) move[1] -= 1.0;
+        }
 
         const move_len = @sqrt(move[0] * move[0] + move[1] * move[1] + move[2] * move[2]);
         if (move_len > 1e-4) {

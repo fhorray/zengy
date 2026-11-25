@@ -264,7 +264,8 @@ fn hitTest3D(
     const cam_svc = resources.get(camera.CameraService) orelse return;
     const active_cams = cam_svc.sortedActiveCameras();
     if (active_cams.len == 0) return;
-    const cam = world.get(active_cams[0].entity, camera.Camera) orelse return;
+    // Match render_3d extraction: highest-order active camera is primary (last in sorted list).
+    const cam = world.getConst(active_cams[active_cams.len - 1].entity, camera.Camera) orelse return;
     const ray = cam.viewportToWorld(pointer_pos) orelse return;
 
     var q = try world.query(.{ .read = .{ Pickable3D, render_3d.Transform3D } });
@@ -312,6 +313,10 @@ pub const PickingService = struct {
     hovered: ?PickHit = null,
     pressed: ?PickHit = null,
     auto_focus_on_press: bool = true,
+    /// When false, `picking.update` does not call `updatePointer` so the application can own
+    /// pointer routing (DPI, viewport gating, capture). Games that opt into automatic picking
+    /// leave this true (default).
+    auto_update: bool = true,
 
     /// Initializes `PickingService` with built-in UI, 2D, and 3D backends.
     pub fn init(allocator: std.mem.Allocator) !PickingService {
@@ -474,6 +479,7 @@ pub const PickingService = struct {
 
 fn pickingUpdateSystem(ctx: *engine.SystemContext) !void {
     const svc = ctx.resources.get(PickingService) orelse return;
+    if (!svc.auto_update) return;
     const mouse = ctx.resources.get(input.MouseInput) orelse return;
     const motion = ctx.resources.get(input.AccumulatedMouseMotion) orelse return;
 

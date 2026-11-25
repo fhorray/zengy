@@ -12,6 +12,9 @@ const std = @import("std");
 const engine = @import("engine");
 const camera = @import("camera");
 
+/// Pure transform-manipulation math (axis drag, scale); no editor/history dependency.
+pub const manipulator = @import("manipulator.zig");
+
 /// Module owner identifier for `official.gizmos`.
 pub const MODULE_OWNER_ID: u64 = 2040;
 

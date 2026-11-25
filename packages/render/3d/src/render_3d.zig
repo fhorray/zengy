@@ -27,11 +27,15 @@ pub const Transform3D = struct {
     scale: [3]f32 = .{ 1, 1, 1 },
 
     pub fn toModelMatrix(self: Transform3D) math3d.Mat4 {
+        // Intrinsic YXZ (yaw/pitch/roll) so all three Euler axes contribute. Prefer
+        // `scene.LocalTransform3D` + GlobalTransform3D for new authoring; this path remains
+        // for legacy components during the migration window.
         const t = math3d.Mat4.translation(self.position[0], self.position[1], self.position[2]);
         const ry = math3d.Mat4.rotationY(self.rotation_euler[1]);
         const rx = math3d.Mat4.rotationX(self.rotation_euler[0]);
+        const rz = math3d.Mat4.rotationZ(self.rotation_euler[2]);
         const s = math3d.Mat4.scale(self.scale[0], self.scale[1], self.scale[2]);
-        return math3d.Mat4.mul(t, math3d.Mat4.mul(ry, math3d.Mat4.mul(rx, s)));
+        return math3d.Mat4.mul(t, math3d.Mat4.mul(ry, math3d.Mat4.mul(rx, math3d.Mat4.mul(rz, s))));
     }
 };
 

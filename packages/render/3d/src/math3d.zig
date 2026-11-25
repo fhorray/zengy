@@ -98,6 +98,17 @@ pub const Mat4 = struct {
         } };
     }
 
+    pub fn rotationZ(rad: f32) Mat4 {
+        const c = @cos(rad);
+        const s = @sin(rad);
+        return .{ .m = .{
+            c,  s, 0, 0,
+            -s, c, 0, 0,
+            0,  0, 1, 0,
+            0,  0, 0, 1,
+        } };
+    }
+
     pub fn rotationX(rad: f32) Mat4 {
         const c = @cos(rad);
         const s = @sin(rad);

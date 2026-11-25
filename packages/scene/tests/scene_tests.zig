@@ -8,6 +8,47 @@ const testing = std.testing;
 const engine = @import("engine");
 const scene = @import("scene");
 
+test "SceneSnapshot3D capture/restore preserves LocalTransform3D and GUIDs" {
+    var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
+    defer app.deinit();
+    try app.registerModule(scene.module());
+
+    const parent = try app.world.spawn();
+    try app.world.set(parent, scene.incremental.LocalTransform3D, .{
+        .translation = .{ 1, 2, 3 },
+        .rotation = .{ 0, 0, 0, 1 },
+        .scale = .{ 1, 1, 1 },
+    });
+    try app.world.set(parent, scene.incremental.GlobalTransform3D, .{});
+
+    const child = try app.world.spawn();
+    try app.world.set(child, scene.incremental.LocalTransform3D, .{
+        .translation = .{ 0, 1, 0 },
+        .rotation = .{ 0, 0, 0, 1 },
+        .scale = .{ 2, 2, 2 },
+    });
+    try app.world.set(child, scene.incremental.GlobalTransform3D, .{});
+    try app.world.set(child, scene.Parent, .{ .entity = parent });
+    try scene.graph.rebuildLinks(&app.world);
+
+    const parent_guid = app.world.getGuid(parent).?;
+    const child_guid = app.world.getGuid(child).?;
+
+    var snap = try scene.SceneSnapshot3D.capture(testing.allocator, &app.world);
+    defer snap.deinit();
+    try testing.expectEqual(@as(usize, 2), snap.records.items.len);
+
+    var dst = engine.World.init(testing.allocator, .{ .index = 2, .generation = 1 });
+    defer dst.deinit();
+    try testing.expectEqual(@as(usize, 2), try snap.restore(&dst));
+
+    const restored_parent = dst.findByGuid(parent_guid).?;
+    const restored_child = dst.findByGuid(child_guid).?;
+    try testing.expectEqual(@as(f32, 1), dst.getConst(restored_parent, scene.incremental.LocalTransform3D).?.translation[0]);
+    try testing.expectEqual(@as(f32, 2), dst.getConst(restored_child, scene.incremental.LocalTransform3D).?.scale[0]);
+    try testing.expectEqual(parent_guid, dst.getGuid(dst.getConst(restored_child, scene.Parent).?.entity).?);
+}
+
 test "Transform2D parent-child propagation and SceneSnapshot restore" {
     var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
     defer app.deinit();

@@ -41,6 +41,87 @@ pub const SceneEntityRecord = struct {
     parent_guid: ?engine.EntityGuid = null,
 };
 
+/// Serializable snapshot of a single entity's canonical 3D local transform and optional parent GUID.
+pub const SceneEntityRecord3D = struct {
+    guid: engine.EntityGuid,
+    local: incremental.LocalTransform3D,
+    parent_guid: ?engine.EntityGuid = null,
+    name: []const u8 = "",
+};
+
+/// Headless 3D scene snapshot using `LocalTransform3D` (authorable) and persistent GUIDs.
+/// Does not capture GPU handles, cameras owned by tools, or derived globals.
+pub const SceneSnapshot3D = struct {
+    allocator: std.mem.Allocator,
+    records: std.ArrayList(SceneEntityRecord3D),
+    owned_names: std.ArrayList([]u8) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) SceneSnapshot3D {
+        return .{ .allocator = allocator, .records = .empty };
+    }
+
+    pub fn deinit(self: *SceneSnapshot3D) void {
+        for (self.owned_names.items) |n| self.allocator.free(n);
+        self.owned_names.deinit(self.allocator);
+        self.records.deinit(self.allocator);
+    }
+
+    /// Captures entities that have `LocalTransform3D`. Optional UTF-8 `name` slices are copied.
+    pub fn capture(allocator: std.mem.Allocator, world: *engine.World) !SceneSnapshot3D {
+        var snap = SceneSnapshot3D.init(allocator);
+        errdefer snap.deinit();
+
+        var q = try world.query(.{ .read = .{incremental.LocalTransform3D} });
+        defer q.deinit();
+        while (q.next()) |row| {
+            const guid = world.getGuid(row.entity) orelse 0;
+            const parent_guid: ?engine.EntityGuid = if (world.getConst(row.entity, Parent)) |p|
+                world.getGuid(p.entity)
+            else
+                null;
+            try snap.records.append(allocator, .{
+                .guid = guid,
+                .local = row.read(incremental.LocalTransform3D).*,
+                .parent_guid = parent_guid,
+            });
+        }
+        return snap;
+    }
+
+    /// Restores entities with persistent GUIDs and `LocalTransform3D` + `Parent` links.
+    pub fn restore(self: *const SceneSnapshot3D, target_world: *engine.World) !usize {
+        _ = try target_world.registerComponent(incremental.LocalTransform3D);
+        _ = try target_world.registerComponent(incremental.GlobalTransform3D);
+        _ = try target_world.registerComponent(Parent);
+
+        var guid_map = std.AutoHashMapUnmanaged(engine.EntityGuid, engine.EntityHandle).empty;
+        defer guid_map.deinit(self.allocator);
+        try guid_map.ensureTotalCapacity(self.allocator, @intCast(self.records.items.len));
+
+        for (self.records.items) |rec| {
+            const e = try target_world.spawn();
+            if (rec.guid != 0) {
+                target_world.guids.items[e.index] = rec.guid;
+                if (target_world.next_guid <= rec.guid) target_world.next_guid = rec.guid + 1;
+                guid_map.putAssumeCapacity(rec.guid, e);
+            }
+            try target_world.set(e, incremental.LocalTransform3D, rec.local);
+            try target_world.set(e, incremental.GlobalTransform3D, .{});
+        }
+
+        for (self.records.items) |rec| {
+            const p_guid = rec.parent_guid orelse continue;
+            const child_e = guid_map.get(rec.guid) orelse continue;
+            const parent_e = guid_map.get(p_guid) orelse continue;
+            if (!std.meta.eql(child_e, parent_e)) {
+                try target_world.set(child_e, Parent, .{ .entity = parent_e });
+            }
+        }
+        try graph.rebuildLinks(target_world);
+        return self.records.items.len;
+    }
+};
+
 /// Portable scene snapshot that can be saved/restored across Worlds.
 pub const SceneSnapshot = struct {
     allocator: std.mem.Allocator,
