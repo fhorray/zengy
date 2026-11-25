@@ -12,6 +12,8 @@ const shadow_plan = @import("shadow_plan.zig");
 const graphics = @import("graphics");
 const dev_tools = @import("dev_tools");
 const c = @import("sdl3_c");
+const screen_transport = @import("screen_transport.zig");
+const gpu_gi = @import("gpu_gi.zig");
 
 fn perfNowNs() u64 {
     const freq = c.SDL_GetPerformanceFrequency();
@@ -27,6 +29,9 @@ const math3d = render_3d.math3d;
 
 const PBR_VERT_SPV = @embedFile("shaders/pbr.vert.spv");
 const PBR_FRAG_SPV = @embedFile("shaders/pbr.frag.spv");
+const PBR_SCREEN_SPV = @embedFile("shaders/pbr_screen.frag.spv");
+const HIZ_REDUCE_SPV = @embedFile("shaders/hiz_reduce.comp.spv");
+const SCREEN_TRANSPORT_SPV = @embedFile("shaders/screen_transport.frag.spv");
 const SKY_VERT_SPV = @embedFile("shaders/sky.vert.spv");
 const SKY_FRAG_SPV = @embedFile("shaders/sky.frag.spv");
 const SHADOW_VERT_SPV = @embedFile("shaders/shadow.vert.spv");
@@ -41,6 +46,7 @@ const POSTFX_FRAG_SPV = @embedFile("shaders/postfx.frag.spv");
 const SSAO_FRAG_SPV = @embedFile("shaders/ssao.frag.spv");
 const SSAO_BLUR_SPV = @embedFile("shaders/ssao_blur.frag.spv");
 const VOL_FOG_SPV = @embedFile("shaders/volumetric_fog.frag.spv");
+const FROXEL_INTEGRATE_SPV = @embedFile("shaders/froxel_integrate.frag.spv");
 const VOL_RESOLVE_SPV = @embedFile("shaders/volumetric_resolve.frag.spv");
 
 const SHADOW_W: u32 = 2048;
@@ -160,6 +166,7 @@ const VolFogParams = extern struct {
     local_vp: [16][16]f32,
     local_rect: [16][4]f32,
     cascade_info: [4]f32,
+    froxel_params: [4]f32,
 };
 
 /// Uniforms for `volumetric_composite.frag`; layout must match its std140 block.
@@ -198,6 +205,7 @@ const GpuReflectionProbe = extern struct {
     half_blend: [4]f32 = .{ 1, 1, 1, 1 },
     sky_box: [4]f32 = .{ 0, 0, 0, 1 },
     ground_pad: [4]f32 = .{ 0, 0, 0, 0 },
+    environment_info: [4]f32 = .{0,0,0,0},
 };
 
 const ClusterLightsBuffer = extern struct {
@@ -330,6 +338,11 @@ pub const PbrGpuState = struct {
     diag: *engine.Diagnostics,
     profiler: ?*dev_tools.FrameProfilerService = null,
 
+    depth_format: c.SDL_GPUTextureFormat,
+    screen: screen_transport.State = .{},
+    gpu_gi_state:gpu_gi.State=.{},
+    screen_pipelines: ?ScreenPipelines = null,
+    screen_failed: bool = false,
     pbr_pipeline: *c.SDL_GPUGraphicsPipeline,
     pbr_double_sided_pipeline: *c.SDL_GPUGraphicsPipeline,
     pbr_blend_pipeline: *c.SDL_GPUGraphicsPipeline,
@@ -349,6 +362,11 @@ pub const PbrGpuState = struct {
     ssao_blur_pipeline: *c.SDL_GPUGraphicsPipeline,
     /// Ray-marches scattering into `vol_texture` (RGB in-scatter, A marched distance).
     volumetric_pipeline: *c.SDL_GPUGraphicsPipeline,
+    froxel_pipeline: ?*c.SDL_GPUGraphicsPipeline = null,
+    froxel_failed: bool = false,
+    froxel_texture: ?*c.SDL_GPUTexture = null,
+    froxel_w: u32 = 0,
+    froxel_h: u32 = 0,
     /// Depth-aware upsample of `vol_texture` into the HDR target, additive.
     volumetric_composite_pipeline: *c.SDL_GPUGraphicsPipeline,
     /// Multiplies the HDR scene by the per-pixel transmittance T (`dst *= T`) before the scatter is added.
@@ -372,6 +390,7 @@ pub const PbrGpuState = struct {
     flat_normal_texture: *c.SDL_GPUTexture,
     black_texture: *c.SDL_GPUTexture,
     brdf_lut_texture: *c.SDL_GPUTexture,
+    ltc_texture: ?*c.SDL_GPUTexture,
     env_prefilter_texture: *c.SDL_GPUTexture,
     hdri_sky_texture: ?*c.SDL_GPUTexture = null,
     /// Content key of `hdri_sky_texture`, so rotation and exposure changes do not re-upload the whole HDRI.
@@ -488,17 +507,17 @@ pub const PbrGpuState = struct {
 
         const pbr_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, PBR_VERT_SPV, 0, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_vs);
-        const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 12, 4, 1);
+        const pbr_fs = try createShaderEx(device, diag, c.SDL_GPU_SHADERSTAGE_FRAGMENT, PBR_FRAG_SPV, 14, 4, 1);
         defer c.SDL_ReleaseGPUShader(device, pbr_fs);
-        const pbr_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false, false);
+        const pbr_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false, false, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_pipe);
-        const pbr_ds_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, false, false);
+        const pbr_ds_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, false, false, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_ds_pipe);
-        const pbr_blend_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, true, false);
+        const pbr_blend_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, true, false, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_blend_pipe);
-        const pbr_reuse_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false, true);
+        const pbr_reuse_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, false, false, true, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_reuse_pipe);
-        const pbr_reuse_ds_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, false, true);
+        const pbr_reuse_ds_pipe = try createMeshPbrPipeline(device, pbr_vs, pbr_fs, hdr_format, depth_format, true, false, true, false);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pbr_reuse_ds_pipe);
 
         const sky_vs = try createShader(device, diag, c.SDL_GPU_SHADERSTAGE_VERTEX, SKY_VERT_SPV, 0, 0);
@@ -612,6 +631,8 @@ pub const PbrGpuState = struct {
         const black_t = try upload1x1(device, .{ 0, 0, 0, 255 });
         errdefer c.SDL_ReleaseGPUTexture(device, black_t);
 
+        const ltc_tex=uploadLtc(device) catch null;
+        errdefer if(ltc_tex) |t| c.SDL_ReleaseGPUTexture(device,t);
         const brdf_lut = try uploadBrdfLut(allocator, device, BRDF_LUT_SIZE);
         errdefer c.SDL_ReleaseGPUTexture(device, brdf_lut);
 
@@ -666,10 +687,11 @@ pub const PbrGpuState = struct {
             .usage = c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ | c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
             .size = 66 * 4,
         })) orelse return error.SdlGpuFailure;
+        errdefer c.SDL_ReleaseGPUBuffer(device, hist_buf);
         try zeroBuffer(device, hist_buf, 66 * 4);
 
         const cl_lights_buf = c.SDL_CreateGPUBuffer(device, &std.mem.zeroInit(c.SDL_GPUBufferCreateInfo, .{
-            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ|c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ|c.SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE,
             .size = @sizeOf(ClusterLightsBuffer),
         })) orelse return error.SdlGpuFailure;
         errdefer c.SDL_ReleaseGPUBuffer(device, cl_lights_buf);
@@ -705,6 +727,7 @@ pub const PbrGpuState = struct {
             .device = device,
             .diag = diag,
             .swapchain_format = swapchain_format,
+            .depth_format = depth_format,
             .pbr_pipeline = pbr_pipe,
             .pbr_double_sided_pipeline = pbr_ds_pipe,
             .pbr_blend_pipeline = pbr_blend_pipe,
@@ -733,6 +756,7 @@ pub const PbrGpuState = struct {
             .flat_normal_texture = flat_n,
             .black_texture = black_t,
             .brdf_lut_texture = brdf_lut,
+            .ltc_texture=ltc_tex,
             .env_prefilter_texture = env_tex,
             .shadow_sampler = shadow_smp,
             .material_sampler = material_smp,
@@ -748,7 +772,11 @@ pub const PbrGpuState = struct {
 
     pub fn deinit(self: *PbrGpuState) void {
         self.cancelIblJob();
-        if (self.hdri_sky_texture) |t| c.SDL_ReleaseGPUTexture(self.device, t);
+        self.screen.deinit(self.device);
+        self.gpu_gi_state.deinit(self.device);
+        if (self.froxel_texture) |t| c.SDL_ReleaseGPUTexture(self.device,t);
+        if (self.froxel_pipeline) |p| c.SDL_ReleaseGPUGraphicsPipeline(self.device,p);
+        if (self.screen_pipelines) |*pipes| pipes.deinit(self.device);
         self.queued_draws.deinit(self.allocator);
         self.cluster_scratch.deinit(self.allocator);
         if (self.capture_pending) |p| c.SDL_ReleaseGPUTransferBuffer(self.device, p.transfer);
@@ -780,6 +808,7 @@ pub const PbrGpuState = struct {
         c.SDL_ReleaseGPUSampler(self.device, self.material_sampler);
         c.SDL_ReleaseGPUTexture(self.device, self.env_prefilter_texture);
         c.SDL_ReleaseGPUTexture(self.device, self.brdf_lut_texture);
+        if(self.ltc_texture) |t| c.SDL_ReleaseGPUTexture(self.device,t);
         c.SDL_ReleaseGPUTexture(self.device, self.black_texture);
         c.SDL_ReleaseGPUTexture(self.device, self.flat_normal_texture);
         c.SDL_ReleaseGPUTexture(self.device, self.exposure_texture);
@@ -1116,8 +1145,19 @@ pub const PbrGpuState = struct {
             self.frame_active = false;
         }
         try self.ensureHdrTargets(tex_w, tex_h);
-        const hdr_tex = self.hdr_texture.?;
+        var hdr_tex = self.hdr_texture.?;
         const pp = self.frame_data.post_process;
+        const screen_cfg = pp.quality.screen_transport;
+        const screen_requested = (screen_cfg.ssr_strength > 0 or screen_cfg.ssgi_strength > 0) and
+            (!self.frame_data.fog.enabled or self.frame_data.fog.volumetric.enabled);
+        if(!screen_requested) self.screen_failed=false;
+        var screen_on=screen_requested and !self.screen_failed;
+        if(screen_on){
+            ensureScreen(self,tex_w,tex_h) catch {
+                self.screen_failed=true;screen_on=false;
+                self.diag.log(.warn,"graphics-sdlgpu","screen transport unavailable; using legacy indirect lighting") catch {};
+            };
+        }
         const physical_cfg = pp.auto_exposure.physical;
         const pre_log2: f32 = if (physical_cfg.enabled and std.math.isFinite(physical_cfg.pre_exposure_stops))
             std.math.clamp(physical_cfg.pre_exposure_stops, -12.0, 12.0)
@@ -1397,6 +1437,17 @@ pub const PbrGpuState = struct {
         }
 
         const pr_count = @min(self.frame_data.reflection_probes.len, 32);
+        var probe_texture: *c.SDL_GPUTexture = self.env_prefilter_texture;
+        var authored_probe: ?usize = null;
+        var best_probe_score: f32 = -1;
+        for (self.frame_data.reflection_probes[0..pr_count],0..) |pr,i| {
+            if(pr.environment_texture==0)continue;
+            const tex=textures.get(@bitCast(pr.environment_texture)) orelse continue;
+            const cam=self.frame_data.camera_position;
+            const dx=cam[0]-pr.position[0];const dy=cam[1]-pr.position[1];const dz=cam[2]-pr.position[2];
+            const score=@max(pr.intensity,0)/(1+dx*dx+dy*dy+dz*dz);
+            if(score>best_probe_score){best_probe_score=score;authored_probe=i;probe_texture=tex;}
+        }
         for (0..pr_count) |i| {
             const pr = self.frame_data.reflection_probes[i];
             cl_lights.probes[i] = .{
@@ -1404,6 +1455,7 @@ pub const PbrGpuState = struct {
                 .half_blend = .{ pr.half_extents[0], pr.half_extents[1], pr.half_extents[2], pr.blend_distance },
                 .sky_box = .{ pr.sky_tint[0], pr.sky_tint[1], pr.sky_tint[2], if (pr.box_projection) 1.0 else 0.0 },
                 .ground_pad = .{ pr.ground_tint[0], pr.ground_tint[1], pr.ground_tint[2], pr.diffuse_scale },
+                .environment_info=.{if(authored_probe!=null and authored_probe.?==i) 1 else 0,@floatFromInt(std.math.clamp(pr.environment_mips,1,16)-1),0,0},
             };
         }
 
@@ -1474,9 +1526,22 @@ pub const PbrGpuState = struct {
             }
         }
 
+        const gi_input=self.frame_data.gpu_gi;
+        const gpu_gi_requested=gi_input.enabled and cl_lights.gi.origin_enabled[3]>0;
+        if(!gpu_gi_requested){self.gpu_gi_state.valid=false;self.gpu_gi_state.failed=false;}
+        var gpu_gi_active=gpu_gi_requested and !self.gpu_gi_state.failed;
+        if(gpu_gi_active){
+            self.gpu_gi_state.prepare(self.device,cmd_buf,gi_input) catch {
+                self.gpu_gi_state.failed=true;self.gpu_gi_state.valid=false;gpu_gi_active=false;
+                self.diag.log(.warn,"graphics-sdlgpu","GPU GI unavailable; using existing CPU grid or IBL fallback") catch {};
+            };
+        }
+        const preserve_gpu_grid=gpu_gi_active and self.gpu_gi_state.valid and self.gpu_gi_state.grid_epoch!=null and self.gpu_gi_state.grid_epoch.?==gi_input.grid_epoch;
+        if(gpu_gi_active and !preserve_gpu_grid) cl_lights.gi.probes=@splat(.{});
         // Batch all 4 SSBO uploads into a single persistent transfer buffer and copy pass.
         {
-            const lights_bytes = std.mem.asBytes(cl_lights);
+            // Only overwrite the light prefix when the probe cache is GPU-resident.
+            const lights_bytes = std.mem.asBytes(cl_lights)[0..if(preserve_gpu_grid) @offsetOf(ClusterLightsBuffer,"gi") else @sizeOf(ClusterLightsBuffer)];
             const grid_bytes = std.mem.sliceAsBytes(built_clusters.entries);
             const idx_raw = std.mem.sliceAsBytes(built_clusters.indices);
             const idx_bytes = idx_raw[0..@min(idx_raw.len, 65536 * 4)];
@@ -1507,6 +1572,16 @@ pub const PbrGpuState = struct {
             const pass_t1 = perfNowNs();
             if (self.profiler) |prof| prof.recordPass("Shadow", .shadow, pass_t1 -| pass_t0);
             pass_t0 = pass_t1;
+        }
+        if(gpu_gi_active){
+            const params=makeGpuGiParams(self,cl_lights,pt_count,sun_dir,sun_col);
+            self.gpu_gi_state.dispatch(cmd_buf,self.cluster_lights_buffer,@offsetOf(ClusterLightsBuffer,"gi"),gi_input,params) catch |err| {
+                self.gpu_gi_state.valid=false;
+                return err; // Command recording failed; caller must cancel the frame.
+            };
+            const end=perfNowNs();
+            if(self.profiler) |prof| prof.recordPass("Helios GPU GI (CPU submit)",.forward_plus,end -| pass_t0);
+            pass_t0=end;
         }
         // 1.5 Depth Prepass + SSAO + Contact Shadows + Bilateral Blur
         const prepass_ran = pp.ssao.enabled or pp.contact_shadows.enabled;
@@ -1641,9 +1716,15 @@ pub const PbrGpuState = struct {
                 .stencil_load_op = c.SDL_GPU_LOADOP_DONT_CARE,
                 .stencil_store_op = c.SDL_GPU_STOREOP_DONT_CARE,
             });
-            const pbr_pass = c.SDL_BeginGPURenderPass(cmd_buf, &hdr_col, 1, &hdr_depth) orelse return error.SdlGpuFailure;
+            var hdr_cols: [4]c.SDL_GPUColorTargetInfo = undefined;
+            hdr_cols[0] = hdr_col;
+            if (screen_on) {
+                hdr_cols[1] = std.mem.zeroInit(c.SDL_GPUColorTargetInfo,.{.texture=self.screen.surface.?,.clear_color=.{.r=0,.g=0,.b=-1,.a=0},.load_op=c.SDL_GPU_LOADOP_CLEAR,.store_op=c.SDL_GPU_STOREOP_STORE});
+                hdr_cols[2] = std.mem.zeroInit(c.SDL_GPUColorTargetInfo,.{.texture=self.screen.diffuse.?,.load_op=c.SDL_GPU_LOADOP_CLEAR,.store_op=c.SDL_GPU_STOREOP_STORE});
+                hdr_cols[3] = std.mem.zeroInit(c.SDL_GPUColorTargetInfo,.{.texture=self.screen.specular.?,.load_op=c.SDL_GPU_LOADOP_CLEAR,.store_op=c.SDL_GPU_STOREOP_STORE});
+            }
+            const pbr_pass = c.SDL_BeginGPURenderPass(cmd_buf, &hdr_cols, if (screen_on) 4 else 1, &hdr_depth) orelse return error.SdlGpuFailure;
             c.SDL_SetGPUViewport(pbr_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(tex_w), .h = @floatFromInt(tex_h), .min_depth = 0, .max_depth = 1 });
-            c.SDL_BindGPUGraphicsPipeline(pbr_pass, if (reuse_depth) self.pbr_reuse_pipeline else self.pbr_pipeline);
 
             var pt_pos: [4][4]f32 = @splat(.{ 0, 0, 0, 1 });
             var pt_col: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
@@ -1716,7 +1797,9 @@ pub const PbrGpuState = struct {
                 const qm = self.queued_draws.items[entry.index];
                 const gm = meshes.get(@bitCast(qm.mesh_asset)) orelse continue;
                 const mat = qm.material;
-                const want_pipe: *c.SDL_GPUGraphicsPipeline = if (mat.alpha_mode == .blend)
+                const want_pipe: *c.SDL_GPUGraphicsPipeline = if (screen_on)
+                    self.screen_pipelines.?.select(mat.alpha_mode == .blend, mat.double_sided, reuse_depth)
+                else if (mat.alpha_mode == .blend)
                     self.pbr_blend_pipeline
                 else if (mat.double_sided)
                     (if (reuse_depth) self.pbr_reuse_double_sided_pipeline else self.pbr_double_sided_pipeline)
@@ -1746,6 +1829,7 @@ pub const PbrGpuState = struct {
                 };
                 c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &vu, @sizeOf(PbrVertUniforms));
 
+                sh_arr[5][3] = if (mat.alpha_mode == .blend) 1.0 else 0.0;
                 const fu = PbrFragUniforms{
                     .camera_pos_fog = .{ self.frame_data.camera_position[0], self.frame_data.camera_position[1], self.frame_data.camera_position[2], if (self.frame_data.fog.enabled) 1.0 else 0.0 },
                     .base_color = .{ mat.base_color[0] * qm.tint[0], mat.base_color[1] * qm.tint[1], mat.base_color[2] * qm.tint[2], mat.base_color[3] * qm.tint[3] },
@@ -1769,7 +1853,7 @@ pub const PbrGpuState = struct {
                     .cascade_depth_ranges = cascade_depth_ranges,
                     .cluster_factors = .{ built_clusters.factors.z_scale, built_clusters.factors.z_bias, 1.0, if (mat.alpha_mode == .mask) mat.alpha_cutoff else -1.0 },
                     .probe_volumetric = .{ @floatFromInt(pr_count), pcss_on, vol_on, self.frame_data.fog.volumetric.scattering },
-                    .layer_info = .{ @floatFromInt(qm.layers & pbr.ALL_LAYERS), @floatFromInt(sun_layers & pbr.ALL_LAYERS), pre_gain, if (pp.quality.area_light_quadrature) 1.0 else 0.0 },
+                    .layer_info = .{ @floatFromInt(qm.layers & pbr.ALL_LAYERS), @floatFromInt(sun_layers & pbr.ALL_LAYERS), pre_gain, if (pp.quality.ltc_area_lights and self.ltc_texture!=null) 2.0 else if (pp.quality.area_light_quadrature) 1.0 else 0.0 },
                     .cascade_info = .{ cascade_count, if (has_dir) self.frame_data.directional_lights[0].pcss_light_size else 0.03, shadow_q.depth_bias_floor_m, if (shadow_q.pcss) 1.0 else 0.0 },
                 };
                 c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &fu, @sizeOf(PbrFragUniforms));
@@ -1787,6 +1871,8 @@ pub const PbrGpuState = struct {
                     // Raw (non-comparison) view of the cascade depth for the PCSS blocker search.
                     .{ .texture = self.shadow_texture, .sampler = nearest_sampler },
                     .{ .texture = self.local_shadow_texture, .sampler = nearest_sampler },
+                    .{ .texture = probe_texture, .sampler = self.ibl_sampler },
+                    .{ .texture=self.ltc_texture orelse self.black_texture,.sampler=nearest_sampler },
                 };
                 c.SDL_BindGPUFragmentSamplers(pbr_pass, 0, &pbr_samplers, pbr_samplers.len);
                 c.SDL_DrawGPUIndexedPrimitives(pbr_pass, gm.index_count, 1, 0, 0, 0);
@@ -1799,10 +1885,55 @@ pub const PbrGpuState = struct {
             if (self.profiler) |prof| prof.recordPass("Forward+", .forward_plus, pass_t1 -| pass_t0);
             pass_t0 = pass_t1;
         }
+        if (screen_on) {
+            const pipes = self.screen_pipelines.?;
+            try self.screen.buildDepth(cmd_buf, pipes.reduce, depth_tex, nearest_sampler);
+            const output = std.mem.zeroInit(c.SDL_GPUColorTargetInfo,.{.texture=self.screen.resolved.?,.load_op=c.SDL_GPU_LOADOP_DONT_CARE,.store_op=c.SDL_GPU_STOREOP_STORE});
+            const pass = c.SDL_BeginGPURenderPass(cmd_buf,&output,1,null) orelse return error.SdlGpuFailure;
+            c.SDL_SetGPUViewport(pass,&.{.x=0,.y=0,.w=@floatFromInt(tex_w),.h=@floatFromInt(tex_h),.min_depth=0,.max_depth=1});
+            c.SDL_BindGPUGraphicsPipeline(pass,pipes.resolve);
+            const samplers = [_]c.SDL_GPUTextureSamplerBinding{
+                .{.texture=hdr_tex,.sampler=linear_sampler},
+                .{.texture=depth_tex,.sampler=nearest_sampler},
+                .{.texture=self.screen.surface.?,.sampler=nearest_sampler},
+                .{.texture=self.screen.diffuse.?,.sampler=nearest_sampler},
+                .{.texture=self.screen.specular.?,.sampler=nearest_sampler},
+                .{.texture=self.brdf_lut_texture,.sampler=linear_sampler},
+            };
+            c.SDL_BindGPUFragmentSamplers(pass,0,&samplers,samplers.len);
+            const buffers = [_]*c.SDL_GPUBuffer{self.screen.buffer.?};
+            c.SDL_BindGPUFragmentStorageBuffers(pass,0,&buffers,1);
+            const cam = self.frame_data.camera_position;
+            const params = screen_transport.Params{
+                .view_proj=self.frame_data.view_proj,.inv_view_proj=invertMat4(self.frame_data.view_proj),
+                .camera_gain=.{cam[0],cam[1],cam[2],pre_gain},
+                .controls=.{safeClamp(screen_cfg.ssr_strength,0,1,0),safeClamp(screen_cfg.ssgi_strength,0,1,0),safeClamp(screen_cfg.max_distance,0.5,100,20),safeClamp(screen_cfg.thickness,0.02,2,0.15)},
+                .levels=self.screen.layout.levels,
+                .budget=.{self.screen.layout.count,std.math.clamp(screen_cfg.max_iterations,8,128),std.math.clamp(screen_cfg.diffuse_rays,1,4),0},
+            };
+            c.SDL_PushGPUFragmentUniformData(cmd_buf,0,&params,@sizeOf(screen_transport.Params));
+            c.SDL_DrawGPUPrimitives(pass,3,1,0,0);
+            c.SDL_EndGPURenderPass(pass);
+            hdr_tex=self.screen.resolved.?;
+            const end=perfNowNs();
+            if (self.profiler) |prof| prof.recordPass("Screen transport (CPU)",.forward_plus,end -| pass_t0);
+            pass_t0=end;
+        }
         // 3.5 Volumetric Fog & God Rays (additive ray-marched scattering into HDR target)
         if (volumetric_active) {
             // Ray-march at half resolution by default; the composite pass upsamples depth-aware (~4x fewer marched pixels).
             const vol_half = self.frame_data.fog.volumetric.half_resolution;
+            if(!self.frame_data.fog.volumetric.froxel_enabled) self.froxel_failed=false;
+            var froxel_on = self.frame_data.fog.volumetric.froxel_enabled and !self.froxel_failed;
+            var froxel_pixel = std.math.clamp(self.frame_data.fog.volumetric.froxel_pixel_size,8,32);
+            const froxel_slices = std.math.clamp(self.frame_data.fog.volumetric.froxel_slices,8,64);
+            froxel_pixel=@max(froxel_pixel,(tex_h*froxel_slices+8191)/8192);
+            const fw = @max((tex_w+froxel_pixel-1)/froxel_pixel,1);
+            const fh = @max((tex_h+froxel_pixel-1)/froxel_pixel,1);
+            if (froxel_on) ensureFroxel(self,fw,fh*froxel_slices) catch {
+                froxel_on=false;self.froxel_failed=true;
+                self.diag.log(.warn,"graphics-sdlgpu","froxel allocation failed; falling back to ray marching") catch {};
+            };
             const vol_w: u32 = if (vol_half) @max(tex_w / 2, 1) else tex_w;
             const vol_h: u32 = if (vol_half) @max(tex_h / 2, 1) else tex_h;
             try self.ensureVolumetricTarget(vol_w, vol_h);
@@ -1814,13 +1945,13 @@ pub const PbrGpuState = struct {
             const jitter_offset: f32 = if (temporal) @floatCast(@mod(@as(f64, @floatFromInt(self.vol_frame)) * 0.6180339887498949, 1.0)) else 0.0;
 
             const vf_col = std.mem.zeroInit(c.SDL_GPUColorTargetInfo, .{
-                .texture = self.vol_texture.?,
+                .texture = if (froxel_on) self.froxel_texture.? else self.vol_texture.?,
                 .clear_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
                 .load_op = c.SDL_GPU_LOADOP_CLEAR,
                 .store_op = c.SDL_GPU_STOREOP_STORE,
             });
             const vf_pass = c.SDL_BeginGPURenderPass(cmd_buf, &vf_col, 1, null) orelse return error.SdlGpuFailure;
-            c.SDL_SetGPUViewport(vf_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(vol_w), .h = @floatFromInt(vol_h), .min_depth = 0, .max_depth = 1 });
+            c.SDL_SetGPUViewport(vf_pass, &.{ .x = 0, .y = 0, .w = @floatFromInt(if(froxel_on) fw else vol_w), .h = @floatFromInt(if(froxel_on) fh*froxel_slices else vol_h), .min_depth = 0, .max_depth = 1 });
             c.SDL_BindGPUGraphicsPipeline(vf_pass, self.volumetric_pipeline);
 
             const has_dir_vf = self.frame_data.directional_lights.len > 0;
@@ -1885,6 +2016,7 @@ pub const PbrGpuState = struct {
                 .local_rect = local_sh_data.atlas_rect,
                 .point_shadow = vf_pt_shadow,
                 .cascade_info = .{ cascade_count, jitter_offset, @floatFromInt(std.math.clamp(vol_cfg.raymarch_steps, 8, 128)), if (vol_cfg.physical_scattering) 1.0 else 0.0 },
+                .froxel_params=.{@floatFromInt(fw),@floatFromInt(fh),@floatFromInt(froxel_slices),if(froxel_on) 1 else 0},
             };
             const vf_samplers = [_]c.SDL_GPUTextureSamplerBinding{
                 .{ .texture = depth_tex, .sampler = nearest_sampler },
@@ -1895,6 +2027,19 @@ pub const PbrGpuState = struct {
             c.SDL_PushGPUFragmentUniformData(cmd_buf, 0, &vfp, @sizeOf(VolFogParams));
             c.SDL_DrawGPUPrimitives(vf_pass, 3, 1, 0, 0);
             c.SDL_EndGPURenderPass(vf_pass);
+            if (froxel_on) {
+                const col=std.mem.zeroInit(c.SDL_GPUColorTargetInfo,.{.texture=self.vol_texture.?,.load_op=c.SDL_GPU_LOADOP_DONT_CARE,.store_op=c.SDL_GPU_STOREOP_STORE});
+                const pass=c.SDL_BeginGPURenderPass(cmd_buf,&col,1,null) orelse return error.SdlGpuFailure;
+                c.SDL_SetGPUViewport(pass,&.{.x=0,.y=0,.w=@floatFromInt(vol_w),.h=@floatFromInt(vol_h),.min_depth=0,.max_depth=1});
+                c.SDL_BindGPUGraphicsPipeline(pass,self.froxel_pipeline.?);
+                const samplers=[_]c.SDL_GPUTextureSamplerBinding{.{.texture=self.froxel_texture.?,.sampler=linear_sampler},.{.texture=depth_tex,.sampler=nearest_sampler}};
+                c.SDL_BindGPUFragmentSamplers(pass,0,&samplers,samplers.len);
+                const cam=self.frame_data.camera_position;
+                const params=FroxelIntegrateParams{.inv_view_proj=vfp.inv_view_proj,.cam_max=.{cam[0],cam[1],cam[2],vol_cfg.max_distance},.dimensions=.{@floatFromInt(fw),@floatFromInt(fh),@floatFromInt(froxel_slices),self.frame_data.fog.density}};
+                c.SDL_PushGPUFragmentUniformData(cmd_buf,0,&params,@sizeOf(FroxelIntegrateParams));
+                c.SDL_DrawGPUPrimitives(pass,3,1,0,0);
+                c.SDL_EndGPURenderPass(pass);
+            }
 
             // Temporal resolve: reproject the previous result, clip it to this frame's neighbourhood and blend.
             var vol_final: *c.SDL_GPUTexture = self.vol_texture.?;
@@ -1918,6 +2063,7 @@ pub const PbrGpuState = struct {
                 key_hasher.update(std.mem.asBytes(&vfp.cam_fwd_maxd[3]));
                 key_hasher.update(std.mem.asBytes(&vfp.cascade_info[2]));
                 key_hasher.update(std.mem.asBytes(&vfp.cascade_info[3]));
+                key_hasher.update(std.mem.asBytes(&vfp.froxel_params));
                 const light_key = key_hasher.final();
                 const fog_unchanged = light_key == self.vol_light_key;
                 self.vol_light_key = light_key;
@@ -2662,6 +2808,7 @@ fn createMeshPbrPipeline(
     alpha_blend: bool,
     /// Pass on equal depth, for a lit pass that starts from the depth prepass.
     depth_equal_ok: bool,
+    transport: bool,
 ) !*c.SDL_GPUGraphicsPipeline {
     const vb_desc = [_]c.SDL_GPUVertexBufferDescription{.{
         .slot = 0,
@@ -2685,7 +2832,11 @@ fn createMeshPbrPipeline(
             .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
             .enable_blend = true,
         }) else std.mem.zeroes(c.SDL_GPUColorTargetBlendState),
-    }};
+    },
+        std.mem.zeroInit(c.SDL_GPUColorTargetDescription,.{.format=c.SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT}),
+        std.mem.zeroInit(c.SDL_GPUColorTargetDescription,.{.format=c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT}),
+        std.mem.zeroInit(c.SDL_GPUColorTargetDescription,.{.format=c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT}),
+    };
     return c.SDL_CreateGPUGraphicsPipeline(device, &std.mem.zeroInit(c.SDL_GPUGraphicsPipelineCreateInfo, .{
         .vertex_shader = vs,
         .fragment_shader = fs,
@@ -2708,7 +2859,7 @@ fn createMeshPbrPipeline(
         }),
         .target_info = std.mem.zeroInit(c.SDL_GPUGraphicsPipelineTargetInfo, .{
             .color_target_descriptions = &targets,
-            .num_color_targets = 1,
+            .num_color_targets = if (transport) 4 else 1,
             .depth_stencil_format = depth_fmt,
             .has_depth_stencil_target = true,
         }),
@@ -2871,4 +3022,113 @@ fn upload1x1(device: *c.SDL_GPUDevice, rgba: [4]u8) !*c.SDL_GPUTexture {
     c.SDL_EndGPUCopyPass(cp);
     _ = c.SDL_SubmitGPUCommandBuffer(cmd);
     return tex;
+}
+
+
+fn safeClamp(v: f32, lo: f32, hi: f32, fallback: f32) f32 {
+    return if (std.math.isFinite(v)) std.math.clamp(v,lo,hi) else fallback;
+}
+const ScreenPipelines = struct {
+    opaque: *c.SDL_GPUGraphicsPipeline,
+    double_sided: *c.SDL_GPUGraphicsPipeline,
+    blend: *c.SDL_GPUGraphicsPipeline,
+    reuse: *c.SDL_GPUGraphicsPipeline,
+    reuse_ds: *c.SDL_GPUGraphicsPipeline,
+    resolve: *c.SDL_GPUGraphicsPipeline,
+    reduce: *c.SDL_GPUComputePipeline,
+    fn init(device: *c.SDL_GPUDevice, diag: *engine.Diagnostics, depth_format: c.SDL_GPUTextureFormat) !ScreenPipelines {
+        const vs = try createShader(device,diag,c.SDL_GPU_SHADERSTAGE_VERTEX,PBR_VERT_SPV,0,1);
+        defer c.SDL_ReleaseGPUShader(device,vs);
+        const fs = try createShaderEx(device,diag,c.SDL_GPU_SHADERSTAGE_FRAGMENT,PBR_SCREEN_SPV,14,4,1);
+        defer c.SDL_ReleaseGPUShader(device,fs);
+        const format=c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+        const opaque=try createMeshPbrPipeline(device,vs,fs,format,depth_format,false,false,false,true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,opaque);
+        const ds=try createMeshPbrPipeline(device,vs,fs,format,depth_format,true,false,false,true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,ds);
+        const blend=try createMeshPbrPipeline(device,vs,fs,format,depth_format,true,true,false,true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,blend);
+        const reuse=try createMeshPbrPipeline(device,vs,fs,format,depth_format,false,false,true,true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,reuse);
+        const reuse_ds=try createMeshPbrPipeline(device,vs,fs,format,depth_format,true,false,true,true);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,reuse_ds);
+        const full_vs=try createShader(device,diag,c.SDL_GPU_SHADERSTAGE_VERTEX,SKY_VERT_SPV,0,0);
+        defer c.SDL_ReleaseGPUShader(device,full_vs);
+        const full_fs=try createShaderEx(device,diag,c.SDL_GPU_SHADERSTAGE_FRAGMENT,SCREEN_TRANSPORT_SPV,6,1,1);
+        defer c.SDL_ReleaseGPUShader(device,full_fs);
+        const resolve=try createFullscreenPipeline(device,full_vs,full_fs,format,false);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device,resolve);
+        const reduce=try createComputePipeline(device,HIZ_REDUCE_SPV,1,0,1,1);
+        return .{.opaque=opaque,.double_sided=ds,.blend=blend,.reuse=reuse,.reuse_ds=reuse_ds,.resolve=resolve,.reduce=reduce};
+    }
+    fn select(self: ScreenPipelines, blend: bool, double_sided: bool, reuse: bool) *c.SDL_GPUGraphicsPipeline {
+        if (blend) return self.blend;
+        if (double_sided) return if (reuse) self.reuse_ds else self.double_sided;
+        return if (reuse) self.reuse else self.opaque;
+    }
+    fn deinit(self: *ScreenPipelines, device: *c.SDL_GPUDevice) void {
+        for ([_]*c.SDL_GPUGraphicsPipeline{self.opaque,self.double_sided,self.blend,self.reuse,self.reuse_ds,self.resolve}) |p| c.SDL_ReleaseGPUGraphicsPipeline(device,p);
+        c.SDL_ReleaseGPUComputePipeline(device,self.reduce);
+    }
+};
+
+const FroxelIntegrateParams=extern struct{inv_view_proj:[16]f32,cam_max:[4]f32,dimensions:[4]f32};
+fn ensureFroxel(self:*PbrGpuState,w:u32,h:u32) !void {
+    if (self.froxel_pipeline==null) {
+        const vs=try createShader(self.device,self.diag,c.SDL_GPU_SHADERSTAGE_VERTEX,SKY_VERT_SPV,0,0);
+        defer c.SDL_ReleaseGPUShader(self.device,vs);
+        const fs=try createShader(self.device,self.diag,c.SDL_GPU_SHADERSTAGE_FRAGMENT,FROXEL_INTEGRATE_SPV,2,1);
+        defer c.SDL_ReleaseGPUShader(self.device,fs);
+        self.froxel_pipeline=try createFullscreenPipeline(self.device,vs,fs,c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,false);
+    }
+    if(self.froxel_texture!=null and self.froxel_w==w and self.froxel_h==h)return;
+    const tex=c.SDL_CreateGPUTexture(self.device,&std.mem.zeroInit(c.SDL_GPUTextureCreateInfo,.{.type=c.SDL_GPU_TEXTURETYPE_2D,.format=c.SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT,.usage=c.SDL_GPU_TEXTUREUSAGE_COLOR_TARGET|c.SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=w,.height=h,.layer_count_or_depth=1,.num_levels=1})) orelse return error.SdlGpuFailure;
+    if(self.froxel_texture) |old| c.SDL_ReleaseGPUTexture(self.device,old);
+    self.froxel_texture=tex;self.froxel_w=w;self.froxel_h=h;
+}
+
+fn uploadLtc(device:*c.SDL_GPUDevice) !*c.SDL_GPUTexture {
+    const bytes=@embedFile("shaders/ltc_fit.bin");
+    comptime {if(bytes.len!=16*32*16)@compileError("Invalid LTC table size");}
+    const tex=c.SDL_CreateGPUTexture(device,&std.mem.zeroInit(c.SDL_GPUTextureCreateInfo,.{.type=c.SDL_GPU_TEXTURETYPE_2D,.format=c.SDL_GPU_TEXTUREFORMAT_R32G32B32A32_FLOAT,.usage=c.SDL_GPU_TEXTUREUSAGE_SAMPLER,.width=16,.height=32,.layer_count_or_depth=1,.num_levels=1})) orelse return error.SdlGpuFailure;
+    errdefer c.SDL_ReleaseGPUTexture(device,tex);
+    const tb=c.SDL_CreateGPUTransferBuffer(device,&std.mem.zeroInit(c.SDL_GPUTransferBufferCreateInfo,.{.usage=c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,.size=bytes.len})) orelse return error.SdlGpuFailure;
+    defer c.SDL_ReleaseGPUTransferBuffer(device,tb);
+    const ptr=c.SDL_MapGPUTransferBuffer(device,tb,false) orelse return error.SdlGpuFailure;
+    @memcpy(@as([*]u8,@ptrCast(ptr))[0..bytes.len],bytes);
+    c.SDL_UnmapGPUTransferBuffer(device,tb);
+    const cmd=c.SDL_AcquireGPUCommandBuffer(device) orelse return error.SdlGpuFailure;
+    const cp=c.SDL_BeginGPUCopyPass(cmd) orelse { _=c.SDL_CancelGPUCommandBuffer(cmd);return error.SdlGpuFailure; };
+    c.SDL_UploadToGPUTexture(cp,&.{.transfer_buffer=tb,.offset=0,.pixels_per_row=16,.rows_per_layer=32},&.{.texture=tex,.mip_level=0,.layer=0,.x=0,.y=0,.z=0,.w=16,.h=32,.d=1},false);
+    c.SDL_EndGPUCopyPass(cp);
+    if(!c.SDL_SubmitGPUCommandBuffer(cmd))return error.SdlGpuFailure;
+    return tex;
+}
+
+fn ensureScreen(self:*PbrGpuState,w:u32,h:u32) !void {
+    if(self.screen_pipelines==null)self.screen_pipelines=try ScreenPipelines.init(self.device,self.diag,self.depth_format);
+    try self.screen.ensure(self.device,w,h);
+}
+
+fn makeGpuGiParams(self:*PbrGpuState,lights:*const ClusterLightsBuffer,count:usize,sun_dir:[3]f32,sun_color:[3]f32) gpu_gi.Params {
+    var cdf:[64][4]f32=@splat(@splat(0));
+    var weights:[256]f64=@splat(0);
+    var total:f64=0;
+    for(lights.points[0..count],0..) |light,i| {
+        const rgb=light.col_radius;
+        const lum=@as(f64,rgb[0])*0.2126+@as(f64,rgb[1])*0.7152+@as(f64,rgb[2])*0.0722;
+        if(std.math.isFinite(lum) and lum>0 and light.shadow_params[2]>0){weights[i]=lum;total+=lum;}
+    }
+    var cumulative:f64=0;
+    for(0..count) |i| {
+        cumulative+=if(total>0) weights[i]/total else 1.0/@as(f64,@floatFromInt(count));
+        cdf[i/4][i%4]=if(i+1==count) 1.0 else @floatCast(@min(cumulative,1));
+    }
+    const hash=std.hash.Wyhash.hash(0,std.mem.sliceAsBytes(lights.points[0..count]));
+    const sky=self.frame_data.sky;
+    const zenith=if(sky.kind==.solid_color) sky.solid_color else sky.sky_tint;
+    const horizon=if(sky.kind==.solid_color) sky.solid_color else sky.horizon_tint;
+    const ground=if(sky.kind==.solid_color) sky.solid_color else sky.ground_albedo;
+    const intensity:f32=if(self.frame_data.directional_lights.len>0) self.frame_data.directional_lights[0].illuminance_lux/2500.0 else 0;
+    return .{.counts=.{0,0,0,@intCast(count)},.offsets=.{0,0,0,0},.dispatch_info=.{0,0,0,0},.light_key=.{@truncate(hash),@truncate(hash>>32),0,0},.config=.{16,0.85,0.4,0},.sun_dir_int=.{sun_dir[0],sun_dir[1],sun_dir[2],intensity},.sun_color=.{sun_color[0],sun_color[1],sun_color[2],0},.sky_zenith=.{zenith[0],zenith[1],zenith[2],0},.sky_horizon=.{horizon[0],horizon[1],horizon[2],0},.sky_ground=.{ground[0],ground[1],ground[2],0},.cdf=cdf};
 }

@@ -368,6 +368,8 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
                 .sky_tint = rp.sky_tint,
                 .ground_tint = rp.ground_tint,
                 .diffuse_scale = rp.diffuse_scale,
+                .environment_texture=rp.environment_texture,
+                .environment_mips=rp.environment_mips,
             });
         }
     }
@@ -379,6 +381,7 @@ fn extract3DSystem(ctx: *engine.SystemContext) !void {
     svc.pbr_frame = .{
         .camera_key = @bitCast(primary.entity),
         .dynamic_gi = if (ctx.resources.getConst(pbr.DynamicGiGrid)) |grid| grid.* else .{},
+        .gpu_gi=if(ctx.resources.getConst(pbr.GpuGiInput)) |input| input.* else .{},
         .camera_position = if (cam_pose) |cp| cp.position else .{ 0, 0, 0 },
         .camera_forward = .{ cam_fwd.x, cam_fwd.y, cam_fwd.z },
         .view_matrix = vw,

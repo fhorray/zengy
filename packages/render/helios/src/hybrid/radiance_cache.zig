@@ -99,7 +99,11 @@ pub const WorldRadianceCache = struct {
                 return;
             }
             const alpha: f32 = 1.0 / @as(f32, @floatFromInt(@min(cell.sample_count + 1, 32)));
-            for (0..3) |i| cell.rgb[i] = cell.rgb[i] * (1.0 - alpha) + rgb[i] * alpha;
+            for (0..3) |i| {
+                const a: f64=alpha;
+                const value=@as(f64,cell.rgb[i])*(1.0-a)+@as(f64,rgb[i])*a;
+                cell.rgb[i]=@floatCast(@min(value,@as(f64,std.math.floatMax(f32))));
+            }
             cell.sample_count = @min(cell.sample_count + 1, 1000);
             cell.confidence = @min(1.0, @as(f32, @floatFromInt(cell.sample_count)) / 8.0);
             cell.last_used_frame = frame_index;

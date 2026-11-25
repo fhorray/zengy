@@ -24,7 +24,8 @@ layout(std140, set = 3, binding = 0) uniform VolFogParams {
     vec4 point_shadow[4];
     mat4 local_vp[16];
     vec4 local_rect[16];
-    vec4 cascade_info; // active cascades, temporal jitter, ray-march steps, reserved
+    vec4 cascade_info; // active cascades, temporal jitter, ray-march steps, physical scattering
+    vec4 froxel_params; // columns, rows, slices, enabled
 };
 
 // RGB = in-scattered light, A = marched distance for bilateral upsampling.
@@ -62,7 +63,6 @@ float sampleVolShadow(vec3 wp, float view_depth) {
 
 float sampleLocalTile(int tile, vec3 wp) {
     if (tile < 0 || tile >= 16) return 1.0;
-    if (tile < 0 || tile >= 16) return 1.0;
     vec4 lp = local_vp[tile] * vec4(wp, 1.0);
     if (lp.w <= 0.0001) return 1.0;
     vec3 proj = lp.xyz / lp.w;
@@ -83,7 +83,143 @@ float samplePointShadow(int j, vec3 wp) {
     return sampleLocalTile(int(point_shadow[j].x + 0.5) + face, wp);
 }
 
+
+// Shared lighting source for ray marching and froxel injection.
+vec3 evaluateStepLight(
+    vec3 p,
+    float vd,
+    float phase,
+    vec3 ray_dir
+) {
+        float vis = sun_dir_int.w > 0.0 ? sampleVolShadow(p, vd) : 0.0;
+        vec3 step_light = sun_col_aniso.rgb * (sun_dir_int.w * phase * vis * (cascade_info.w > 0.5 ? 1.0 : 0.72));
+
+        for (int j = 0; j < 4; ++j) {
+            if (point_col[j].w < 0.5) continue;
+            vec3 to_pt = p - point_pos[j].xyz;
+            float pdist2 = dot(to_pt, to_pt);
+            float prange = point_pos[j].w;
+            if (prange <= 0.0 || pdist2 >= prange * prange) continue;
+            float pdist = sqrt(pdist2);
+            float win = clamp(1.0 - pdist / prange, 0.0, 1.0);
+            float att = (win * win) / max(0.35 + pdist2 * 0.55, 0.12);
+            float pt_phase = mix(0.25, henyeyGreenstein(dot(ray_dir, -to_pt / max(pdist, 1e-4)), 0.3), 0.5);
+            step_light += point_col[j].rgb * (att * pt_phase * 0.85 * samplePointShadow(j, p));
+        }
+
+        for (int j = 0; j < 4; ++j) {
+            if (spot_col_on[j].w < 0.5) continue;
+            vec3 to_sp = p - spot_pos_range[j].xyz;
+            float sdist2 = dot(to_sp, to_sp);
+            float range = spot_pos_range[j].w;
+            if (range <= 0.0 || sdist2 >= range * range) continue;
+            float sdist = sqrt(sdist2);
+            vec3 sdir = to_sp / max(sdist, 1e-4);
+            float cd = dot(sdir, normalize(spot_dir_cos[j].xyz));
+            if (cd > spot_dir_cos[j].w) {
+                float cone = smoothstep(spot_dir_cos[j].w, max(spot_dir_cos[j].w + 0.001, min(spot_dir_cos[j].w + 0.14, 0.99)), cd);
+                float win = clamp(1.0 - sdist / range, 0.0, 1.0);
+                float att = (win * win) / max(0.35 + sdist2 * 0.25, 0.12);
+                float sp_sv = spot_shadow[j].y > 0.5 ? sampleLocalTile(int(spot_shadow[j].x + 0.5), p) : 1.0;
+                float sp_phase = mix(0.25, henyeyGreenstein(dot(ray_dir, -sdir), 0.35), 0.5);
+                step_light += spot_col_on[j].rgb * (att * cone * sp_sv * sp_phase * 1.15);
+            }
+        }
+
+
+    return step_light;
+}
+
+void injectFroxel() {
+    float w = froxel_params.x;
+    float h = froxel_params.y;
+    float count = froxel_params.z;
+
+    float slice = floor(gl_FragCoord.y / h);
+
+    vec2 uv = vec2(
+        gl_FragCoord.x / w,
+        mod(gl_FragCoord.y, h) / h
+    );
+
+    vec2 ndc = vec2(
+        uv.x * 2.0 - 1.0,
+        1.0 - uv.y * 2.0
+    );
+
+    vec4 wp = inv_view_proj * vec4(ndc, 1.0, 1.0);
+
+    vec3 ray =
+        wp.xyz / max(wp.w, 1e-5)
+        - cam_pos_density.xyz;
+
+    vec3 dir = ray * inversesqrt(
+        max(dot(ray, ray), 1e-12)
+    );
+
+    float max_dist = max(cam_fwd_maxd.w, 0.1);
+
+    float lo = max_dist
+        * (exp2(4.0 * slice / count) - 1.0)
+        / 15.0;
+
+    float hi = max_dist
+        * (exp2(4.0 * (slice + 1.0) / count) - 1.0)
+        / 15.0;
+
+    float distance = mix(lo, hi, 0.5);
+
+    vec3 p = cam_pos_density.xyz + dir * distance;
+
+    vec3 fwd = cam_fwd_maxd.xyz * inversesqrt(
+        max(
+            dot(cam_fwd_maxd.xyz, cam_fwd_maxd.xyz),
+            1e-12
+        )
+    );
+
+    vec3 sun = sun_dir_int.xyz * inversesqrt(
+        max(
+            dot(sun_dir_int.xyz, sun_dir_int.xyz),
+            1e-12
+        )
+    );
+
+    float hg = henyeyGreenstein(
+        dot(dir, sun),
+        clamp(sun_col_aniso.w, -0.85, 0.85)
+    );
+
+    float phase = cascade_info.w > 0.5
+        ? hg
+        : mix(0.20, hg, 0.65);
+
+    float density = max(cam_pos_density.w, 0.0);
+
+    float scattering = cascade_info.w > 0.5
+        ? density * clamp(fog_col_scat.w, 0.0, 1.0)
+        : max(fog_col_scat.w, 0.0) * 0.18;
+
+    if (scattering <= 0.0) {
+        frag_color = vec4(0);
+        return;
+    }
+
+    vec3 source = evaluateStepLight(
+        p,
+        max(dot(p - cam_pos_density.xyz, fwd), 0.0),
+        phase,
+        dir
+    ) * scattering;
+
+    frag_color = vec4(
+        clamp(source, vec3(0), vec3(65000)),
+        0.0
+    );
+}
+
 void main() {
+    if(froxel_params.w>0.5){injectFroxel();return;}
     vec2 uv = vec2(v_ndc.x * 0.5 + 0.5, 0.5 - v_ndc.y * 0.5);
     float d = texture(u_depth, uv).r;
     vec4 far_ndc = vec4(v_ndc, (d >= 0.9999) ? 1.0 : d, 1.0);
@@ -132,43 +268,10 @@ void main() {
         float t = (float(i) + jitter) * step_len;
         vec3 p = cam_pos_density.xyz + ray_dir * t;
         float vd = max(dot(p - cam_pos_density.xyz, cam_fwd), 0.0);
-        float vis = sun_dir_int.w > 0.0 ? sampleVolShadow(p, vd) : 0.0;
-        vec3 step_light = sun_col_aniso.rgb * (sun_dir_int.w * phase * vis * (cascade_info.w > 0.5 ? 1.0 : 0.72));
-
-        for (int j = 0; j < 4; ++j) {
-            if (point_col[j].w < 0.5) continue;
-            vec3 to_pt = p - point_pos[j].xyz;
-            float pdist2 = dot(to_pt, to_pt);
-            float prange = point_pos[j].w;
-            if (prange <= 0.0 || pdist2 >= prange * prange) continue;
-            float pdist = sqrt(pdist2);
-            float win = clamp(1.0 - pdist / prange, 0.0, 1.0);
-            float att = (win * win) / max(0.35 + pdist2 * 0.55, 0.12);
-            float pt_phase = mix(0.25, henyeyGreenstein(dot(ray_dir, -to_pt / max(pdist, 1e-4)), 0.3), 0.5);
-            step_light += point_col[j].rgb * (att * pt_phase * 0.85 * samplePointShadow(j, p));
-        }
-
-        for (int j = 0; j < 4; ++j) {
-            if (spot_col_on[j].w < 0.5) continue;
-            vec3 to_sp = p - spot_pos_range[j].xyz;
-            float sdist2 = dot(to_sp, to_sp);
-            float range = spot_pos_range[j].w;
-            if (range <= 0.0 || sdist2 >= range * range) continue;
-            float sdist = sqrt(sdist2);
-            vec3 sdir = to_sp / max(sdist, 1e-4);
-            float cd = dot(sdir, normalize(spot_dir_cos[j].xyz));
-            if (cd > spot_dir_cos[j].w) {
-                float cone = smoothstep(spot_dir_cos[j].w, max(spot_dir_cos[j].w + 0.001, min(spot_dir_cos[j].w + 0.14, 0.99)), cd);
-                float win = clamp(1.0 - sdist / range, 0.0, 1.0);
-                float att = (win * win) / max(0.35 + sdist2 * 0.25, 0.12);
-                float sp_sv = spot_shadow[j].y > 0.5 ? sampleLocalTile(int(spot_shadow[j].x + 0.5), p) : 1.0;
-                float sp_phase = mix(0.25, henyeyGreenstein(dot(ray_dir, -sdir), 0.35), 0.5);
-                step_light += spot_col_on[j].rgb * (att * cone * sp_sv * sp_phase * 1.15);
-            }
-        }
+        vec3 step_light = evaluateStepLight(p,vd,phase,ray_dir);
 
         accum += transmittance * step_light * (scat_coeff * step_integral);
         transmittance *= step_ext;
     }
-    frag_color = vec4(clamp(accum, vec3(0.0), vec3(50.0)), max_dist);
+    frag_color = vec4(clamp(accum, vec3(0.0), vec3(65000.0)), max_dist);
 }

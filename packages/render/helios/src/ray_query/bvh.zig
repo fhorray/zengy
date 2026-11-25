@@ -85,7 +85,6 @@ fn intersectAabb(ray: Ray, inv_dir: [3]f32, bmin: [3]f32, bmax: [3]f32, cur_t_ma
     var tmin = ray.t_min;
     var tmax = cur_t_max;
     inline for (0..3) |i| {
-        if (!std.math.isFinite(ray.origin[i]) or !std.math.isFinite(ray.direction[i])) return null;
         if (ray.direction[i] == 0.0) {
             if (ray.origin[i] < bmin[i] or ray.origin[i] > bmax[i]) return null;
         } else {
@@ -103,6 +102,10 @@ fn intersectAabb(ray: Ray, inv_dir: [3]f32, bmin: [3]f32, bmax: [3]f32, cur_t_ma
 
 /// Moller-Trumbore ray-triangle intersection.
 pub fn intersectTriangle(ray: Ray, tri: BvhTriangle, cur_t_max: f32) ?RayHit {
+    if (!validRay(ray)) return null;
+    return intersectTriangleUnchecked(ray,tri,cur_t_max);
+}
+fn intersectTriangleUnchecked(ray: Ray, tri: BvhTriangle, cur_t_max: f32) ?RayHit {
     if ((ray.mask & tri.mask) == 0) return null;
     const e1 = sub3(tri.v1, tri.v0);
     const e2 = sub3(tri.v2, tri.v0);
@@ -262,7 +265,7 @@ pub const Bvh = struct {
     /// Bounded iterative closest-hit ray query.
     pub fn traceClosest(self: *const Bvh, ray: Ray, stats: ?*QueryStats) RayHit {
         if (stats) |s| s.rays_cast += 1;
-        if (self.nodes.items.len == 0) return .{};
+        if (self.nodes.items.len == 0 or !validRay(ray)) return .{};
 
         const inv_dir = [3]f32{
             if (ray.direction[0] != 0.0) 1.0 / ray.direction[0] else 0.0,
@@ -271,23 +274,26 @@ pub const Bvh = struct {
         };
 
         var best = RayHit{ .t = ray.t_max };
-        var stack: [MAX_STACK]u32 = undefined;
+        const Entry=struct{ index:u32, near:f32 };
+        var stack: [MAX_STACK]Entry = undefined;
         var sp: usize = 0;
-        stack[sp] = 0;
+        const root=self.nodes.items[0];
+        const near=intersectAabb(ray,inv_dir,root.aabb_min,root.aabb_max,ray.t_max) orelse return best;
+        stack[sp] = .{.index=0,.near=near};
         sp += 1;
 
         while (sp > 0) {
             sp -= 1;
-            const idx = stack[sp];
-            const node = self.nodes.items[idx];
+            const entry = stack[sp];
+            if (entry.near > best.t) continue;
+            const node = self.nodes.items[entry.index];
             if (stats) |s| s.node_visits += 1;
 
-            if (intersectAabb(ray, inv_dir, node.aabb_min, node.aabb_max, best.t) == null) continue;
 
             if (node.prim_count > 0) {
                 for (self.triangles.items[node.left_or_first .. node.left_or_first + node.prim_count]) |tri| {
                     if (stats) |s| s.tri_tests += 1;
-                    if (intersectTriangle(ray, tri, best.t)) |h| {
+                    if (intersectTriangleUnchecked(ray, tri, best.t)) |h| {
                         best = h;
                     }
                 }
@@ -301,22 +307,22 @@ pub const Bvh = struct {
                     const near_c = if (dl.? <= dr.?) l else r;
                     const far_c = if (dl.? <= dr.?) r else l;
                     if (sp + 2 <= MAX_STACK) {
-                        stack[sp] = far_c;
-                        stack[sp + 1] = near_c;
+                        stack[sp] = .{.index=far_c,.near=@max(dl.?,dr.?)};
+                        stack[sp + 1] = .{.index=near_c,.near=@min(dl.?,dr.?)};
                         sp += 2;
                     } else if (stats) |s| {
                         s.stack_overflows += 1;
                     }
                 } else if (dl != null) {
                     if (sp < MAX_STACK) {
-                        stack[sp] = l;
+                        stack[sp] = .{.index=l,.near=dl.?};
                         sp += 1;
                     } else if (stats) |s| {
                         s.stack_overflows += 1;
                     }
                 } else if (dr != null) {
                     if (sp < MAX_STACK) {
-                        stack[sp] = r;
+                        stack[sp] = .{.index=r,.near=dr.?};
                         sp += 1;
                     } else if (stats) |s| {
                         s.stack_overflows += 1;
@@ -330,7 +336,7 @@ pub const Bvh = struct {
     /// Bounded iterative any-hit visibility query (exits on first occluder).
     pub fn traceAnyHit(self: *const Bvh, ray: Ray, stats: ?*QueryStats) bool {
         if (stats) |s| s.rays_cast += 1;
-        if (self.nodes.items.len == 0) return false;
+        if (self.nodes.items.len == 0 or !validRay(ray)) return false;
 
         const inv_dir = [3]f32{
             if (ray.direction[0] != 0.0) 1.0 / ray.direction[0] else 0.0,
@@ -352,7 +358,7 @@ pub const Bvh = struct {
             if (node.prim_count > 0) {
                 for (self.triangles.items[node.left_or_first .. node.left_or_first + node.prim_count]) |tri| {
                     if (stats) |s| s.tri_tests += 1;
-                    if (intersectTriangle(ray, tri, ray.t_max) != null) return true;
+                    if (intersectTriangleUnchecked(ray, tri, ray.t_max) != null) return true;
                 }
             } else {
                 const l = node.left_or_first;
@@ -369,3 +375,10 @@ pub const Bvh = struct {
         return false;
     }
 };
+
+fn validRay(ray: Ray) bool {
+    if (!std.math.isFinite(ray.t_min) or std.math.isNan(ray.t_max) or ray.t_min>ray.t_max) return false;
+    for(ray.origin) |v| if(!std.math.isFinite(v))return false;
+    for(ray.direction) |v| if(!std.math.isFinite(v))return false;
+    return dot3(ray.direction,ray.direction)>0;
+}

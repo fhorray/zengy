@@ -16,7 +16,9 @@ layout(set = 2, binding = 7) uniform sampler2DShadow u_local_shadow_tex;
 layout(set = 2, binding = 8) uniform sampler2D u_ao_tex;
 layout(set = 2, binding = 9) uniform sampler2D u_emissive_tex;
 layout(set = 2, binding = 10) uniform sampler2D u_shadow_raw; // same depth as u_shadow_tex, read without comparison (PCSS blocker search)
-layout(set = 2, binding = 11) uniform sampler2D u_local_shadow_raw; // same for the local shadow atlas
+layout(set = 2, binding = 11) uniform sampler2D u_local_shadow_raw;
+layout(set = 2, binding = 12) uniform sampler2D u_probe_environment;
+layout(set = 2, binding = 13) uniform sampler2D u_ltc; // same for the local shadow atlas
 
 struct GpuPointLight {
     vec4 pos_range;  // xyz=pos, w=range
@@ -44,6 +46,7 @@ struct GpuReflectionProbe {
     vec4 half_blend; // xyz=half_extents, w=blend_distance
     vec4 sky_box;    // rgb=sky_tint, w=box_projection
     vec4 ground_pad; // rgb=ground_tint, w=diffuse scale
+    vec4 environment_info; // x=authored map, y=max mip
 };
 
 
@@ -53,7 +56,7 @@ struct DynamicGiProbe {
     vec4 offset_validity;
 };
 
-layout(std430, set = 2, binding = 12) readonly buffer ClusterLightsBuffer {
+layout(std430, set = 2, binding = 14) readonly buffer ClusterLightsBuffer {
     GpuPointLight c_points[256];
     GpuSpotLight c_spots[256];
     GpuRectLight c_rects[64];
@@ -63,15 +66,15 @@ layout(std430, set = 2, binding = 12) readonly buffer ClusterLightsBuffer {
     DynamicGiProbe c_gi[64];
 };
 
-layout(std430, set = 2, binding = 13) readonly buffer ClusterGridBuffer {
+layout(std430, set = 2, binding = 15) readonly buffer ClusterGridBuffer {
     uvec4 clusters[];
 };
 
-layout(std430, set = 2, binding = 14) readonly buffer ClusterIndicesBuffer {
+layout(std430, set = 2, binding = 16) readonly buffer ClusterIndicesBuffer {
     uint cluster_indices[];
 };
 
-layout(std430, set = 2, binding = 15) readonly buffer LocalShadowBuffer {
+layout(std430, set = 2, binding = 17) readonly buffer LocalShadowBuffer {
     mat4 local_shadow_vp[16];
     vec4 local_atlas_rect[16]; // x, y, w, h in [0,1]
     vec4 local_shadow_info[16]; // x = tan(half fov), y = near, z = far
@@ -105,6 +108,19 @@ layout(std140, set = 3, binding = 0) uniform PbrFragUniforms {
 };
 
 layout(location = 0) out vec4 frag_color;
+#ifdef ZENGY_SCREEN_TRANSPORT
+layout(location = 1) out vec4 out_surface;
+layout(location = 2) out vec4 out_diffuse;
+layout(location = 3) out vec4 out_specular;
+vec2 encodeNormal(vec3 n) {
+    n /= max(abs(n.x)+abs(n.y)+abs(n.z),1e-6);
+    return n.z >= 0.0 ? n.xy : (1.0-abs(n.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(n.xy,vec2(0)));
+}
+float packRgb(vec3 v) {
+    uvec3 q=uvec3(round(clamp(v,0.0,1.0)*255.0));
+    return float(q.x|(q.y<<8)|(q.z<<16));
+}
+#endif
 
 const float PI = 3.14159265359;
 
@@ -457,7 +473,60 @@ vec3 evalRectLightQuadrature(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albe
     return sum_rgb;
 }
 
+vec4 ltcLookup(vec2 uv,bool amplitude) {
+    vec2 p=clamp(uv,vec2(0),vec2(1))*15.0;
+    ivec2 i=min(ivec2(floor(p)),ivec2(14));
+    vec2 f=p-vec2(i);
+    ivec2 base=i+ivec2(0,amplitude?16:0);
+    vec4 a=texelFetch(u_ltc,base,0),b=texelFetch(u_ltc,base+ivec2(1,0),0);
+    vec4 c=texelFetch(u_ltc,base+ivec2(0,1),0),d=texelFetch(u_ltc,base+ivec2(1,1),0);
+    return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
+}
+float ltcPolygon(vec3 corners[4],mat3 invM) {
+    // Clip the transformed polygon against the cosine hemisphere, then integrate edges.
+    vec3 v[4];for(int i=0;i<4;++i)v[i]=invM*corners[i];
+    vec3 clipped[8];int count=0;
+    for(int i=0;i<4;++i){vec3 a=v[i],b=v[(i+1)%4];bool ia=a.z>0.0,ib=b.z>0.0;
+        if(ia)clipped[count++]=a;
+        if(ia!=ib)clipped[count++]=mix(a,b,clamp(a.z/(a.z-b.z),0.0,1.0));
+    }
+    if(count<3)return 0.0;
+    float integral=0.0;
+    for(int i=0;i<count;++i){vec3 a=clipped[i],b=clipped[(i+1)%count];
+        float la=length(a),lb=length(b);if(la<1e-6||lb<1e-6)continue;
+        a/=la;b/=lb;vec3 crossAB=cross(a,b);float s=length(crossAB);
+        if(s>1e-6)integral+=crossAB.z*atan(s,clamp(dot(a,b),-1.0,1.0))/s;
+    }
+    return clamp(abs(integral)/(2.0*PI),0.0,1.0);
+}
+vec3 evalRectLightLtc(GpuRectLight rl,vec3 N,vec3 V,vec3 F0,vec3 albedo,float metallic,float roughness) {
+    float nv=max(dot(N,V),0.0);
+    if(roughness<0.18||nv<0.1)return evalRectLightQuadrature(rl,N,V,F0,albedo,metallic,roughness);
+    vec2 uv=vec2((roughness-0.18)/0.82,(1.0-nv)/0.9);
+    vec4 fit=ltcLookup(uv,false),amp=ltcLookup(uv,true);
+    if(fit.w>0.45)return evalRectLightQuadrature(rl,N,V,F0,albedo,metallic,roughness);
+    vec3 delta=rl.pos_range.xyz-v_world_pos;
+    float distance=length(delta),range=max(rl.pos_range.w,0.001);
+    if(dot(-delta,rl.dir_two.xyz)<=0.0&&rl.dir_two.w<0.5)return vec3(0);
+    float area=4.0*rl.right_hx.w*rl.up_hy.w;
+    if(area<=1e-5||distance<1e-4)return evalRectLightQuadrature(rl,N,V,F0,albedo,metallic,roughness);
+    vec3 T=V-N*nv;
+    if(dot(T,T)<1e-6)T=cross(abs(N.y)<0.99?vec3(0,1,0):vec3(1,0,0),N);
+    T=normalize(T);vec3 B=cross(N,T);mat3 basis=transpose(mat3(T,B,N));
+    vec3 right=rl.right_hx.xyz*rl.right_hx.w,up=rl.up_hy.xyz*rl.up_hy.w;
+    vec3 corners[4]=vec3[4](basis*(delta-right-up),basis*(delta+right-up),basis*(delta+right+up),basis*(delta-right+up));
+    mat3 invM=mat3(vec3(fit.x,0,0),vec3(0,fit.y,0),vec3(fit.z,0,1));
+    float diffuse=ltcPolygon(corners,mat3(1));float specular=ltcPolygon(corners,invM);
+    vec3 fresnel=F0+(1.0-F0)*pow(1.0-nv,5.0);
+    vec3 kd=(1.0-fresnel)*(1.0-metallic);
+    vec3 amplitude=F0*amp.x+(1.0-F0)*amp.y;
+    float nearDistance=max(distance-length(right)-length(up),0.0);
+    float r=clamp(nearDistance/range,0.0,1.0);float window=1.0-r*r*r*r;
+    // Keep the legacy finite-range and approximate photometric scale; no global SI migration here.
+    return (kd*albedo*diffuse+amplitude*specular)*rl.col_pad.rgb*(window*window/area);
+}
 vec3 evalRectLight(GpuRectLight rl, vec3 N, vec3 V, vec3 F0, vec3 albedo, float metallic, float roughness) {
+    if(layer_info.w>1.5)return evalRectLightLtc(rl,N,V,F0,albedo,metallic,roughness);
     if (layer_info.w > 0.5) return evalRectLightQuadrature(rl,N,V,F0,albedo,metallic,roughness);
     return evalRectLightLegacy(rl,N,V,F0,albedo,metallic,roughness);
 }
@@ -469,6 +538,11 @@ void main() {
         discard;
     }
 
+#ifdef ZENGY_SCREEN_TRANSPORT
+    out_surface=vec4(0,0,-1,0);
+    out_diffuse=vec4(0);
+    out_specular=vec4(0);
+#endif
     vec3 emissive_rgb = emissive_weight.rgb * texture(u_emissive_tex, v_uv).rgb;
     if (mat_flags.x > 0.5) {
         frag_color = vec4((albedo_a.rgb + emissive_rgb) * layer_info.z, albedo_a.a);
@@ -593,7 +667,21 @@ void main() {
                 float hemi = N.y * 0.5 + 0.5;
                 probe_irr += mix(pr.ground_pad.rgb, pr.sky_box.rgb, hemi) * (w * pr.ground_pad.w);
                 float r_hemi = R.y * 0.5 + 0.5;
-                probe_spec += mix(pr.ground_pad.rgb, pr.sky_box.rgb, r_hemi) * w;
+                vec3 local_spec=mix(pr.ground_pad.rgb,pr.sky_box.rgb,r_hemi);
+                if(pr.environment_info.x>0.5){
+                    vec3 local_R=R;
+                    if(pr.sky_box.w>0.5){
+                        vec3 relative=v_world_pos-pr.pos_int.xyz;
+                        vec3 side=mix(-pr.half_blend.xyz,pr.half_blend.xyz,greaterThanEqual(R,vec3(0)));
+                        vec3 t=vec3(1e20);
+                        for(int axis=0;axis<3;++axis)if(abs(R[axis])>1e-6)t[axis]=(side[axis]-relative[axis])/R[axis];
+                        float travel=max(min(min(t.x,t.y),t.z),0.0);
+                        vec3 corrected=relative+R*travel;
+                        if(dot(corrected,corrected)>1e-8)local_R=normalize(corrected);
+                    }
+                    local_spec=textureLod(u_probe_environment,equirectUv(local_R),roughness*pr.environment_info.y).rgb;
+                }
+                probe_spec += local_spec * w;
                 probe_w += w;
             }
         }
@@ -618,6 +706,15 @@ void main() {
     float diff_ao = mix(1.0, ao_tex_val, mat_params.w) * ssao;
     float spec_ao = clamp(pow(NdotV + diff_ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + diff_ao, 0.0, 1.0);
     vec3 ambient = kD_env * diffuse_ibl * diff_ao + specular_ibl * spec_ao;
+#ifdef ZENGY_SCREEN_TRANSPORT
+    // A transparent draw invalidates the underlying opaque metadata; no screen-space
+    // lighting replacement is performed on an already blended HDR pixel.
+    if(sh_coeffs[5].w < 0.5 && !any(isnan(N)) && !any(isinf(N)) && dot(N,N)>1e-6 && !any(isnan(albedo_a.rgb)) && !any(isinf(albedo_a.rgb))) {
+        out_surface=vec4(encodeNormal(N),packRgb(vec3(roughness,metallic,mat_params.z)),packRgb(albedo_a.rgb));
+        out_diffuse=vec4(kD_env*diffuse_ibl*diff_ao*layer_info.z,diff_ao);
+        out_specular=vec4(specular_ibl*spec_ao*layer_info.z,spec_ao);
+    }
+#endif
     vec3 color = ambient + Lo + emissive_rgb;
 
     // With ray-marched volumetric fog on, the composite pass applies transmittance and in-scatter

@@ -89,7 +89,9 @@ const JsonScene = struct {
     point_lights: []const JsonPointLight = &.{},
 };
 
+const CpuShape = struct { vertices: []const shapes.Vertex3D, indices: []const u32 };
 const ShapeAssets = struct {
+    cpu: [7]CpuShape,
     plane: u64,
     cuboid: u64,
     sphere: u64,
@@ -98,6 +100,10 @@ const ShapeAssets = struct {
     torus: u64,
     cone: u64,
 
+    fn cpuForMesh(self: ShapeAssets, mesh: u64) ?CpuShape {
+        for ([_]u64{self.plane,self.cuboid,self.sphere,self.capsule,self.cylinder,self.torus,self.cone},self.cpu) |id, data| if (id==mesh) return data;
+        return null;
+    }
     fn meshForName(self: ShapeAssets, name: []const u8) u64 {
         if (std.mem.eql(u8, name, "plane")) return self.plane;
         if (std.mem.eql(u8, name, "cuboid")) return self.cuboid;
@@ -244,9 +250,19 @@ const PrismShowcaseState = struct {
     gi_stats: helios.gi_solver.GiSolveStats = .{},
     gi_dirty: bool = true,
     dynamic_gi_enabled: bool = false,
+    gpu_gi_enabled:bool=false,
+    gpu_nodes:std.ArrayList(render_3d.pbr.GpuGiNode)=.empty,
+    gpu_triangles:std.ArrayList(render_3d.pbr.GpuGiTriangle)=.empty,
+    gpu_materials:std.ArrayList(render_3d.pbr.GpuGiMaterial)=.empty,
+    gpu_geometry_revision:?u64=null,
+    gpu_grid_epoch:u64=0,
+    gpu_last_sky:?u8=null,
     advanced_lighting_enabled: bool = false,
+    screen_mode: []const u8 = "0",
+    froxel_enabled: bool = false,
     dynamic_grid: helios.dynamic_gi.Grid = .{},
     dynamic_revision: u64 = 0,
+    dynamic_scene: ?usize = null,
     dynamic_sky_preset: ?u8 = null,
     dynamic_cursor: usize = 0,
     gi_geometry_dirty: bool = false,
@@ -280,6 +296,9 @@ const PrismShowcaseState = struct {
         self.spawned.deinit(self.app.allocator);
         self.gi_vol.deinit();
         self.gi_materials.deinit(self.app.allocator);
+        self.gpu_nodes.deinit(self.app.allocator);
+        self.gpu_triangles.deinit(self.app.allocator);
+        self.gpu_materials.deinit(self.app.allocator);
         self.gi_emitters.deinit(self.app.allocator);
         self.gi_vpls.deinit(self.app.allocator);
         self.gi_vpl_slots.deinit(self.app.allocator);
@@ -296,11 +315,9 @@ fn rebuildGiBvhFromEntities(st: *PrismShowcaseState) !void {
     const n = @min(st.spawned_obj_count, st.spawned.items.len);
     for (0..n) |oi| {
         const tf = st.app.world.get(st.spawned.items[oi], render_3d.Transform3D) orelse continue;
-        const half_ext = if (oi == 0)
-            [3]f32{ tf.scale[0] * 0.5, 0.05, tf.scale[2] * 0.5 }
-        else
-            [3]f32{ tf.scale[0] * 0.5, tf.scale[1] * 0.5, tf.scale[2] * 0.5 };
-        try helios.gi_solver.appendBoxTriangles(allocator, &gi_tris, tf.position, half_ext, @intCast(oi));
+        const mr=st.app.world.getConst(st.spawned.items[oi],render_3d.MeshRef) orelse continue;
+        const mesh=st.assets.cpuForMesh(mr.mesh_asset) orelse continue;
+        try appendMeshTriangles(allocator,&gi_tris,mesh,tf.toModelMatrix().m,@intCast(oi));
     }
     const gi_service = st.app.resources.get(helios.HeliosService) orelse return error.MissingHeliosService;
     try gi_service.runtime.replaceGeometry(gi_tris.items, st.gi_materials.items);
@@ -391,13 +408,18 @@ fn updateDynamicGi(st: *PrismShowcaseState) !void {
     const service = st.app.resources.get(helios.HeliosService) orelse return;
     const target = st.app.resources.get(render_3d.pbr.DynamicGiGrid) orelse return;
     if (service.settings.tier == .off) {
+        if(st.app.resources.get(render_3d.pbr.GpuGiInput)) |input| input.enabled=false;
+        st.gpu_last_sky=null;
         target.origin_enabled[3] = 0;
         st.dynamic_grid.origin_enabled[3] = 0;
         return;
     }
     // Do not spend the ray budget on a stale geometry snapshot while a drag is pending.
-    if (st.gi_geometry_dirty) return;
-    if (st.dynamic_revision != service.runtime.geometry_revision or st.dynamic_sky_preset == null or st.dynamic_sky_preset.? != st.sky_preset or st.dynamic_grid.origin_enabled[3] == 0) {
+    if (st.gi_geometry_dirty) {
+        if(st.app.resources.get(render_3d.pbr.GpuGiInput)) |input| input.enabled=false;
+        return;
+    }
+    if (st.dynamic_scene == null or st.dynamic_scene.? != st.scene_index or st.dynamic_sky_preset == null or st.dynamic_sky_preset.? != st.sky_preset or st.dynamic_grid.origin_enabled[3] == 0) {
         st.dynamic_grid = .{};
         if (st.scene_index == 5) {
             st.dynamic_grid.origin_enabled = .{ -2.86, 0.13, -4.86, 1 };
@@ -407,8 +429,19 @@ fn updateDynamicGi(st: *PrismShowcaseState) !void {
             st.dynamic_grid.spacing = .{ 5.3333, 1.8, 5.3333, 0 };
         }
         st.dynamic_revision = service.runtime.geometry_revision;
+        st.dynamic_scene=st.scene_index;
         st.dynamic_sky_preset = st.sky_preset;
         st.dynamic_cursor = 0;
+    }
+    const changed_geometry=st.dynamic_revision!=service.runtime.geometry_revision;
+    if(changed_geometry){
+        st.dynamic_revision=service.runtime.geometry_revision;
+        // Start with the probe nearest the edited object. Preserve unaffected history.
+        if(st.selected_obj<st.spawned_obj_count and st.selected_obj<st.spawned.items.len){
+            if(st.app.world.getConst(st.spawned.items[st.selected_obj],render_3d.Transform3D)) |tf| {
+                st.dynamic_cursor=helios.dynamic_gi.invalidateNear(&st.dynamic_grid,tf.position,@max(@abs(tf.scale[0]),@max(@abs(tf.scale[1]),@abs(tf.scale[2])))+2.0);
+            }
+        }
     }
     var sun: ?helios.gi_solver.DirectSunEmitter = null;
     if (st.app.world.getConst(st.sun_entity, render_3d.pbr.DirectionalLight)) |light| {
@@ -417,6 +450,7 @@ fn updateDynamicGi(st: *PrismShowcaseState) !void {
     var settings = helios.dynamic_gi.Settings{
         .probes_per_frame = switch (service.settings.tier) { .off => 0, .low => 1, .medium => 2, .high => 4 },
         .rays_per_probe = switch (service.settings.tier) { .off, .low => 24, .medium => 48, .high => 64 },
+        .max_ray_queries=switch(service.settings.tier){.off=>0,.low=>384,.medium=>768,.high=>1536},
         .hysteresis = if (st.gi_move_age < GI_SETTLE_SECONDS) 0.35 else 0.85,
     };
     if (st.app.resources.getConst(render_3d.pbr.SkyEnvironment)) |sky| {
@@ -426,6 +460,11 @@ fn updateDynamicGi(st: *PrismShowcaseState) !void {
             settings.sky_gradient = .{ .zenith = sky.sky_tint, .horizon = sky.horizon_tint, .ground = sky.ground_albedo };
         }
     }
+    if(st.gpu_gi_enabled){
+        try publishGpuGi(st,service,target,&settings);
+        return;
+    }
+    try refreshGiEmitters(st);
     _ = helios.dynamic_gi.update(&st.dynamic_grid, &service.runtime.bvh, service.runtime.materials.items, st.gi_emitters.items, sun, settings, &st.dynamic_cursor, service.frame_index);
     target.origin_enabled = st.dynamic_grid.origin_enabled;
     target.spacing = st.dynamic_grid.spacing;
@@ -481,6 +520,7 @@ fn rebuildHeliosGi(st: *PrismShowcaseState) !void {
         }
     }
 
+    try refreshGiEmitters(st);
     st.gi_stats = try hsvc.runtime.solve(st.gi_emitters.items, sun_opt, cfg);
     const result = hsvc.runtime.result();
     try st.gi_vpls.ensureTotalCapacity(allocator, result.len);
@@ -548,7 +588,12 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
     const mats = st.app.resources.get(render_3d.pbr.MaterialRegistry).?;
 
     // Despawn previous scene entities.
-    for (st.spawned.items) |e| _ = st.app.world.despawn(e) catch false;
+    for (st.spawned.items) |e| {
+        if (st.app.world.getConst(e,render_3d.MeshRef)) |mr| {
+            if (mr.material_handle) |handle| _=mats.remove(handle);
+        }
+        _=st.app.world.despawn(e) catch false;
+    }
     st.spawned.clearRetainingCapacity();
 
     const parsed = try std.json.parseFromSlice(JsonScene, allocator, SCENE_FILES[idx], .{ .ignore_unknown_fields = true });
@@ -556,6 +601,8 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
     const sc = parsed.value;
 
     st.scene_index = idx;
+    st.dynamic_scene=null;
+    if(st.app.resources.get(render_3d.pbr.DynamicGiGrid)) |grid| grid.origin_enabled[3]=0;
     const nlen = @min(sc.name.len, st.scene_name.len);
     @memcpy(st.scene_name[0..nlen], sc.name[0..nlen]);
     st.scene_name_len = nlen;
@@ -595,7 +642,9 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         fg.density = sc.fog_density;
         fg.color = .{ sc.horizon_tint[0] * 0.65, sc.horizon_tint[1] * 0.65, sc.horizon_tint[2] * 0.65 };
         fg.volumetric.enabled = sc.volumetric_enabled;
-        fg.volumetric.physical_scattering = st.advanced_lighting_enabled;
+        fg.volumetric.physical_scattering = st.advanced_lighting_enabled or st.froxel_enabled;
+        fg.volumetric.froxel_enabled=st.froxel_enabled;
+        if(st.froxel_enabled) fg.volumetric.half_resolution=true;
     }
     if (st.app.world.get(st.cam_entity, render_3d.pbr.PostProcessSettings)) |pp| {
         pp.ssao.enabled = sc.ssao_enabled;
@@ -603,7 +652,10 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
         pp.auto_exposure.history_epoch +%= 1;
         pp.bloom.enabled = sc.bloom_enabled;
         pp.quality.area_light_quadrature = st.advanced_lighting_enabled;
+        pp.quality.ltc_area_lights = st.advanced_lighting_enabled;
         pp.quality.specular_aa = st.advanced_lighting_enabled;
+        const screen_enabled=std.mem.eql(u8, st.screen_mode, "1");
+        pp.quality.screen_transport=.{.ssr_strength=if(screen_enabled) 0.8 else 0,.ssgi_strength=if(screen_enabled) 0.35 else 0};
         pp.auto_exposure.physical.local_exposure_strength = if (st.advanced_lighting_enabled) 0.35 else 0.0;
     }
     if (st.app.world.get(st.sun_entity, render_3d.pbr.DirectionalLight)) |sun| {
@@ -650,11 +702,9 @@ fn loadJsonScene(st: *PrismShowcaseState, idx: usize) !void {
             .roughness = obj.roughness,
             .metallic = obj.metallic,
         });
-        const half_ext = if (std.mem.eql(u8, obj.shape, "plane"))
-            [3]f32{ obj.scale[0] * 0.5, 0.05, obj.scale[2] * 0.5 }
-        else
-            [3]f32{ obj.scale[0] * 0.5, obj.scale[1] * 0.5, obj.scale[2] * 0.5 };
-        try helios.gi_solver.appendBoxTriangles(allocator, &gi_tris, obj.pos, half_ext, @intCast(oi));
+        const mesh=st.assets.cpuForMesh(st.assets.meshForName(obj.shape)) orelse return error.MissingCpuMesh;
+        const tf=render_3d.Transform3D{.position=obj.pos,.scale=obj.scale};
+        try appendMeshTriangles(allocator,&gi_tris,mesh,tf.toModelMatrix().m,@intCast(oi));
     }
     const gi_service = st.app.resources.get(helios.HeliosService) orelse return error.MissingHeliosService;
     try gi_service.runtime.replaceGeometry(gi_tris.items, st.gi_materials.items);
@@ -1433,6 +1483,15 @@ pub fn main(init: std.process.Init) !void {
     defer m_cone.deinit();
 
     const assets = ShapeAssets{
+        .cpu=.{
+            .{.vertices=m_plane.vertices,.indices=m_plane.indices},
+            .{.vertices=m_cuboid.vertices,.indices=m_cuboid.indices},
+            .{.vertices=m_sphere.vertices,.indices=m_sphere.indices},
+            .{.vertices=m_capsule.vertices,.indices=m_capsule.indices},
+            .{.vertices=m_cyl.vertices,.indices=m_cyl.indices},
+            .{.vertices=m_torus.vertices,.indices=m_torus.indices},
+            .{.vertices=m_cone.vertices,.indices=m_cone.indices},
+        },
         .plane = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_plane.vertices), m_plane.indices)),
         .cuboid = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_cuboid.vertices), m_cuboid.indices)),
         .sphere = @bitCast(try graphics_sdlgpu.createMesh3D(&app, std.mem.sliceAsBytes(m_sphere.vertices), m_sphere.indices)),
@@ -1503,9 +1562,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try app.resources.insert(render_3d.pbr.DynamicGiGrid, .{});
+    try app.resources.insert(render_3d.pbr.GpuGiInput,.{});
     try app.resources.insert(PrismShowcaseState, .{
-        .dynamic_gi_enabled = std.mem.eql(u8, init.environ_map.get("ZENGY_DYNAMIC_GI") orelse "0", "1"),
+        .dynamic_gi_enabled = std.mem.eql(u8, init.environ_map.get("ZENGY_DYNAMIC_GI") orelse "0", "1") or std.mem.eql(u8,init.environ_map.get("ZENGY_GPU_GI") orelse "0","1"),
+        .gpu_gi_enabled=std.mem.eql(u8,init.environ_map.get("ZENGY_GPU_GI") orelse "0","1"),
         .advanced_lighting_enabled = std.mem.eql(u8, init.environ_map.get("ZENGY_ADVANCED_LIGHTING") orelse "0", "1"),
+        .screen_mode=init.environ_map.get("ZENGY_SCREEN_TRANSPORT") orelse "0",
+        .froxel_enabled=std.mem.eql(u8,init.environ_map.get("ZENGY_FROXEL") orelse "0","1"),
         .app = &app,
         .gfx = gfx,
         .rt = rt,
@@ -1520,4 +1583,52 @@ pub fn main(init: std.process.Init) !void {
 
     try loadJsonScene(app.resources.get(PrismShowcaseState).?, 0);
     try window_sdl3.runVisualLoop(&app);
+}
+
+
+fn meshPoint(v: shapes.Vertex3D,m: [16]f32) [3]f32 {
+    return .{m[0]*v.x+m[4]*v.y+m[8]*v.z+m[12],m[1]*v.x+m[5]*v.y+m[9]*v.z+m[13],m[2]*v.x+m[6]*v.y+m[10]*v.z+m[14]};
+}
+fn appendMeshTriangles(allocator: std.mem.Allocator, out: *std.ArrayList(helios.ray_query.BvhTriangle), mesh: CpuShape, model: [16]f32, instance: u32) !void {
+    if (mesh.indices.len%3!=0) return error.InvalidMeshIndices;
+    try out.ensureUnusedCapacity(allocator,mesh.indices.len/3);
+    const determinant=model[0]*(model[5]*model[10]-model[9]*model[6])-model[4]*(model[1]*model[10]-model[9]*model[2])+model[8]*(model[1]*model[6]-model[5]*model[2]);
+    var i:usize=0;
+    while(i<mesh.indices.len):(i+=3){
+        const a=mesh.indices[i];const b=mesh.indices[i+1];const c_index=mesh.indices[i+2];
+        if(a>=mesh.vertices.len or b>=mesh.vertices.len or c_index>=mesh.vertices.len)return error.InvalidMeshIndices;
+        out.appendAssumeCapacity(.{.v0=meshPoint(mesh.vertices[a],model),.v1=meshPoint(mesh.vertices[if(determinant<0)c_index else b],model),.v2=meshPoint(mesh.vertices[if(determinant<0)b else c_index],model),.instance_id=instance,.primitive_id=@intCast(i/3)});
+    }
+}
+
+fn refreshGiEmitters(st: *PrismShowcaseState) !void {
+    st.gi_emitters.clearRetainingCapacity();
+    for(st.spawned.items[@min(st.spawned_obj_count,st.spawned.items.len)..]) |entity| {
+        const light=st.app.world.getConst(entity,render_3d.pbr.PointLight) orelse continue;
+        const tf=st.app.world.getConst(entity,render_3d.Transform3D) orelse continue;
+        try st.gi_emitters.append(st.app.allocator,.{.position=tf.position,.color=light.color,.lumens=light.intensity_lumens,.range=light.range});
+    }
+}
+
+fn publishGpuGi(st:*PrismShowcaseState,service:*helios.HeliosService,target:*render_3d.pbr.DynamicGiGrid,settings:*const helios.dynamic_gi.Settings) !void {
+    const input=st.app.resources.get(render_3d.pbr.GpuGiInput) orelse return error.MissingGpuGiInput;
+    const allocator=st.app.allocator;
+    const revision=service.runtime.geometry_revision;
+    if(st.gpu_geometry_revision==null or st.gpu_geometry_revision.?!=revision){
+        // Reallocation invalidates previously borrowed slices, even on a later failure.
+        input.*=.{};
+        // Reserve every array before publishing any borrowed slice.
+        try st.gpu_nodes.ensureTotalCapacity(allocator,service.runtime.bvh.nodes.items.len);
+        try st.gpu_triangles.ensureTotalCapacity(allocator,service.runtime.bvh.triangles.items.len);
+        try st.gpu_materials.ensureTotalCapacity(allocator,service.runtime.materials.items.len);
+        st.gpu_nodes.clearRetainingCapacity();st.gpu_triangles.clearRetainingCapacity();st.gpu_materials.clearRetainingCapacity();
+        for(service.runtime.bvh.nodes.items) |node| st.gpu_nodes.appendAssumeCapacity(.{.aabb_min=node.aabb_min,.left_or_first=node.left_or_first,.aabb_max=node.aabb_max,.prim_count=node.prim_count});
+        for(service.runtime.bvh.triangles.items) |tri| st.gpu_triangles.appendAssumeCapacity(.{.v0=tri.v0,.material=tri.instance_id,.v1=tri.v1,.mask=tri.mask,.v2=tri.v2});
+        for(service.runtime.materials.items) |mat| st.gpu_materials.appendAssumeCapacity(.{.albedo_metal=.{mat.albedo[0],mat.albedo[1],mat.albedo[2],mat.metallic},.emissive_rough=.{mat.emissive[0],mat.emissive[1],mat.emissive[2],mat.roughness}});
+        st.gpu_geometry_revision=revision;st.gpu_grid_epoch+%=1;
+    }
+    if(st.gpu_last_sky==null or st.gpu_last_sky.?!=st.sky_preset){st.gpu_last_sky=st.sky_preset;st.gpu_grid_epoch+%=1;}
+    // Reset the CPU seed only; the backend keeps the updated probes on GPU between frames.
+    target.origin_enabled=st.dynamic_grid.origin_enabled;target.spacing=st.dynamic_grid.spacing;
+    input.*=.{.enabled=true,.geometry_revision=revision,.grid_epoch=st.gpu_grid_epoch,.nodes=st.gpu_nodes.items,.triangles=st.gpu_triangles.items,.materials=st.gpu_materials.items,.rays_per_probe=settings.rays_per_probe,.probes_per_frame=settings.probes_per_frame};
 }

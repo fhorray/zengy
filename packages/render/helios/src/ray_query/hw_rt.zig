@@ -111,12 +111,14 @@ pub const BlasCache = struct {
         if (!backend.capabilities.supports_acceleration_structure) {
             return error.UnsupportedHardwareRayTracing;
         }
-        if (self.entries.get(mesh_id)) |existing| {
-            if (existing.revision == revision) return existing.handle;
-            backend.destroy_blas(backend.ctx, existing.handle);
-        }
+        const existing = self.entries.get(mesh_id);
+        if (existing) |entry| if (entry.revision == revision) return entry.handle;
+        try self.entries.ensureUnusedCapacity(self.allocator,1);
         const handle = try backend.build_blas(backend.ctx, mesh_id, vertex_bytes, index_bytes);
-        try self.entries.put(self.allocator, mesh_id, .{ .handle = handle, .revision = revision });
+        if (handle.index == BlasHandle.invalid.index) return error.InvalidBlasHandle;
+        self.entries.putAssumeCapacity(mesh_id, .{ .handle = handle, .revision = revision });
+        // A native provider must defer destruction until in-flight TLAS references retire.
+        if (existing) |entry| backend.destroy_blas(backend.ctx, entry.handle);
         return handle;
     }
 

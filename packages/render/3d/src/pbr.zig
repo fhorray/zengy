@@ -271,6 +271,9 @@ pub const VolumetricFogConfig = struct {
     max_distance: f32 = 80.0,
     /// Ray-march budget per pixel, clamped to 8..128 by the backend.
     raymarch_steps: u32 = 64,
+    froxel_enabled: bool = false,
+    froxel_pixel_size: u32 = 12,
+    froxel_slices: u32 = 32,
     /// Treat scattering as a single-scattering albedo fraction of extinction.
     physical_scattering: bool = false,
     /// Ray-march at half resolution and upsample depth-aware (about 4x fewer marched pixels).
@@ -414,6 +417,8 @@ pub const ContactShadowSettings = struct {
 
 /// Local box-projected reflection & irradiance probe component.
 pub const ReflectionProbe = struct {
+    environment_texture: u64 = 0,
+    environment_mips: u32 = 1,
     half_extents: [3]f32 = .{ 6.0, 4.0, 6.0 },
     blend_distance: f32 = 1.5,
     intensity: f32 = 1.0,
@@ -427,6 +432,8 @@ pub const ReflectionProbe = struct {
 
 /// Extracted reflection probe snapshot for backend submission.
 pub const ExtractedReflectionProbe = struct {
+    environment_texture: u64 = 0,
+    environment_mips: u32 = 1,
     position: [3]f32,
     half_extents: [3]f32,
     blend_distance: f32,
@@ -475,9 +482,20 @@ pub const ShadowQuality = struct {
 };
 
 /// Quality and cost switches that do not change what the scene means, only how the backend renders it.
+pub const ScreenTransportSettings = struct {
+    ssr_strength: f32 = 0.0,
+    ssgi_strength: f32 = 0.0,
+    max_distance: f32 = 20.0,
+    thickness: f32 = 0.15,
+    max_iterations: u32 = 48,
+    diffuse_rays: u32 = 1,
+};
+
 pub const RenderQuality = struct {
+    screen_transport: ScreenTransportSettings = .{},
     /// Four finite emitter samples instead of the legacy closest-point approximation.
     area_light_quadrature: bool = false,
+    ltc_area_lights: bool = false,
     specular_aa: bool = false,
     /// Reuse the depth prepass (written for SSAO and contact shadows) as the depth buffer of the lit pass, so
     /// opaque fragments are shaded once. Only takes effect while the prepass runs. Off by default until the
@@ -579,7 +597,23 @@ comptime {
     if (@sizeOf(DynamicGiProbe) != 208 or @sizeOf(DynamicGiGrid) != 13344) @compileError("Dynamic GI GPU layout mismatch");
 }
 
+pub const GpuGiNode=extern struct {aabb_min:[3]f32,left_or_first:u32,aabb_max:[3]f32,prim_count:u32};
+pub const GpuGiTriangle=extern struct {v0:[3]f32,material:u32,v1:[3]f32,mask:u32,v2:[3]f32,pad:u32=0};
+pub const GpuGiMaterial=extern struct {albedo_metal:[4]f32,emissive_rough:[4]f32};
+comptime {if(@sizeOf(GpuGiNode)!=32 or @sizeOf(GpuGiTriangle)!=48 or @sizeOf(GpuGiMaterial)!=32)@compileError("GPU GI geometry ABI mismatch");}
+/// Borrowed read-only geometry snapshot. Producer must retain slices through render recording.
+pub const GpuGiInput=struct {
+    enabled:bool=false,
+    geometry_revision:u64=0,
+    grid_epoch:u64=0,
+    nodes:[]const GpuGiNode=&.{},
+    triangles:[]const GpuGiTriangle=&.{},
+    materials:[]const GpuGiMaterial=&.{},
+    rays_per_probe:u32=32,
+    probes_per_frame:u32=2,
+};
 pub const ExtractedPbrFrame = struct {
+    gpu_gi:GpuGiInput=.{},
     dynamic_gi: DynamicGiGrid = .{},
     camera_key: u64 = 0,
     camera_position: [3]f32 = .{ 0, 0, 0 },

@@ -25,6 +25,7 @@ pub const SkyGradient = struct { zenith: [3]f32, horizon: [3]f32, ground: [3]f32
 pub const Settings = struct {
     rays_per_probe: u32 = 48,
     probes_per_frame: u32 = 4,
+    max_ray_queries:u32=0, // zero preserves the original caller-controlled budget
     max_distance: f32 = 16,
     hysteresis: f32 = 0.85,
     sky_radiance: [3]f32 = .{ 0.04, 0.06, 0.09 },
@@ -134,6 +135,7 @@ fn hitRadiance(grid: *const Grid, bvh: *const bvh_mod.Bvh, materials: []const ma
     for (emitters) |em| {
         const delta = @as(Vec, .{ em.position[0], em.position[1], em.position[2] }) - biased;
         const dist2 = dot(delta, delta);
+        if(!std.math.isFinite(dist2) or !std.math.isFinite(em.lumens) or !std.math.isFinite(em.range) or em.lumens<=0 or em.range<=0) continue;
         const dist = @sqrt(dist2);
         if (dist < 0.05 or dist >= em.range) continue;
         const l = delta / splat(dist);
@@ -195,11 +197,19 @@ pub fn update(grid: *Grid, bvh: *const bvh_mod.Bvh, materials: []const material.
     if (grid.origin_enabled[3] <= 0 or settings.probes_per_frame == 0 or settings.rays_per_probe == 0) return stats;
     for (grid.origin_enabled[0..3]) |v| if (!std.math.isFinite(v)) return stats;
     for (grid.spacing[0..3]) |v| if (!std.math.isFinite(v) or v <= 0.01) return stats;
-    const snapshot = grid.*;
-    const count = std.math.clamp(settings.rays_per_probe, 12, 128);
+    const snapshot = grid.*; // Immutable feedback snapshot for this bounded batch.
+    const configured_count = std.math.clamp(settings.rays_per_probe, 12, 128);
     const max_dist = if (std.math.isFinite(settings.max_distance)) std.math.clamp(settings.max_distance, 0.1, 100) else 16;
     const rotation = @as(f32, @floatFromInt(epoch % 1024)) * 2.39996323;
     for (0..@min(settings.probes_per_frame, probe_count)) |_| {
+        var count=configured_count;
+        if(settings.max_ray_queries>0){
+            const remaining=@as(u64,settings.max_ray_queries)-|stats.rays_cast;
+            const worst_per_ray=1+@min(emitters.len,8)+@as(usize,if(sun!=null) 1 else 0);
+            const affordable=(remaining-|6)/@as(u64,worst_per_ray);
+            if(affordable<12)break;
+            count=@min(count,@as(u32,@intCast(@min(affordable,128))));
+        }
         const index = cursor.* % probe_count;
         cursor.* = (index + 1) % probe_count;
         const previous = &snapshot.probes[index];
@@ -262,4 +272,19 @@ pub fn update(grid: *Grid, bvh: *const bvh_mod.Bvh, materials: []const material.
         grid.probes[index] = probe;
     }
     return stats;
+}
+
+
+/// Mark nearby probes dirty while retaining the rest of the grid. Returns the closest index.
+pub fn invalidateNear(grid:*Grid,center:[3]f32,radius:f32) usize {
+    const p:Vec=center;
+    var best:usize=0;
+    var best_distance:f32=std.math.inf(f32);
+    for(&grid.probes,0..) |*probe,i| {
+        const d=p-position(grid,i);
+        const distance=dot(d,d);
+        if(distance<best_distance){best=i;best_distance=distance;}
+        if(distance<=radius*radius)probe.offset_validity[3]=0;
+    }
+    return best;
 }

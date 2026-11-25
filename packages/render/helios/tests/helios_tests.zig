@@ -469,3 +469,34 @@ test "reservoir rejects invalid updates and retains valid zero samples" {
     reservoir.finalize();
     try testing.expectEqual(@as(f32, 1), reservoir.unbiased_weight);
 }
+
+
+test "dynamic GI invalidation preserves distant probe history" {
+    var grid=helios.dynamic_gi.Grid{};
+    grid.origin_enabled[3]=1;
+    for(&grid.probes) |*probe| probe.offset_validity[3]=1;
+    const nearest=helios.dynamic_gi.invalidateNear(&grid,.{0,0,0},0.5);
+    try testing.expectEqual(@as(usize,0),nearest);
+    try testing.expectEqual(@as(f32,0),grid.probes[0].offset_validity[3]);
+    try testing.expectEqual(@as(f32,1),grid.probes[63].offset_validity[3]);
+}
+
+test "BVH rejects non-finite public rays" {
+    var bvh=helios.ray_query.Bvh.init(testing.allocator);
+    defer bvh.deinit();
+    const t=helios.ray_query.BvhTriangle{.v0=.{0,0,-1},.v1=.{1,0,-1},.v2=.{0,1,-1}};
+    try bvh.build(&.{t});
+    const ray=helios.ray_query.Ray{.origin=.{std.math.nan(f32),0,0},.direction=.{0,0,-1}};
+    try testing.expect(!bvh.traceClosest(ray,null).hit);
+    try testing.expect(!bvh.traceAnyHit(ray,null));
+}
+
+
+test "dynamic GI hard ray budget includes relocation and visibility" {
+    var bvh=helios.ray_query.Bvh.init(testing.allocator);defer bvh.deinit();
+    var grid=helios.dynamic_gi.Grid{};grid.origin_enabled[3]=1;
+    var cursor:usize=0;
+    const stats=helios.dynamic_gi.update(&grid,&bvh,&.{},&.{},null,.{.probes_per_frame=64,.rays_per_probe=64,.max_ray_queries=100},&cursor,0);
+    try testing.expect(stats.rays_cast<=100);
+    try testing.expect(cursor>0);
+}

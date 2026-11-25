@@ -933,6 +933,12 @@ fn onPresent(raw_ctx: *anyopaque, handle: graphics.RenderTargetHandle, commands:
         return sdlFail(state.diagnostics, "SDL_AcquireGPUCommandBuffer failed");
     };
     var cmd_submitted = false;
+    errdefer {
+        state.pbr.gpu_gi_state.valid=false;
+        state.pbr.gpu_gi_state.geometry_revision=null;
+        state.pbr.exposure_history_valid=false;
+        state.pbr.vol_history_valid=false;
+    }
     errdefer if (!cmd_submitted) {
         _ = c.SDL_SubmitGPUCommandBuffer(cmd_buf);
     };
