@@ -1,6 +1,6 @@
 //! Editor shell tests (`apps/editor/tests/shell_tests.zig`).
 //!
-//! Validates Phase 12 `official.tools.editor_shell`: default panel registration,
+//! Validates Phase 12 `app.editor.shell`: default panel registration,
 //! schema-driven field inspection via `TypeRegistry`, and undo/redo transactions.
 
 const std = @import("std");

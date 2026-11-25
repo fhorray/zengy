@@ -1,4 +1,4 @@
-//! Editor shell (`official.tools.editor_shell`), owned by the editor application (`apps/editor`).
+//! Editor shell (`app.editor.shell`), owned by the editor application (`apps/editor`).
 //!
 //! Demonstrates Phase 12: editor tooling (panel registry, undo/redo command
 //! history, and schema-driven component inspector) built strictly as an optional
@@ -148,9 +148,9 @@ fn buildModule(raw_app: *anyopaque) !void {
     try svc.registerPanel(.{ .id = "editor.remote", .title = "Remote Inspector" });
 
     try app.services.register(.{
-        .capability = "engine.tools.editor_shell",
+        .capability = "editor.shell",
         .major_version = 1,
-        .provider_id = "official.tools.editor_shell",
+        .provider_id = "app.editor.shell",
         .owner_id = MODULE_OWNER_ID,
         .exclusive = true,
         .api_ptr = svc,
@@ -167,9 +167,9 @@ fn stopModule(raw_app: *anyopaque) void {
 pub fn module() engine.Module {
     return .{
         .descriptor = .{
-            .id = "official.tools.editor_shell",
+            .id = "app.editor.shell",
             .version = "0.1.0",
-            .provides_capabilities = &.{"engine.tools.editor_shell/1"},
+            .provides_capabilities = &.{"editor.shell/1"},
             .required_capabilities = &.{"engine.ui.tree/1"},
         },
         .build = buildModule,

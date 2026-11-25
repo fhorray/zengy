@@ -5,7 +5,7 @@
 //! - Global minimum level (`LogConfig.level`) and per-subsystem filter strings
 //!   (e.g. `"sdlgpu=warn,picking=debug,info"`).
 //! - Pluggable `LogSinkVTable` outputs (built-in ANSI console sink, custom UI/file
-//!   sinks, and an in-memory ring buffer for `editor-shell` and `remote`).
+//!   sinks, and an in-memory ring buffer for editor tooling and `remote`).
 //! - Automatic mirroring of `app.diagnostics` records during `.post_update` and an
 //!   optional `stdLogBridge` for `std.Options.logFn`.
 

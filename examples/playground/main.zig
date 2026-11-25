@@ -6,7 +6,7 @@
 //! - `official.script.host` (runtime bridge + isolated event posting)
 //! - `official.assets` (importer priority + caching)
 //! - `official.scene` (2D transform hierarchy + snapshot)
-//! - `official.tools.editor_shell` (panel registry + schema inspector + undo/redo)
+//! - `app.editor.shell` (panel registry + schema inspector + undo/redo)
 //! - `official.render.3d` (3D camera + mesh extraction)
 //! - Dynamic C11 plugin (`zig-out/lib/libc_plugin.so`) via `PluginHost`
 //!

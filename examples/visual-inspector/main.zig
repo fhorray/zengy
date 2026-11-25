@@ -1,7 +1,7 @@
 //! Visual Shapes, Picking, Profiler & Remote Inspector Showcase (`examples/visual-inspector/main.zig`).
 //!
 //! Combines `official.shapes`, `official.picking`, `official.gizmos`,
-//! `official.dev_tools`, `official.tools.editor_shell`, and `official.remote`:
+//! `official.dev_tools`, `app.editor.shell`, and `official.remote`:
 //! - Procedural PBR shapes (`Plane`, `Cuboid`, `Sphere`, `Capsule`, `Cylinder`, `Torus`, `Cone`)
 //! - 3D raycast picking + `InputFocus` selection + `GizmoService` highlight
 //! - Live per-pass profiler HUD (`Shadow`, `SSAO`, `Forward+`, `Volumetric`, `Bloom`, `PostFX`)

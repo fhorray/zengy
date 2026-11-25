@@ -21,7 +21,7 @@ Dependency direction: core imports nothing above it; packages may import core an
 
 Concrete changes:
 - `tools/runtime` moved to `apps/runtime/src`; the `zengy-runtime` binary name and launch contract are unchanged.
-- `packages/editor-shell` moved to `apps/editor` (`src/shell.zig`). It is an application-local build module, no longer a public SDK module or CLI package. Module ID `official.tools.editor_shell`, capability `engine.tools.editor_shell/1` and owner ID are unchanged.
+- `packages/editor-shell` moved to `apps/editor` (`src/shell.zig`). It is an application-local build module, no longer a public SDK module or CLI package. Module ID `app.editor.shell` and capability `editor.shell/1` use the application namespace instead of `official.*`/`engine.*`.
 - `remote` defines a small optional `RemoteIntegration` (edit hook and panel visitor). `apps/editor/src/remote_adapter.zig` implements it on top of the shell; compositions call `remote_adapter.attach(&app)` after `app.initialize()`.
 
 ## Alternatives considered
