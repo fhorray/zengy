@@ -1,6 +1,12 @@
 //! Real-window test: opens an SDL window, runs the full provider + Render2D stack through
 //! `GraphicsDeviceService.present`, and verifies the pixels of the actual swapchain frame.
 //! Skipped (not failed) when no window or adapter can be created, for example on a headless CI runner.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn requireGpu() bool {
+    const value = getenv("ZENGY_REQUIRE_GPU") orelse return false;
+    return value[0] == '1' and value[1] == 0;
+}
+
 const std = @import("std");
 const engine = @import("engine");
 const graphics = @import("graphics");
@@ -57,11 +63,14 @@ fn close(a: [4]u8, b: [4]u8, tol: u8) bool {
 test "provider presents Render2D output to a real swapchain" {
     var app = engine.App.init(std.testing.allocator, .{});
     defer app.deinit();
-    app.registerModule(window_sdl3.module()) catch return error.SkipZigTest;
-    app.registerModule(wgpu.module()) catch return error.SkipZigTest;
-    app.registerModule(draw_2d.module()) catch return error.SkipZigTest;
+    try app.registerModule(window_sdl3.module());
+    try app.registerModule(wgpu.module());
+    try app.registerModule(draw_2d.module());
     try app.resources.insert(window_sdl3.WindowConfig, .{ .title = "zengy gpu test", .width = 320, .height = 200, .resizable = false });
-    app.initialize() catch return error.SkipZigTest;
+    app.initialize() catch |err| {
+        if (requireGpu()) return err;
+        return error.SkipZigTest;
+    };
 
     const entry = try app.services.getService("engine.graphics.device", 1);
     const service: *graphics.GraphicsDeviceService = @ptrCast(@alignCast(@constCast(entry.api_ptr)));

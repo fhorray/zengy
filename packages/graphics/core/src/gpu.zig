@@ -750,6 +750,7 @@ pub const GpuDevice = struct {
         begin_readback: *const fn (ctx: *anyopaque, buffer: BufferHandle, offset: u64, size: u64) anyerror!ReadbackHandle,
         /// Returns true and fills `out` when the mapping completed; false when it is still pending.
         poll_readback: *const fn (ctx: *anyopaque, handle: ReadbackHandle, out: []u8) anyerror!bool,
+        cancel_readback: ?*const fn (ctx: *anyopaque, handle: ReadbackHandle) void = null,
         /// Drives provider callbacks. `wait` blocks until submitted work completes.
         poll: *const fn (ctx: *anyopaque, wait: bool) void,
     };
@@ -838,6 +839,10 @@ pub const GpuDevice = struct {
     pub fn pollReadback(self: GpuDevice, handle: ReadbackHandle, out: []u8) !bool {
         return self.vtable.poll_readback(self.ctx, handle, out);
     }
+    pub fn cancelReadback(self: GpuDevice, handle: ReadbackHandle) void {
+        if (self.vtable.cancel_readback) |cancel| cancel(self.ctx, handle);
+    }
+
     pub fn poll(self: GpuDevice, wait: bool) void {
         self.vtable.poll(self.ctx, wait);
     }
@@ -846,6 +851,7 @@ pub const GpuDevice = struct {
     /// so frames never stall on the GPU.
     pub fn readBufferBlocking(self: GpuDevice, buffer: BufferHandle, offset: u64, out: []u8) !void {
         const ticket = try self.beginReadback(buffer, offset, out.len);
+        defer self.cancelReadback(ticket); // idempotent after successful polling
         var spins: u32 = 0;
         while (!try self.pollReadback(ticket, out)) {
             self.poll(true);

@@ -1,5 +1,11 @@
 //! Real-GPU tests for the PBR renderer. They drive the `PbrBackendVTable` exactly like the ECS frontend and
 //! check pixels read back from an offscreen target.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn requireGpu() bool {
+    const value = getenv("ZENGY_REQUIRE_GPU") orelse return false;
+    return value[0] == '1' and value[1] == 0;
+}
+
 const std = @import("std");
 const graphics = @import("graphics");
 const wgpu_gpu = @import("wgpu_gpu");
@@ -20,7 +26,10 @@ const Fixture = struct {
     textures: graphics.textures.TextureStore,
 
     fn init(allocator: std.mem.Allocator) !*Fixture {
-        const device = wgpu_gpu.Device.initHeadless(allocator) catch return error.SkipZigTest;
+        const device = wgpu_gpu.Device.initHeadless(allocator) catch |err| {
+            if (requireGpu()) return err;
+            return error.SkipZigTest;
+        };
         errdefer device.deinit();
         const self = try allocator.create(Fixture);
         self.* = .{
@@ -63,9 +72,12 @@ const Fixture = struct {
             .color_target = .{ .view = view },
         };
         const r = self.renderer.frameRenderer();
+        var submitted = false;
+        defer if (r.frame_result) |notify| notify(r.ctx, submitted);
         try r.render(r.ctx, &input);
         try rec.finish();
         try self.g.submit(rec.slice());
+        submitted = true;
 
         const pitch = gpu.alignedBytesPerRow(width * 4);
         const staging = try self.g.createBuffer(.{ .size = @as(u64, pitch) * height, .usage = .{ .map_read = true, .copy_dst = true } });

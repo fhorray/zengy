@@ -23,6 +23,7 @@ void *zwgpu_native_instance(ZWgpu *gpu);
 /* WGPUTextureFormat of the configured surface (0 for headless). */
 uint32_t zwgpu_surface_format(ZWgpu *gpu);
 int zwgpu_failed(ZWgpu *gpu);
+int zwgpu_surface_copy_src(ZWgpu *gpu);
 
 /* Drawable size in physical pixels. Returns 0 when minimized or headless. */
 int zwgpu_drawable_size(ZWgpu *gpu, uint32_t *width, uint32_t *height);

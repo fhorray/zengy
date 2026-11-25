@@ -242,12 +242,12 @@ pub const GraphicsDeviceService = struct {
         if (!self.device_available) return error.DeviceUnavailable;
         const slot = self.getSlotMut(handle) orelse return error.InvalidSurfaceHandle;
         if (!slot.frame_open) return error.FrameNotStarted;
+        defer slot.frame_open = false;
         if (self.backend) |vt| {
             if (vt.on_present) |cb| {
                 try cb(self.backend_ctx.?, handle, self.last_frame_commands.items);
             }
         }
-        slot.frame_open = false;
         slot.presented_frames += 1;
     }
 

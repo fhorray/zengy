@@ -69,6 +69,8 @@ pub const State = struct {
 
     fn ensure(self: *State, g: *gpu_objects.Gpu, ring_buffer: gpu.BufferHandle) !void {
         if (self.pipeline != null) return;
+        const checkpoint = g.tracked.items.len;
+        errdefer g.rollbackTracked(checkpoint);
         const c = gpu_objects.comp;
         const l_geometry = try g.newLayout(&.{ gpu_objects.sbo(0, true, c), gpu_objects.sbo(1, true, c) });
         const l_output = try g.newLayout(&.{ gpu_objects.sbo(0, false, c), gpu_objects.sbo(1, false, c) });
@@ -80,15 +82,18 @@ pub const State = struct {
             .shader = try g.newShader("dynamic gi", shader),
             .entry = "main",
         });
-        self.snapshot = try g.device.createBuffer(.{ .label = "gi snapshot", .size = @sizeOf(pbr.DynamicGiGrid), .usage = .{ .storage = true, .copy_dst = true } });
-        errdefer g.device.destroyBuffer(self.snapshot.?);
-        self.reservoirs = try g.device.createBuffer(.{ .label = "gi reservoirs", .size = reservoir_bytes, .usage = .{ .storage = true } });
+        const snapshot = try g.device.createBuffer(.{ .label = "gi snapshot", .size = @sizeOf(pbr.DynamicGiGrid), .usage = .{ .storage = true, .copy_dst = true } });
+        errdefer g.device.destroyBuffer(snapshot);
+        const reservoirs = try g.device.createBuffer(.{ .label = "gi reservoirs", .size = reservoir_bytes, .usage = .{ .storage = true } });
+        errdefer g.device.destroyBuffer(reservoirs);
         self.pipeline = .{
             .compute = compute,
             .l_geometry = l_geometry,
             .l_output = l_output,
             .g_params = try g.ringGroup(l_params, ring_buffer, @sizeOf(Params)),
         };
+        self.snapshot = snapshot;
+        self.reservoirs = reservoirs;
     }
 
     /// Uploads the BVH snapshot when its revision changed. Input slices are borrowed for this call only.
@@ -99,17 +104,25 @@ pub const State = struct {
         const tris = std.mem.sliceAsBytes(input.triangles);
         const mats = std.mem.sliceAsBytes(input.materials);
         const total = @as(u64, nodes.len) + tris.len + mats.len;
-        if (total > max_geometry_bytes) return error.GiGeometryTooLarge;
-        const required: u32 = @intCast(@max(total, 4));
-        if (self.geometry == null or required > self.capacity) {
-            const next = try g.device.createBuffer(.{ .label = "gi geometry", .size = required, .usage = .{ .storage = true, .copy_dst = true } });
+        const limits = g.device.capabilities().limits;
+        const limit = @min(@as(u64, max_geometry_bytes), @min(limits.max_buffer_size, limits.max_storage_buffer_binding_size));
+        const required: u64 = @max(total, 4);
+        if (required > limit) return error.GiGeometryTooLarge;
+        const grow = self.geometry == null or required > self.capacity;
+        var capacity: u64 = @min(@max(@as(u64, self.capacity), 64 * 1024), limit);
+        while (capacity < required) capacity = @min(capacity *| 2, limit);
+        const next = if (grow) try g.device.createBuffer(.{ .label = "gi geometry", .size = capacity, .usage = .{ .storage = true, .copy_dst = true } }) else self.geometry.?;
+        errdefer if (grow) g.device.destroyBuffer(next);
+        // Existing storage may be partially overwritten on upload failure; force a complete retry.
+        errdefer { self.geometry_revision = null; self.valid = false; }
+        if (nodes.len > 0) try g.device.writeBuffer(next, 0, nodes);
+        if (tris.len > 0) try g.device.writeBuffer(next, nodes.len, tris);
+        if (mats.len > 0) try g.device.writeBuffer(next, nodes.len + tris.len, mats);
+        if (grow) {
             if (self.geometry) |old| g.device.destroyBuffer(old);
             self.geometry = next;
-            self.capacity = required;
+            self.capacity = @intCast(capacity);
         }
-        if (nodes.len > 0) try g.device.writeBuffer(self.geometry.?, 0, nodes);
-        if (tris.len > 0) try g.device.writeBuffer(self.geometry.?, nodes.len, tris);
-        if (mats.len > 0) try g.device.writeBuffer(self.geometry.?, nodes.len + tris.len, mats);
         self.counts = .{ @intCast(input.nodes.len), @intCast(input.triangles.len), @intCast(input.materials.len) };
         self.offsets = .{ 0, @intCast(nodes.len / 4), @intCast((nodes.len + tris.len) / 4) };
         self.geometry_revision = input.geometry_revision;

@@ -36,8 +36,12 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.1
+      - name: Install Windows wgpu SDK for cross compilation
+        run: python3 tools/wgpu/install_wgpu.py --target windows-x86_64-gnu --output .deps/wgpu-native
       - name: Build all Windows x64 targets
-        run: zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe --summary all
+        run: zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --summary all
+      - name: Require visual build targets
+        run: zig build build-wgpu-examples -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --summary all
 
   macos:
     name: Build & Test macOS arm64 (${{ matrix.optimize }})
@@ -125,6 +129,12 @@ jobs:
       - name: Build all native targets
         # zig build finds SDL3 through its library search paths (not pkg-config), so point it at the prefix.
         run: zig build --search-prefix /opt/sdl3 --summary all -Doptimize=ReleaseSafe
+      - name: Run mandatory real-adapter tests under Xvfb
+        run: |
+          export LD_LIBRARY_PATH=/opt/sdl3/lib:$PWD/.deps/wgpu-native/lib
+          export VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n 1)
+          export SDL_VIDEODRIVER=x11 ZENGY_REQUIRE_GPU=1 ZENGY_WGPU_BACKEND=vulkan
+          xvfb-run -a zig build test-wgpu-gpu --search-prefix /opt/sdl3 -Doptimize=ReleaseSafe --summary all
       - name: Run each visual demo for 8s and check for leaks, panics, and errors
         run: |
           export LD_LIBRARY_PATH=/opt/sdl3/lib:$PWD/.deps/wgpu-native/lib
@@ -132,7 +142,8 @@ jobs:
           # wgpu needs a real native window surface, so run under Xvfb with SDL's X11 driver instead of `offscreen`.
           export SDL_VIDEODRIVER=x11
           status=0
-          for demo in visual-gpu visual-2d visual-plume visual-ui visual-playground visual-3d visual-python visual-hello visual-inspector visual-pbr; do
+          export ZENGY_WGPU_BACKEND=vulkan ZENGY_GPU_GI=1
+          for demo in visual-gpu visual-2d visual-plume visual-ui visual-playground visual-3d visual-python visual-hello visual-inspector visual-pbr visual-prism visual-camera visual-gamepad visual-audio visual-gizmos; do
             rc=0
             xvfb-run -a timeout 8 ./zig-out/bin/$demo > /tmp/$demo.log 2>&1 || rc=$?
             if { [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; } || grep -qiE 'leak|panic|error' /tmp/$demo.log; then

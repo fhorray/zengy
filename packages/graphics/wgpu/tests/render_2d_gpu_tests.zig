@@ -1,5 +1,11 @@
 //! Real-GPU tests for `render/2d` running on the wgpu provider. Each test renders into an offscreen texture
 //! and checks the pixels read back from the GPU, so they verify actual output, not just API calls.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn requireGpu() bool {
+    const value = getenv("ZENGY_REQUIRE_GPU") orelse return false;
+    return value[0] == '1' and value[1] == 0;
+}
+
 const std = @import("std");
 const graphics = @import("graphics");
 const wgpu_gpu = @import("wgpu_gpu");
@@ -16,7 +22,10 @@ const Fixture = struct {
     textures: graphics.textures.TextureStore,
 
     fn init(allocator: std.mem.Allocator) !Fixture {
-        const device = wgpu_gpu.Device.initHeadless(allocator) catch return error.SkipZigTest;
+        const device = wgpu_gpu.Device.initHeadless(allocator) catch |err| {
+            if (requireGpu()) return err;
+            return error.SkipZigTest;
+        };
         errdefer device.deinit();
         return .{ .allocator = allocator, .device = device, .g = device.gpuDevice(), .r2d = try draw_2d.Renderer2D.init(allocator), .textures = graphics.textures.TextureStore.init(allocator) };
     }

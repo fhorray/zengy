@@ -50,7 +50,7 @@ jobs:
         run: |
           $root = (Resolve-Path .deps/wgpu-native).Path
           zig build build-wgpu-examples "-Dwgpu-root=$root" -Doptimize=ReleaseSafe
-      - name: GPU conformance tests (skipped when the runner has no adapter)
+      - name: GPU conformance tests (optional on hosted Windows)
         shell: pwsh
         run: |
           $root = (Resolve-Path .deps/wgpu-native).Path

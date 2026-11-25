@@ -50,7 +50,10 @@ pub const Ring = struct {
         if (self.scratch.items.len == 0) return;
         // Queue writes need a size that is a multiple of 4; the scratch is padded to the alignment.
         const padded = std.mem.alignForward(usize, self.scratch.items.len, 4);
+        if (padded > self.capacity) return error.UniformRingExhausted;
+        const previous = self.scratch.items.len;
         try self.scratch.resize(self.allocator, padded);
+        @memset(self.scratch.items[previous..padded], 0);
         try self.device.writeBuffer(self.buffer, 0, self.scratch.items);
     }
 };
@@ -60,7 +63,10 @@ pub const Ring = struct {
 pub const GroupCache = struct {
     allocator: std.mem.Allocator,
     device: gpu.GpuDevice,
-    map: std.AutoHashMapUnmanaged(u64, gpu.BindGroupHandle) = .empty,
+    map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+    frame_index: u64 = 0,
+
+    const Entry = struct { handle: gpu.BindGroupHandle, last_used: u64 };
 
     const max_entries = 512;
 
@@ -75,20 +81,39 @@ pub const GroupCache = struct {
 
     pub fn clear(self: *GroupCache) void {
         var it = self.map.valueIterator();
-        while (it.next()) |g| self.device.destroyBindGroup(g.*);
+        while (it.next()) |g| self.device.destroyBindGroup(g.handle);
         self.map.clearRetainingCapacity();
     }
 
     /// Call at the start of a frame, before any command that references a cached group was recorded.
     pub fn trim(self: *GroupCache) void {
-        if (self.map.count() > max_entries) self.clear();
+        self.frame_index +%= 1;
+        if (self.map.count() <= max_entries and self.frame_index % 60 != 0) return;
+        // Bound destruction rate. Never clear hot groups en masse.
+        var stale: [64]u64 = undefined;
+        var count: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const age = self.frame_index -% entry.value_ptr.last_used;
+            if (age > 120 or (self.map.count() > max_entries and age > 2)) {
+                stale[count] = entry.key_ptr.*;
+                count += 1;
+                if (count == stale.len) break;
+            }
+        }
+        for (stale[0..count]) |k| {
+            if (self.map.fetchRemove(k)) |entry| self.device.destroyBindGroup(entry.value.handle);
+        }
     }
 
     pub fn get(self: *GroupCache, cache_key: u64, desc: gpu.BindGroupDesc) !gpu.BindGroupHandle {
-        if (self.map.get(cache_key)) |existing| return existing;
+        if (self.map.getPtr(cache_key)) |existing| {
+            existing.last_used = self.frame_index;
+            return existing.handle;
+        }
         const group = try self.device.createBindGroup(desc);
         errdefer self.device.destroyBindGroup(group);
-        try self.map.put(self.allocator, cache_key, group);
+        try self.map.put(self.allocator, cache_key, .{ .handle = group, .last_used = self.frame_index });
         return group;
     }
 };

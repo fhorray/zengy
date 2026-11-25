@@ -264,8 +264,14 @@ pub const Gpu = struct {
 
     pub fn deinit(self: *Gpu) void {
         const allocator = self.allocator;
+        self.rollbackTracked(0);
+        self.tracked.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    pub fn rollbackTracked(self: *Gpu, checkpoint: usize) void {
         var i = self.tracked.items.len;
-        while (i > 0) {
+        while (i > checkpoint) {
             i -= 1;
             switch (self.tracked.items[i]) {
                 .shader => |h| self.device.destroyShaderModule(h),
@@ -280,8 +286,7 @@ pub const Gpu = struct {
                 .buffer => |h| self.device.destroyBuffer(h),
             }
         }
-        self.tracked.deinit(allocator);
-        allocator.destroy(self);
+        self.tracked.shrinkRetainingCapacity(checkpoint);
     }
 
     // ------------------------------------------------------------ tracked creators
@@ -345,10 +350,11 @@ pub const Gpu = struct {
     pub fn newImage(self: *Gpu, desc: gpu.TextureDesc) !Image {
         const t = try self.device.createTexture(desc);
         errdefer self.device.destroyTexture(t);
-        try self.tracked.append(self.allocator, .{ .texture = t });
         const v = try self.device.createTextureView(.{ .texture = t });
         errdefer self.device.destroyTextureView(v);
-        try self.tracked.append(self.allocator, .{ .view = v });
+        try self.tracked.ensureUnusedCapacity(self.allocator, 2);
+        self.tracked.appendAssumeCapacity(.{ .texture = t });
+        self.tracked.appendAssumeCapacity(.{ .view = v });
         return .{ .texture = t, .view = v };
     }
 
@@ -570,6 +576,8 @@ pub const Gpu = struct {
     /// Builds the screen-transport pipelines the first time a view enables SSR/SSGI.
     pub fn ensureScreen(self: *Gpu, ring_buffer: gpu.BufferHandle) !*const Screen {
         if (self.screen_gpu) |*s| return s;
+        const checkpoint = self.tracked.items.len;
+        errdefer self.rollbackTracked(checkpoint);
         const f = frag;
         const c = comp;
         const pbr_vs = try self.newShader("pbr vs (transport)", sh.pbr_vs);
@@ -609,6 +617,8 @@ pub const Gpu = struct {
     /// Builds the volumetric pipelines the first time fog is rendered.
     pub fn ensureVolumetric(self: *Gpu, ring_buffer: gpu.BufferHandle) !*const Volumetric {
         if (self.volumetric_gpu) |*v| return v;
+        const checkpoint = self.tracked.items.len;
+        errdefer self.rollbackTracked(checkpoint);
         const f = frag;
         const l_fog = try self.newLayout(&.{ tex(0, .unfilterable, f), samp(32, .non_filtering, f), tex(1, .depth, f), samp(33, .comparison, f), tex(2, .depth, f), samp(34, .comparison, f) });
         const l_resolve = try self.newLayout(&.{ tex(0, .float, f), samp(32, .filtering, f), tex(1, .float, f), samp(33, .filtering, f), tex(2, .unfilterable, f), samp(34, .non_filtering, f) });
@@ -647,6 +657,8 @@ pub const Gpu = struct {
     /// Builds the exposure compute pipelines the first time automatic exposure is used.
     pub fn ensureExposure(self: *Gpu, ring_buffer: gpu.BufferHandle) !*const Exposure {
         if (self.exposure_gpu) |*e| return e;
+        const checkpoint = self.tracked.items.len;
+        errdefer self.rollbackTracked(checkpoint);
         const c = comp;
         const l_hdr = try self.newLayout(&.{tex(0, .unfilterable, c)});
         const l_hist_buf = try self.newLayout(&.{sbo(0, false, c)});

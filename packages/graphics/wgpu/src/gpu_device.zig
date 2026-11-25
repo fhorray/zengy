@@ -74,6 +74,11 @@ const ReadbackState = struct {
     size: u64,
     /// 0 pending, 1 mapped, 2 failed.
     status: std.atomic.Value(u32) = .init(0),
+    refs: std.atomic.Value(u32) = .init(2), // ticket + callback
+
+    fn release(self: *ReadbackState) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) std.heap.c_allocator.destroy(self);
+    }
 };
 
 pub const Device = struct {
@@ -148,9 +153,11 @@ pub const Device = struct {
     /// Releases every resource still alive so a forgotten `destroy*` can never leak native memory.
     fn releaseAll(self: *Device) void {
         for (self.readbacks.slots.items) |slot| if (slot.alive) {
-            c.wgpuBufferRelease(slot.value.buffer);
-            self.allocator.destroy(slot.value);
+            cancelReadbackState(slot.value);
         };
+        // Cancel first, then drive callbacks before releasing the device. Callback-owned
+        // storage remains alive even if a lost device delivers a callback later.
+        poll(self, false);
         for (self.render_pipelines.slots.items) |slot| if (slot.alive) c.wgpuRenderPipelineRelease(slot.value.raw);
         for (self.compute_pipelines.slots.items) |slot| if (slot.alive) c.wgpuComputePipelineRelease(slot.value.raw);
         for (self.bind_groups.slots.items) |slot| if (slot.alive) c.wgpuBindGroupRelease(slot.value.raw);
@@ -193,6 +200,21 @@ pub const Device = struct {
 
     pub fn surfaceFormat(self: *const Device) ?gpu.TextureFormat {
         return fromNativeFormat(zwgpu_surface_format(self.bridge));
+    }
+
+    pub fn beginWindowFrame(self: *Device, width: *u32, height: *u32) !bool {
+        _ = (try acquireSwapchain(self)) orelse return false;
+        errdefer self.abortFrame();
+        try self.checkValidation(false);
+        if (zwgpu_frame_texture(self.bridge, width, height) == null) {
+            self.abortFrame();
+            return error.SurfaceFailure;
+        }
+        return true;
+    }
+
+    pub fn discardWindowFrame(self: *Device) void {
+        self.abortFrame();
     }
 
     /// Presents the swapchain frame acquired by `submit`, if any, and releases it.
@@ -504,7 +526,7 @@ fn detectCapabilities(adapter: c.WGPUAdapter, device: c.WGPUDevice, queue: c.WGP
         .texture_compression_etc2 = has(device, c.WGPUFeatureName_TextureCompressionETC2),
         .texture_compression_astc = has(device, c.WGPUFeatureName_TextureCompressionASTC),
         // Reported by the adapter only: the pinned wgpu-native has no acceleration-structure API.
-        .ray_query = c.wgpuAdapterHasFeature(adapter, c.WGPUNativeFeature_RayQuery) != 0,
+        .ray_query = false, // not enabled on this device and no acceleration-structure API
     };
 
     var l = std.mem.zeroes(c.WGPULimits);
@@ -574,6 +596,11 @@ fn createBuffer(ctx: *anyopaque, desc: gpu.BufferDesc) anyerror!gpu.BufferHandle
 fn destroyBuffer(ctx: *anyopaque, handle: gpu.BufferHandle) void {
     const self = dev(ctx);
     const buffer = self.buffers.release(handle) orelse return;
+    for (self.readbacks.slots.items, 0..) |slot, index| {
+        if (slot.alive and slot.value.buffer == buffer.raw) {
+            cancelReadback(self, .{ .index = @intCast(index), .generation = slot.generation });
+        }
+    }
     c.wgpuBufferDestroy(buffer.raw);
     c.wgpuBufferRelease(buffer.raw);
 }
@@ -1286,6 +1313,7 @@ fn submit(ctx: *anyopaque, commands: []const gpu.Command) anyerror!void {
 fn mapCallback(status: c.WGPUMapAsyncStatus, _: c.WGPUStringView, userdata1: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     const state: *ReadbackState = @ptrCast(@alignCast(userdata1.?));
     state.status.store(if (status == c.WGPUMapAsyncStatus_Success) 1 else 2, .release);
+    state.release();
 }
 
 fn beginReadback(ctx: *anyopaque, handle: gpu.BufferHandle, offset: u64, size: u64) anyerror!gpu.ReadbackHandle {
@@ -1295,12 +1323,19 @@ fn beginReadback(ctx: *anyopaque, handle: gpu.BufferHandle, offset: u64, size: u
     if (offset % 8 != 0 or size % 4 != 0 or size == 0) return error.Unaligned;
     if (offset > buffer.size or size > buffer.size - offset) return error.OutOfBounds;
 
-    const state = try self.allocator.create(ReadbackState);
-    errdefer self.allocator.destroy(state);
-    // Hold a reference so destroying the engine handle cannot free the buffer under a pending map.
+    try self.checkValidation(false);
+    // The pinned wgpu-native does not implement wgpuBufferGetMapState.
+    for (self.readbacks.slots.items) |slot| {
+        if (slot.alive and slot.value.buffer == buffer.raw) return error.InvalidDescriptor;
+    }
+    // Register before starting the callback. The callback owns a separate reference;
+    // the C allocator permits release even after the engine allocator/device is gone.
+    const state = try std.heap.c_allocator.create(ReadbackState);
+    errdefer std.heap.c_allocator.destroy(state);
     c.wgpuBufferAddRef(buffer.raw);
     state.* = .{ .buffer = buffer.raw, .offset = offset, .size = size };
     errdefer c.wgpuBufferRelease(buffer.raw);
+    const ticket = try self.readbacks.acquire(self.allocator, state);
     _ = c.wgpuBufferMapAsync(buffer.raw, c.WGPUMapMode_Read, offset, size, .{
         .nextInChain = null,
         .mode = c.WGPUCallbackMode_AllowProcessEvents,
@@ -1308,8 +1343,8 @@ fn beginReadback(ctx: *anyopaque, handle: gpu.BufferHandle, offset: u64, size: u
         .userdata1 = state,
         .userdata2 = null,
     });
-    try self.checkValidation(true);
-    return self.readbacks.acquire(self.allocator, state);
+    // Mapping errors are delivered via the callback. No fallible allocation after registration.
+    return ticket;
 }
 
 fn pollReadback(ctx: *anyopaque, handle: gpu.ReadbackHandle, out: []u8) anyerror!bool {
@@ -1318,11 +1353,17 @@ fn pollReadback(ctx: *anyopaque, handle: gpu.ReadbackHandle, out: []u8) anyerror
     if (out.len != state.size) return error.OutOfBounds;
     poll(ctx, false);
     switch (state.status.load(.acquire)) {
-        0 => return false,
+        0 => {
+            if (zwgpu_failed(self.bridge) != 0) {
+                cancelReadback(ctx, handle);
+                return error.GpuFailure;
+            }
+            return false;
+        },
         1 => {
             const ptr = c.wgpuBufferGetConstMappedRange(state.buffer, state.offset, state.size);
             if (ptr == null) {
-                finishReadback(self, handle, state, false);
+                finishReadback(self, handle, state, true);
                 return error.ReadbackFailed;
             }
             const bytes: [*]const u8 = @ptrCast(ptr);
@@ -1340,13 +1381,25 @@ fn pollReadback(ctx: *anyopaque, handle: gpu.ReadbackHandle, out: []u8) anyerror
 fn finishReadback(self: *Device, handle: gpu.ReadbackHandle, state: *ReadbackState, mapped: bool) void {
     if (mapped) c.wgpuBufferUnmap(state.buffer);
     c.wgpuBufferRelease(state.buffer);
-    self.allocator.destroy(state);
     _ = self.readbacks.release(handle);
+    state.release();
+}
+
+fn cancelReadbackState(state: *ReadbackState) void {
+    if (state.status.load(.acquire) != 2) c.wgpuBufferUnmap(state.buffer);
+    c.wgpuBufferRelease(state.buffer);
+    state.release();
+}
+
+fn cancelReadback(ctx: *anyopaque, handle: gpu.ReadbackHandle) void {
+    const self = dev(ctx);
+    const state = self.readbacks.release(handle) orelse return;
+    cancelReadbackState(state);
 }
 
 fn poll(ctx: *anyopaque, wait: bool) void {
     const self = dev(ctx);
-    _ = c.wgpuDevicePoll(self.device, @intFromBool(wait), null);
+    if (zwgpu_failed(self.bridge) == 0) _ = c.wgpuDevicePoll(self.device, @intFromBool(wait), null);
     c.wgpuInstanceProcessEvents(self.instance);
 }
 
@@ -1379,5 +1432,6 @@ pub const vtable: gpu.GpuDevice.VTable = .{
     .submit = submit,
     .begin_readback = beginReadback,
     .poll_readback = pollReadback,
+    .cancel_readback = cancelReadback,
     .poll = poll,
 };

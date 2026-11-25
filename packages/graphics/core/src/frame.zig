@@ -84,6 +84,8 @@ pub const FrameRenderer = struct {
     ctx: *anyopaque,
     order: i32,
     render: *const fn (ctx: *anyopaque, input: *FrameInput) anyerror!void,
+    /// Called after command submission or when recording/submission fails.
+    frame_result: ?*const fn (ctx: *anyopaque, submitted: bool) void = null,
     /// Called when the device is replaced or the service is torn down, so the renderer can drop GPU resources.
     release: ?*const fn (ctx: *anyopaque, device: gpu.GpuDevice) void = null,
     /// Called before a texture is destroyed so the renderer can drop bind groups that reference it.
@@ -126,6 +128,12 @@ pub const RendererList = struct {
     /// Runs every renderer in order, stopping at the first error.
     pub fn run(self: *const RendererList, input: *FrameInput) !void {
         for (self.items.items) |renderer| try renderer.render(renderer.ctx, input);
+    }
+
+    pub fn notifyFrameResult(self: *const RendererList, submitted: bool) void {
+        for (self.items.items) |renderer| {
+            if (renderer.frame_result) |notify| notify(renderer.ctx, submitted);
+        }
     }
 
     /// Tells every renderer to drop cached bindings of `id`.
@@ -193,6 +201,26 @@ test "renderers run in order and stop at the first failure" {
 
     try std.testing.expect(list.unregister("overlay"));
     try std.testing.expect(!list.unregister("overlay"));
+}
+
+test "frame result notification reaches registered renderers" {
+    const State = struct {
+        accepted: u32 = 0,
+        aborted: u32 = 0,
+        fn render(_: *anyopaque, _: *FrameInput) anyerror!void {}
+        fn result(ctx: *anyopaque, submitted: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (submitted) self.accepted += 1 else self.aborted += 1;
+        }
+    };
+    var state: State = .{};
+    var list: RendererList = .{};
+    defer list.deinit(std.testing.allocator);
+    try list.register(std.testing.allocator, .{ .name = "result", .ctx = &state, .order = 0, .render = State.render, .frame_result = State.result });
+    list.notifyFrameResult(true);
+    list.notifyFrameResult(false);
+    try std.testing.expectEqual(@as(u32, 1), state.accepted);
+    try std.testing.expectEqual(@as(u32, 1), state.aborted);
 }
 
 test "first color pass clears and later passes load" {

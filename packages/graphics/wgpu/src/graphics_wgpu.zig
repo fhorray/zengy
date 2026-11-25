@@ -26,6 +26,7 @@ extern fn zwgpu_create(window: *anyopaque) ?*anyopaque;
 extern fn zwgpu_destroy(bridge: *anyopaque) void;
 extern fn zwgpu_drawable_size(bridge: *anyopaque, width: *u32, height: *u32) c_int;
 extern fn zwgpu_error() [*:0]const u8;
+extern fn zwgpu_surface_copy_src(bridge: *anyopaque) c_int;
 // libc is linked already; used only by the debug frame dump below.
 extern fn SDL_GetTicksNS() u64;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -111,7 +112,8 @@ fn captureFinalRender(ctx: *anyopaque, input: *frame.FrameInput) anyerror!void {
 fn scheduleCapture(state: *State, input: *frame.FrameInput) !void {
     const cap = &state.capture;
     if (cap.scheduled) return;
-    const pitch = gpu.alignedBytesPerRow(input.target.width * 4);
+    if (zwgpu_surface_copy_src(state.bridge) == 0) return error.CaptureUnsupported;
+    const pitch = gpu.alignedBytesPerRow(input.target.width * input.target.color_format.bytesPerTexel());
     const bytes = @as(u64, pitch) * input.target.height;
     if (cap.buffer == null or cap.capacity < bytes) {
         if (cap.buffer) |old| input.device.destroyBuffer(old);
@@ -220,6 +222,17 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
     var height: u32 = 0;
     if (zwgpu_drawable_size(state.bridge, &width, &height) == 0) return; // minimized: skip the frame
     const dpi_scale: f32 = if (window_sdl3.pixelSize(state.app)) |px| (if (px.dpi_scale > 0.0) px.dpi_scale else 1.0) else 1.0;
+    const acquired = state.device.beginWindowFrame(&width, &height) catch |err| {
+        if (isFatal(err)) state.service.setDeviceAvailable(false);
+        return err;
+    };
+    if (!acquired) return;
+    defer state.device.discardWindowFrame();
+    var submitted = false;
+    defer {
+        state.service.renderers.notifyFrameResult(submitted);
+        if (!submitted) state.capture.scheduled = false;
+    }
     const format = state.device.surfaceFormat() orelse return error.UnsupportedSurfaceFormat;
 
     // The last `.clear` command of the frame decides the background; renderers never parse it themselves.
@@ -229,9 +242,8 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
         else => {},
     };
 
-    state.frames_presented += 1;
     const t0 = SDL_GetTicksNS();
-    if (state.debug_capture_path != null and state.frames_presented == debug_capture_frame and state.capture.request == null) {
+    if (state.debug_capture_path != null and state.frames_presented + 1 == debug_capture_frame and state.capture.request == null and zwgpu_surface_copy_src(state.bridge) != 0) {
         state.capture.request = .presented;
     }
 
@@ -275,10 +287,14 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
         if (isFatal(err)) state.service.setDeviceAvailable(false);
         return err;
     };
+    submitted = true;
     state.device.presentFrame() catch |err| {
+        // The GPU passes were submitted even if the surface could not present.
+        state.capture.scheduled = false;
         if (isFatal(err)) state.service.setDeviceAvailable(false);
         return err;
     };
+    state.frames_presented += 1;
     if (getenv("ZENGY_WGPU_TIMING") != null) {
         const t3 = SDL_GetTicksNS();
         std.debug.print("[wgpu] frame {d}: renderers={d}us submit+present={d}us commands={d}\n", .{ state.frames_presented, (t1 - t0) / 1000, (t3 - t2) / 1000, recorder.slice().len });
@@ -399,6 +415,9 @@ pub fn driverName(app: *engine.App) ?[]const u8 {
 /// `hdr` and `ssao` are produced by whichever renderer owns those targets; if none does, no image is produced.
 pub fn requestCapture(app: *engine.App, target: graphics.CaptureTarget) bool {
     const ref = app.resources.get(StateRef) orelse return false;
+    if ((target == .final or target == .presented) and zwgpu_surface_copy_src(ref.state.bridge) == 0) return false;
+    if (ref.state.capture.ready) |*old| old.deinit(ref.state.allocator);
+    ref.state.capture.ready = null;
     ref.state.capture.request = target;
     return true;
 }

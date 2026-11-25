@@ -133,6 +133,8 @@ pub const PbrRenderer = struct {
     // Screen-space transport: metadata targets, Hi-Z pyramid and the resolved HDR image.
     screen: ?ScreenState = null,
     screen_failed: bool = false,
+    screen_idle_frames: u32 = 0,
+    screen_failure_size: [2]u32 = .{ 0, 0 },
     /// Set per frame: the lit pass writes the transport metadata targets.
     screen_on: bool = false,
 
@@ -233,12 +235,44 @@ pub const PbrRenderer = struct {
 
     pub fn frameRenderer(self: *PbrRenderer) frame.FrameRenderer {
         // Runs before the unlit mesh renderer so a PBR frame replaces the unlit pass.
-        return .{ .name = "official.render.3d.gpu.pbr", .ctx = self, .order = frame.Order.world - 10, .render = renderThunk, .release = releaseThunk };
+        return .{ .name = "official.render.3d.gpu.pbr", .ctx = self, .order = frame.Order.world - 10, .render = renderThunk, .release = releaseThunk, .frame_result = frameResultThunk, .forget_texture = forgetTextureThunk };
     }
 
     fn renderThunk(ctx: *anyopaque, input: *frame.FrameInput) anyerror!void {
         const self: *PbrRenderer = @ptrCast(@alignCast(ctx));
         try self.render(input);
+    }
+
+    fn frameResultThunk(ctx: *anyopaque, submitted: bool) void {
+        const self: *PbrRenderer = @ptrCast(@alignCast(ctx));
+        if (submitted) {
+            if (self.timing) |*t| t.last_recorded = null;
+            return;
+        }
+        self.invalidateRecordedFrame();
+    }
+
+    fn invalidateRecordedFrame(self: *PbrRenderer) void {
+        self.exposure_history_valid = false;
+        self.vol_history_valid = false;
+        self.gi.valid = false;
+        self.dir_atlas_valid = false;
+        self.local_atlas_valid = false;
+        for (&self.dir_cascade_cache) |*key| key.invalidate();
+        for (&self.local_tile_cache) |*key| key.invalidate();
+        if (self.timing) |*t| t.abortRecorded();
+        self.rendered_this_frame = false;
+        self.base.pbr_rendered = false;
+    }
+
+    fn forgetTextureThunk(ctx: *anyopaque, _: gpu.GpuDevice, _: graphics.TextureId) void {
+        const self: *PbrRenderer = @ptrCast(@alignCast(ctx));
+        // Shared texture deletion happens outside frame recording.
+        if (self.groups) |*groups| groups.clear();
+        self.dir_atlas_valid = false;
+        self.local_atlas_valid = false;
+        for (&self.dir_cascade_cache) |*key| key.invalidate();
+        for (&self.local_tile_cache) |*key| key.invalidate();
     }
 
     fn releaseThunk(ctx: *anyopaque, device: gpu.GpuDevice) void {
@@ -396,19 +430,30 @@ pub const PbrRenderer = struct {
     /// Recreates the HDR, SSAO and bloom targets when the frame size changes.
     fn ensureTargets(self: *PbrRenderer, device: gpu.GpuDevice, w: u32, h: u32) !void {
         if (self.hdr) |t| if (t.width == w and t.height == h) return;
-        // Cached bind groups may reference the old views; they are keyed by handle, so they simply stop matching.
-        self.destroyTargets(device);
-        errdefer self.destroyTargets(device);
-        self.hdr = try newTarget(device, w, h, hdr_format, "pbr hdr");
-        self.ssao = try newTarget(device, @max(w / 2, 1), @max(h / 2, 1), ao_format, "pbr ssao");
-        self.ssao_blur = try newTarget(device, w, h, ao_format, "pbr ssao blur");
+        // Release references to resized resources before destroying them.
+        if (self.groups) |*groups| groups.clear();
+        const hdr = try newTarget(device, w, h, hdr_format, "pbr hdr");
+        errdefer self.destroyTarget(device, hdr);
+        const ssao = try newTarget(device, @max(w / 2, 1), @max(h / 2, 1), ao_format, "pbr ssao");
+        errdefer self.destroyTarget(device, ssao);
+        const blur = try newTarget(device, w, h, ao_format, "pbr ssao blur");
+        errdefer self.destroyTarget(device, blur);
+        var bloom: [layout.BLOOM_MIPS]?Target = @splat(null);
+        errdefer {
+            for (bloom) |b| if (b) |t| self.destroyTarget(device, t);
+        }
         var mw = @max(w / 2, 1);
         var mh = @max(h / 2, 1);
         for (0..layout.BLOOM_MIPS) |i| {
-            self.bloom[i] = try newTarget(device, mw, mh, hdr_format, "pbr bloom");
+            bloom[i] = try newTarget(device, mw, mh, hdr_format, "pbr bloom");
             mw = @max(mw / 2, 1);
             mh = @max(mh / 2, 1);
         }
+        self.destroyTargets(device);
+        self.hdr = hdr;
+        self.ssao = ssao;
+        self.ssao_blur = blur;
+        self.bloom = bloom;
     }
 
     // --------------------------------------------------------------------------------------------
@@ -560,8 +605,11 @@ pub const PbrRenderer = struct {
         const needed: u64 = @max(bytes, 256);
         if (db.buffer != null and db.capacity >= needed) return;
         var capacity: u64 = @max(db.capacity, 16 * 1024);
-        while (capacity < needed) capacity *= 2;
         const device = self.device.?;
+        const limit = device.capabilities().limits.max_buffer_size;
+        if (needed > limit) return error.DrawBufferTooLarge;
+        while (capacity < needed) capacity = @min(capacity *| 2, limit);
+        capacity = @min(capacity, limit);
         const buffer = try device.createBuffer(.{ .label = label, .size = capacity, .usage = .{ .uniform = true, .copy_dst = true } });
         errdefer device.destroyBuffer(buffer);
         const group = try device.createBindGroup(.{ .layout = lay, .entries = &.{.{ .binding = 0, .resource = .{ .buffer = .{ .buffer = buffer, .size = bind_size } } }} });
@@ -698,14 +746,15 @@ pub const PbrRenderer = struct {
         const rec = input.recorder;
 
         // Timestamp spans are injected into the passes recorded below, then resolved for async readback.
-        if (!self.timing_probed) {
+        if (!self.timing_probed and self.timing_sink != null) {
             self.timing_probed = true;
             self.timing = gpu_timing.Timing.init(device);
         }
         const first_command = rec.commands.items.len;
         const frame_ns: u64 = if (std.math.isFinite(self.frame_data.dt) and self.frame_data.dt > 0) @intFromFloat(@as(f64, self.frame_data.dt) * 1e9) else 0;
         if (self.timing) |*t| t.beginFrame(self.timing_sink, frame_ns);
-        defer if (self.timing) |*t| t.endFrame(rec, first_command) catch {};
+        errdefer self.invalidateRecordedFrame();
+        // Stamp only after successful recording and uploads. See frame_result for submit failures.
         const tex_w = input.target.width;
         const tex_h = input.target.height;
         try self.ensureTargets(device, tex_w, tex_h);
@@ -732,7 +781,15 @@ pub const PbrRenderer = struct {
         const st_cfg = pp.quality.screen_transport;
         const screen_requested = (st_cfg.ssr_strength > 0 or st_cfg.ssgi_strength > 0) and
             (!self.frame_data.fog.enabled or self.frame_data.fog.volumetric.enabled);
-        if (!screen_requested) self.screen_failed = false;
+        if (!screen_requested) {
+            self.screen_failed = false;
+            self.screen_idle_frames +|= 1;
+            if (self.screen_idle_frames >= 120 and self.screen != null) {
+                self.groups.?.clear();
+                self.destroyScreen(device);
+            }
+        } else self.screen_idle_frames = 0;
+        if (self.screen_failure_size[0] != tex_w or self.screen_failure_size[1] != tex_h) self.screen_failed = false;
         self.screen_on = screen_requested and !self.screen_failed;
         if (self.screen_on) {
             if (!g.supportsScreenTransport()) {
@@ -749,6 +806,13 @@ pub const PbrRenderer = struct {
                 self.screen_failed = true;
                 self.screen_on = false;
                 std.debug.print("[pbr] screen transport unavailable ({s}); using the legacy indirect lighting\n", .{@errorName(err)});
+            }
+        }
+        if (self.screen_failed) {
+            self.screen_failure_size = .{ tex_w, tex_h };
+            if (self.screen != null) {
+                self.groups.?.clear();
+                self.destroyScreen(device);
             }
         }
         const fog = self.frame_data.fog;
@@ -1346,6 +1410,7 @@ pub const PbrRenderer = struct {
         try self.flushScratch(g, &self.mask_params, &self.mask_scratch, g.l_mask_params, @sizeOf(layout.ShadowMaskParams), "shadow mask uniforms");
         self.rendered_this_frame = true;
         self.base.pbr_rendered = true;
+        if (self.timing) |*t| t.endFrame(rec, first_command) catch { t.abortRecorded(); };
     }
 
     /// Light importance table and sky constants for the GI compute pass.
@@ -1409,8 +1474,11 @@ pub const PbrRenderer = struct {
     /// (Re)allocates the transport targets when the frame size changes; they exist only while a view uses them.
     fn ensureScreen(self: *PbrRenderer, device: gpu.GpuDevice, w: u32, h: u32) !*ScreenState {
         if (self.screen) |*s| if (s.width == w and s.height == h) return s;
+        if (self.groups) |*groups| groups.clear();
         self.destroyScreen(device);
         const lay = try screen_transport.Layout.init(w, h);
+        const limits = device.capabilities().limits;
+        if (lay.bytes > limits.max_buffer_size or lay.bytes > limits.max_storage_buffer_binding_size) return error.ScreenBufferTooLarge;
         const bounds = try device.createBuffer(.{ .label = "hiz bounds", .size = lay.bytes, .usage = .{ .storage = true } });
         errdefer device.destroyBuffer(bounds);
         const surface = try newTarget(device, w, h, .rgba32_float, "screen surface");
@@ -1530,7 +1598,11 @@ pub const PbrRenderer = struct {
         var froxel_on = vol_cfg.froxel_enabled and !self.froxel_failed;
         var froxel_pixel = std.math.clamp(vol_cfg.froxel_pixel_size, 8, 32);
         const froxel_slices = std.math.clamp(vol_cfg.froxel_slices, 8, 64);
-        froxel_pixel = @max(froxel_pixel, (tex_h * froxel_slices + 8191) / 8192);
+        const max_dim = @max(device.capabilities().limits.max_texture_dimension_2d, 1);
+        const max_rows = max_dim / froxel_slices;
+        if (max_rows == 0) froxel_on = false;
+        if (max_rows > 0) froxel_pixel = @max(froxel_pixel, (tex_h + max_rows - 1) / max_rows);
+        froxel_pixel = @max(froxel_pixel, (tex_w + max_dim - 1) / max_dim);
         const fw = @max((tex_w + froxel_pixel - 1) / froxel_pixel, 1);
         const fh = @max((tex_h + froxel_pixel - 1) / froxel_pixel, 1);
         var froxel_target: ?Target = null;
@@ -1550,9 +1622,11 @@ pub const PbrRenderer = struct {
             // A size change drops the history.
             const have = self.vol_history[0] != null and self.vol_history[0].?.width == vol_w and self.vol_history[0].?.height == vol_h;
             if (!have) {
+                const first = try newTarget(device, vol_w, vol_h, hdr_format, "volumetric history");
+                errdefer self.destroyTarget(device, first);
+                const second = try newTarget(device, vol_w, vol_h, hdr_format, "volumetric history");
                 for (self.vol_history) |h| if (h) |t| self.destroyTarget(device, t);
-                self.vol_history = @splat(null);
-                for (&self.vol_history) |*slot| slot.* = try newTarget(device, vol_w, vol_h, hdr_format, "volumetric history");
+                self.vol_history = .{ first, second };
                 self.vol_history_read = 0;
                 self.vol_history_valid = false;
             }
@@ -1686,6 +1760,11 @@ pub const PbrRenderer = struct {
             key_hasher.update(std.mem.asBytes(&vfp.cascade_info[2]));
             key_hasher.update(std.mem.asBytes(&vfp.cascade_info[3]));
             key_hasher.update(std.mem.asBytes(&vfp.froxel_params));
+            var caster_hash = shadow_plan.CasterHasher.init(0x30b0_116a);
+            for (self.queued_draws.items) |draw| caster_hash.addDraw(draw);
+            for (self.shadow_casters.items) |caster| caster_hash.addCaster(caster);
+            const geometry_key = caster_hash.final();
+            key_hasher.update(std.mem.asBytes(&geometry_key));
             const light_key = key_hasher.final();
             const fog_unchanged = light_key == self.vol_light_key;
             self.vol_light_key = light_key;
@@ -1807,6 +1886,7 @@ pub const PbrRenderer = struct {
             .range_params = .{ min_log2 + pre_log2, 1.0 / log2_range, @floatFromInt(meter_w), @floatFromInt(meter_h) },
             .metering_params = .{ center_weight, phase_x, phase_y, @floatFromInt(@max(@as(u64, 1), @min(@as(u64, 8), @as(u64, std.math.maxInt(u32)) / (@as(u64, meter_w) * meter_h)))) },
         };
+        if (reset) try rec.clearBuffer(g.histogram, 0, 66 * 4);
         try rec.beginComputePass(.{ .label = "exposure histogram" });
         try rec.setComputePipeline(ex.hist);
         try rec.setBindGroup(0, hdr_group, &.{});

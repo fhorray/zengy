@@ -1,5 +1,11 @@
 //! Real-GPU tests for the unlit mesh and gizmo renderer (`gpu_3d`). Pixels are read back from an offscreen
 //! target, so they verify actual output: culling orientation, texture sampling, depth ordering and gizmo lines.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn requireGpu() bool {
+    const value = getenv("ZENGY_REQUIRE_GPU") orelse return false;
+    return value[0] == '1' and value[1] == 0;
+}
+
 const std = @import("std");
 const graphics = @import("graphics");
 const wgpu_gpu = @import("wgpu_gpu");
@@ -19,7 +25,10 @@ const Fixture = struct {
     textures: graphics.textures.TextureStore,
 
     fn init(allocator: std.mem.Allocator) !Fixture {
-        const device = wgpu_gpu.Device.initHeadless(allocator) catch return error.SkipZigTest;
+        const device = wgpu_gpu.Device.initHeadless(allocator) catch |err| {
+            if (requireGpu()) return err;
+            return error.SkipZigTest;
+        };
         return .{ .allocator = allocator, .device = device, .g = device.gpuDevice(), .r3d = gpu_3d.Renderer3D.init(allocator), .textures = graphics.textures.TextureStore.init(allocator) };
     }
 

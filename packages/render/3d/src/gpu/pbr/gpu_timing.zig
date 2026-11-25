@@ -45,7 +45,7 @@ fn classify(label: []const u8) ?Span {
 }
 
 const slot_count = 3;
-const max_spans = 32;
+const max_spans = 64;
 const query_bytes = max_spans * 2 * 8;
 
 const Slot = struct {
@@ -54,6 +54,7 @@ const Slot = struct {
     staging: gpu.BufferHandle,
     spans: [max_spans]Span = undefined,
     count: u32 = 0,
+    frame_ns: u64 = 0,
     state: enum { idle, submitted, reading } = .idle,
     ticket: gpu.ReadbackHandle = undefined,
 };
@@ -64,11 +65,13 @@ pub const Timing = struct {
     period_ns: f64,
     /// Slot being recorded this frame.
     current: ?usize = null,
+    last_recorded: ?usize = null,
+    dropped_spans: u64 = 0,
 
     /// Returns null when the adapter has no timestamp queries (the profiler then simply shows no GPU passes).
     pub fn init(device: gpu.GpuDevice) ?Timing {
         const caps = device.capabilities();
-        if (!caps.features.timestamp_query or caps.timestamp_period_ns <= 0) return null;
+        if (!caps.features.timestamp_query or !std.math.isFinite(caps.timestamp_period_ns) or caps.timestamp_period_ns <= 0) return null;
         var self: Timing = .{ .device = device, .slots = undefined, .period_ns = caps.timestamp_period_ns };
         var made: usize = 0;
         while (made < slot_count) : (made += 1) {
@@ -91,6 +94,7 @@ pub const Timing = struct {
 
     fn destroySlots(self: *Timing, count: usize) void {
         for (self.slots[0..count]) |slot| {
+            if (slot.state == .reading) self.device.cancelReadback(slot.ticket);
             self.device.destroyQuerySet(slot.set);
             self.device.destroyBuffer(slot.resolve);
             self.device.destroyBuffer(slot.staging);
@@ -104,6 +108,7 @@ pub const Timing = struct {
     /// Start of a frame: collects finished readbacks and picks a free slot to record into.
     pub fn beginFrame(self: *Timing, sink: ?Sink, frame_ns: u64) void {
         self.current = null;
+        self.last_recorded = null;
         for (&self.slots, 0..) |*slot, i| {
             switch (slot.state) {
                 .idle => if (self.current == null) {
@@ -119,15 +124,27 @@ pub const Timing = struct {
                 .reading => {
                     var raw: [query_bytes]u8 = undefined;
                     const bytes = raw[0 .. slot.count * 2 * 8];
-                    const done = self.device.pollReadback(slot.ticket, bytes) catch true;
+                    const done = self.device.pollReadback(slot.ticket, bytes) catch {
+                        self.device.cancelReadback(slot.ticket);
+                        slot.state = .idle;
+                        continue;
+                    };
                     if (done) {
-                        if (sink) |s| self.publish(slot, bytes, s, frame_ns);
+                        if (sink) |s| self.publish(slot, bytes, s, slot.frame_ns);
                         slot.state = .idle;
                         if (self.current == null) self.current = i;
                     }
                 },
             }
         }
+        if (sink == null) self.current = null;
+        if (self.current) |index| self.slots[index].frame_ns = frame_ns;
+    }
+
+    pub fn abortRecorded(self: *Timing) void {
+        if (self.last_recorded) |i| self.slots[i].state = .idle;
+        self.last_recorded = null;
+        self.current = null;
     }
 
     fn publish(self: *Timing, slot: *const Slot, bytes: []const u8, sink: Sink, frame_ns: u64) void {
@@ -138,7 +155,9 @@ pub const Timing = struct {
             const begin = std.mem.readInt(u64, bytes[i * 16 ..][0..8], .little);
             const end = std.mem.readInt(u64, bytes[i * 16 + 8 ..][0..8], .little);
             if (end < begin) continue;
-            const ns: u64 = @intFromFloat(@as(f64, @floatFromInt(end - begin)) * self.period_ns);
+            const elapsed = @as(f64, @floatFromInt(end - begin)) * self.period_ns;
+            if (!std.math.isFinite(elapsed) or elapsed < 0 or elapsed >= 18446744073709551616.0) continue;
+            const ns: u64 = @intFromFloat(elapsed);
             const span = slot.spans[i];
             var found: ?usize = null;
             for (names[0..distinct], 0..) |n, j| if (std.mem.eql(u8, n.name, span.name)) {
@@ -150,7 +169,7 @@ pub const Timing = struct {
                 distinct += 1;
                 break :blk distinct - 1;
             };
-            totals[index] += ns;
+            totals[index] +|= ns;
         }
         sink.begin_frame(sink.ctx);
         for (names[0..distinct], totals[0..distinct]) |n, t| sink.record(sink.ctx, n.name, n.category, t);
@@ -171,7 +190,10 @@ pub const Timing = struct {
                 else => continue,
             };
             const span = classify(label orelse continue) orelse continue;
-            if (count >= max_spans) break;
+            if (count >= max_spans) {
+                self.dropped_spans +|= 1;
+                continue;
+            }
             const stamps: gpu.PassTimestamps = .{ .query_set = slot.set, .begin_index = count * 2, .end_index = count * 2 + 1 };
             switch (command.*) {
                 .begin_render_pass => |*d| d.timestamps = stamps,
@@ -186,6 +208,7 @@ pub const Timing = struct {
         try rec.copyBufferToBuffer(slot.resolve, 0, slot.staging, 0, count * 2 * 8);
         slot.count = count;
         slot.state = .submitted;
+        self.last_recorded = index;
         self.current = null;
     }
 };

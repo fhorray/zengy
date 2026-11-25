@@ -33,6 +33,7 @@ struct ZWgpu {
     /* When capture is on, validation errors are queued for the Zig layer instead of latching `failed`. */
     atomic_int capture;
     atomic_int validation_pending;
+    SDL_Mutex *validation_mutex;
     char validation[512];
 };
 static _Thread_local char last_error[512];
@@ -66,14 +67,26 @@ static void error_cb(WGPUDevice const *device,WGPUErrorType type,WGPUStringView 
     ZWgpu *g=p;
     size_t n=message.length>sizeof g->validation-1?sizeof g->validation-1:message.length;
     if (type==WGPUErrorType_Validation && atomic_load(&g->capture)) {
+        SDL_LockMutex(g->validation_mutex);
         if (!atomic_load(&g->validation_pending)) {
             if (message.data) memcpy(g->validation,message.data,n);
+            else n=0;
             g->validation[n]=0;
             atomic_store(&g->validation_pending,1);
         }
+        SDL_UnlockMutex(g->validation_mutex);
     } else atomic_store(&g->failed,1);
     SDL_LogError(SDL_LOG_CATEGORY_RENDER,"WebGPU error: %.*s",(int)n,message.data?message.data:"");
 }
+static void lost_cb(WGPUDevice const *device,WGPUDeviceLostReason reason,WGPUStringView message,void *p,void *unused) {
+    (void)device; (void)unused;
+    ZWgpu *g=p;
+    if (reason==WGPUDeviceLostReason_Destroyed) return;
+    atomic_store(&g->failed,1);
+    size_t n=message.length>511?511:message.length;
+    SDL_LogError(SDL_LOG_CATEGORY_RENDER,"WebGPU device lost: %.*s",(int)n,message.data?message.data:"");
+}
+
 static WGPUSurface make_surface(ZWgpu *g) {
     SDL_PropertiesID props=SDL_GetWindowProperties(g->window);
 #if defined(_WIN32)
@@ -115,7 +128,8 @@ static WGPUSurface make_surface(ZWgpu *g) {
 static WGPUTextureFormat choose_format(const WGPUSurfaceCapabilities *caps) {
     /* Prefer non-sRGB to preserve the legacy 2D color contract. */
     for (size_t i=0;i<caps->formatCount;i++) if (caps->formats[i]==WGPUTextureFormat_BGRA8Unorm || caps->formats[i]==WGPUTextureFormat_RGBA8Unorm) return caps->formats[i];
-    return caps->formats[0];
+    for (size_t i=0;i<caps->formatCount;i++) if (caps->formats[i]==WGPUTextureFormat_BGRA8UnormSrgb || caps->formats[i]==WGPUTextureFormat_RGBA8UnormSrgb) return caps->formats[i];
+    return WGPUTextureFormat_Undefined;
 }
 
 /* Optional features the engine can use. Only those the adapter reports are requested. */
@@ -132,11 +146,20 @@ void zwgpu_destroy(ZWgpu *g);
 static ZWgpu *create_impl(void *window,int headless) {
     if (!headless && !window) { fail("Missing window"); return NULL; }
     ZWgpu *g=calloc(1,sizeof *g); if (!g) { fail("Out of memory"); return NULL; }
-    atomic_init(&g->failed,0); g->window=window;
+    atomic_init(&g->failed,0); atomic_init(&g->capture,0); atomic_init(&g->validation_pending,0); g->window=window;
+    g->validation_mutex=SDL_CreateMutex();
+    if (!g->validation_mutex) { fail("Validation mutex creation failed"); goto bad; }
     g->instance=wgpuCreateInstance(NULL); if (!g->instance) { fail("wgpuCreateInstance failed"); goto bad; }
     if (!headless) { g->surface=make_surface(g); if (!g->surface) { fail("Unsupported SDL native window or surface creation failed"); goto bad; } }
     Request req={0};
     WGPURequestAdapterOptions adapter_options={.compatibleSurface=g->surface,.powerPreference=WGPUPowerPreference_HighPerformance};
+    const char *backend=getenv("ZENGY_WGPU_BACKEND");
+    if (backend && *backend) {
+        if (!strcmp(backend,"vulkan")) adapter_options.backendType=WGPUBackendType_Vulkan;
+        else if (!strcmp(backend,"dx12")) adapter_options.backendType=WGPUBackendType_D3D12;
+        else if (!strcmp(backend,"metal")) adapter_options.backendType=WGPUBackendType_Metal;
+        else if (strcmp(backend,"auto")) { fail("Invalid ZENGY_WGPU_BACKEND"); goto bad; }
+    }
     wgpuInstanceRequestAdapter(g->instance,&adapter_options,(WGPURequestAdapterCallbackInfo){.mode=WGPUCallbackMode_AllowProcessEvents,.callback=adapter_cb,.userdata1=&req});
     await_request(g->instance,&req); g->adapter=req.adapter;
     if (!g->adapter) { fail("No compatible WebGPU adapter"); goto bad; }
@@ -150,6 +173,7 @@ static ZWgpu *create_impl(void *window,int headless) {
     device_desc.requiredFeatureCount=enabled_count; device_desc.requiredFeatures=enabled;
     if (have_limits) device_desc.requiredLimits=&limits;
     device_desc.uncapturedErrorCallbackInfo=(WGPUUncapturedErrorCallbackInfo){.callback=error_cb,.userdata1=g};
+    device_desc.deviceLostCallbackInfo=(WGPUDeviceLostCallbackInfo){.mode=WGPUCallbackMode_AllowProcessEvents,.callback=lost_cb,.userdata1=g};
     wgpuAdapterRequestDevice(g->adapter,&device_desc,(WGPURequestDeviceCallbackInfo){.mode=WGPUCallbackMode_AllowProcessEvents,.callback=device_cb,.userdata1=&req});
     await_request(g->instance,&req); g->device=req.device;
     if (!g->device) { fail("wgpuAdapterRequestDevice failed"); goto bad; }
@@ -158,7 +182,11 @@ static ZWgpu *create_impl(void *window,int headless) {
     WGPUSurfaceCapabilities caps={0};
     if (wgpuSurfaceGetCapabilities(g->surface,g->adapter,&caps)!=WGPUStatus_Success) { fail("Surface capabilities unavailable"); goto bad; }
     if (!caps.formatCount || !caps.alphaModeCount || !(caps.usages&WGPUTextureUsage_RenderAttachment)) { wgpuSurfaceCapabilitiesFreeMembers(caps); fail("Unsupported surface capabilities"); goto bad; }
-    g->config=(WGPUSurfaceConfiguration){.device=g->device,.format=choose_format(&caps),.usage=WGPUTextureUsage_RenderAttachment|WGPUTextureUsage_CopySrc,.presentMode=WGPUPresentMode_Fifo,.alphaMode=caps.alphaModes[0]};
+    WGPUTextureFormat format=choose_format(&caps);
+    if (format==WGPUTextureFormat_Undefined) { wgpuSurfaceCapabilitiesFreeMembers(caps); fail("No supported 8-bit surface format"); goto bad; }
+    WGPUTextureUsage usage=WGPUTextureUsage_RenderAttachment;
+    if (caps.usages&WGPUTextureUsage_CopySrc) usage|=WGPUTextureUsage_CopySrc;
+    g->config=(WGPUSurfaceConfiguration){.device=g->device,.format=format,.usage=usage,.presentMode=WGPUPresentMode_Fifo,.alphaMode=caps.alphaModes[0]};
     wgpuSurfaceCapabilitiesFreeMembers(caps);
     return g;
 bad: zwgpu_destroy(g); return NULL;
@@ -168,18 +196,20 @@ ZWgpu *zwgpu_create_headless(void) { return create_impl(NULL,1); }
 
 void zwgpu_destroy(ZWgpu *g) {
     if (!g) return;
-    if (g->device) wgpuDevicePoll(g->device,1,NULL);
+    if (g->device && !atomic_load(&g->failed)) wgpuDevicePoll(g->device,1,NULL);
     if (g->frame_view) wgpuTextureViewRelease(g->frame_view);
     if (g->frame_texture) wgpuTextureRelease(g->frame_texture);
     if (g->configured) wgpuSurfaceUnconfigure(g->surface);
     if (g->queue) wgpuQueueRelease(g->queue);
-    if (g->device) { wgpuDeviceDestroy(g->device); wgpuDevicePoll(g->device,0,NULL); wgpuDeviceRelease(g->device); }
+    if (g->device) { wgpuDeviceDestroy(g->device); wgpuDeviceRelease(g->device); }
+    if (g->instance) wgpuInstanceProcessEvents(g->instance);
     if (g->adapter) wgpuAdapterRelease(g->adapter);
     if (g->surface) wgpuSurfaceRelease(g->surface);
 #ifdef __APPLE__
     if (g->metal_view) SDL_Metal_DestroyView(g->metal_view);
 #endif
     if (g->instance) wgpuInstanceRelease(g->instance);
+    if (g->validation_mutex) SDL_DestroyMutex(g->validation_mutex);
     free(g);
 }
 
@@ -188,6 +218,7 @@ void *zwgpu_native_queue(ZWgpu *g) { return g?(void*)g->queue:NULL; }
 void *zwgpu_native_adapter(ZWgpu *g) { return g?(void*)g->adapter:NULL; }
 void *zwgpu_native_instance(ZWgpu *g) { return g?(void*)g->instance:NULL; }
 uint32_t zwgpu_surface_format(ZWgpu *g) { return g?(uint32_t)g->config.format:0; }
+int zwgpu_surface_copy_src(ZWgpu *g) { return g && (g->config.usage&WGPUTextureUsage_CopySrc)!=0; }
 int zwgpu_failed(ZWgpu *g) { return !g || atomic_load(&g->failed); }
 
 /* Drawable size in physical pixels, from the same SDL call the swapchain uses. Returns 0 when minimized. */
@@ -248,8 +279,10 @@ void zwgpu_set_validation_capture(ZWgpu *g,int enabled) { if (g) atomic_store(&g
 /* Optionally polls the device, then returns 1 and copies the message if a validation error is queued. */
 int zwgpu_take_validation(ZWgpu *g,char *out,size_t capacity,int flush) {
     if (!g || !out || !capacity) return 0;
-    if (flush && g->device) wgpuDevicePoll(g->device,0,NULL);
-    if (!atomic_exchange(&g->validation_pending,0)) return 0;
-    snprintf(out,capacity,"%s",g->validation);
-    return 1;
+    if (flush && g->device && !atomic_load(&g->failed)) wgpuDevicePoll(g->device,0,NULL);
+    SDL_LockMutex(g->validation_mutex);
+    int pending=atomic_exchange(&g->validation_pending,0);
+    if (pending) snprintf(out,capacity,"%s",g->validation);
+    SDL_UnlockMutex(g->validation_mutex);
+    return pending;
 }

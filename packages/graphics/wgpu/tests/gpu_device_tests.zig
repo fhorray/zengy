@@ -3,6 +3,12 @@
 //! These tests open a headless wgpu device and verify results by reading pixels and buffers back from the
 //! GPU. They are NOT part of the default `zig build test` (which must run without a GPU): run them with
 //! `zig build test-wgpu-gpu -Dwgpu-root=<sdk>`. When no adapter exists the tests are skipped.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn requireGpu() bool {
+    const value = getenv("ZENGY_REQUIRE_GPU") orelse return false;
+    return value[0] == '1' and value[1] == 0;
+}
+
 const std = @import("std");
 const graphics = @import("graphics");
 const wgpu_gpu = @import("wgpu_gpu");
@@ -14,7 +20,10 @@ const Harness = struct {
     g: gpu.GpuDevice,
 
     fn init(allocator: std.mem.Allocator) !Harness {
-        const device = wgpu_gpu.Device.initHeadless(allocator) catch return error.SkipZigTest;
+        const device = wgpu_gpu.Device.initHeadless(allocator) catch |err| {
+            if (requireGpu()) return err;
+            return error.SkipZigTest;
+        };
         return .{ .allocator = allocator, .device = device, .g = device.gpuDevice() };
     }
 
@@ -50,6 +59,37 @@ const Harness = struct {
 fn pixel(pixels: []const u8, width: u32, x: u32, y: u32) [4]u8 {
     const i = (@as(usize, y) * width + x) * 4;
     return .{ pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3] };
+}
+
+test "cancelled readback is idempotent and permits reuse" {
+    var h = try Harness.init(std.testing.allocator);
+    defer h.deinit();
+    // Queue writes only reach a buffer when work is submitted, so the data travels through a copy.
+    const source_buffer = try h.g.createBuffer(.{ .size = 16, .usage = .{ .copy_src = true, .copy_dst = true } });
+    defer h.g.destroyBuffer(source_buffer);
+    const buffer = try h.g.createBuffer(.{ .size = 16, .usage = .{ .map_read = true, .copy_dst = true } });
+    defer h.g.destroyBuffer(buffer);
+    const source: [16]u8 = @splat(7);
+    try h.g.writeBuffer(source_buffer, 0, &source);
+    var rec = gpu.CommandRecorder.init(std.testing.allocator);
+    defer rec.deinit();
+    try rec.copyBufferToBuffer(source_buffer, 0, buffer, 0, 16);
+    try h.g.submit(rec.slice());
+
+    const ticket = try h.g.beginReadback(buffer, 0, 16);
+    h.g.cancelReadback(ticket);
+    h.g.cancelReadback(ticket);
+    var result: [16]u8 = undefined;
+    try std.testing.expectError(error.InvalidHandle, h.g.pollReadback(ticket, &result));
+    try h.g.readBufferBlocking(buffer, 0, &result);
+    try std.testing.expectEqualSlices(u8, &source, &result);
+}
+
+test "device shutdown cancels an unconsumed readback" {
+    var h = try Harness.init(std.testing.allocator);
+    defer h.deinit();
+    const buffer = try h.g.createBuffer(.{ .size = 16, .usage = .{ .map_read = true, .copy_dst = true } });
+    _ = try h.g.beginReadback(buffer, 0, 16);
 }
 
 test "capabilities are detected from the real adapter" {

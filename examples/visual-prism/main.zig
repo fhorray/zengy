@@ -464,7 +464,11 @@ fn updateDynamicGi(st: *PrismShowcaseState) !void {
     }
     if(st.gpu_gi_enabled){
         try publishGpuGi(st,service,target,&settings);
-        return;
+        // The provider latches setup failures. Keep publishing the requested mode so the latch
+        // survives, but populate a real CPU fallback grid when compute cannot run.
+        if (st.app.resources.get(gpu_3d.PbrRenderer)) |renderer| {
+            if (!renderer.gi.failed) return;
+        } else return;
     }
     try refreshGiEmitters(st);
     _ = helios.dynamic_gi.update(&st.dynamic_grid, &service.runtime.bvh, service.runtime.materials.items, st.gi_emitters.items, sun, settings, &st.dynamic_cursor, service.frame_index);
