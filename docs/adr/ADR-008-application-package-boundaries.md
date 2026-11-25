@@ -24,6 +24,10 @@ Concrete changes:
 - `packages/editor-shell` moved to `apps/editor` (`src/shell.zig`). It is an application-local build module, no longer a public SDK module or CLI package. Module ID `app.editor.shell` and capability `editor.shell/1` use the application namespace instead of `official.*`/`engine.*`.
 - `remote` defines a small optional `RemoteIntegration` (edit hook and panel visitor). `apps/editor/src/remote_adapter.zig` implements it on top of the shell; compositions call `remote_adapter.attach(&app)` after `app.initialize()`.
 
+- `visual-inspector` moved to `apps/editor/examples` because it composes the editor shell and adapter.
+- `build.zig` was split into `build/modules.zig`, `examples.zig`, `tools.zig`, `apps.zig` and `tests.zig`; the target and step names are unchanged.
+- The CLI source was split into `catalog.zig`, `process.zig`, `project.zig` and `install.zig`; `ui-widgets` and `ui-plume` are now installable catalog entries.
+
 ## Alternatives considered
 - Keep all tooling as packages: leaves reverse dependencies and ships product policy as public API.
 - Move reusable tooling (remote, gizmos, testing, file watching) into apps: these are application-independent capabilities and stay packages.

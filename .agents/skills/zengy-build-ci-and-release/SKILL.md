@@ -10,6 +10,7 @@ description: >-
 
 ## Toolchain
 
+- **Build layout**: `build.zig` only wires the pieces; `build/modules.zig` declares every module and external dependency, `build/examples.zig` the examples, `build/tools.zig` the CLI and benchmarks, `build/apps.zig` the runtime, `build/tests.zig` the test roots. Keep local module aliases named identically across these files (`tools/ci/check_architecture.py` reads them together).
 - **Zig `0.17.1`** is pinned in `build.zig.zon`. Do not use older or newer Zig versions when verifying builds or CI parity.
 - **Rust (`cargo` / `rustc`)** is optional and only required when building `packages/physics/rapier`.
 

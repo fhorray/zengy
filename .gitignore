@@ -17,4 +17,4 @@ target/
 
 # Plugins/caches installed by `zengy add` inside projects
 .zengy/
-.tmp
+.tmp__pycache__/

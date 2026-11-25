@@ -6,11 +6,13 @@ Checks, without modifying any file:
   * packages do not depend on apps, tools, examples, projects, benchmarks or tests;
   * apps and tools do not import each other's sources;
   * no production module dependency cycles;
-  * every `b.path("....zig")` root in build.zig exists;
+  * every `b.path("....zig")` root and every `addModuleTest("....zig")` root in build.zig and build/*.zig exists;
   * every CLI catalog entry (OFFICIAL_PACKAGES / packageDir) resolves to an existing file.
 
 Limits: only `const x = b.addModule/createModule(...)` roots and `x.addImport("n", y)` edges are
-resolved. Anything else is printed as "unclassified" and does not fail the run. Test modules
+resolved (build.zig and build/*.zig are read together, so local aliases must keep one name).
+Imports of locally defined third-party modules (translate-c, dependencies) are treated as external;
+imports of names never defined in the build files are printed as "unclassified". Neither fails the run. Test modules
 (passed to addModuleTest) are not part of the production graph and may import any layer.
 
 Usage: check_architecture.py [repo_root]    |    check_architecture.py --self-test
@@ -36,8 +38,18 @@ def layer_of(path):
     return top if top in LAYERS else ""
 
 
+def read_build(root):
+    """Concatenated text of build.zig and build/*.zig ('' if build.zig is missing)."""
+    paths = [os.path.join(root, "build.zig")]
+    bdir = os.path.join(root, "build")
+    if os.path.isdir(bdir):
+        paths += [os.path.join(bdir, f) for f in sorted(os.listdir(bdir)) if f.endswith(".zig")]
+    return "\n".join(open(p, encoding="utf-8").read() for p in paths if os.path.isfile(p))
+
+
 def parse_build(text):
     mods = {}
+    known = set(re.findall(r"^\s*const (\w+_mod) = ", text, re.M))
     for m in re.finditer(r"const (\w+) = b\.(?:addModule|createModule)\((?:\"\w+\", )?\.\{(.*?)\n    \}\);", text, re.S):
         r = re.search(r'root_source_file = b\.path\("([^"]+)"\)', m.group(2))
         if r:
@@ -47,7 +59,7 @@ def parse_build(text):
         src, _, dst = m.groups()
         if src in mods and dst in mods:
             edges.append((src, dst))
-        elif src in mods or dst in mods:
+        elif (src in mods or dst in mods) and not (src in known and dst in known):
             unclassified.append(m.group(0))
     return mods, edges, unclassified
 
@@ -116,21 +128,22 @@ def check_catalog(root, errors):
 
 def check(root):
     errors, notes = [], []
-    bp = os.path.join(root, "build.zig")
-    if os.path.isfile(bp):
-        text = open(bp, encoding="utf-8").read()
-        for path in sorted(set(re.findall(r'b\.path\("([^"]+\.zig)"\)', text))):
+    text = read_build(root)
+    if text:
+        roots = set(re.findall(r'b\.path\("([^"]+\.zig)"\)', text))
+        roots |= set(re.findall(r'addModuleTest\(b, \w+, "([^"]+\.zig)"', text))
+        for path in sorted(roots):
             if not os.path.isfile(os.path.join(root, path)):
-                errors.append(f"build.zig: root '{path}' does not exist")
+                errors.append(f"build: root '{path}' does not exist")
         mods, edges, unclassified = parse_build(text)
         notes += [f"unclassified edge: {u}" for u in unclassified]
         for a, b in edges:
             la, lb = layer_of(mods[a]), layer_of(mods[b])
             if la in FORBIDDEN and lb in FORBIDDEN[la]:
-                errors.append(f"build.zig: {la} module '{a}' ({mods[a]}) imports {lb} module '{b}' ({mods[b]})")
+                errors.append(f"build: {la} module '{a}' ({mods[a]}) imports {lb} module '{b}' ({mods[b]})")
         cyc = find_cycle(mods, edges)
         if cyc:
-            errors.append("build.zig: module dependency cycle: " + " -> ".join(cyc))
+            errors.append("build: module dependency cycle: " + " -> ".join(cyc))
     check_sources(root, errors)
     check_catalog(root, errors)
     return errors, notes
@@ -161,6 +174,10 @@ def self_test():
         ("core imports package", dict(base, **{"build.zig": build('engine_mod.addImport("pkg", pkg_mod);\n')}), True),
         ("missing build root", dict(base, **{"build.zig": build('const x = b.path("apps/gone/main.zig");\n')}), True),
         ("package source escapes into apps", dict(base, **{"build.zig": build(), "packages/pkg/src/pkg.zig": '@import("../../../apps/ed/src/app.zig")'}), True),
+        ("split build layout: package imports application", dict(base, **{"build.zig": "", "build/modules.zig": build('pkg_mod.addImport("app", app_mod);\n')}), True),
+        ("split build layout: valid", dict(base, **{"build.zig": "", "build/modules.zig": build()}), False),
+        ("external third-party import is not a violation", dict(base, **{"build.zig": build('const c_mod = b.createModule(.{});\npkg_mod.addImport("c", c_mod);\n')}), False),
+        ("missing test root", dict(base, **{"build.zig": build('addModuleTest(b, test_step, "apps/gone/tests/x_tests.zig", target)\n')}), True),
         ("dependency cycle", dict(base, **{"build.zig": build('pkg_mod.addImport("x", app_mod);\n')}), True),
     ]
     failed = 0
