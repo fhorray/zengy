@@ -12,6 +12,7 @@ const layout = @import("layout.zig");
 const util = @import("util.zig");
 const shadow_cull = @import("shadow_cull.zig");
 const shadow_plan = @import("shadow_plan.zig");
+const volumetric_lights = @import("volumetric_lights.zig");
 const gpu_objects = @import("gpu.zig");
 const frame_res = @import("frame_res.zig");
 const base = @import("../renderer.zig");
@@ -115,6 +116,33 @@ pub const PbrRenderer = struct {
     last_analytic_sun: bool = false,
     last_hdri_width: u32 = 0,
     last_hdri_height: u32 = 0,
+
+    // Volumetric fog targets and temporal history.
+    vol_target: ?Target = null,
+    vol_history: [2]?Target = @splat(null),
+    vol_history_read: u8 = 0,
+    vol_history_valid: bool = false,
+    vol_history_camera_key: u64 = 0,
+    vol_history_epoch: u64 = 0,
+    vol_prev_view_proj: [16]f32 = @splat(0),
+    vol_prev_cam: [3]f32 = .{ 0, 0, 0 },
+    vol_prev_fwd: [3]f32 = .{ 0, 0, -1 },
+    /// Hash of the fog parameters and light slots the temporal history was built with.
+    vol_light_key: u64 = 0,
+    vol_frame: u32 = 0,
+    vol_sp_fader: volumetric_lights.SlotFader = .{},
+    vol_pt_fader: volumetric_lights.SlotFader = .{},
+    froxel_texture: ?Target = null,
+    froxel_failed: bool = false,
+
+    // Automatic exposure history (see `AutoExposureSettings`).
+    exposure_history_valid: bool = false,
+    exposure_frame: u32 = 0,
+    exposure_camera_key: u64 = 0,
+    exposure_physical_mode: bool = false,
+    exposure_scale_log2: f32 = 0.0,
+    exposure_history_epoch: u64 = 0,
+    exposure_prev_camera: [3]f32 = .{ 0, 0, 0 },
 
     // Shadow caches (see `ShadowQuality.static_cache`).
     dir_cascade_cache: [4]shadow_plan.CacheKey = @splat(.{}),
@@ -322,6 +350,13 @@ pub const PbrRenderer = struct {
         self.ssao = null;
         self.ssao_blur = null;
         self.bloom = @splat(null);
+        if (self.vol_target) |t| self.destroyTarget(device, t);
+        self.vol_target = null;
+        for (self.vol_history) |h| if (h) |t| self.destroyTarget(device, t);
+        self.vol_history = @splat(null);
+        self.vol_history_valid = false;
+        if (self.froxel_texture) |t| self.destroyTarget(device, t);
+        self.froxel_texture = null;
     }
 
     fn newTarget(device: gpu.GpuDevice, width: u32, height: u32, format: gpu.TextureFormat, label: []const u8) !Target {
@@ -651,7 +686,8 @@ pub const PbrRenderer = struct {
             0.0;
         const pre_gain = @exp2(pre_log2);
         const fog = self.frame_data.fog;
-        _ = fog;
+        const volumetric_active = fog.enabled and fog.volumetric.enabled and
+            (fog.density > 0.0 or (!fog.volumetric.physical_scattering and fog.volumetric.scattering > 0.0));
 
         const dirs = self.frame_data.directional_lights;
         const sun_dir: [3]f32 = if (dirs.len > 0) .{ -dirs[0].direction[0], -dirs[0].direction[1], -dirs[0].direction[2] } else .{ 0.4, 0.8, 0.45 };
@@ -1101,9 +1137,27 @@ pub const PbrRenderer = struct {
             .pr_count = pr_count,
             .z_scale = built_clusters.factors.z_scale,
             .z_bias = built_clusters.factors.z_bias,
-            .volumetric_active = false,
+            .volumetric_active = volumetric_active,
             .ssao_view = if (prepass_ran) blur_t.view else g.white.view,
         });
+
+        // 3.5 Volumetric fog and god rays: scattering is composited onto the HDR scene.
+        if (volumetric_active) {
+            try self.volumetricPass(input, g, hdr, depth_view, .{
+                .light_vps = light_vps,
+                .cascade_splits = cascade_splits,
+                .cascade_count = cascade_count,
+                .shadows_enabled = shadows_enabled,
+                .pre_gain = pre_gain,
+                .pt_count = pt_count,
+                .sp_count = sp_count,
+            });
+        } else {
+            self.vol_history_valid = false;
+        }
+
+        // 4. Automatic exposure: luminance histogram, then adaptation into the 1x1 exposure texture.
+        try self.autoExposure(input, g, hdr, pre_log2);
 
         // 5. Bloom: downsample chain, then additive upsample back to the first level.
         const bloom_view: gpu.TextureViewHandle = if (pp.bloom.enabled) blk: {
@@ -1188,6 +1242,354 @@ pub const PbrRenderer = struct {
         try self.flushScratch(g, &self.mask_params, &self.mask_scratch, g.l_mask_params, @sizeOf(layout.ShadowMaskParams), "shadow mask uniforms");
         self.rendered_this_frame = true;
         self.base.pbr_rendered = true;
+    }
+
+    const VolCtx = struct {
+        light_vps: [4]math3d.Mat4,
+        cascade_splits: [4]f32,
+        cascade_count: f32,
+        shadows_enabled: f32,
+        pre_gain: f32,
+        pt_count: usize,
+        sp_count: usize,
+    };
+
+    /// Keeps `slot` at `w x h` in the HDR format, recreating it only when the size changes.
+    fn ensureHdrTarget(self: *PbrRenderer, device: gpu.GpuDevice, slot: *?Target, w: u32, h: u32, label: []const u8) !Target {
+        if (slot.*) |t| if (t.width == w and t.height == h) return t;
+        const fresh = try newTarget(device, w, h, hdr_format, label);
+        if (slot.*) |old| self.destroyTarget(device, old);
+        slot.* = fresh;
+        return fresh;
+    }
+
+    fn volumetricPass(self: *PbrRenderer, input: *frame.FrameInput, g: *Gpu, hdr: Target, depth_view: gpu.TextureViewHandle, vc: VolCtx) !void {
+        const device = input.device;
+        const rec = input.recorder;
+        const ring = &self.ring.?;
+        const groups = &self.groups.?;
+        const vol = try g.ensureVolumetric(ring.buffer);
+        const tex_w = input.target.width;
+        const tex_h = input.target.height;
+        const fogc = self.frame_data.fog;
+        const vol_cfg = fogc.volumetric;
+        const pp = self.frame_data.post_process;
+        const local_sh = self.local_shadow;
+        const cl_lights = self.cluster_lights;
+        const dirs = self.frame_data.directional_lights;
+
+        // Ray-march at half resolution by default; the composite pass upsamples depth-aware (~4x fewer marched pixels).
+        const vol_half = vol_cfg.half_resolution;
+        if (!vol_cfg.froxel_enabled) self.froxel_failed = false;
+        var froxel_on = vol_cfg.froxel_enabled and !self.froxel_failed;
+        var froxel_pixel = std.math.clamp(vol_cfg.froxel_pixel_size, 8, 32);
+        const froxel_slices = std.math.clamp(vol_cfg.froxel_slices, 8, 64);
+        froxel_pixel = @max(froxel_pixel, (tex_h * froxel_slices + 8191) / 8192);
+        const fw = @max((tex_w + froxel_pixel - 1) / froxel_pixel, 1);
+        const fh = @max((tex_h + froxel_pixel - 1) / froxel_pixel, 1);
+        var froxel_target: ?Target = null;
+        if (froxel_on) {
+            froxel_target = self.ensureHdrTarget(device, &self.froxel_texture, fw, fh * froxel_slices, "froxels") catch blk: {
+                froxel_on = false;
+                self.froxel_failed = true;
+                std.debug.print("[pbr] froxel allocation failed; falling back to ray marching\n", .{});
+                break :blk null;
+            };
+        }
+        const vol_w: u32 = if (vol_half) @max(tex_w / 2, 1) else tex_w;
+        const vol_h: u32 = if (vol_half) @max(tex_h / 2, 1) else tex_h;
+        const vol_t = try self.ensureHdrTarget(device, &self.vol_target, vol_w, vol_h, "volumetric");
+        const temporal = vol_cfg.temporal;
+        if (temporal) {
+            // A size change drops the history.
+            const have = self.vol_history[0] != null and self.vol_history[0].?.width == vol_w and self.vol_history[0].?.height == vol_h;
+            if (!have) {
+                for (self.vol_history) |h| if (h) |t| self.destroyTarget(device, t);
+                self.vol_history = @splat(null);
+                for (&self.vol_history) |*slot| slot.* = try newTarget(device, vol_w, vol_h, hdr_format, "volumetric history");
+                self.vol_history_read = 0;
+                self.vol_history_valid = false;
+            }
+        }
+        // Golden-ratio sequence: successive frames sample different positions along each ray.
+        self.vol_frame +%= 1;
+        const jitter_offset: f32 = if (temporal) @floatCast(@mod(@as(f64, @floatFromInt(self.vol_frame)) * 0.6180339887498949, 1.0)) else 0.0;
+
+        const has_dir_vf = dirs.len > 0;
+        const vf_sun_dir: [3]f32 = if (has_dir_vf) .{ -dirs[0].direction[0], -dirs[0].direction[1], -dirs[0].direction[2] } else .{ 0.4, 0.8, 0.45 };
+        const vf_sun_col: [3]f32 = if (has_dir_vf) dirs[0].color else .{ 1, 1, 1 };
+        const vf_sun_int: f32 = if (has_dir_vf) dirs[0].illuminance_lux / 2500.0 else 0.0;
+
+        // Spot lights get the same relevance ranking as point lights, with one local-atlas tile per shadowed slot.
+        var vf_sp_pos: [4][4]f32 = @splat(.{ 0, 0, 0, 1 });
+        var vf_sp_dir: [4][4]f32 = @splat(.{ 0, -1, 0, 0.8 });
+        var vf_sp_col: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
+        var vf_sp_shadow: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
+        self.vol_sp_fader.update(self.frame_data.spot_lights[0..vc.sp_count], self.frame_data.camera_position, self.frame_data.dt);
+        for (self.vol_sp_fader.slots, 0..) |s, slot| {
+            if (!s.active or s.weight <= 0.0) continue;
+            const li = s.idx;
+            const sl = self.frame_data.spot_lights[li];
+            const sc = (sl.intensity_lumens / 100.0) * s.weight;
+            vf_sp_pos[slot] = .{ sl.position[0], sl.position[1], sl.position[2], sl.range };
+            vf_sp_dir[slot] = .{ sl.direction[0], sl.direction[1], sl.direction[2], @cos(sl.outer_angle_rad) };
+            vf_sp_col[slot] = .{ sl.color[0] * sc, sl.color[1] * sc, sl.color[2] * sc, 1.0 };
+            const tile = cl_lights.spots[li].shadow_params[0];
+            if (tile >= 0.0) vf_sp_shadow[slot] = .{ tile, 1.0, 0.0, 0.0 };
+        }
+
+        var vf_pt_pos: [4][4]f32 = @splat(.{ 0, 0, 0, 1 });
+        var vf_pt_col: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
+        var vf_pt_shadow: [4][4]f32 = @splat(.{ 0, 0, 0, 0 });
+        // Only lights that received a cluster entry this frame are candidates, so `cl_lights` indices stay valid.
+        self.vol_pt_fader.update(self.frame_data.point_lights[0..vc.pt_count], self.frame_data.camera_position, self.frame_data.dt);
+        for (self.vol_pt_fader.slots, 0..) |s, slot| {
+            if (!s.active or s.weight <= 0.0) continue;
+            const li = s.idx;
+            const pl = self.frame_data.point_lights[li];
+            const sc = (pl.intensity_lumens / 100.0) * s.weight;
+            vf_pt_pos[slot] = .{ pl.position[0], pl.position[1], pl.position[2], pl.range };
+            vf_pt_col[slot] = .{ pl.color[0] * sc, pl.color[1] * sc, pl.color[2] * sc, 1.0 };
+            // Local-atlas tile of the first cube face (six consecutive tiles), or -1 when unshadowed.
+            const tile = cl_lights.points[li].col_radius[3];
+            if (tile >= 0.0) vf_pt_shadow[slot] = .{ tile, 1.0, 0.0, 0.0 };
+        }
+
+        const inv_view_proj = util.invertMat4(self.frame_data.view_proj);
+        const vfp = layout.VolFogParams{
+            .inv_view_proj = inv_view_proj,
+            .light_vp = .{ vc.light_vps[0].m, vc.light_vps[1].m, vc.light_vps[2].m, vc.light_vps[3].m },
+            .cam_pos_density = .{ self.frame_data.camera_position[0], self.frame_data.camera_position[1], self.frame_data.camera_position[2], fogc.density },
+            .sun_dir_int = .{ vf_sun_dir[0], vf_sun_dir[1], vf_sun_dir[2], vf_sun_int },
+            .sun_col_aniso = .{ vf_sun_col[0], vf_sun_col[1], vf_sun_col[2], vol_cfg.anisotropy },
+            .fog_col_scat = .{ fogc.color[0], fogc.color[1], fogc.color[2], vol_cfg.scattering },
+            .cascade_splits = if (vc.shadows_enabled > 0.5) vc.cascade_splits else .{ -1.0, -1.0, -1.0, -1.0 },
+            .cam_fwd_maxd = .{ self.frame_data.camera_forward[0], self.frame_data.camera_forward[1], self.frame_data.camera_forward[2], vol_cfg.max_distance },
+            .spot_pos_range = vf_sp_pos,
+            .spot_dir_cos = vf_sp_dir,
+            .spot_col_on = vf_sp_col,
+            .spot_shadow = vf_sp_shadow,
+            .point_pos = vf_pt_pos,
+            .point_col = vf_pt_col,
+            .local_vp = local_sh.shadow_vp,
+            .local_rect = local_sh.atlas_rect,
+            .point_shadow = vf_pt_shadow,
+            .cascade_info = .{ vc.cascade_count, jitter_offset, @floatFromInt(std.math.clamp(vol_cfg.raymarch_steps, 8, 128)), if (vol_cfg.physical_scattering) 1.0 else 0.0 },
+            .froxel_params = .{ @floatFromInt(fw), @floatFromInt(fh), @floatFromInt(froxel_slices), if (froxel_on) 1 else 0 },
+        };
+
+        const fog_group = try groups.get(frame_res.key(&.{ 0x70a1, frame_res.bits(depth_view) }), .{ .layout = vol.l_fog, .entries = &.{
+            .{ .binding = 0, .resource = .{ .texture_view = depth_view } },
+            .{ .binding = 32, .resource = .{ .sampler = g.nearest } },
+            .{ .binding = 1, .resource = .{ .texture_view = g.shadow_atlas.view } },
+            .{ .binding = 33, .resource = .{ .sampler = g.shadow_cmp } },
+            .{ .binding = 2, .resource = .{ .texture_view = g.local_shadow.view } },
+            .{ .binding = 34, .resource = .{ .sampler = g.shadow_cmp } },
+        } });
+        const fog_target = if (froxel_on) froxel_target.? else vol_t;
+        const fog_attachments = [_]gpu.ColorAttachment{.{ .target = .{ .view = fog_target.view }, .load = .clear, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } }};
+        try rec.beginRenderPass(.{ .label = "volumetric fog", .color_attachments = &fog_attachments });
+        try rec.setRenderPipeline(vol.fog);
+        try rec.setBindGroup(0, fog_group, &.{});
+        try rec.setBindGroup(1, vol.g_u_fog, &.{try ring.pushValue(vfp)});
+        try rec.draw(3, 1, 0, 0);
+        try rec.endRenderPass();
+
+        if (froxel_on) {
+            const froxel_group = try groups.get(frame_res.key(&.{ 0x70a2, frame_res.bits(froxel_target.?.view), frame_res.bits(depth_view) }), .{ .layout = vol.l_froxel, .entries = &.{
+                .{ .binding = 0, .resource = .{ .texture_view = froxel_target.?.view } },
+                .{ .binding = 32, .resource = .{ .sampler = g.linear } },
+                .{ .binding = 1, .resource = .{ .texture_view = depth_view } },
+                .{ .binding = 33, .resource = .{ .sampler = g.nearest } },
+            } });
+            const cam = self.frame_data.camera_position;
+            const params = layout.FroxelIntegrateParams{
+                .inv_view_proj = inv_view_proj,
+                .cam_max = .{ cam[0], cam[1], cam[2], vol_cfg.max_distance },
+                .dimensions = .{ @floatFromInt(fw), @floatFromInt(fh), @floatFromInt(froxel_slices), fogc.density },
+            };
+            const attachments = [_]gpu.ColorAttachment{.{ .target = .{ .view = vol_t.view }, .load = .clear }};
+            try rec.beginRenderPass(.{ .label = "froxel integrate", .color_attachments = &attachments });
+            try rec.setRenderPipeline(vol.froxel);
+            try rec.setBindGroup(0, froxel_group, &.{});
+            try rec.setBindGroup(1, vol.g_u_froxel, &.{try ring.pushValue(params)});
+            try rec.draw(3, 1, 0, 0);
+            try rec.endRenderPass();
+        }
+
+        // Temporal resolve: reproject the previous result, clip it to this frame's neighbourhood and blend.
+        var vol_final = vol_t;
+        if (temporal) {
+            const cam_now = self.frame_data.camera_position;
+            const fwd_now = self.frame_data.camera_forward;
+            // History also dies when the fog itself changed: density, scattering, the sun, or any light that the
+            // volume uses moved, recoloured or switched slot. Reprojecting old scatter would trail behind the change.
+            var key_hasher = std.hash.Wyhash.init(0x76f6);
+            key_hasher.update(std.mem.asBytes(&vfp.sun_dir_int));
+            key_hasher.update(std.mem.asBytes(&vfp.sun_col_aniso));
+            key_hasher.update(std.mem.asBytes(&vfp.fog_col_scat));
+            key_hasher.update(std.mem.asBytes(&vfp.cam_pos_density[3]));
+            key_hasher.update(std.mem.asBytes(&vfp.spot_pos_range));
+            key_hasher.update(std.mem.asBytes(&vfp.spot_dir_cos));
+            key_hasher.update(std.mem.asBytes(&vfp.spot_col_on));
+            key_hasher.update(std.mem.asBytes(&vfp.point_pos));
+            key_hasher.update(std.mem.asBytes(&vfp.point_col));
+            key_hasher.update(std.mem.asBytes(&vfp.point_shadow));
+            key_hasher.update(std.mem.asBytes(&vfp.spot_shadow));
+            key_hasher.update(std.mem.asBytes(&vfp.cam_fwd_maxd[3]));
+            key_hasher.update(std.mem.asBytes(&vfp.cascade_info[2]));
+            key_hasher.update(std.mem.asBytes(&vfp.cascade_info[3]));
+            key_hasher.update(std.mem.asBytes(&vfp.froxel_params));
+            const light_key = key_hasher.final();
+            const fog_unchanged = light_key == self.vol_light_key;
+            self.vol_light_key = light_key;
+            const usable = self.vol_history_valid and self.vol_history_camera_key == self.frame_data.camera_key and
+                self.vol_history_epoch == pp.auto_exposure.history_epoch and fog_unchanged and
+                volumetric_lights.historyUsable(self.vol_prev_cam, self.vol_prev_fwd, cam_now, fwd_now);
+            const read_idx: usize = self.vol_history_read;
+            const write_idx: usize = 1 - read_idx;
+            const write_t = self.vol_history[write_idx].?;
+            const read_t = self.vol_history[read_idx].?;
+            const res_group = try groups.get(frame_res.key(&.{ 0x70a3, frame_res.bits(vol_t.view), frame_res.bits(read_t.view), frame_res.bits(depth_view) }), .{ .layout = vol.l_resolve, .entries = &.{
+                .{ .binding = 0, .resource = .{ .texture_view = vol_t.view } },
+                .{ .binding = 32, .resource = .{ .sampler = g.nearest } },
+                .{ .binding = 1, .resource = .{ .texture_view = read_t.view } },
+                .{ .binding = 33, .resource = .{ .sampler = g.linear } },
+                .{ .binding = 2, .resource = .{ .texture_view = depth_view } },
+                .{ .binding = 34, .resource = .{ .sampler = g.nearest } },
+            } });
+            const res_u = layout.VolResolveParams{
+                .inv_view_proj = inv_view_proj,
+                .prev_view_proj = self.vol_prev_view_proj,
+                .cam_pos_max = .{ cam_now[0], cam_now[1], cam_now[2], vol_cfg.max_distance },
+                .size_blend = .{ @floatFromInt(vol_w), @floatFromInt(vol_h), std.math.clamp(vol_cfg.temporal_blend, 0.02, 1.0), if (usable) 1.0 else 0.0 },
+            };
+            const attachments = [_]gpu.ColorAttachment{.{ .target = .{ .view = write_t.view }, .load = .clear }};
+            try rec.beginRenderPass(.{ .label = "volumetric resolve", .color_attachments = &attachments });
+            try rec.setRenderPipeline(vol.resolve);
+            try rec.setBindGroup(0, res_group, &.{});
+            try rec.setBindGroup(1, vol.g_u_resolve, &.{try ring.pushValue(res_u)});
+            try rec.draw(3, 1, 0, 0);
+            try rec.endRenderPass();
+
+            vol_final = write_t;
+            self.vol_history_read = @intCast(write_idx);
+            self.vol_history_valid = true;
+            self.vol_history_camera_key = self.frame_data.camera_key;
+            self.vol_history_epoch = pp.auto_exposure.history_epoch;
+            self.vol_prev_view_proj = self.frame_data.view_proj;
+            self.vol_prev_cam = cam_now;
+            self.vol_prev_fwd = fwd_now;
+        } else {
+            self.vol_history_valid = false;
+        }
+
+        // Physically based composition on the HDR scene: L = L_scene * T + L_scatter.
+        // Pass 0 multiplies by T; pass 1 adds the upsampled in-scatter plus the ambient fog colour (1 - T) * C.
+        const vc_base = layout.VolCompositeParams{
+            .inv_view_proj = inv_view_proj,
+            .cam_pos = .{ self.frame_data.camera_position[0], self.frame_data.camera_position[1], self.frame_data.camera_position[2], vc.pre_gain },
+            .vol_size_dist = .{ @floatFromInt(vol_w), @floatFromInt(vol_h), vol_cfg.max_distance, 0 },
+            .fog_color_density = .{ fogc.color[0], fogc.color[1], fogc.color[2], fogc.density },
+        };
+        const comp_group = try groups.get(frame_res.key(&.{ 0x70a4, frame_res.bits(vol_final.view), frame_res.bits(depth_view) }), .{ .layout = vol.l_composite, .entries = &.{
+            .{ .binding = 0, .resource = .{ .texture_view = vol_final.view } },
+            .{ .binding = 32, .resource = .{ .sampler = g.nearest } },
+            .{ .binding = 1, .resource = .{ .texture_view = depth_view } },
+            .{ .binding = 33, .resource = .{ .sampler = g.nearest } },
+        } });
+        const passes = [_]struct { mode: f32, pipeline: gpu.RenderPipelineHandle }{
+            .{ .mode = 0.0, .pipeline = vol.transmittance },
+            .{ .mode = 1.0, .pipeline = vol.composite },
+        };
+        for (passes) |p| {
+            var vcp = vc_base;
+            vcp.vol_size_dist[3] = p.mode;
+            const attachments = [_]gpu.ColorAttachment{.{ .target = .{ .view = hdr.view }, .load = .load }};
+            try rec.beginRenderPass(.{ .label = "volumetric composite", .color_attachments = &attachments });
+            try rec.setRenderPipeline(p.pipeline);
+            try rec.setBindGroup(0, comp_group, &.{});
+            try rec.setBindGroup(1, vol.g_u_composite, &.{try ring.pushValue(vcp)});
+            try rec.draw(3, 1, 0, 0);
+            try rec.endRenderPass();
+        }
+    }
+
+    fn autoExposure(self: *PbrRenderer, input: *frame.FrameInput, g: *Gpu, hdr: Target, pre_log2: f32) !void {
+        const pp = self.frame_data.post_process;
+        const exposure = pp.auto_exposure;
+        const physical = exposure.physical;
+        if (!exposure.enabled) {
+            self.exposure_history_valid = false;
+            return;
+        }
+        const rec = input.recorder;
+        const ring = &self.ring.?;
+        const groups = &self.groups.?;
+        const ex = try g.ensureExposure(ring.buffer);
+        const tex_w = input.target.width;
+        const tex_h = input.target.height;
+
+        const scale_log2 = physical.scaleLog2();
+        const hist_a = if (std.math.isFinite(exposure.histogram_min_log2)) std.math.clamp(exposure.histogram_min_log2, -32.0, 32.0) else -12.0;
+        const hist_b = if (std.math.isFinite(exposure.histogram_max_log2)) std.math.clamp(exposure.histogram_max_log2, -32.0, 32.0) else 12.0;
+        const min_log2 = @min(hist_a, hist_b);
+        const log2_range = @max(@abs(hist_b - hist_a), 0.25);
+        const stride = std.math.clamp(exposure.metering_stride, 1, 16);
+        const meter_w = @max((tex_w + stride - 1) / stride, 1);
+        const meter_h = @max((tex_h + stride - 1) / stride, 1);
+        const cam = self.frame_data.camera_position;
+        const dx = cam[0] - self.exposure_prev_camera[0];
+        const dy = cam[1] - self.exposure_prev_camera[1];
+        const dz = cam[2] - self.exposure_prev_camera[2];
+        const reset = !self.exposure_history_valid or exposure.reset_history or
+            self.exposure_camera_key != self.frame_data.camera_key or
+            self.exposure_history_epoch != exposure.history_epoch or
+            self.exposure_physical_mode != physical.enabled or
+            (physical.enabled and self.exposure_scale_log2 != scale_log2) or
+            dx * dx + dy * dy + dz * dz > 400.0;
+        self.exposure_history_valid = false; // Only commit validity after both passes are recorded.
+        const frame_phase: f32 = @floatFromInt(self.exposure_frame % 256);
+        const phase_x: f32 = if (stride == 1) 0.5 else @mod(frame_phase * 0.754877666 + 0.5, 1.0);
+        const phase_y: f32 = if (stride == 1) 0.5 else @mod(frame_phase * 0.569840296 + 0.5, 1.0);
+        const center_weight: f32 = if (std.math.isFinite(exposure.metering_center_weight)) std.math.clamp(exposure.metering_center_weight, 0.0, 1.0) else 0.0;
+
+        const hdr_group = try groups.get(frame_res.key(&.{ 0xe501, frame_res.bits(hdr.view) }), .{ .layout = ex.l_hist_hdr, .entries = &.{
+            .{ .binding = 0, .resource = .{ .texture_view = hdr.view } },
+        } });
+        const hp = layout.HistParams{
+            .range_params = .{ min_log2 + pre_log2, 1.0 / log2_range, @floatFromInt(meter_w), @floatFromInt(meter_h) },
+            .metering_params = .{ center_weight, phase_x, phase_y, @floatFromInt(@max(@as(u64, 1), @min(@as(u64, 8), @as(u64, std.math.maxInt(u32)) / (@as(u64, meter_w) * meter_h)))) },
+        };
+        try rec.beginComputePass(.{ .label = "exposure histogram" });
+        try rec.setComputePipeline(ex.hist);
+        try rec.setBindGroup(0, hdr_group, &.{});
+        try rec.setBindGroup(1, ex.g_hist_buffer, &.{});
+        try rec.setBindGroup(2, ex.g_hist_uniform, &.{try ring.pushValue(hp)});
+        try rec.dispatch((meter_w + 15) / 16, (meter_h + 15) / 16, 1);
+        try rec.endComputePass();
+
+        const ap = layout.AdaptParams{
+            .ev_bounds = .{ if (physical.enabled) physical.min_ev100 else exposure.min_ev100, if (physical.enabled) physical.max_ev100 else exposure.max_ev100, exposure.low_percent, exposure.high_percent },
+            .speed_dt = .{ exposure.speed_brighten, exposure.speed_darken, if (std.math.isFinite(self.frame_data.dt)) std.math.clamp(self.frame_data.dt, 0.0, 0.1) else 0.0, exposure.compensation_ev },
+            .hist_range = .{ min_log2, log2_range, if (reset) 2.0 else 1.0, exposure.hybrid_transition_stops },
+            .physical_params = .{ if (physical.enabled) 1.0 else 0.0, scale_log2, physical.manualEv100(), 0.0 },
+        };
+        try rec.beginComputePass(.{ .label = "exposure adapt" });
+        try rec.setComputePipeline(ex.adapt);
+        try rec.setBindGroup(0, g.empty_group, &.{});
+        try rec.setBindGroup(1, ex.g_adapt_out, &.{});
+        try rec.setBindGroup(2, ex.g_adapt_uniform, &.{try ring.pushValue(ap)});
+        try rec.dispatch(1, 1, 1);
+        try rec.endComputePass();
+
+        self.exposure_history_valid = true;
+        self.exposure_prev_camera = cam;
+        self.exposure_camera_key = self.frame_data.camera_key;
+        self.exposure_physical_mode = physical.enabled;
+        self.exposure_scale_log2 = scale_log2;
+        self.exposure_history_epoch = exposure.history_epoch;
+        self.exposure_frame +%= 1;
     }
 
     const LitParams = struct {

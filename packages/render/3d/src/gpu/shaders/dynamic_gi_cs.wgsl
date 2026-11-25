@@ -1483,7 +1483,7 @@ fn main_1() {
     }
     storageBarrier();
     workgroupBarrier();
-    subgroupBarrier();
+    workgroupBarrier();
     textureBarrier();
     let _e159 = lane;
     let _e160 = count;
@@ -1647,7 +1647,7 @@ fn main_1() {
     }
     storageBarrier();
     workgroupBarrier();
-    subgroupBarrier();
+    workgroupBarrier();
     textureBarrier();
     let _e482 = lane;
     if (_e482 == 0u) {

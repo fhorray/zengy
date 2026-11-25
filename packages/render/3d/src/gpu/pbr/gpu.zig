@@ -34,6 +34,12 @@ const sh = struct {
     const bloom_down_fs = @embedFile("../shaders/bloom_downsample_fs.wgsl");
     const bloom_up_fs = @embedFile("../shaders/bloom_upsample_fs.wgsl");
     const postfx_fs = @embedFile("../shaders/postfx_fs.wgsl");
+    const volumetric_fog_fs = @embedFile("../shaders/volumetric_fog_fs.wgsl");
+    const volumetric_resolve_fs = @embedFile("../shaders/volumetric_resolve_fs.wgsl");
+    const volumetric_composite_fs = @embedFile("../shaders/volumetric_composite_fs.wgsl");
+    const froxel_integrate_fs = @embedFile("../shaders/froxel_integrate_fs.wgsl");
+    const exposure_hist_cs = @embedFile("../shaders/auto_exposure_hist_cs.wgsl");
+    const exposure_adapt_cs = @embedFile("../shaders/auto_exposure_adapt_cs.wgsl");
 };
 
 const ltc_table = @embedFile("../shaders/ltc_fit.bin");
@@ -175,6 +181,12 @@ pub const Gpu = struct {
     l_u_bloom: gpu.BindGroupLayoutHandle = undefined,
     l_u_post: gpu.BindGroupLayoutHandle = undefined,
 
+    /// Volumetric fog pipelines, created on first use.
+    volumetric_gpu: ?Volumetric = null,
+
+    /// Automatic exposure compute pipelines, created on first use.
+    exposure_gpu: ?Exposure = null,
+
     // Post-process pipeline depends on the frame target format.
     postfx_pl: gpu.PipelineLayoutHandle = undefined,
     m_postfx_fs: gpu.ShaderModuleHandle = undefined,
@@ -182,6 +194,37 @@ pub const Gpu = struct {
     postfx_format: ?gpu.TextureFormat = null,
 
     pub const Image = struct { texture: gpu.TextureHandle, view: gpu.TextureViewHandle };
+
+    /// Ray-marched (or froxel) volumetric fog, temporal resolve and physically based composite.
+    pub const Volumetric = struct {
+        fog: gpu.RenderPipelineHandle,
+        resolve: gpu.RenderPipelineHandle,
+        composite: gpu.RenderPipelineHandle,
+        transmittance: gpu.RenderPipelineHandle,
+        froxel: gpu.RenderPipelineHandle,
+        l_fog: gpu.BindGroupLayoutHandle,
+        l_resolve: gpu.BindGroupLayoutHandle,
+        l_composite: gpu.BindGroupLayoutHandle,
+        l_froxel: gpu.BindGroupLayoutHandle,
+        g_u_fog: gpu.BindGroupHandle,
+        g_u_resolve: gpu.BindGroupHandle,
+        g_u_composite: gpu.BindGroupHandle,
+        g_u_froxel: gpu.BindGroupHandle,
+    };
+
+    /// Histogram + adaptation compute passes of the automatic exposure.
+    pub const Exposure = struct {
+        hist: gpu.ComputePipelineHandle,
+        adapt: gpu.ComputePipelineHandle,
+        l_hist_hdr: gpu.BindGroupLayoutHandle,
+        /// Static: the histogram buffer for the histogram pass (group 1).
+        g_hist_buffer: gpu.BindGroupHandle,
+        /// Static: exposure storage texture + histogram buffer for the adaptation pass (group 1).
+        g_adapt_out: gpu.BindGroupHandle,
+        /// Dynamic-offset uniform groups over the renderer's uniform ring (group 2).
+        g_hist_uniform: gpu.BindGroupHandle,
+        g_adapt_uniform: gpu.BindGroupHandle,
+    };
 
     pub fn init(allocator: std.mem.Allocator, device: gpu.GpuDevice) !*Gpu {
         const self = try allocator.create(Gpu);
@@ -460,7 +503,7 @@ pub const Gpu = struct {
         const depth_usage: gpu.TextureUsage = .{ .render_attachment = true, .texture_binding = true };
         self.shadow_atlas = try self.newImage(.{ .label = "shadow atlas", .width = layout.SHADOW_W, .height = layout.SHADOW_H, .format = depth_format, .usage = depth_usage });
         self.local_shadow = try self.newImage(.{ .label = "local shadow atlas", .width = 2048, .height = 2048, .format = depth_format, .usage = depth_usage });
-        self.exposure = try self.newImage(.{ .label = "exposure", .width = 1, .height = 1, .format = .r32_float, .usage = .{ .texture_binding = true, .storage_binding = true, .copy_dst = true } });
+        self.exposure = try self.newImage(.{ .label = "exposure", .width = 1, .height = 1, .format = .r32_float, .usage = .{ .texture_binding = true, .storage_binding = true, .copy_dst = true, .copy_src = true } });
         try self.upload(self.exposure, 0, 1, 1, &std.mem.toBytes(@as(f32, 1.0)), 4);
 
         // BRDF lookup table generated on the CPU (unchanged algorithm).
@@ -487,6 +530,75 @@ pub const Gpu = struct {
         self.histogram = try self.newBuffer(.{ .label = "exposure histogram", .size = 66 * 4, .usage = .{ .storage = true, .copy_dst = true } });
         const zeros = std.mem.zeroes([66 * 4]u8);
         try self.device.writeBuffer(self.histogram, 0, &zeros);
+    }
+
+    /// Builds the volumetric pipelines the first time fog is rendered.
+    pub fn ensureVolumetric(self: *Gpu, ring_buffer: gpu.BufferHandle) !*const Volumetric {
+        if (self.volumetric_gpu) |*v| return v;
+        const f = frag;
+        const l_fog = try self.newLayout(&.{ tex(0, .unfilterable, f), samp(32, .non_filtering, f), tex(1, .depth, f), samp(33, .comparison, f), tex(2, .depth, f), samp(34, .comparison, f) });
+        const l_resolve = try self.newLayout(&.{ tex(0, .float, f), samp(32, .filtering, f), tex(1, .float, f), samp(33, .filtering, f), tex(2, .unfilterable, f), samp(34, .non_filtering, f) });
+        const l_composite = try self.newLayout(&.{ tex(0, .float, f), samp(32, .filtering, f), tex(1, .unfilterable, f), samp(33, .non_filtering, f) });
+        const l_froxel = try self.newLayout(&.{ tex(0, .float, f), samp(32, .filtering, f), tex(1, .unfilterable, f), samp(33, .non_filtering, f) });
+        const l_u_fog = try self.newLayout(&.{ubo(0, @sizeOf(layout.VolFogParams), f)});
+        const l_u_resolve = try self.newLayout(&.{ubo(0, @sizeOf(layout.VolResolveParams), f)});
+        const l_u_composite = try self.newLayout(&.{ubo(0, @sizeOf(layout.VolCompositeParams), f)});
+        const l_u_froxel = try self.newLayout(&.{ubo(0, @sizeOf(layout.FroxelIntegrateParams), f)});
+        const composite_fs = try self.newShader("volumetric composite", sh.volumetric_composite_fs);
+        const composite_pl = try self.newPipelineLayout(&.{ l_composite, l_u_composite });
+        self.volumetric_gpu = .{
+            // The ray march writes into a cleared target, so it does not need additive blending.
+            .fog = try self.fullscreen("volumetric fog", sh.volumetric_fog_fs, &.{ l_fog, l_u_fog }, hdr_format, .none),
+            .resolve = try self.fullscreen("volumetric resolve", sh.volumetric_resolve_fs, &.{ l_resolve, l_u_resolve }, hdr_format, .none),
+            .composite = try self.fullscreenWith("volumetric composite", composite_fs, composite_pl, hdr_format, .additive),
+            .transmittance = try self.fullscreenWith("volumetric transmittance", composite_fs, composite_pl, hdr_format, .multiply),
+            .froxel = try self.fullscreen("froxel integrate", sh.froxel_integrate_fs, &.{ l_froxel, l_u_froxel }, hdr_format, .none),
+            .l_fog = l_fog,
+            .l_resolve = l_resolve,
+            .l_composite = l_composite,
+            .l_froxel = l_froxel,
+            .g_u_fog = try self.ringGroup(l_u_fog, ring_buffer, @sizeOf(layout.VolFogParams)),
+            .g_u_resolve = try self.ringGroup(l_u_resolve, ring_buffer, @sizeOf(layout.VolResolveParams)),
+            .g_u_composite = try self.ringGroup(l_u_composite, ring_buffer, @sizeOf(layout.VolCompositeParams)),
+            .g_u_froxel = try self.ringGroup(l_u_froxel, ring_buffer, @sizeOf(layout.FroxelIntegrateParams)),
+        };
+        return &self.volumetric_gpu.?;
+    }
+
+    /// Bind group exposing `size` bytes of the uniform ring through a dynamic-offset binding.
+    pub fn ringGroup(self: *Gpu, lay: gpu.BindGroupLayoutHandle, ring_buffer: gpu.BufferHandle, size: u64) !gpu.BindGroupHandle {
+        return self.newBindGroup(.{ .layout = lay, .entries = &.{.{ .binding = 0, .resource = .{ .buffer = .{ .buffer = ring_buffer, .size = size } } }} });
+    }
+
+    /// Builds the exposure compute pipelines the first time automatic exposure is used.
+    pub fn ensureExposure(self: *Gpu, ring_buffer: gpu.BufferHandle) !*const Exposure {
+        if (self.exposure_gpu) |*e| return e;
+        const c = comp;
+        const l_hdr = try self.newLayout(&.{tex(0, .unfilterable, c)});
+        const l_hist_buf = try self.newLayout(&.{sbo(0, false, c)});
+        const l_adapt_out = try self.newLayout(&.{
+            .{ .binding = 0, .visibility = c, .kind = .{ .storage_texture = .{ .access = .write_only, .format = .r32_float } } },
+            sbo(1, false, c),
+        });
+        const l_u_hist = try self.newLayout(&.{ubo(0, @sizeOf(layout.HistParams), c)});
+        const l_u_adapt = try self.newLayout(&.{ubo(0, @sizeOf(layout.AdaptParams), c)});
+        const hist_pl = try self.newPipelineLayout(&.{ l_hdr, l_hist_buf, l_u_hist });
+        const adapt_pl = try self.newPipelineLayout(&.{ self.l_empty, l_adapt_out, l_u_adapt });
+        const hist = try self.newCompute(.{ .label = "exposure histogram", .layout = hist_pl, .shader = try self.newShader("exposure hist", sh.exposure_hist_cs), .entry = "main" });
+        const adapt = try self.newCompute(.{ .label = "exposure adapt", .layout = adapt_pl, .shader = try self.newShader("exposure adapt", sh.exposure_adapt_cs), .entry = "main" });
+        self.exposure_gpu = .{
+            .hist = hist,
+            .adapt = adapt,
+            .l_hist_hdr = l_hdr,
+            .g_hist_buffer = try self.newBindGroup(.{ .layout = l_hist_buf, .entries = &.{.{ .binding = 0, .resource = .{ .buffer = .{ .buffer = self.histogram } } }} }),
+            .g_adapt_out = try self.newBindGroup(.{ .layout = l_adapt_out, .entries = &.{
+                .{ .binding = 0, .resource = .{ .texture_view = self.exposure.view } },
+                .{ .binding = 1, .resource = .{ .buffer = .{ .buffer = self.histogram } } },
+            } }),
+            .g_hist_uniform = try self.newBindGroup(.{ .layout = l_u_hist, .entries = &.{.{ .binding = 0, .resource = .{ .buffer = .{ .buffer = ring_buffer, .size = @sizeOf(layout.HistParams) } } }} }),
+            .g_adapt_uniform = try self.newBindGroup(.{ .layout = l_u_adapt, .entries = &.{.{ .binding = 0, .resource = .{ .buffer = .{ .buffer = ring_buffer, .size = @sizeOf(layout.AdaptParams) } } }} }),
+        };
+        return &self.exposure_gpu.?;
     }
 
     /// Returns the post-process pipeline for `format`, rebuilding it if the target format changed.

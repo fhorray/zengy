@@ -163,3 +163,103 @@ test "pbr frame with no meshes still produces a sky and does not leak state acro
         try std.testing.expectEqual(@as(u8, 255), p[3]);
     }
 }
+
+fn readExposure(f: *Fixture) !f32 {
+    const image = f.renderer.gpu.?.exposure;
+    const staging = try f.g.createBuffer(.{ .size = 256, .usage = .{ .map_read = true, .copy_dst = true } });
+    defer f.g.destroyBuffer(staging);
+    var rec = gpu.CommandRecorder.init(f.allocator);
+    defer rec.deinit();
+    try rec.copyTextureToBuffer(.{ .texture = image.texture }, staging, .{ .bytes_per_row = 256, .rows_per_image = 1 }, .{ .width = 1, .height = 1 });
+    try f.g.submit(rec.slice());
+    var raw: [256]u8 = undefined;
+    try f.g.readBufferBlocking(staging, 0, &raw);
+    return @bitCast(raw[0..4].*);
+}
+
+test "auto exposure stores a higher EV100 for a brighter scene" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const backend = f.renderer.vtable();
+
+    var dim = sceneFrame(.{ 0, 1, 5 }, 1.0);
+    dim.post_process.auto_exposure.enabled = true;
+    dim.post_process.auto_exposure.speed_brighten = 100;
+    dim.post_process.auto_exposure.speed_darken = 100;
+    dim.post_process.bloom.enabled = false;
+    dim.sky.kind = .solid_color;
+    dim.sky.solid_color = .{ 0.02, 0.02, 0.02 };
+    dim.dt = 0.1;
+    var bright = dim;
+    bright.sky.solid_color = .{ 8.0, 8.0, 8.0 };
+
+    var dim_ev: f32 = 0;
+    for (0..8) |_| {
+        try backend.beginPbrFrame(backend.ctx, &dim);
+        const px_ = try f.renderFrame(64, 64, .rgba8_unorm);
+        std.testing.allocator.free(px_);
+        dim_ev = try readExposure(f);
+    }
+    var bright_ev: f32 = 0;
+    for (0..8) |_| {
+        try backend.beginPbrFrame(backend.ctx, &bright);
+        const px_ = try f.renderFrame(64, 64, .rgba8_unorm);
+        std.testing.allocator.free(px_);
+        bright_ev = try readExposure(f);
+    }
+    std.debug.print("\n[pbr] exposure dim={d:.3} bright={d:.3}\n", .{ dim_ev, bright_ev });
+    try std.testing.expect(std.math.isFinite(dim_ev) and std.math.isFinite(bright_ev));
+    try std.testing.expect(dim_ev != bright_ev);
+    // The texture holds the metered EV100: a brighter scene meters a higher value (the composite then applies less gain).
+    try std.testing.expect(bright_ev > dim_ev + 3.0);
+    // Both stay inside the configured bounds (-4..8 by default).
+    try std.testing.expect(dim_ev >= -4.0 and bright_ev <= 8.0);
+}
+
+fn fogScene(fog_on: bool, temporal: bool, froxel: bool) pbr.ExtractedPbrFrame {
+    var data = sceneFrame(.{ 0, 1, 5 }, 1.0);
+    data.directional_lights = &sun;
+    data.post_process.bloom.enabled = false;
+    data.fog.enabled = fog_on;
+    data.fog.density = 0.08;
+    data.fog.color = .{ 0.6, 0.65, 0.7 };
+    data.fog.volumetric.enabled = fog_on;
+    data.fog.volumetric.temporal = temporal;
+    data.fog.volumetric.froxel_enabled = froxel;
+    return data;
+}
+
+test "volumetric fog changes the scene for ray march, temporal resolve and froxels" {
+    var f = try Fixture.init(std.testing.allocator);
+    defer f.deinit();
+    const backend = f.renderer.vtable();
+
+    var base = fogScene(false, false, false);
+    try backend.beginPbrFrame(backend.ctx, &base);
+    const clear = try f.renderFrame(96, 96, .rgba8_unorm);
+    defer std.testing.allocator.free(clear);
+
+    const modes = [_][2]bool{ .{ false, false }, .{ true, false }, .{ true, true } };
+    for (modes) |m| {
+        var data = fogScene(true, m[0], m[1]);
+        var last: []u8 = &.{};
+        defer if (last.len != 0) std.testing.allocator.free(last);
+        // Several frames so the temporal history is exercised (valid history path, ping-pong).
+        for (0..4) |_| {
+            if (last.len != 0) std.testing.allocator.free(last);
+            try backend.beginPbrFrame(backend.ctx, &data);
+            last = try f.renderFrame(96, 96, .rgba8_unorm);
+        }
+        var changed: usize = 0;
+        var i: usize = 0;
+        while (i < last.len) : (i += 4) {
+            const a = clear[i .. i + 3];
+            const b = last[i .. i + 3];
+            if (!std.mem.eql(u8, a, b)) changed += 1;
+            // Never NaN-black or blown out to the clear colour.
+            try std.testing.expect(!(b[0] > 250 and b[1] < 5 and b[2] > 250));
+        }
+        std.debug.print("\n[pbr] fog temporal={} froxel={} changed={d}/{d}\n", .{ m[0], m[1], changed, last.len / 4 });
+        try std.testing.expect(changed > last.len / 4 / 4);
+    }
+}

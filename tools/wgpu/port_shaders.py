@@ -85,6 +85,9 @@ def port_one(repo: Path, src: Path, naga: str) -> tuple[str, list]:
         return f'@group({g}) @binding({b})'
 
     out = DECL.sub(sub, out)
+    # Naga maps GLSL barrier() to subgroupBarrier(), which needs the optional Subgroups feature. GLSL's barrier()
+    # is a workgroup barrier, so emit the portable WGSL equivalent.
+    out = out.replace('subgroupBarrier();', 'workgroupBarrier();')
     # Fail loudly if the remap produced two variables with the same slot.
     slots = [(g, b) for _, _, g, b in used]
     if len(slots) != len(set(slots)):

@@ -251,7 +251,7 @@ fn main_1() {
     global.bins[_e24] = 0u;
     storageBarrier();
     workgroupBarrier();
-    subgroupBarrier();
+    workgroupBarrier();
     textureBarrier();
     let _e27 = idx;
     if (_e27 != 0u) {
