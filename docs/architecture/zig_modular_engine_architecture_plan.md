@@ -1,5 +1,7 @@
 # Modular Zig Engine — Architecture, Extension SDK, and Full Roadmap
 
+> **Current layout note (2026-11-25):** repository layers (core, packages, apps, tools) and their dependency rules are defined in [ADR-008](../adr/ADR-008-application-package-boundaries.md). The editor shell and runtime now live under `apps/`. The text below preserves the original design context.
+
 **Status:** technical proposal for incremental implementation.  
 **Reference date:** 2026-11-23.  
 **Scope:** greenfield engine, independent of any existing engine.  

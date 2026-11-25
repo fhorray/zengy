@@ -1,0 +1,41 @@
+# ADR-008: Application and Package Boundaries
+
+- **Status:** Accepted
+- **Date:** 2026-11-25
+
+## Context
+`packages/` had grown to hold more than reusable capabilities. The manifest-driven runtime lived under `tools/runtime`, the editor shell (panel registry, undo/redo policy) was an installable package, and `remote` imported `editor_shell` directly, so a generic inspection package knew about one application's state.
+
+## Decision
+Ownership is decided by layer:
+
+| Layer | Location | Owns |
+|---|---|---|
+| Engine SDK | `src/engine.zig`, `src/core/` | Minimal headless infrastructure. |
+| Packages | `packages/` | Optional, reusable capabilities and providers with application-independent semantics. |
+| Applications | `apps/` | Product-specific composition, lifecycle, policies and workflows (`apps/runtime`, `apps/editor`). |
+| Tools | `tools/` | Developer automation (`cli`, `ci`). |
+| Examples / projects / tests | `examples/`, `projects/`, `tests/` | Demonstrations, integration sandboxes and fixtures. |
+
+Dependency direction: core imports nothing above it; packages may import core and other packages (acyclic) but never applications, tools, examples or tests; applications may import core and packages; tools may import core and packages. Launching an executable (the CLI starting `zengy-runtime`) is not a source dependency. `tools/ci/check_architecture.py` enforces these rules.
+
+Concrete changes:
+- `tools/runtime` moved to `apps/runtime/src`; the `zengy-runtime` binary name and launch contract are unchanged.
+- `packages/editor-shell` moved to `apps/editor` (`src/shell.zig`). It is an application-local build module, no longer a public SDK module or CLI package. Module ID `official.tools.editor_shell`, capability `engine.tools.editor_shell/1` and owner ID are unchanged.
+- `remote` defines a small optional `RemoteIntegration` (edit hook and panel visitor). `apps/editor/src/remote_adapter.zig` implements it on top of the shell; compositions call `remote_adapter.attach(&app)` after `app.initialize()`.
+
+## Alternatives considered
+- Keep all tooling as packages: leaves reverse dependencies and ships product policy as public API.
+- Move reusable tooling (remote, gizmos, testing, file watching) into apps: these are application-independent capabilities and stay packages.
+- Regroup `packages/` into new categories: churn that breaks public names and paths for no boundary benefit.
+
+## Tradeoffs and compatibility
+- Removing `editor-shell` from the CLI catalog is a deliberate breaking change for anyone running `zengy add editor-shell` or importing the old module path. Migration: copy `apps/editor/src/shell.zig` into the consuming application and attach `remote_adapter` explicitly if remote edits should join its history.
+- Remote edits no longer enter undo history implicitly; the application must attach the adapter. Without an adapter `set_component_field` writes directly and `list_panels` returns `{"panels":[]}`.
+- An adapter error is returned to the caller; Remote never retries it as a direct write.
+
+## Exceptions
+`packages/sdl3` is vendored SDK and provisioning infrastructure used by the build and CLI, not a feature package. It stays where it is.
+
+## Out of scope
+Scene documents, editor selection, document history, panels and the editor executable belong to `apps/editor` when they are built. Nothing here creates them.

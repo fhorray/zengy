@@ -10,6 +10,12 @@
 - **Reference ecosystem (`zig-gamedev`)**: When implementing specific Zig gamedev systems, math, audio, physics, or native bindings, consult [`zig-gamedev`](https://github.com/zig-gamedev) packages as a reference before reinventing low-level bindings, while wrapping any chosen dependency behind `zengy`'s agnostic capability contracts.
 - **Headless-first**: All core simulation and tests must run deterministically without a window or GPU.
 
+## Repository Layers
+
+- `src/core/` core SDK; `packages/` reusable optional capabilities and providers; `apps/` complete applications (`apps/runtime`, `apps/editor`); `tools/` developer automation (`cli`, `ci`); `examples/`, `projects/`, `benchmarks/`, `tests/` demos, integration sandboxes, perf and fixtures. See `docs/adr/ADR-008-application-package-boundaries.md`.
+- **Forbidden reverse dependencies**: core never imports packages; packages never import `apps/`, `tools/`, `examples/` or tests; apps and tools never import each other's sources (launching an executable is fine). Application-specific UI, documents, selection and workflow stay in the application until a concrete reuse need exists; do not create a package just to split a file.
+- Run `python3 tools/ci/check_architecture.py` after moving files or changing module wiring in `build.zig`.
+
 ## Code & Documentation Style
 
 - **English only**: Keep all repository code, comments, docstrings, documentation, skills, and commit messages in English.
