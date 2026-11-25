@@ -38,6 +38,7 @@ pub const Modules = struct {
     remote_mod: *std.Build.Module,
     log_mod: *std.Build.Module,
     editor_remote_adapter_mod: *std.Build.Module,
+    editor_document_mod: *std.Build.Module,
     window_sdl3_mod: *std.Build.Module,
     input_sdl3_mod: *std.Build.Module,
     zaudio_pkg_mod: *std.Build.Module,
@@ -434,6 +435,15 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     editor_remote_adapter_mod.addImport("remote", remote_mod);
     editor_remote_adapter_mod.addImport("editor_shell", editor_shell_mod);
 
+    // Editor document (entities, selection, transform history): plain data over the world, tested headless.
+    const editor_document_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/src/document.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    editor_document_mod.addImport("engine", engine_mod);
+    editor_document_mod.addImport("render_3d", render_3d_mod);
+
     // SDL 3.4.20 (zlib) vendored in third_party/sdl3 (Windows x64 binaries).
     const sdl3_c_mod = blk: {
         const translate_sdl3 = b.addTranslateC(.{
@@ -629,6 +639,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .remote_mod = remote_mod,
         .log_mod = log_mod,
         .editor_remote_adapter_mod = editor_remote_adapter_mod,
+        .editor_document_mod = editor_document_mod,
         .window_sdl3_mod = window_sdl3_mod,
         .input_sdl3_mod = input_sdl3_mod,
         .zaudio_pkg_mod = zaudio_pkg_mod,

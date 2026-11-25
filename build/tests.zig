@@ -180,6 +180,12 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .{ .name = "scene", .mod = scene_mod },
     }, null);
 
+    addModuleTest(b, test_step, "apps/editor/tests/document_tests.zig", target, optimize, false, &.{
+        .{ .name = "engine", .mod = engine_mod },
+        .{ .name = "render_3d", .mod = render_3d_mod },
+        .{ .name = "document", .mod = mods.editor_document_mod },
+    }, null);
+
     addModuleTest(b, test_step, "apps/editor/tests/shell_tests.zig", target, optimize, false, &.{
         .{ .name = "engine", .mod = engine_mod },
         .{ .name = "window", .mod = window_mod },

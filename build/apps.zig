@@ -1,9 +1,9 @@
-//! Applications: the manifest-driven `zengy-runtime` executable.
+//! Applications: the manifest-driven `zengy-runtime` executable and the `zengy-editor` MVP editor.
 
 const std = @import("std");
 const Modules = @import("modules.zig").Modules;
 
-/// Adds the `zengy-runtime` executable.
+/// Adds the `zengy-runtime` and `zengy-editor` executables.
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, mods: Modules) void {
     const engine_mod = mods.engine_mod;
     const window_mod = mods.window_mod;
@@ -20,6 +20,16 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const graphics_wgpu_mod = mods.graphics_wgpu_mod;
     const draw_2d_mod = mods.draw_2d_mod;
     const wgpu_missing = mods.wgpu_missing;
+    const gpu_3d_mod = mods.gpu_3d_mod;
+    const input_mod = mods.input_mod;
+    const input_sdl3_mod = mods.input_sdl3_mod;
+    const camera_mod = mods.camera_mod;
+    const render_3d_mod = mods.render_3d_mod;
+    const gizmos_mod = mods.gizmos_mod;
+    const shapes_mod = mods.shapes_mod;
+    const dev_tools_mod = mods.dev_tools_mod;
+    const picking_mod = mods.picking_mod;
+    const editor_document_mod = mods.editor_document_mod;
 
     // Manifesto-driven visual runtime (`apps/runtime/src/main.zig`): reads game.toml in CWD.
     const runtime_mod = b.createModule(.{
@@ -48,4 +58,41 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .root_module = runtime_mod,
     });
     if (wgpu_missing) |fail| runtime_exe.step.dependOn(&fail.step) else b.installArtifact(runtime_exe);
+
+    // Minimal scene editor (`apps/editor/src/main.zig`). Run with `zig build run-editor`.
+    const editor_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    editor_mod.addImport("engine", engine_mod);
+    editor_mod.addImport("window_sdl3", window_sdl3_mod);
+    editor_mod.addImport("graphics", graphics_mod);
+    editor_mod.addImport("graphics_wgpu", graphics_wgpu_mod);
+    editor_mod.addImport("draw_2d", draw_2d_mod);
+    editor_mod.addImport("gpu_3d", gpu_3d_mod);
+    editor_mod.addImport("input", input_mod);
+    editor_mod.addImport("input_sdl3", input_sdl3_mod);
+    editor_mod.addImport("ui_core", ui_core_mod);
+    editor_mod.addImport("camera", camera_mod);
+    editor_mod.addImport("render_3d", render_3d_mod);
+    editor_mod.addImport("gizmos", gizmos_mod);
+    editor_mod.addImport("shapes", shapes_mod);
+    editor_mod.addImport("dev_tools", dev_tools_mod);
+    editor_mod.addImport("picking", picking_mod);
+    editor_mod.addImport("document", editor_document_mod);
+
+    const editor_exe = b.addExecutable(.{
+        .name = "zengy-editor",
+        .root_module = editor_mod,
+    });
+    if (wgpu_missing) |fail| editor_exe.step.dependOn(&fail.step) else b.installArtifact(editor_exe);
+
+    const run_editor = b.addSystemCommand(&.{"zig-out/bin/zengy-editor.exe"});
+    run_editor.setCwd(b.path("."));
+    run_editor.step.dependOn(b.getInstallStep());
+    if (wgpu_missing) |fail| run_editor.step.dependOn(&fail.step);
+    const run_editor_step = b.step("run-editor", "Open the zengy-editor MVP scene editor");
+    run_editor_step.dependOn(&run_editor.step);
 }
