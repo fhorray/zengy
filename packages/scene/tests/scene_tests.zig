@@ -8,6 +8,10 @@ const testing = std.testing;
 const engine = @import("engine");
 const scene = @import("scene");
 
+test {
+    std.testing.refAllDecls(scene.codec);
+}
+
 test "SceneSnapshot3D capture/restore preserves LocalTransform3D and GUIDs" {
     var app = engine.App.init(testing.allocator, .{ .max_frames = 1 });
     defer app.deinit();

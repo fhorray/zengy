@@ -310,6 +310,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    const startup_scene: ?[]const u8 = if (manifest.startup_scene.len > 0) manifest.startup_scene else null;
     var has_scene = false;
     for (manifest.plugins) |plugin_name| {
         if (std.mem.eql(u8, plugin_name, "scene")) {
@@ -318,6 +319,11 @@ pub fn main(init: std.process.Init) !void {
                 has_scene = true;
             }
         }
+    }
+    // Authored scenes require the scene module even when it was not listed in plugins.
+    if (startup_scene != null and !has_scene) {
+        try app.registerModule(scene.module());
+        has_scene = true;
     }
     if (needsPhysicsModule(manifest.plugins)) {
         try app.registerModule(physics.module());
@@ -329,6 +335,10 @@ pub fn main(init: std.process.Init) !void {
         try app.scheduler.addSystem(.{ .name = "runtime.headless_destroy", .stage = .shutdown, .run = headlessDestroySystem });
         try app.initialize();
         const dynamic_loaded = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
+        var scene_entities: usize = 0;
+        if (startup_scene) |path| {
+            scene_entities = try scene.codec.loadSnapshot3DFile(allocator, io, path, &app.world);
+        }
 
         var loaded_script: ?scripting_host.ScriptModuleHandle = null;
         if (entry_script) |sp| {
@@ -353,8 +363,8 @@ pub fn main(init: std.process.Init) !void {
         const phys_backend = if (app.resources.get(physics.PhysicsService)) |ps| ps.hasBackend() else false;
         app.shutdown();
         std.debug.print(
-            "{{\"mode\":\"headless\",\"ticks\":{d},\"dynamic_plugins\":{d},\"physics_steps\":{d},\"physics_backend\":{},\"status\":\"ok\"}}\n",
-            .{ t, dynamic_loaded, phys_steps, phys_backend },
+            "{{\"mode\":\"headless\",\"ticks\":{d},\"dynamic_plugins\":{d},\"physics_steps\":{d},\"physics_backend\":{},\"scene_entities\":{d},\"status\":\"ok\"}}\n",
+            .{ t, dynamic_loaded, phys_steps, phys_backend, scene_entities },
         );
         return;
     }
@@ -373,6 +383,9 @@ pub fn main(init: std.process.Init) !void {
 
     try app.initialize();
     _ = try loadDynamicPlugins(allocator, io, &app, manifest.plugins);
+    if (startup_scene) |path| {
+        _ = try scene.codec.loadSnapshot3DFile(allocator, io, path, &app.world);
+    }
 
     const i_entry = try app.services.getService("engine.input", 1);
     const input: *window.InputService = @ptrCast(@alignCast(@constCast(i_entry.api_ptr)));

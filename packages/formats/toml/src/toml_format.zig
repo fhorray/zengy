@@ -122,6 +122,8 @@ pub const TomlService = struct {
         mode: []const u8,
         entry_script: []const u8,
         ui: []const u8,
+        /// Optional authored 3D scene path (JSON `SceneSnapshot3D`), resolved from the project CWD.
+        startup_scene: []const u8 = "",
         plugins: []const []const u8 = &.{},
 
         pub fn deinit(self: *GameManifest, allocator: std.mem.Allocator) void {
@@ -129,6 +131,7 @@ pub const TomlService = struct {
             allocator.free(self.mode);
             allocator.free(self.entry_script);
             allocator.free(self.ui);
+            allocator.free(self.startup_scene);
             for (self.plugins) |p| allocator.free(p);
             if (self.plugins.len > 0) allocator.free(self.plugins);
         }
@@ -150,6 +153,7 @@ pub const TomlService = struct {
         const mode_s = if (tbl.get("mode")) |v| (if (v == .string) v.string else "2d") else "2d";
         const script_s = if (tbl.get("entry_script")) |v| (if (v == .string) v.string else "") else "";
         const ui_s = if (tbl.get("ui")) |v| (if (v == .string) v.string else "") else "";
+        const scene_s = if (tbl.get("startup_scene")) |v| (if (v == .string) v.string else "") else "";
         const w: u32 = if (tbl.get("width")) |v| (if (v == .integer and v.integer.value > 0) @intCast(v.integer.value) else 1280) else 1280;
         const h: u32 = if (tbl.get("height")) |v| (if (v == .integer and v.integer.value > 0) @intCast(v.integer.value) else 720) else 720;
 
@@ -176,6 +180,8 @@ pub const TomlService = struct {
         errdefer allocator.free(script_copy);
         const ui_copy = try allocator.dupe(u8, ui_s);
         errdefer allocator.free(ui_copy);
+        const scene_copy = try allocator.dupe(u8, scene_s);
+        errdefer allocator.free(scene_copy);
 
         return .{
             .title = title_copy,
@@ -184,6 +190,7 @@ pub const TomlService = struct {
             .mode = mode_copy,
             .entry_script = script_copy,
             .ui = ui_copy,
+            .startup_scene = scene_copy,
             .plugins = try plugins_list.toOwnedSlice(allocator),
         };
     }

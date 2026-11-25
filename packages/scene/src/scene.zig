@@ -15,6 +15,9 @@ pub const graph = @import("graph.zig");
 /// `LocalTransform2D/3D` + `GlobalTransform2D/3D` with incremental propagation (see `incremental.zig`).
 pub const incremental = @import("incremental.zig");
 
+/// JSON codec for `SceneSnapshot3D` (see `codec.zig`).
+pub const codec = @import("codec.zig");
+
 /// Local and computed world-space 2D transform component.
 pub const Transform2D = struct {
     x: f32 = 0,
