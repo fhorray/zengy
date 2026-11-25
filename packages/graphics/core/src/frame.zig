@@ -130,6 +130,20 @@ pub const RendererList = struct {
         for (self.items.items) |renderer| try renderer.render(renderer.ctx, input);
     }
 
+    /// Runs renderers whose `order` is `<= max_order` (inclusive).
+    pub fn runUpTo(self: *const RendererList, input: *FrameInput, max_order: i32) !void {
+        for (self.items.items) |renderer| {
+            if (renderer.order <= max_order) try renderer.render(renderer.ctx, input);
+        }
+    }
+
+    /// Runs renderers whose `order` is `> min_order`.
+    pub fn runAfter(self: *const RendererList, input: *FrameInput, min_order: i32) !void {
+        for (self.items.items) |renderer| {
+            if (renderer.order > min_order) try renderer.render(renderer.ctx, input);
+        }
+    }
+
     pub fn notifyFrameResult(self: *const RendererList, submitted: bool) void {
         for (self.items.items) |renderer| {
             if (renderer.frame_result) |notify| notify(renderer.ctx, submitted);

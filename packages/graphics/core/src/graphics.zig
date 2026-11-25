@@ -71,6 +71,16 @@ pub const BackendVTable = struct {
     on_present: ?*const fn (ctx: *anyopaque, handle: RenderTargetHandle, commands: []const DrawCommand) anyerror!PresentResult = null,
 };
 
+/// Optional embedded scene view: world/gizmo renderers draw into this sampleable target;
+/// overlay/UI renderers still present to the swapchain and may sample `texture_id`.
+pub const SceneViewTarget = struct {
+    texture_id: TextureId,
+    width: u32,
+    height: u32,
+    /// Inclusive max `frame.Order` rendered into the offscreen target (default: gizmos).
+    max_order: i32 = frame.Order.gizmos,
+};
+
 pub const GraphicsDeviceService = struct {
     allocator: std.mem.Allocator,
     targets: std.ArrayList(RenderTargetSlot),
@@ -85,6 +95,8 @@ pub const GraphicsDeviceService = struct {
     renderers: frame.RendererList = .{},
     /// Textures shared by every renderer (sprites, meshes, materials).
     textures: textures.TextureStore,
+    /// When set, providers render world passes into this target before compositing UI.
+    scene_view: ?SceneViewTarget = null,
 
     pub fn init(allocator: std.mem.Allocator) GraphicsDeviceService {
         return .{

@@ -29,6 +29,7 @@ const shapes = @import("shapes");
 const dev_tools = @import("dev_tools");
 const picking = @import("picking");
 const document = @import("document");
+const editor_shell = @import("editor_shell");
 
 const LEFT_W: f32 = 220;
 const RIGHT_W: f32 = 270;
@@ -55,6 +56,9 @@ const EditorState = struct {
     doc: *document.EditorDocument,
     cmds: *std.ArrayList(graphics.DrawCommand),
     cube_ref: render_3d.MeshRef,
+    scene_tex: ?graphics.TextureId = null,
+    scene_w: u32 = 0,
+    scene_h: u32 = 0,
     gizmo_mode: gizmos.TransformGizmoMode = .translate,
     next_cube: u32 = 1,
     status: [120]u8 = @splat(0),
@@ -145,9 +149,9 @@ fn updateEditor(ctx: *engine.SystemContext) !void {
 
     // Undo / redo.
     if (ctrl and keys.justPressed(.key_z) and !shift) {
-        st.setStatus("{s}", .{if (try doc.undo(ctx.world)) "Undo" else "Nothing to undo"});
+        st.setStatus("{s}", .{if (try doc.undo(ctx.world, &st.app.types)) "Undo" else "Nothing to undo"});
     } else if (ctrl and (keys.justPressed(.key_y) or (shift and keys.justPressed(.key_z)))) {
-        st.setStatus("{s}", .{if (try doc.redo(ctx.world)) "Redo" else "Nothing to redo"});
+        st.setStatus("{s}", .{if (try doc.redo(ctx.world, &st.app.types)) "Redo" else "Nothing to redo"});
     }
 
     // Selection shortcuts.
@@ -252,17 +256,53 @@ fn text(st: *EditorState, x: f32, y: f32, content: []const u8, color: graphics.C
     try st.cmds.append(st.app.allocator, .{ .text = .{ .x = x, .y = y, .content = content, .color = color } });
 }
 
+fn ensureSceneView(st: *EditorState, logical_w: f32, logical_h: f32, dpi: f32) !void {
+    const vw = @max(1, @as(u32, @intFromFloat(@floor((logical_w - LEFT_W - RIGHT_W) * dpi))));
+    const vh = @max(1, @as(u32, @intFromFloat(@floor((logical_h - HEADER_H - FOOTER_H) * dpi))));
+    if (st.scene_tex) |id| {
+        if (st.scene_w == vw and st.scene_h == vh) {
+            st.gfx.scene_view = .{ .texture_id = id, .width = vw, .height = vh };
+            return;
+        }
+        st.gfx.destroyTexture(id);
+        st.scene_tex = null;
+    }
+    const id = try graphics.createRenderTarget(st.app, vw, vh, .rgba8_unorm);
+    st.scene_tex = id;
+    st.scene_w = vw;
+    st.scene_h = vh;
+    st.gfx.scene_view = .{ .texture_id = id, .width = vw, .height = vh };
+}
+
 fn renderOverlay(ctx: *engine.SystemContext) !void {
     const st = ctx.resources.get(EditorState) orelse return;
     const cam_svc = ctx.resources.get(camera.CameraService) orelse return;
     const prof = ctx.resources.get(dev_tools.FrameProfilerService) orelse return;
     const px = window_sdl3.pixelSize(st.app);
-    cam_svc.setPrimaryTargetSize(if (px) |p| p.width else 1280, if (px) |p| p.height else 720);
+    const dpi: f32 = if (px) |p| (if (p.dpi_scale > 0) p.dpi_scale else 1.0) else 1.0;
 
     const win = windowSize(st.app);
+    try ensureSceneView(st, win.w, win.h, dpi);
+    // Camera / picking use the embedded view pixel size, not the full window.
+    cam_svc.setPrimaryTargetSize(st.scene_w, st.scene_h);
+
     const doc = st.doc;
     st.cmds.clearRetainingCapacity();
     st.text_len = 0;
+
+    // Full-window backdrop (swapchain clear via first rect / clear).
+    try st.cmds.append(st.app.allocator, .{ .clear = .{ .r = 0.08, .g = 0.09, .b = 0.11, .a = 1.0 } });
+
+    // Embedded Scene View (world was rendered into scene_tex this frame).
+    if (st.scene_tex) |tex| {
+        try st.cmds.append(st.app.allocator, .{ .image = .{
+            .x = LEFT_W,
+            .y = HEADER_H,
+            .width = win.w - LEFT_W - RIGHT_W,
+            .height = win.h - HEADER_H - FOOTER_H,
+            .texture_id = tex,
+        } });
+    }
 
     // Header.
     try st.cmds.append(st.app.allocator, .{ .rect = .{ .x = 0, .y = 0, .width = win.w, .height = HEADER_H, .color = header_bg } });
@@ -326,6 +366,7 @@ pub fn main(init: std.process.Init) !void {
     try app.registerModule(shapes.module());
     try app.registerModule(dev_tools.module());
     try app.registerModule(picking.module());
+    try app.registerModule(editor_shell.module());
 
     try app.resources.insert(window_sdl3.WindowConfig, .{
         .title = "Zengy Editor",
@@ -354,6 +395,7 @@ pub fn main(init: std.process.Init) !void {
 
     var doc = document.EditorDocument.init(allocator);
     defer doc.deinit();
+    if (app.resources.get(editor_shell.EditorShellService)) |shell| shell.bindDocument(&doc);
     var cmds: std.ArrayList(graphics.DrawCommand) = .empty;
     defer cmds.deinit(allocator);
 

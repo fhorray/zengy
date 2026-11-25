@@ -265,7 +265,32 @@ fn present(raw: *anyopaque, handle: graphics.RenderTargetHandle, commands: []con
         .clear = clear,
         .draw_commands = commands,
     };
-    try state.service.renderers.run(&input);
+
+    if (state.service.scene_view) |sv| {
+        if (sv.width == 0 or sv.height == 0) return error.InvalidSceneView;
+        const entry = state.service.textures.get(sv.texture_id) orelse return error.InvalidSceneView;
+        var world_input = input;
+        world_input.draw_commands = &.{};
+        world_input.color_target = .{ .view = entry.view };
+        world_input.color_target_used = false;
+        world_input.target = .{
+            .width = sv.width,
+            .height = sv.height,
+            .dpi_scale = dpi_scale,
+            .color_format = entry.format,
+        };
+        try state.service.renderers.runUpTo(&world_input, sv.max_order);
+        if (!world_input.color_target_used) {
+            const attachments = [_]gpu.ColorAttachment{world_input.colorAttachment()};
+            try recorder.beginRenderPass(.{ .label = "scene-view-clear", .color_attachments = &attachments });
+            try recorder.endRenderPass();
+        }
+        input.color_target = .swapchain;
+        input.color_target_used = false;
+        try state.service.renderers.runAfter(&input, sv.max_order);
+    } else {
+        try state.service.renderers.run(&input);
+    }
     const t1 = SDL_GetTicksNS();
     if (!input.color_target_used) {
         // Nothing drew: still clear the swapchain so the window shows the background instead of stale pixels.

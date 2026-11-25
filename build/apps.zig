@@ -30,6 +30,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const dev_tools_mod = mods.dev_tools_mod;
     const picking_mod = mods.picking_mod;
     const editor_document_mod = mods.editor_document_mod;
+    const editor_shell_mod = mods.editor_shell_mod;
 
     // Manifesto-driven visual runtime (`apps/runtime/src/main.zig`): reads game.toml in CWD.
     const runtime_mod = b.createModule(.{
@@ -82,6 +83,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     editor_mod.addImport("dev_tools", dev_tools_mod);
     editor_mod.addImport("picking", picking_mod);
     editor_mod.addImport("document", editor_document_mod);
+    editor_mod.addImport("editor_shell", editor_shell_mod);
 
     const editor_exe = b.addExecutable(.{
         .name = "zengy-editor",
