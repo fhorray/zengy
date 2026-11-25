@@ -42,7 +42,7 @@ const Fixture = struct {
     }
 
     fn hp(self: *Fixture) !f32 {
-        const v = try engine.TypeRegistry.getField(self.schema, self.app.world.getRaw(self.entity, self.schema.component_type_id).?, "hp");
+        const v = try engine.TypeRegistry.getField(self.schema, self.app.world.getRawConst(self.entity, self.schema.component_type_id).?, "hp");
         return v.f32_t;
     }
 
@@ -68,7 +68,7 @@ test "remote edit through the adapter records exactly one undo transaction" {
     const res = try fx.setRequest("55.5");
     defer testing.allocator.free(res);
     try testing.expect(std.mem.indexOf(u8, res, "\"ok\":true") != null);
-    try testing.expectEqual(@as(usize, 1), shell.undo_stack.items.len);
+    try testing.expectEqual(@as(usize, 1), shell.authoring().undo_stack.items.len);
     try testing.expectApproxEqAbs(@as(f32, 55.5), try fx.hp(), 1e-3);
 
     try testing.expect(try shell.undo(&fx.app.world, &fx.app.types));
@@ -101,7 +101,7 @@ test "invalid remote edits through the adapter leave no history and no mutation"
     const bad = try fx.setRequest("\"not a number\"");
     defer testing.allocator.free(bad);
     try testing.expect(std.mem.indexOf(u8, bad, "\"error\"") != null);
-    try testing.expectEqual(@as(usize, 0), shell.undo_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), shell.authoring().undo_stack.items.len);
     try testing.expectApproxEqAbs(@as(f32, 100.0), try fx.hp(), 1e-3);
 }
 
@@ -128,7 +128,7 @@ test "detached adapter restores direct edits and an empty panel list" {
     const res = try fx.setRequest("12.0");
     defer testing.allocator.free(res);
     try testing.expect(std.mem.indexOf(u8, res, "\"ok\":true") != null);
-    try testing.expectEqual(@as(usize, 0), shell.undo_stack.items.len);
+    try testing.expectEqual(@as(usize, 0), shell.authoring().undo_stack.items.len);
     try testing.expectApproxEqAbs(@as(f32, 12.0), try fx.hp(), 1e-3);
 
     const rem = fx.app.resources.get(remote.RemoteInspectorService).?;

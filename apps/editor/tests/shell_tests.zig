@@ -36,16 +36,17 @@ test "EditorShell panels, schema-driven inspector, and undo/redo" {
     try engine.TypeRegistry.setField(schema, init_bytes, "hp", .{ .f32_t = 100.0 });
     try app.world.setRaw(e, schema.component_type_id, init_bytes);
 
-    // Edit via inspector and verify undo/redo.
+    // Edit via inspector (document history) and verify undo/redo.
     try shell.setInspectedField(&app.world, &app.types, e, schema.schema_id, "hp", .{ .f32_t = 42.5 });
-    const after_edit = try engine.TypeRegistry.getField(schema, app.world.getRaw(e, schema.component_type_id).?, "hp");
+    try testing.expectEqual(@as(usize, 1), shell.authoring().undo_stack.items.len);
+    const after_edit = try engine.TypeRegistry.getField(schema, app.world.getRawConst(e, schema.component_type_id).?, "hp");
     try testing.expectApproxEqAbs(@as(f32, 42.5), after_edit.f32_t, 0.001);
 
     try testing.expect(try shell.undo(&app.world, &app.types));
-    const after_undo = try engine.TypeRegistry.getField(schema, app.world.getRaw(e, schema.component_type_id).?, "hp");
+    const after_undo = try engine.TypeRegistry.getField(schema, app.world.getRawConst(e, schema.component_type_id).?, "hp");
     try testing.expectApproxEqAbs(@as(f32, 100.0), after_undo.f32_t, 0.001);
 
     try testing.expect(try shell.redo(&app.world, &app.types));
-    const after_redo = try engine.TypeRegistry.getField(schema, app.world.getRaw(e, schema.component_type_id).?, "hp");
+    const after_redo = try engine.TypeRegistry.getField(schema, app.world.getRawConst(e, schema.component_type_id).?, "hp");
     try testing.expectApproxEqAbs(@as(f32, 42.5), after_redo.f32_t, 0.001);
 }

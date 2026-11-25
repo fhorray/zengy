@@ -443,6 +443,8 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     });
     editor_document_mod.addImport("engine", engine_mod);
     editor_document_mod.addImport("render_3d", render_3d_mod);
+    // Shell routes authoring history through the document module.
+    editor_shell_mod.addImport("document", editor_document_mod);
 
     // SDL 3.4.20 (zlib) vendored in third_party/sdl3 (Windows x64 binaries).
     const sdl3_c_mod = blk: {

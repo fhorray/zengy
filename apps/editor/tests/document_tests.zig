@@ -67,17 +67,17 @@ test "setTransform records history; undo and redo restore it; a new edit clears 
     try doc.setTransform(&app.world, e, .{ .position = .{ 3, 0, 0 } });
     try testing.expectEqual(@as(f32, 3), app.world.get(e, render_3d.Transform3D).?.position[0]);
 
-    try testing.expect(try doc.undo(&app.world));
+    try testing.expect(try doc.undo(&app.world, null));
     try testing.expectEqual(@as(f32, 2), app.world.get(e, render_3d.Transform3D).?.position[0]);
-    try testing.expect(try doc.undo(&app.world));
+    try testing.expect(try doc.undo(&app.world, null));
     try testing.expectEqual(@as(f32, 1), app.world.get(e, render_3d.Transform3D).?.position[0]);
-    try testing.expect(!(try doc.undo(&app.world)));
+    try testing.expect(!(try doc.undo(&app.world, null)));
 
-    try testing.expect(try doc.redo(&app.world));
+    try testing.expect(try doc.redo(&app.world, null));
     try testing.expectEqual(@as(f32, 2), app.world.get(e, render_3d.Transform3D).?.position[0]);
 
     try doc.setTransform(&app.world, e, .{ .position = .{ 7, 0, 0 } });
-    try testing.expect(!(try doc.redo(&app.world)));
+    try testing.expect(!(try doc.redo(&app.world, null)));
     try testing.expectEqual(@as(f32, 7), app.world.get(e, render_3d.Transform3D).?.position[0]);
 }
 
@@ -91,7 +91,7 @@ test "setTransform on an entity without a Transform3D fails without recording" {
     try testing.expectError(error.EntityNotInDocument, doc.setTransform(&app.world, bare, .{}));
     try doc.register(bare, "Bare");
     try testing.expectError(error.MissingTransform, doc.setTransform(&app.world, bare, .{}));
-    try testing.expect(!(try doc.undo(&app.world)));
+    try testing.expect(!(try doc.undo(&app.world, null)));
 }
 
 test "undo skips stale targets and does not report false success" {
@@ -105,7 +105,35 @@ test "undo skips stale targets and does not report false success" {
     try doc.setTransform(&app.world, e, .{ .position = .{ 2, 0, 0 } });
     _ = try app.world.despawn(e);
     _ = doc.unregister(e);
-    try testing.expect(!(try doc.undo(&app.world)));
+    try testing.expect(!(try doc.undo(&app.world, null)));
+}
+
+test "field and transform edits share one chronological history" {
+    var app = engine.App.init(testing.allocator, .{});
+    defer app.deinit();
+    var doc = document.EditorDocument.init(testing.allocator);
+    defer doc.deinit();
+
+    const schema = try app.types.registerSchema("game", "Health", 1, .blittable, &.{
+        .{ .name = "hp", .field_type = .f32_t },
+    });
+    _ = try app.world.registerDynamicComponent("game.Health", schema.byte_size);
+    const e = try spawnAt(&app, 1);
+    try doc.register(e, "E");
+    const bytes = try testing.allocator.alloc(u8, schema.byte_size);
+    defer testing.allocator.free(bytes);
+    @memset(bytes, 0);
+    try engine.TypeRegistry.setField(schema, bytes, "hp", .{ .f32_t = 100 });
+    try app.world.setRaw(e, schema.component_type_id, bytes);
+
+    try doc.setTransform(&app.world, e, .{ .position = .{ 5, 0, 0 } });
+    try doc.setField(&app.world, &app.types, e, schema.schema_id, "hp", .{ .f32_t = 40 });
+    try testing.expectEqual(@as(usize, 2), doc.undo_stack.items.len);
+
+    try testing.expect(try doc.undo(&app.world, &app.types));
+    try testing.expectApproxEqAbs(@as(f32, 100), (try engine.TypeRegistry.getField(schema, app.world.getRawConst(e, schema.component_type_id).?, "hp")).f32_t, 1e-3);
+    try testing.expect(try doc.undo(&app.world, &app.types));
+    try testing.expectEqual(@as(f32, 1), app.world.getConst(e, render_3d.Transform3D).?.position[0]);
 }
 
 test "unregister clears selection and drops that entity's history" {
@@ -128,9 +156,9 @@ test "unregister clears selection and drops that entity's history" {
     try testing.expectEqual(@as(usize, 1), doc.entries.items.len);
 
     // Only b's edit remains.
-    try testing.expect(try doc.undo(&app.world));
+    try testing.expect(try doc.undo(&app.world, null));
     try testing.expectEqual(@as(f32, 0), app.world.get(b, render_3d.Transform3D).?.position[0]);
-    try testing.expect(!(try doc.undo(&app.world)));
+    try testing.expect(!(try doc.undo(&app.world, null)));
 }
 
 test "history is bounded" {

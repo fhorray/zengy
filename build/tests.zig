@@ -192,6 +192,8 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .{ .name = "graphics", .mod = graphics_mod },
         .{ .name = "ui_core", .mod = ui_core_mod },
         .{ .name = "editor_shell", .mod = editor_shell_mod },
+        .{ .name = "document", .mod = mods.editor_document_mod },
+        .{ .name = "render_3d", .mod = render_3d_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/render/3d/tests/render_3d_tests.zig", target, optimize, false, &.{
@@ -250,6 +252,8 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .{ .name = "remote", .mod = remote_mod },
         .{ .name = "editor_shell", .mod = editor_shell_mod },
         .{ .name = "remote_adapter", .mod = editor_remote_adapter_mod },
+        .{ .name = "document", .mod = mods.editor_document_mod },
+        .{ .name = "render_3d", .mod = render_3d_mod },
     }, null);
 
     addModuleTest(b, test_step, "packages/log/tests/log_tests.zig", target, optimize, false, &.{
